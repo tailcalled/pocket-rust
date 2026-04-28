@@ -311,3 +311,33 @@ fn let_out_of_scope_after_block_is_rejected() {
         err
     );
 }
+
+#[test]
+fn borrow_through_inner_block_blocks_outer_move() {
+    // The borrow `&pt1` is created inside the inner block, but the block returns
+    // it (as `pt3`) so the borrow ends up bound to `pt2`. A subsequent move of
+    // `pt1` must be rejected — `pt2` would otherwise be a dangling reference.
+    let err = compile_source(
+        "struct Point { x: usize, y: usize }\nfn x_of(p: &Point) -> usize { p.x }\nfn f() -> usize { let pt1 = Point { x: 42, y: 0 }; let pt2 = { let pt3 = &pt1; pt3 }; let invalid = pt1; x_of(pt2) }",
+    );
+    assert!(
+        err.contains("borrowed"),
+        "expected move-while-borrowed error, got: {}",
+        err
+    );
+}
+
+#[test]
+fn borrow_of_subfield_blocks_parent_move() {
+    // `&p.x` borrows the subfield, leaving `p` with a borrowed sub-place.
+    // Trying to move `p` whole then has to fail.
+    let err = compile_source(
+        "struct Point { x: usize, y: usize }\nfn f(p: Point) -> usize { let r = &p.x; let q = p; q.y }",
+    );
+    assert!(
+        err.contains("borrowed"),
+        "expected move-while-borrowed error, got: {}",
+        err
+    );
+}
+

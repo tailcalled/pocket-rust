@@ -151,3 +151,37 @@ fn block_expr_returns_11() {
     let result = answer.call(&mut store, ()).expect("call failed");
     assert_eq!(result, 11);
 }
+
+#[test]
+fn escaping_borrow_returns_42() {
+    let bytes = compile_example("escaping_borrow", "lib.rs");
+    let (mut store, instance) = instantiate(&bytes);
+    let answer = instance
+        .get_typed_func::<(), i32>(&store, "answer")
+        .expect("export `answer` not found / wrong signature");
+    let result = answer.call(&mut store, ()).expect("call failed");
+    assert_eq!(result, 42);
+}
+
+// KNOWN-FAILING: pocket-rust's borrowck is stricter than Rust here.
+//
+// `examples/inner_borrow_lifetime/lib.rs` is valid Rust — the borrow `&pt1`
+// inside the inner block is bound to `r`, which goes out of scope at the
+// inner `}`. The block's tail is `r.x` (a `usize`, copied through the
+// reference), so nothing borrowing `pt1` escapes, and `let q = pt1;` is
+// accepted. `q.x` is `5`.
+//
+// Pocket-rust currently keeps the `&pt1` borrow alive for the rest of the
+// function (borrows are scoped per-`Call`, not per-binding), so it rejects
+// the `let q = pt1;` move and `compile_example` panics. This test will
+// start passing the day we add per-binding borrow lifetimes.
+#[test]
+fn inner_borrow_lifetime_returns_5() {
+    let bytes = compile_example("inner_borrow_lifetime", "lib.rs");
+    let (mut store, instance) = instantiate(&bytes);
+    let answer = instance
+        .get_typed_func::<(), i32>(&store, "answer")
+        .expect("export `answer` not found / wrong signature");
+    let result = answer.call(&mut store, ()).expect("call failed");
+    assert_eq!(result, 5);
+}
