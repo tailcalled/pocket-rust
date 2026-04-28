@@ -1,6 +1,6 @@
 use crate::ast::{
-    Block, Call, Expr, ExprKind, FieldAccess, FieldInit, Function, Param, Path, PathSegment,
-    StructDef, StructField, StructLit, Type, TypeKind,
+    Block, Call, Expr, ExprKind, FieldAccess, FieldInit, Function, LetStmt, Param, Path,
+    PathSegment, Stmt, StructDef, StructField, StructLit, Type, TypeKind,
 };
 use crate::lexer::{Token, TokenKind, token_kind_name};
 use crate::span::{Error, Pos, Span};
@@ -165,6 +165,10 @@ impl Parser {
 
     fn parse_block(&mut self) -> Result<Block, Error> {
         let lb = self.expect(&TokenKind::LBrace, "`{`")?;
+        let mut stmts: Vec<Stmt> = Vec::new();
+        while self.peek_kind(&TokenKind::Let) {
+            stmts.push(self.parse_let_stmt()?);
+        }
         let tail = if self.peek_kind(&TokenKind::RBrace) {
             None
         } else {
@@ -172,9 +176,30 @@ impl Parser {
         };
         let rb = self.expect(&TokenKind::RBrace, "`}`")?;
         Ok(Block {
+            stmts,
             tail,
             span: Span::new(lb.start, rb.end),
         })
+    }
+
+    fn parse_let_stmt(&mut self) -> Result<Stmt, Error> {
+        self.expect(&TokenKind::Let, "`let`")?;
+        let (name, name_span) = self.expect_ident()?;
+        let ty = if self.peek_kind(&TokenKind::Colon) {
+            self.pos += 1;
+            Some(self.parse_type()?)
+        } else {
+            None
+        };
+        self.expect(&TokenKind::Eq, "`=`")?;
+        let value = self.parse_expr()?;
+        self.expect(&TokenKind::Semi, "`;`")?;
+        Ok(Stmt::Let(LetStmt {
+            name,
+            name_span,
+            ty,
+            value,
+        }))
     }
 
     fn parse_expr(&mut self) -> Result<Expr, Error> {
@@ -428,6 +453,8 @@ impl Parser {
             (TokenKind::PathSep, TokenKind::PathSep) => true,
             (TokenKind::Comma, TokenKind::Comma) => true,
             (TokenKind::Amp, TokenKind::Amp) => true,
+            (TokenKind::Let, TokenKind::Let) => true,
+            (TokenKind::Eq, TokenKind::Eq) => true,
             _ => false,
         }
     }

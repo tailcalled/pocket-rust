@@ -1,14 +1,26 @@
-use pocket_rust::{Vfs, compile};
+use pocket_rust::{Library, Vfs, compile};
 use std::fs;
 use std::path::Path;
 use wasmi::{Engine, Linker, Module, Store};
+
+fn load_stdlib() -> Library {
+    let stdlib_path = Path::new("lib/std");
+    let mut vfs = Vfs::new();
+    load_dir(stdlib_path, stdlib_path, &mut vfs);
+    Library {
+        name: "std".to_string(),
+        vfs,
+        entry: "lib.rs".to_string(),
+    }
+}
 
 fn compile_example(dir: &str, entry: &str) -> Vec<u8> {
     let dir_path = format!("examples/{}", dir);
     let root = Path::new(&dir_path);
     let mut vfs = Vfs::new();
     load_dir(root, root, &mut vfs);
-    let module = compile(&vfs, entry).expect("compile failed");
+    let libs = vec![load_stdlib()];
+    let module = compile(&libs, &vfs, entry).expect("compile failed");
     module.encode()
 }
 
@@ -116,4 +128,15 @@ fn uses_std_dummy_id_returns_7() {
         .expect("export `answer` not found / wrong signature");
     let result = answer.call(&mut store, ()).expect("call failed");
     assert_eq!(result, 7);
+}
+
+#[test]
+fn lets_returns_5() {
+    let bytes = compile_example("lets", "lib.rs");
+    let (mut store, instance) = instantiate(&bytes);
+    let answer = instance
+        .get_typed_func::<(), i32>(&store, "answer")
+        .expect("export `answer` not found / wrong signature");
+    let result = answer.call(&mut store, ()).expect("call failed");
+    assert_eq!(result, 5);
 }

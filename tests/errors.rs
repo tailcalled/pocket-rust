@@ -3,7 +3,7 @@ use pocket_rust::{Vfs, compile};
 fn compile_source(source: &str) -> String {
     let mut vfs = Vfs::new();
     vfs.insert("lib.rs".to_string(), source.to_string());
-    compile(&vfs, "lib.rs").err().expect("expected error")
+    compile(&[], &vfs, "lib.rs").err().expect("expected error")
 }
 
 #[test]
@@ -264,6 +264,30 @@ fn ref_return_type_is_rejected() {
     assert!(
         err.contains("cannot return reference"),
         "expected ref-return error, got: {}",
+        err
+    );
+}
+
+#[test]
+fn let_annotation_type_mismatch_is_rejected() {
+    let err = compile_source(
+        "struct Point { x: usize, y: usize }\nfn f() -> usize { let x: usize = Point { x: 1, y: 2 }; x }",
+    );
+    assert!(
+        err.contains("let initializer has type"),
+        "expected let-annotation mismatch, got: {}",
+        err
+    );
+}
+
+#[test]
+fn let_then_use_after_move_is_rejected() {
+    let err = compile_source(
+        "struct Point { x: usize, y: usize }\nfn use_point(p: Point) -> usize { p.x }\nfn f() -> usize { let p = Point { x: 1, y: 2 }; let q = use_point(p); p.y }",
+    );
+    assert!(
+        err.contains("already moved"),
+        "expected use-after-move error, got: {}",
         err
     );
 }

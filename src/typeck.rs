@@ -1,6 +1,6 @@
 use crate::ast::{
-    Block, Call, Expr, ExprKind, FieldAccess, Function, Item, Module, PathSegment, StructLit,
-    Type, TypeKind,
+    Block, Call, Expr, ExprKind, FieldAccess, Function, Item, LetStmt, Module, PathSegment, Stmt,
+    StructLit, Type, TypeKind,
 };
 use crate::span::{Error, Span};
 
@@ -108,6 +108,7 @@ pub struct FnSymbol {
     pub idx: u32,
     pub param_types: Vec<RType>,
     pub return_type: Option<RType>,
+    pub let_types: Vec<RType>,
 }
 
 pub struct FuncTable {
@@ -209,27 +210,36 @@ pub fn resolve_type(
 
 // ----- Top-level entry point -----
 
-pub fn check(root: &Module) -> Result<(StructTable, FuncTable), Error> {
-    let mut structs = StructTable {
-        entries: Vec::new(),
-    };
+pub fn check(
+    root: &Module,
+    structs: &mut StructTable,
+    funcs: &mut FuncTable,
+    next_idx: &mut u32,
+) -> Result<(), Error> {
     let mut path: Vec<String> = Vec::new();
-    collect_struct_names(root, &mut path, &mut structs);
-    let mut path: Vec<String> = Vec::new();
-    resolve_struct_fields(root, &mut path, &mut structs)?;
-
-    let mut funcs = FuncTable {
-        entries: Vec::new(),
-    };
-    let mut next_idx: u32 = 0;
-    let mut path: Vec<String> = Vec::new();
-    collect_funcs(root, &mut path, &mut funcs, &mut next_idx, &structs)?;
+    push_root_name(&mut path, root);
+    collect_struct_names(root, &mut path, structs);
 
     let mut path: Vec<String> = Vec::new();
+    push_root_name(&mut path, root);
+    resolve_struct_fields(root, &mut path, structs)?;
+
+    let mut path: Vec<String> = Vec::new();
+    push_root_name(&mut path, root);
+    collect_funcs(root, &mut path, funcs, next_idx, structs)?;
+
+    let mut path: Vec<String> = Vec::new();
+    push_root_name(&mut path, root);
     let mut current_file = root.source_file.clone();
-    check_module(root, &mut path, &mut current_file, &structs, &funcs)?;
+    check_module(root, &mut path, &mut current_file, structs, funcs)?;
 
-    Ok((structs, funcs))
+    Ok(())
+}
+
+fn push_root_name(path: &mut Vec<String>, root: &Module) {
+    if !root.name.is_empty() {
+        path.push(root.name.clone());
+    }
 }
 
 fn collect_struct_names(module: &Module, path: &mut Vec<String>, table: &mut StructTable) {
@@ -352,6 +362,7 @@ fn collect_funcs(
                     idx: *next_idx,
                     param_types,
                     return_type,
+                    let_types: Vec::new(),
                 });
                 *next_idx += 1;
             }
@@ -370,7 +381,8 @@ fn collect_funcs(
 // ----- Body check pass -----
 
 struct CheckCtx<'a> {
-    locals: &'a Vec<(String, RType)>,
+    locals: Vec<(String, RType)>,
+    let_types: Vec<RType>,
     current_module: &'a Vec<String>,
     current_file: &'a str,
     structs: &'a StructTable,
@@ -382,7 +394,7 @@ fn check_module(
     path: &mut Vec<String>,
     current_file: &mut String,
     structs: &StructTable,
-    funcs: &FuncTable,
+    funcs: &mut FuncTable,
 ) -> Result<(), Error> {
     let saved = current_file.clone();
     *current_file = module.source_file.clone();
@@ -408,7 +420,7 @@ fn check_function(
     current_module: &Vec<String>,
     current_file: &str,
     structs: &StructTable,
-    funcs: &FuncTable,
+    funcs: &mut FuncTable,
 ) -> Result<(), Error> {
     let mut locals: Vec<(String, RType)> = Vec::new();
     let mut k = 0;
@@ -422,23 +434,44 @@ fn check_function(
         None => None,
     };
 
-    let ctx = CheckCtx {
-        locals: &locals,
-        current_module,
-        current_file,
-        structs,
-        funcs,
+    let let_types = {
+        let mut ctx = CheckCtx {
+            locals,
+            let_types: Vec::new(),
+            current_module,
+            current_file,
+            structs,
+            funcs: &*funcs,
+        };
+        check_block(&mut ctx, &func.body, &return_rt)?;
+        ctx.let_types
     };
 
-    check_block(&ctx, &func.body, &return_rt)?;
+    let mut full = clone_path(current_module);
+    full.push(func.name.clone());
+    let mut e = 0;
+    while e < funcs.entries.len() {
+        if path_eq(&funcs.entries[e].path, &full) {
+            funcs.entries[e].let_types = let_types;
+            break;
+        }
+        e += 1;
+    }
     Ok(())
 }
 
 fn check_block(
-    ctx: &CheckCtx,
+    ctx: &mut CheckCtx,
     block: &Block,
     return_type: &Option<RType>,
 ) -> Result<(), Error> {
+    let mut i = 0;
+    while i < block.stmts.len() {
+        match &block.stmts[i] {
+            Stmt::Let(let_stmt) => check_let_stmt(ctx, let_stmt)?,
+        }
+        i += 1;
+    }
     match (&block.tail, return_type) {
         (Some(expr), Some(expected)) => {
             let actual = check_expr(ctx, expr)?;
@@ -469,7 +502,38 @@ fn check_block(
     }
 }
 
-fn check_expr(ctx: &CheckCtx, expr: &Expr) -> Result<RType, Error> {
+fn check_let_stmt(ctx: &mut CheckCtx, let_stmt: &LetStmt) -> Result<(), Error> {
+    let value_ty = check_expr(ctx, &let_stmt.value)?;
+    let final_ty = match &let_stmt.ty {
+        Some(annotation) => {
+            let annot_ty = resolve_type(
+                annotation,
+                ctx.current_module,
+                ctx.structs,
+                ctx.current_file,
+            )?;
+            if !rtype_eq(&value_ty, &annot_ty) {
+                return Err(Error {
+                    file: ctx.current_file.to_string(),
+                    message: format!(
+                        "let initializer has type `{}`, expected `{}`",
+                        rtype_to_string(&value_ty),
+                        rtype_to_string(&annot_ty)
+                    ),
+                    span: let_stmt.value.span.copy(),
+                });
+            }
+            annot_ty
+        }
+        None => value_ty,
+    };
+    ctx.locals
+        .push((let_stmt.name.clone(), rtype_clone(&final_ty)));
+    ctx.let_types.push(final_ty);
+    Ok(())
+}
+
+fn check_expr(ctx: &mut CheckCtx, expr: &Expr) -> Result<RType, Error> {
     match &expr.kind {
         ExprKind::UsizeLit(n) => {
             if *n > (u32::MAX as u64) {
@@ -505,7 +569,7 @@ fn check_expr(ctx: &CheckCtx, expr: &Expr) -> Result<RType, Error> {
     }
 }
 
-fn check_call(ctx: &CheckCtx, call: &Call, call_expr: &Expr) -> Result<RType, Error> {
+fn check_call(ctx: &mut CheckCtx, call: &Call, call_expr: &Expr) -> Result<RType, Error> {
     let mut full = clone_path(ctx.current_module);
     let mut i = 0;
     while i < call.callee.segments.len() {
@@ -581,7 +645,7 @@ fn check_call(ctx: &CheckCtx, call: &Call, call_expr: &Expr) -> Result<RType, Er
 }
 
 fn check_struct_lit(
-    ctx: &CheckCtx,
+    ctx: &mut CheckCtx,
     lit: &StructLit,
     lit_expr: &Expr,
 ) -> Result<RType, Error> {
@@ -702,7 +766,7 @@ fn check_struct_lit(
 }
 
 fn check_field_access(
-    ctx: &CheckCtx,
+    ctx: &mut CheckCtx,
     fa: &FieldAccess,
     _fa_expr: &Expr,
 ) -> Result<RType, Error> {

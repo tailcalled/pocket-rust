@@ -51,8 +51,20 @@ pub enum TypeKind {
 }
 
 pub struct Block {
+    pub stmts: Vec<Stmt>,
     pub tail: Option<Expr>,
     pub span: Span,
+}
+
+pub enum Stmt {
+    Let(LetStmt),
+}
+
+pub struct LetStmt {
+    pub name: String,
+    pub name_span: Span,
+    pub ty: Option<Type>,
+    pub value: Expr,
 }
 
 pub struct Expr {

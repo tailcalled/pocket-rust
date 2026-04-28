@@ -1,4 +1,4 @@
-use crate::ast::{Expr, ExprKind, Function, Item, Module};
+use crate::ast::{Block, Expr, ExprKind, Function, Item, Module, Stmt};
 use crate::span::{Error, Span};
 use crate::typeck::{FuncTable, RType, StructTable, clone_path, func_lookup, rtype_clone};
 
@@ -9,8 +9,15 @@ pub fn check(
 ) -> Result<(), Error> {
     let mut current_file = root.source_file.clone();
     let mut current_module: Vec<String> = Vec::new();
+    push_root_name(&mut current_module, root);
     check_module(root, &mut current_module, &mut current_file, structs, funcs)?;
     Ok(())
+}
+
+fn push_root_name(path: &mut Vec<String>, root: &Module) {
+    if !root.name.is_empty() {
+        path.push(root.name.clone());
+    }
 }
 
 fn check_module(
@@ -62,23 +69,45 @@ fn check_function(
         k += 1;
     }
 
-    if let Some(tail) = &func.body.tail {
-        let mut ctx = BorrowCtx {
-            moved: Vec::new(),
-            borrows: Vec::new(),
-            locals: &locals,
-            file: current_file.to_string(),
-        };
-        track_expr(&mut ctx, tail)?;
-    }
+    let mut ctx = BorrowCtx {
+        moved: Vec::new(),
+        borrows: Vec::new(),
+        locals,
+        file: current_file.to_string(),
+    };
+    track_block(&mut ctx, &func.body, &entry.let_types)?;
     Ok(())
 }
 
-struct BorrowCtx<'a> {
+struct BorrowCtx {
     moved: Vec<Vec<String>>,
     borrows: Vec<Vec<String>>,
-    locals: &'a Vec<(String, RType)>,
+    locals: Vec<(String, RType)>,
     file: String,
+}
+
+fn track_block(
+    ctx: &mut BorrowCtx,
+    block: &Block,
+    let_types: &Vec<RType>,
+) -> Result<(), Error> {
+    let mut let_idx: usize = 0;
+    let mut i = 0;
+    while i < block.stmts.len() {
+        match &block.stmts[i] {
+            Stmt::Let(let_stmt) => {
+                track_expr(ctx, &let_stmt.value)?;
+                ctx.locals
+                    .push((let_stmt.name.clone(), rtype_clone(&let_types[let_idx])));
+                let_idx += 1;
+            }
+        }
+        i += 1;
+    }
+    if let Some(tail) = &block.tail {
+        track_expr(ctx, tail)?;
+    }
+    Ok(())
 }
 
 fn is_ref_local(locals: &Vec<(String, RType)>, name: &str) -> bool {
@@ -96,7 +125,7 @@ fn track_expr(ctx: &mut BorrowCtx, expr: &Expr) -> Result<(), Error> {
     match &expr.kind {
         ExprKind::UsizeLit(_) => Ok(()),
         ExprKind::Var(name) => {
-            if is_ref_local(ctx.locals, name) {
+            if is_ref_local(&ctx.locals, name) {
                 Ok(())
             } else {
                 let mut place: Vec<String> = Vec::new();
@@ -106,7 +135,7 @@ fn track_expr(ctx: &mut BorrowCtx, expr: &Expr) -> Result<(), Error> {
         }
         ExprKind::FieldAccess(fa) => match extract_place(expr) {
             Some(place) => {
-                if is_ref_local(ctx.locals, &place[0]) {
+                if is_ref_local(&ctx.locals, &place[0]) {
                     Ok(())
                 } else {
                     try_move(ctx, place, expr.span.copy())

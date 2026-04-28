@@ -9,6 +9,7 @@ pub enum TokenKind {
     Fn,
     Mod,
     Struct,
+    Let,
     Ident(String),
     LParen,
     RParen,
@@ -21,6 +22,7 @@ pub enum TokenKind {
     PathSep,
     Comma,
     Amp,
+    Eq,
     IntLit(u64),
 }
 
@@ -29,6 +31,7 @@ pub fn token_kind_name(t: &TokenKind) -> &'static str {
         TokenKind::Fn => "`fn`",
         TokenKind::Mod => "`mod`",
         TokenKind::Struct => "`struct`",
+        TokenKind::Let => "`let`",
         TokenKind::Ident(_) => "identifier",
         TokenKind::LParen => "`(`",
         TokenKind::RParen => "`)`",
@@ -41,6 +44,7 @@ pub fn token_kind_name(t: &TokenKind) -> &'static str {
         TokenKind::PathSep => "`::`",
         TokenKind::Comma => "`,`",
         TokenKind::Amp => "`&`",
+        TokenKind::Eq => "`=`",
         TokenKind::IntLit(_) => "integer literal",
     }
 }
@@ -85,6 +89,11 @@ pub fn tokenize(file: &str, source: &str) -> Result<Vec<Token>, Error> {
             } else if text == "struct" {
                 tokens.push(Token {
                     kind: TokenKind::Struct,
+                    span,
+                });
+            } else if text == "let" {
+                tokens.push(Token {
+                    kind: TokenKind::Let,
                     span,
                 });
             } else {
@@ -136,6 +145,9 @@ pub fn tokenize(file: &str, source: &str) -> Result<Vec<Token>, Error> {
             byte_pos += 1;
         } else if b == b'&' {
             push_single(&mut tokens, TokenKind::Amp, line, &mut col);
+            byte_pos += 1;
+        } else if b == b'=' {
+            push_single(&mut tokens, TokenKind::Eq, line, &mut col);
             byte_pos += 1;
         } else if b == b'-' && (byte_pos + 1) < bytes.len() && bytes[byte_pos + 1] == b'>' {
             let start = Pos::new(line, col);

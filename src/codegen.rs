@@ -1,4 +1,6 @@
-use crate::ast::{Block, Call, Expr, ExprKind, FieldAccess, Function, Item, Module, StructLit};
+use crate::ast::{
+    Block, Call, Expr, ExprKind, FieldAccess, Function, Item, LetStmt, Module, Stmt, StructLit,
+};
 use crate::span::Error;
 use crate::typeck::{
     FuncTable, RType, StructTable, clone_path, flatten_rtype, func_lookup, rtype_clone,
@@ -6,15 +8,22 @@ use crate::typeck::{
 };
 use crate::wasm;
 
-pub fn codegen(
+pub fn emit(
+    wasm_mod: &mut wasm::Module,
     root: &Module,
     structs: &StructTable,
     funcs: &FuncTable,
-) -> Result<wasm::Module, Error> {
-    let mut wasm_mod = wasm::Module::new();
+) -> Result<(), Error> {
     let mut module_path: Vec<String> = Vec::new();
-    emit_module(&mut wasm_mod, root, &mut module_path, structs, funcs)?;
-    Ok(wasm_mod)
+    push_root_name(&mut module_path, root);
+    emit_module(wasm_mod, root, &mut module_path, structs, funcs)?;
+    Ok(())
+}
+
+fn push_root_name(path: &mut Vec<String>, root: &Module) {
+    if !root.name.is_empty() {
+        path.push(root.name.clone());
+    }
 }
 
 struct LocalBinding {
@@ -131,9 +140,41 @@ fn emit_function(
 }
 
 fn codegen_block(ctx: &mut FnCtx, block: &Block) -> Result<(), Error> {
+    let mut i = 0;
+    while i < block.stmts.len() {
+        match &block.stmts[i] {
+            Stmt::Let(let_stmt) => codegen_let_stmt(ctx, let_stmt)?,
+        }
+        i += 1;
+    }
     if let Some(expr) = &block.tail {
         codegen_expr(ctx, expr)?;
     }
+    Ok(())
+}
+
+fn codegen_let_stmt(ctx: &mut FnCtx, let_stmt: &LetStmt) -> Result<(), Error> {
+    let value_ty = codegen_expr(ctx, &let_stmt.value)?;
+    let size = rtype_size(&value_ty, ctx.structs);
+    let start = ctx.next_local;
+    let mut k = 0;
+    while k < size {
+        ctx.extra_locals.push(wasm::ValType::I32);
+        ctx.next_local += 1;
+        k += 1;
+    }
+    let mut k = 0;
+    while k < size {
+        ctx.instructions
+            .push(wasm::Instruction::LocalSet(start + size - 1 - k));
+        k += 1;
+    }
+    ctx.locals.push(LocalBinding {
+        name: let_stmt.name.clone(),
+        wasm_start: start,
+        size,
+        rtype: value_ty,
+    });
     Ok(())
 }
 

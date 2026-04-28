@@ -1,4 +1,4 @@
-use pocket_rust::{Vfs, compile};
+use pocket_rust::{Library, Vfs, compile};
 use std::env;
 use std::fs;
 use std::path::Path;
@@ -14,13 +14,25 @@ fn main() -> ExitCode {
     let input_dir = Path::new(&args[1]);
     let output_path = Path::new(&args[2]);
 
-    let mut vfs = Vfs::new();
-    if let Err(e) = load_dir(input_dir, input_dir, &mut vfs) {
+    let mut user_vfs = Vfs::new();
+    if let Err(e) = load_dir(input_dir, input_dir, &mut user_vfs) {
         eprintln!("error: {}", e);
         return ExitCode::from(1);
     }
 
-    match compile(&vfs, "main.rs") {
+    let stdlib_path = Path::new("lib/std");
+    let mut stdlib_vfs = Vfs::new();
+    if let Err(e) = load_dir(stdlib_path, stdlib_path, &mut stdlib_vfs) {
+        eprintln!("error loading stdlib at {}: {}", stdlib_path.display(), e);
+        return ExitCode::from(1);
+    }
+    let std_lib = Library {
+        name: "std".to_string(),
+        vfs: stdlib_vfs,
+        entry: "lib.rs".to_string(),
+    };
+
+    match compile(&[std_lib], &user_vfs, "main.rs") {
         Ok(module) => match fs::write(output_path, &module.encode()) {
             Ok(()) => ExitCode::SUCCESS,
             Err(e) => {
