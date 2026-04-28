@@ -79,6 +79,7 @@ pub enum ExprKind {
     StructLit(StructLit),
     FieldAccess(FieldAccess),
     Borrow(Box<Expr>),
+    Block(Box<Block>),
 }
 
 pub struct Call {

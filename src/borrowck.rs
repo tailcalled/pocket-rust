@@ -69,13 +69,22 @@ fn check_function(
         k += 1;
     }
 
+    let mut let_types: Vec<RType> = Vec::new();
+    let mut k = 0;
+    while k < entry.let_types.len() {
+        let_types.push(rtype_clone(&entry.let_types[k]));
+        k += 1;
+    }
+
     let mut ctx = BorrowCtx {
         moved: Vec::new(),
         borrows: Vec::new(),
         locals,
+        let_types,
+        let_idx: 0,
         file: current_file.to_string(),
     };
-    track_block(&mut ctx, &func.body, &entry.let_types)?;
+    track_block_top(&mut ctx, &func.body)?;
     Ok(())
 }
 
@@ -83,31 +92,13 @@ struct BorrowCtx {
     moved: Vec<Vec<String>>,
     borrows: Vec<Vec<String>>,
     locals: Vec<(String, RType)>,
+    let_types: Vec<RType>,
+    let_idx: usize,
     file: String,
 }
 
-fn track_block(
-    ctx: &mut BorrowCtx,
-    block: &Block,
-    let_types: &Vec<RType>,
-) -> Result<(), Error> {
-    let mut let_idx: usize = 0;
-    let mut i = 0;
-    while i < block.stmts.len() {
-        match &block.stmts[i] {
-            Stmt::Let(let_stmt) => {
-                track_expr(ctx, &let_stmt.value)?;
-                ctx.locals
-                    .push((let_stmt.name.clone(), rtype_clone(&let_types[let_idx])));
-                let_idx += 1;
-            }
-        }
-        i += 1;
-    }
-    if let Some(tail) = &block.tail {
-        track_expr(ctx, tail)?;
-    }
-    Ok(())
+fn track_block_top(ctx: &mut BorrowCtx, block: &Block) -> Result<(), Error> {
+    track_block_inner(ctx, block)
 }
 
 fn is_ref_local(locals: &Vec<(String, RType)>, name: &str) -> bool {
@@ -167,7 +158,32 @@ fn track_expr(ctx: &mut BorrowCtx, expr: &Expr) -> Result<(), Error> {
             Some(place) => try_borrow(ctx, place, expr.span.copy()),
             None => track_expr(ctx, inner),
         },
+        ExprKind::Block(block) => {
+            let mark = ctx.locals.len();
+            track_block_inner(ctx, block.as_ref())?;
+            ctx.locals.truncate(mark);
+            Ok(())
+        }
     }
+}
+
+fn track_block_inner(ctx: &mut BorrowCtx, block: &Block) -> Result<(), Error> {
+    let mut i = 0;
+    while i < block.stmts.len() {
+        match &block.stmts[i] {
+            Stmt::Let(let_stmt) => {
+                track_expr(ctx, &let_stmt.value)?;
+                let ty = rtype_clone(&ctx.let_types[ctx.let_idx]);
+                ctx.locals.push((let_stmt.name.clone(), ty));
+                ctx.let_idx += 1;
+            }
+        }
+        i += 1;
+    }
+    if let Some(tail) = &block.tail {
+        track_expr(ctx, tail)?;
+    }
+    Ok(())
 }
 
 fn extract_place(expr: &Expr) -> Option<Vec<String>> {

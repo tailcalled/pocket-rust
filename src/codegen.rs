@@ -194,7 +194,25 @@ fn codegen_expr(ctx: &mut FnCtx, expr: &Expr) -> Result<RType, Error> {
             let inner_ty = codegen_expr(ctx, inner)?;
             Ok(RType::Ref(Box::new(inner_ty)))
         }
+        ExprKind::Block(block) => codegen_block_expr(ctx, block.as_ref()),
     }
+}
+
+fn codegen_block_expr(ctx: &mut FnCtx, block: &Block) -> Result<RType, Error> {
+    let mark = ctx.locals.len();
+    let mut i = 0;
+    while i < block.stmts.len() {
+        match &block.stmts[i] {
+            Stmt::Let(let_stmt) => codegen_let_stmt(ctx, let_stmt)?,
+        }
+        i += 1;
+    }
+    let result_ty = match &block.tail {
+        Some(expr) => codegen_expr(ctx, expr)?,
+        None => unreachable!("typeck rejects block expressions without a tail"),
+    };
+    ctx.locals.truncate(mark);
+    Ok(result_ty)
 }
 
 fn codegen_var(ctx: &mut FnCtx, name: &str) -> Result<RType, Error> {

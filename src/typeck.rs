@@ -465,6 +465,37 @@ fn check_block(
     block: &Block,
     return_type: &Option<RType>,
 ) -> Result<(), Error> {
+    let actual = check_block_inner(ctx, block)?;
+    match (actual, return_type) {
+        (Some(a), Some(e)) => {
+            if !rtype_eq(&a, e) {
+                return Err(Error {
+                    file: ctx.current_file.to_string(),
+                    message: format!(
+                        "expected return type `{}`, got `{}`",
+                        rtype_to_string(e),
+                        rtype_to_string(&a)
+                    ),
+                    span: tail_span_or_block(block),
+                });
+            }
+            Ok(())
+        }
+        (None, None) => Ok(()),
+        (Some(_), None) => Err(Error {
+            file: ctx.current_file.to_string(),
+            message: "function returns unit but body has a tail expression".to_string(),
+            span: tail_span_or_block(block),
+        }),
+        (None, Some(_)) => Err(Error {
+            file: ctx.current_file.to_string(),
+            message: "function expects a return value but body is empty".to_string(),
+            span: block.span.copy(),
+        }),
+    }
+}
+
+fn check_block_inner(ctx: &mut CheckCtx, block: &Block) -> Result<Option<RType>, Error> {
     let mut i = 0;
     while i < block.stmts.len() {
         match &block.stmts[i] {
@@ -472,33 +503,31 @@ fn check_block(
         }
         i += 1;
     }
-    match (&block.tail, return_type) {
-        (Some(expr), Some(expected)) => {
-            let actual = check_expr(ctx, expr)?;
-            if !rtype_eq(&actual, expected) {
-                return Err(Error {
-                    file: ctx.current_file.to_string(),
-                    message: format!(
-                        "expected return type `{}`, got `{}`",
-                        rtype_to_string(expected),
-                        rtype_to_string(&actual)
-                    ),
-                    span: expr.span.copy(),
-                });
-            }
-            Ok(())
-        }
-        (None, None) => Ok(()),
-        (Some(expr), None) => Err(Error {
+    match &block.tail {
+        Some(expr) => Ok(Some(check_expr(ctx, expr)?)),
+        None => Ok(None),
+    }
+}
+
+fn check_block_expr(ctx: &mut CheckCtx, block: &Block) -> Result<RType, Error> {
+    let mark = ctx.locals.len();
+    let result = check_block_inner(ctx, block)?;
+    ctx.locals.truncate(mark);
+    match result {
+        Some(ty) => Ok(ty),
+        None => Err(Error {
             file: ctx.current_file.to_string(),
-            message: "function returns unit but body has a tail expression".to_string(),
-            span: expr.span.copy(),
-        }),
-        (None, Some(_)) => Err(Error {
-            file: ctx.current_file.to_string(),
-            message: "function expects a return value but body is empty".to_string(),
+            message: "block expression must end with an expression that produces a value"
+                .to_string(),
             span: block.span.copy(),
         }),
+    }
+}
+
+fn tail_span_or_block(block: &Block) -> Span {
+    match &block.tail {
+        Some(expr) => expr.span.copy(),
+        None => block.span.copy(),
     }
 }
 
@@ -566,6 +595,7 @@ fn check_expr(ctx: &mut CheckCtx, expr: &Expr) -> Result<RType, Error> {
             let inner_ty = check_expr(ctx, inner)?;
             Ok(RType::Ref(Box::new(inner_ty)))
         }
+        ExprKind::Block(block) => check_block_expr(ctx, block.as_ref()),
     }
 }
 

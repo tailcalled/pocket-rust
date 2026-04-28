@@ -140,3 +140,14 @@ fn lets_returns_5() {
     let result = answer.call(&mut store, ()).expect("call failed");
     assert_eq!(result, 5);
 }
+
+#[test]
+fn block_expr_returns_11() {
+    let bytes = compile_example("block_expr", "lib.rs");
+    let (mut store, instance) = instantiate(&bytes);
+    let answer = instance
+        .get_typed_func::<(), i32>(&store, "answer")
+        .expect("export `answer` not found / wrong signature");
+    let result = answer.call(&mut store, ()).expect("call failed");
+    assert_eq!(result, 11);
+}

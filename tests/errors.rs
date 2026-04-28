@@ -291,3 +291,23 @@ fn let_then_use_after_move_is_rejected() {
         err
     );
 }
+
+#[test]
+fn block_expr_without_tail_is_rejected() {
+    let err = compile_source("fn f() -> usize { let x = { let y = 5; }; x }");
+    assert!(
+        err.contains("block expression must end with"),
+        "expected tailless block-expr error, got: {}",
+        err
+    );
+}
+
+#[test]
+fn let_out_of_scope_after_block_is_rejected() {
+    let err = compile_source("fn f() -> usize { let x = { let y = 7; y }; y }");
+    assert!(
+        err.contains("unknown variable: `y`"),
+        "expected out-of-scope error, got: {}",
+        err
+    );
+}

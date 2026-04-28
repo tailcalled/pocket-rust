@@ -248,6 +248,7 @@ impl Parser {
         match &self.tokens[self.pos].kind {
             TokenKind::IntLit(_) => self.parse_int_lit(),
             TokenKind::Ident(_) => self.parse_path_atom(),
+            TokenKind::LBrace => self.parse_block_expr(),
             other => {
                 let msg = format!("expected expression, got {}", token_kind_name(other));
                 let span = self.tokens[self.pos].span.copy();
@@ -258,6 +259,15 @@ impl Parser {
                 })
             }
         }
+    }
+
+    fn parse_block_expr(&mut self) -> Result<Expr, Error> {
+        let block = self.parse_block()?;
+        let span = block.span.copy();
+        Ok(Expr {
+            kind: ExprKind::Block(Box::new(block)),
+            span,
+        })
     }
 
     fn parse_int_lit(&mut self) -> Result<Expr, Error> {
