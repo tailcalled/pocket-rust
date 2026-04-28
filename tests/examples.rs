@@ -242,6 +242,39 @@ fn int_inference_returns_7() {
 }
 
 #[test]
+fn mut_ref_through_binding_returns_99() {
+    let bytes = compile_example("mut_ref_through_binding", "lib.rs");
+    let (mut store, instance) = instantiate(&bytes);
+    let answer = instance
+        .get_typed_func::<(), i32>(&store, "answer")
+        .expect("export `answer` not found / wrong signature");
+    let result = answer.call(&mut store, ()).expect("call failed");
+    assert_eq!(result, 99);
+}
+
+#[test]
+fn mut_ref_direct_returns_50() {
+    let bytes = compile_example("mut_ref_direct", "lib.rs");
+    let (mut store, instance) = instantiate(&bytes);
+    let answer = instance
+        .get_typed_func::<(), i32>(&store, "answer")
+        .expect("export `answer` not found / wrong signature");
+    let result = answer.call(&mut store, ()).expect("call failed");
+    assert_eq!(result, 50);
+}
+
+#[test]
+fn mut_ref_field_returns_77() {
+    let bytes = compile_example("mut_ref_field", "lib.rs");
+    let (mut store, instance) = instantiate(&bytes);
+    let answer = instance
+        .get_typed_func::<(), i32>(&store, "answer")
+        .expect("export `answer` not found / wrong signature");
+    let result = answer.call(&mut store, ()).expect("call failed");
+    assert_eq!(result, 77);
+}
+
+#[test]
 fn inner_borrow_lifetime_returns_5() {
     let bytes = compile_example("inner_borrow_lifetime", "lib.rs");
     let (mut store, instance) = instantiate(&bytes);

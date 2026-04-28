@@ -114,14 +114,17 @@ fn int_kind_max(k: &IntKind) -> u128 {
 pub enum RType {
     Int(IntKind),
     Struct(Vec<String>),
-    Ref(Box<RType>),
+    Ref { inner: Box<RType>, mutable: bool },
 }
 
 pub fn rtype_clone(t: &RType) -> RType {
     match t {
         RType::Int(k) => RType::Int(int_kind_copy(k)),
         RType::Struct(p) => RType::Struct(clone_path(p)),
-        RType::Ref(inner) => RType::Ref(Box::new(rtype_clone(inner))),
+        RType::Ref { inner, mutable } => RType::Ref {
+            inner: Box::new(rtype_clone(inner)),
+            mutable: *mutable,
+        },
     }
 }
 
@@ -129,7 +132,16 @@ pub fn rtype_eq(a: &RType, b: &RType) -> bool {
     match (a, b) {
         (RType::Int(ka), RType::Int(kb)) => int_kind_eq(ka, kb),
         (RType::Struct(pa), RType::Struct(pb)) => path_eq(pa, pb),
-        (RType::Ref(ia), RType::Ref(ib)) => rtype_eq(ia, ib),
+        (
+            RType::Ref {
+                inner: ia,
+                mutable: ma,
+            },
+            RType::Ref {
+                inner: ib,
+                mutable: mb,
+            },
+        ) => ma == mb && rtype_eq(ia, ib),
         _ => false,
     }
 }
@@ -138,7 +150,13 @@ pub fn rtype_to_string(t: &RType) -> String {
     match t {
         RType::Int(k) => int_kind_name(k).to_string(),
         RType::Struct(p) => place_to_string(p),
-        RType::Ref(inner) => format!("&{}", rtype_to_string(inner)),
+        RType::Ref { inner, mutable } => {
+            if *mutable {
+                format!("&mut {}", rtype_to_string(inner))
+            } else {
+                format!("&{}", rtype_to_string(inner))
+            }
+        }
     }
 }
 
@@ -158,7 +176,7 @@ pub fn rtype_size(ty: &RType, structs: &StructTable) -> u32 {
             }
             s
         }
-        RType::Ref(inner) => rtype_size(inner, structs),
+        RType::Ref { inner, .. } => rtype_size(inner, structs),
     }
 }
 
@@ -180,7 +198,7 @@ pub fn flatten_rtype(ty: &RType, structs: &StructTable, out: &mut Vec<crate::was
                 i += 1;
             }
         }
-        RType::Ref(inner) => flatten_rtype(inner, structs, out),
+        RType::Ref { inner, .. } => flatten_rtype(inner, structs, out),
     }
 }
 
@@ -188,8 +206,12 @@ pub fn is_copy(t: &RType) -> bool {
     match t {
         RType::Int(_) => true,
         RType::Struct(_) => false,
-        RType::Ref(_) => true,
+        RType::Ref { .. } => true,
     }
+}
+
+pub fn is_ref_mutable(t: &RType) -> bool {
+    matches!(t, RType::Ref { mutable: true, .. })
 }
 
 pub struct RTypedField {
@@ -323,9 +345,12 @@ pub fn resolve_type(
                 })
             }
         }
-        TypeKind::Ref(inner) => {
+        TypeKind::Ref { inner, mutable } => {
             let r = resolve_type(inner, current_module, structs, file)?;
-            Ok(RType::Ref(Box::new(r)))
+            Ok(RType::Ref {
+                inner: Box::new(r),
+                mutable: *mutable,
+            })
         }
     }
 }
@@ -404,7 +429,7 @@ fn resolve_struct_fields(
                 let mut k = 0;
                 while k < sd.fields.len() {
                     let rt = resolve_type(&sd.fields[k].ty, path, table, &module.source_file)?;
-                    if let RType::Ref(_) = &rt {
+                    if let RType::Ref { .. } = &rt {
                         return Err(Error {
                             file: module.source_file.clone(),
                             message: "struct fields cannot have reference types".to_string(),
@@ -462,7 +487,7 @@ fn collect_funcs(
                 let return_type = match &f.return_type {
                     Some(ty) => {
                         let rt = resolve_type(ty, path, structs, &module.source_file)?;
-                        if let RType::Ref(_) = &rt {
+                        if let RType::Ref { .. } = &rt {
                             return Err(Error {
                                 file: module.source_file.clone(),
                                 message: "functions cannot return reference types".to_string(),
@@ -501,7 +526,7 @@ enum InferType {
     Var(u32),
     Int(IntKind),
     Struct(Vec<String>),
-    Ref(Box<InferType>),
+    Ref { inner: Box<InferType>, mutable: bool },
 }
 
 fn infer_clone(t: &InferType) -> InferType {
@@ -509,7 +534,10 @@ fn infer_clone(t: &InferType) -> InferType {
         InferType::Var(v) => InferType::Var(*v),
         InferType::Int(k) => InferType::Int(int_kind_copy(k)),
         InferType::Struct(p) => InferType::Struct(clone_path(p)),
-        InferType::Ref(inner) => InferType::Ref(Box::new(infer_clone(inner))),
+        InferType::Ref { inner, mutable } => InferType::Ref {
+            inner: Box::new(infer_clone(inner)),
+            mutable: *mutable,
+        },
     }
 }
 
@@ -517,7 +545,10 @@ fn rtype_to_infer(rt: &RType) -> InferType {
     match rt {
         RType::Int(k) => InferType::Int(int_kind_copy(k)),
         RType::Struct(p) => InferType::Struct(clone_path(p)),
-        RType::Ref(inner) => InferType::Ref(Box::new(rtype_to_infer(inner))),
+        RType::Ref { inner, mutable } => InferType::Ref {
+            inner: Box::new(rtype_to_infer(inner)),
+            mutable: *mutable,
+        },
     }
 }
 
@@ -526,7 +557,13 @@ fn infer_to_string(t: &InferType) -> String {
         InferType::Var(v) => format!("?{}", v),
         InferType::Int(k) => int_kind_name(k).to_string(),
         InferType::Struct(p) => place_to_string(p),
-        InferType::Ref(inner) => format!("&{}", infer_to_string(inner)),
+        InferType::Ref { inner, mutable } => {
+            if *mutable {
+                format!("&mut {}", infer_to_string(inner))
+            } else {
+                format!("&{}", infer_to_string(inner))
+            }
+        }
     }
 }
 
@@ -554,7 +591,10 @@ impl Subst {
             },
             InferType::Int(k) => InferType::Int(int_kind_copy(k)),
             InferType::Struct(p) => InferType::Struct(clone_path(p)),
-            InferType::Ref(inner) => InferType::Ref(Box::new(self.substitute(inner))),
+            InferType::Ref { inner, mutable } => InferType::Ref {
+                inner: Box::new(self.substitute(inner)),
+                mutable: *mutable,
+            },
         }
     }
 
@@ -630,7 +670,37 @@ impl Subst {
                     })
                 }
             }
-            (InferType::Ref(ia), InferType::Ref(ib)) => self.unify(&ia, &ib, span, file),
+            (
+                InferType::Ref {
+                    inner: ia,
+                    mutable: ma,
+                },
+                InferType::Ref {
+                    inner: ib,
+                    mutable: mb,
+                },
+            ) => {
+                if ma != mb {
+                    return Err(Error {
+                        file: file.to_string(),
+                        message: format!(
+                            "type mismatch: expected `{}`, got `{}`",
+                            if mb {
+                                format!("&mut {}", infer_to_string(&ib))
+                            } else {
+                                format!("&{}", infer_to_string(&ib))
+                            },
+                            if ma {
+                                format!("&mut {}", infer_to_string(&ia))
+                            } else {
+                                format!("&{}", infer_to_string(&ia))
+                            }
+                        ),
+                        span: span.copy(),
+                    });
+                }
+                self.unify(&ia, &ib, span, file)
+            }
             (a, b) => Err(Error {
                 file: file.to_string(),
                 message: format!(
@@ -648,7 +718,10 @@ impl Subst {
             InferType::Var(_) => RType::Int(IntKind::I32),
             InferType::Int(k) => RType::Int(k),
             InferType::Struct(p) => RType::Struct(p),
-            InferType::Ref(inner) => RType::Ref(Box::new(self.finalize(&inner))),
+            InferType::Ref { inner, mutable } => RType::Ref {
+                inner: Box::new(self.finalize(&inner)),
+                mutable,
+            },
         }
     }
 }
@@ -932,29 +1005,38 @@ fn check_assign_stmt(ctx: &mut CheckCtx, assign: &AssignStmt) -> Result<(), Erro
             });
         }
     };
-    if !ctx.locals[idx].mutable {
-        return Err(Error {
-            file: ctx.current_file.to_string(),
-            message: format!(
-                "cannot assign to `{}`: not declared as `mut`",
-                chain[0]
-            ),
-            span: assign.lhs.span.copy(),
-        });
-    }
-    // Field assignments only valid on owned structs (no ref-rooted assignments).
-    if chain.len() > 1 {
-        let resolved = ctx.subst.substitute(&ctx.locals[idx].ty);
-        if matches!(resolved, InferType::Ref(_)) {
+    let root_resolved = ctx.subst.substitute(&ctx.locals[idx].ty);
+    let root_is_mut_ref = matches!(root_resolved, InferType::Ref { mutable: true, .. });
+    let root_is_shared_ref = matches!(root_resolved, InferType::Ref { mutable: false, .. });
+    if chain.len() == 1 {
+        if !ctx.locals[idx].mutable {
             return Err(Error {
                 file: ctx.current_file.to_string(),
                 message: format!(
-                    "cannot assign through `{}`: assignment through references is not supported",
+                    "cannot assign to `{}`: not declared as `mut`",
                     chain[0]
                 ),
                 span: assign.lhs.span.copy(),
             });
         }
+    } else if root_is_shared_ref {
+        return Err(Error {
+            file: ctx.current_file.to_string(),
+            message: format!(
+                "cannot assign through `{}`: shared reference is not mutable",
+                chain[0]
+            ),
+            span: assign.lhs.span.copy(),
+        });
+    } else if !root_is_mut_ref && !ctx.locals[idx].mutable {
+        return Err(Error {
+            file: ctx.current_file.to_string(),
+            message: format!(
+                "cannot assign to field of `{}`: not declared as `mut`",
+                chain[0]
+            ),
+            span: assign.lhs.span.copy(),
+        });
     }
     // Walk the chain to determine the LHS type.
     let lhs_ty = walk_chain_type(
@@ -1006,6 +1088,16 @@ fn walk_chain_type(
     while i < chain.len() {
         let struct_path = match &current {
             InferType::Struct(p) => clone_path(p),
+            InferType::Ref { inner, .. } => match inner.as_ref() {
+                InferType::Struct(p) => clone_path(p),
+                _ => {
+                    return Err(Error {
+                        file: file.to_string(),
+                        message: "field assignment on non-struct value".to_string(),
+                        span: span.copy(),
+                    });
+                }
+            },
             _ => {
                 return Err(Error {
                     file: file.to_string(),
@@ -1070,9 +1162,12 @@ fn check_expr(ctx: &mut CheckCtx, expr: &Expr) -> Result<InferType, Error> {
         ExprKind::Call(call) => check_call(ctx, call, expr),
         ExprKind::StructLit(lit) => check_struct_lit(ctx, lit, expr),
         ExprKind::FieldAccess(fa) => check_field_access(ctx, fa, expr),
-        ExprKind::Borrow(inner) => {
+        ExprKind::Borrow { inner, mutable } => {
             let inner_ty = check_expr(ctx, inner)?;
-            Ok(InferType::Ref(Box::new(inner_ty)))
+            Ok(InferType::Ref {
+                inner: Box::new(inner_ty),
+                mutable: *mutable,
+            })
         }
         ExprKind::Block(block) => check_block_expr(ctx, block.as_ref()),
     }
@@ -1267,7 +1362,7 @@ fn check_field_access(
     let resolved = ctx.subst.substitute(&base_ty);
     let (struct_path, through_ref) = match resolved {
         InferType::Struct(p) => (p, false),
-        InferType::Ref(inner) => match *inner {
+        InferType::Ref { inner, .. } => match *inner {
             InferType::Struct(p) => (p, true),
             _ => {
                 return Err(Error {

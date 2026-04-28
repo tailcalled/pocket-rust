@@ -398,3 +398,39 @@ fn borrow_of_subfield_blocks_parent_move() {
     );
 }
 
+#[test]
+fn two_mut_borrows_of_same_place_conflict() {
+    let err = compile_source(
+        "struct Point { x: u32, y: u32 }\nfn take(a: &mut Point, b: &mut Point) -> u32 { a.x }\nfn f() -> u32 { let mut p = Point { x: 1, y: 2 }; take(&mut p, &mut p) }",
+    );
+    assert!(
+        err.contains("already borrowed") || err.contains("borrowed"),
+        "expected mut/mut borrow conflict, got: {}",
+        err
+    );
+}
+
+#[test]
+fn shared_and_mut_borrow_conflict() {
+    let err = compile_source(
+        "struct Point { x: u32, y: u32 }\nfn take(a: &mut Point, b: &Point) -> u32 { a.x }\nfn f() -> u32 { let mut p = Point { x: 1, y: 2 }; take(&mut p, &p) }",
+    );
+    assert!(
+        err.contains("already borrowed") || err.contains("borrowed"),
+        "expected mut/shared borrow conflict, got: {}",
+        err
+    );
+}
+
+#[test]
+fn assign_through_shared_ref_is_rejected() {
+    let err = compile_source(
+        "struct Point { x: u32, y: u32 }\nfn f(p: &Point) -> u32 { p.x = 7; p.x }",
+    );
+    assert!(
+        err.contains("shared reference") || err.contains("not mutable"),
+        "expected shared-ref assignment rejection, got: {}",
+        err
+    );
+}
+

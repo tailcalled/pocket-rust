@@ -109,7 +109,12 @@ struct BorrowState {
 struct Holder {
     name: Option<String>,
     rtype: Option<RType>,
-    holds: Vec<Vec<String>>,
+    holds: Vec<HeldBorrow>,
+}
+
+struct HeldBorrow {
+    place: Vec<String>,
+    mutable: bool,
 }
 
 // A descriptor of the borrows a value carries forward — i.e. which places this
@@ -117,7 +122,7 @@ struct Holder {
 // always empty. The caller decides what to do with these (absorb into a binding,
 // attach to a call slot, drop on the floor).
 struct ValueDesc {
-    borrows: Vec<Vec<String>>,
+    borrows: Vec<HeldBorrow>,
 }
 
 fn empty_desc() -> ValueDesc {
@@ -148,23 +153,49 @@ fn walk_assign_stmt(state: &mut BorrowState, assign: &AssignStmt) -> Result<(), 
         .expect("typeck verified the assignment LHS is a place expression");
     // Reject if any holder has an overlapping path — assignment can't proceed
     // while the target memory is borrowed.
-    let mut h = 0;
-    while h < state.holders.len() {
-        let mut k = 0;
-        while k < state.holders[h].holds.len() {
-            if paths_share_prefix(&state.holders[h].holds[k], &chain) {
-                return Err(Error {
-                    file: state.file.clone(),
-                    message: format!(
-                        "cannot assign to `{}` while it is borrowed",
-                        place_to_string(&chain)
-                    ),
-                    span: assign.span.copy(),
-                });
+    // Skip the conflict scan when the assignment is *through* a `&mut` binding —
+    // the borrow on that binding is the very thing that authorizes the write.
+    let through_mut_ref = if chain.len() > 1 {
+        let mut found: Option<usize> = None;
+        let mut i = state.holders.len();
+        while i > 0 {
+            i -= 1;
+            if let Some(n) = &state.holders[i].name {
+                if n == &chain[0] {
+                    found = Some(i);
+                    break;
+                }
             }
-            k += 1;
         }
-        h += 1;
+        match found {
+            Some(idx) => matches!(
+                state.holders[idx].rtype,
+                Some(RType::Ref { mutable: true, .. })
+            ),
+            None => false,
+        }
+    } else {
+        false
+    };
+    if !through_mut_ref {
+        let mut h = 0;
+        while h < state.holders.len() {
+            let mut k = 0;
+            while k < state.holders[h].holds.len() {
+                if paths_share_prefix(&state.holders[h].holds[k].place, &chain) {
+                    return Err(Error {
+                        file: state.file.clone(),
+                        message: format!(
+                            "cannot assign to `{}` while it is borrowed",
+                            place_to_string(&chain)
+                        ),
+                        span: assign.span.copy(),
+                    });
+                }
+                k += 1;
+            }
+            h += 1;
+        }
     }
     // Walk the RHS for its move/borrow effects.
     let desc = walk_expr(state, &assign.rhs)?;
@@ -228,18 +259,43 @@ fn walk_expr(state: &mut BorrowState, expr: &Expr) -> Result<ValueDesc, Error> {
         ExprKind::Call(call) => walk_call(state, call),
         ExprKind::StructLit(lit) => walk_struct_lit(state, lit),
         ExprKind::FieldAccess(fa) => walk_field_access(state, fa, expr),
-        ExprKind::Borrow(_) => walk_borrow(state, expr),
+        ExprKind::Borrow { .. } => walk_borrow(state, expr),
         ExprKind::Block(block) => walk_block_expr(state, block.as_ref()),
     }
 }
 
 fn walk_var(state: &mut BorrowState, name: &str, expr: &Expr) -> Result<ValueDesc, Error> {
     let idx = find_binding(state, name).expect("typeck verified the variable exists");
+    // For ref bindings, also reject reads of a binding that's been moved.
     if is_ref_holder(&state.holders[idx]) {
-        // Reading a ref: refs are Copy. The value carries the same borrows
-        // the binding holds; the caller may decide to add another holder for them.
-        let holds = clone_places(&state.holders[idx].holds);
-        Ok(ValueDesc { borrows: holds })
+        let mut place: Vec<String> = Vec::new();
+        place.push(name.to_string());
+        let mut i = 0;
+        while i < state.moved.len() {
+            if paths_share_prefix(&state.moved[i], &place) {
+                return Err(Error {
+                    file: state.file.clone(),
+                    message: format!(
+                        "`{}` was already moved",
+                        place_to_string(&place)
+                    ),
+                    span: expr.span.copy(),
+                });
+            }
+            i += 1;
+        }
+        if is_mut_ref_holder(&state.holders[idx]) {
+            // Reading a `&mut` binding consumes it: take its holds, mark it moved,
+            // and propagate the borrow to whichever consumer we end up in.
+            let mut taken: Vec<HeldBorrow> = Vec::new();
+            std::mem::swap(&mut taken, &mut state.holders[idx].holds);
+            state.moved.push(place);
+            Ok(ValueDesc { borrows: taken })
+        } else {
+            // Reading a `&` binding: refs are Copy, clone the holds.
+            let holds = clone_held_borrows(&state.holders[idx].holds);
+            Ok(ValueDesc { borrows: holds })
+        }
     } else {
         // Owned read: this is a move.
         let mut place: Vec<String> = Vec::new();
@@ -263,9 +319,13 @@ fn walk_call(state: &mut BorrowState, call: &Call) -> Result<ValueDesc, Error> {
         let desc = walk_expr(state, &call.args[i])?;
         let mut k = 0;
         while k < desc.borrows.len() {
-            state.holders[call_idx]
-                .holds
-                .push(clone_path(&desc.borrows[k]));
+            // Conflict-check the new borrow against every other holder's holds.
+            let new = HeldBorrow {
+                place: clone_path(&desc.borrows[k].place),
+                mutable: desc.borrows[k].mutable,
+            };
+            check_borrow_conflict(state, &new, &call.args[i].span)?;
+            state.holders[call_idx].holds.push(new);
             k += 1;
         }
         i += 1;
@@ -273,6 +333,39 @@ fn walk_call(state: &mut BorrowState, call: &Call) -> Result<ValueDesc, Error> {
     state.holders.truncate(call_idx);
     // Functions can't return references (typeck-rejected), so result carries no borrows.
     Ok(empty_desc())
+}
+
+fn check_borrow_conflict(
+    state: &BorrowState,
+    new: &HeldBorrow,
+    span: &Span,
+) -> Result<(), Error> {
+    let mut h = 0;
+    while h < state.holders.len() {
+        let mut k = 0;
+        while k < state.holders[h].holds.len() {
+            let other = &state.holders[h].holds[k];
+            if paths_share_prefix(&other.place, &new.place)
+                && (other.mutable || new.mutable)
+            {
+                let kind = if new.mutable { "mutable" } else { "shared" };
+                let other_kind = if other.mutable { "mutable" } else { "shared" };
+                return Err(Error {
+                    file: state.file.clone(),
+                    message: format!(
+                        "cannot borrow `{}` as {}: already borrowed as {}",
+                        place_to_string(&new.place),
+                        kind,
+                        other_kind
+                    ),
+                    span: span.copy(),
+                });
+            }
+            k += 1;
+        }
+        h += 1;
+    }
+    Ok(())
 }
 
 fn walk_struct_lit(state: &mut BorrowState, lit: &StructLit) -> Result<ValueDesc, Error> {
@@ -317,8 +410,8 @@ fn walk_field_access(
 }
 
 fn walk_borrow(state: &mut BorrowState, expr: &Expr) -> Result<ValueDesc, Error> {
-    let inner = match &expr.kind {
-        ExprKind::Borrow(i) => i,
+    let (inner, mutable) = match &expr.kind {
+        ExprKind::Borrow { inner, mutable } => (inner.as_ref(), *mutable),
         _ => unreachable!("walk_borrow called on non-Borrow"),
     };
     match extract_place(inner) {
@@ -338,8 +431,13 @@ fn walk_borrow(state: &mut BorrowState, expr: &Expr) -> Result<ValueDesc, Error>
                 }
                 i += 1;
             }
+            let new = HeldBorrow {
+                place: clone_path(&place),
+                mutable,
+            };
+            check_borrow_conflict(state, &new, &expr.span)?;
             let mut borrows = Vec::new();
-            borrows.push(place);
+            borrows.push(HeldBorrow { place, mutable });
             Ok(ValueDesc { borrows })
         }
         None => {
@@ -379,7 +477,11 @@ fn find_binding(state: &BorrowState, name: &str) -> Option<usize> {
 }
 
 fn is_ref_holder(h: &Holder) -> bool {
-    matches!(h.rtype, Some(RType::Ref(_)))
+    matches!(h.rtype, Some(RType::Ref { .. }))
+}
+
+fn is_mut_ref_holder(h: &Holder) -> bool {
+    matches!(h.rtype, Some(RType::Ref { mutable: true, .. }))
 }
 
 fn extract_place(expr: &Expr) -> Option<Vec<String>> {
@@ -422,7 +524,7 @@ fn try_move(state: &mut BorrowState, place: Vec<String>, span: Span) -> Result<(
     while h < state.holders.len() {
         let mut k = 0;
         while k < state.holders[h].holds.len() {
-            if paths_share_prefix(&state.holders[h].holds[k], &place) {
+            if paths_share_prefix(&state.holders[h].holds[k].place, &place) {
                 return Err(Error {
                     file: state.file.clone(),
                     message: format!(
@@ -465,11 +567,14 @@ fn place_to_string(p: &Vec<String>) -> String {
     s
 }
 
-fn clone_places(places: &Vec<Vec<String>>) -> Vec<Vec<String>> {
+fn clone_held_borrows(holds: &Vec<HeldBorrow>) -> Vec<HeldBorrow> {
     let mut out = Vec::new();
     let mut i = 0;
-    while i < places.len() {
-        out.push(clone_path(&places[i]));
+    while i < holds.len() {
+        out.push(HeldBorrow {
+            place: clone_path(&holds[i].place),
+            mutable: holds[i].mutable,
+        });
         i += 1;
     }
     out

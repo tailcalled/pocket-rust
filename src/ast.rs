@@ -46,7 +46,7 @@ pub struct Type {
 
 pub enum TypeKind {
     Path(Path),
-    Ref(Box<Type>),
+    Ref { inner: Box<Type>, mutable: bool },
 }
 
 pub struct Block {
@@ -85,7 +85,7 @@ pub enum ExprKind {
     Var(String),
     StructLit(StructLit),
     FieldAccess(FieldAccess),
-    Borrow(Box<Expr>),
+    Borrow { inner: Box<Expr>, mutable: bool },
     Block(Box<Block>),
 }
 

@@ -141,10 +141,19 @@ impl Parser {
     fn parse_type(&mut self) -> Result<Type, Error> {
         if self.peek_kind(&TokenKind::Amp) {
             let amp_span = self.expect(&TokenKind::Amp, "`&`")?;
+            let mutable = if self.peek_kind(&TokenKind::Mut) {
+                self.pos += 1;
+                true
+            } else {
+                false
+            };
             let inner = self.parse_type()?;
             let span = Span::new(amp_span.start, inner.span.end.copy());
             return Ok(Type {
-                kind: TypeKind::Ref(Box::new(inner)),
+                kind: TypeKind::Ref {
+                    inner: Box::new(inner),
+                    mutable,
+                },
                 span,
             });
         }
@@ -227,10 +236,19 @@ impl Parser {
     fn parse_unary(&mut self) -> Result<Expr, Error> {
         if self.peek_kind(&TokenKind::Amp) {
             let amp_span = self.expect(&TokenKind::Amp, "`&`")?;
+            let mutable = if self.peek_kind(&TokenKind::Mut) {
+                self.pos += 1;
+                true
+            } else {
+                false
+            };
             let inner = self.parse_unary()?;
             let span = Span::new(amp_span.start, inner.span.end.copy());
             return Ok(Expr {
-                kind: ExprKind::Borrow(Box::new(inner)),
+                kind: ExprKind::Borrow {
+                    inner: Box::new(inner),
+                    mutable,
+                },
                 span,
             });
         }

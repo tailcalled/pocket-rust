@@ -4,8 +4,8 @@ use crate::ast::{
 };
 use crate::span::Error;
 use crate::typeck::{
-    FuncTable, IntKind, RType, StructTable, clone_path, flatten_rtype, func_lookup, rtype_clone,
-    rtype_size, struct_lookup,
+    FuncTable, IntKind, RType, StructTable, clone_path, flatten_rtype, func_lookup,
+    is_ref_mutable, rtype_clone, rtype_size, struct_lookup,
 };
 use crate::wasm;
 
@@ -105,6 +105,16 @@ fn emit_function(
     if let Some(rt) = &entry.return_type {
         flatten_rtype(rt, structs, &mut wasm_results);
     }
+    // For each `&mut T` parameter, append T's flat ValTypes to the function's
+    // results — the function returns the modified parameter values alongside
+    // its normal return so the caller can store them back.
+    let mut k = 0;
+    while k < entry.param_types.len() {
+        if is_ref_mutable(&entry.param_types[k]) {
+            flatten_rtype(&entry.param_types[k], structs, &mut wasm_results);
+        }
+        k += 1;
+    }
 
     let func_type = wasm::FuncType {
         params: wasm_params,
@@ -130,6 +140,23 @@ fn emit_function(
         lit_idx: 0,
     };
     codegen_block(&mut ctx, &func.body)?;
+
+    // Emit LocalGets for each `&mut` parameter's flat locals so the values flow
+    // out of the function as additional return values.
+    let mut k = 0;
+    while k < ctx.locals.len() && k < func.params.len() {
+        if is_ref_mutable(&ctx.locals[k].rtype) {
+            let start = ctx.locals[k].wasm_start;
+            let size = ctx.locals[k].size;
+            let mut j = 0;
+            while j < size {
+                ctx.instructions
+                    .push(wasm::Instruction::LocalGet(start + j));
+                j += 1;
+            }
+        }
+        k += 1;
+    }
 
     let body = wasm::FuncBody {
         locals: ctx.extra_locals,
@@ -188,6 +215,10 @@ fn codegen_assign_stmt(ctx: &mut FnCtx, assign: &AssignStmt) -> Result<(), Error
     while i < chain.len() {
         let struct_path = match &current_ty {
             RType::Struct(p) => clone_path(p),
+            RType::Ref { inner, .. } => match inner.as_ref() {
+                RType::Struct(p) => clone_path(p),
+                _ => unreachable!("typeck verified field assignment is on a struct"),
+            },
             _ => unreachable!("typeck verified field assignment is on a struct"),
         };
         let entry = struct_lookup(ctx.structs, &struct_path).expect("resolved struct");
@@ -252,6 +283,33 @@ fn extract_place(expr: &Expr) -> Option<Vec<String>> {
 }
 
 fn codegen_let_stmt(ctx: &mut FnCtx, let_stmt: &LetStmt) -> Result<(), Error> {
+    // `&mut T` bindings alias the source's locals — no allocation needed.
+    // We must still walk the value expression so nested let_idx / lit_idx
+    // counters stay in sync, but its pushed values are dropped on the floor.
+    let needs_alias = is_ref_mutable(&ctx.let_types[ctx.let_idx]);
+    if needs_alias {
+        let alias_range = mut_ref_source_range(ctx, &let_stmt.value)
+            .expect("typeck verified the &mut value is a place expression");
+        codegen_expr(ctx, &let_stmt.value)?;
+        let value_ty = rtype_clone(&ctx.let_types[ctx.let_idx]);
+        ctx.let_idx += 1;
+        let mut value_valtypes: Vec<wasm::ValType> = Vec::new();
+        flatten_rtype(&value_ty, ctx.structs, &mut value_valtypes);
+        let drop_count = value_valtypes.len();
+        let mut k = 0;
+        while k < drop_count {
+            ctx.instructions.push(wasm::Instruction::Drop);
+            k += 1;
+        }
+        let (start, size) = alias_range;
+        ctx.locals.push(LocalBinding {
+            name: let_stmt.name.clone(),
+            wasm_start: start,
+            size,
+            rtype: value_ty,
+        });
+        return Ok(());
+    }
     codegen_expr(ctx, &let_stmt.value)?;
     let value_ty = rtype_clone(&ctx.let_types[ctx.let_idx]);
     ctx.let_idx += 1;
@@ -280,6 +338,77 @@ fn codegen_let_stmt(ctx: &mut FnCtx, let_stmt: &LetStmt) -> Result<(), Error> {
     Ok(())
 }
 
+// Compute the (wasm_start, size) of the underlying place that a `&mut`-typed
+// value refers to. Used both for `let r = …;` aliasing and for working out
+// where to write back after a call.
+fn mut_ref_source_range(ctx: &FnCtx, expr: &Expr) -> Option<(u32, u32)> {
+    match &expr.kind {
+        ExprKind::Borrow { inner, .. } => place_range(ctx, inner.as_ref()),
+        ExprKind::Var(name) => {
+            let mut i = ctx.locals.len();
+            while i > 0 {
+                i -= 1;
+                if ctx.locals[i].name == *name {
+                    return Some((ctx.locals[i].wasm_start, ctx.locals[i].size));
+                }
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
+fn place_range(ctx: &FnCtx, expr: &Expr) -> Option<(u32, u32)> {
+    let chain = extract_place(expr)?;
+    let mut binding_idx: Option<usize> = None;
+    let mut i = ctx.locals.len();
+    while i > 0 {
+        i -= 1;
+        if ctx.locals[i].name == chain[0] {
+            binding_idx = Some(i);
+            break;
+        }
+    }
+    let bidx = binding_idx?;
+    let mut offset: u32 = 0;
+    let mut current_ty = rtype_clone(&ctx.locals[bidx].rtype);
+    let mut i = 1;
+    while i < chain.len() {
+        let struct_path = match &current_ty {
+            RType::Struct(p) => clone_path(p),
+            RType::Ref { inner, .. } => match inner.as_ref() {
+                RType::Struct(p) => clone_path(p),
+                _ => return None,
+            },
+            _ => return None,
+        };
+        let entry = struct_lookup(ctx.structs, &struct_path)?;
+        let mut field_offset: u32 = 0;
+        let mut found = false;
+        let mut j = 0;
+        while j < entry.fields.len() {
+            let mut vts: Vec<wasm::ValType> = Vec::new();
+            flatten_rtype(&entry.fields[j].ty, ctx.structs, &mut vts);
+            let s = vts.len() as u32;
+            if entry.fields[j].name == chain[i] {
+                offset += field_offset;
+                current_ty = rtype_clone(&entry.fields[j].ty);
+                found = true;
+                break;
+            }
+            field_offset += s;
+            j += 1;
+        }
+        if !found {
+            return None;
+        }
+        i += 1;
+    }
+    let mut vts: Vec<wasm::ValType> = Vec::new();
+    flatten_rtype(&current_ty, ctx.structs, &mut vts);
+    Some((ctx.locals[bidx].wasm_start + offset, vts.len() as u32))
+}
+
 fn codegen_expr(ctx: &mut FnCtx, expr: &Expr) -> Result<RType, Error> {
     match &expr.kind {
         ExprKind::IntLit(n) => {
@@ -292,9 +421,12 @@ fn codegen_expr(ctx: &mut FnCtx, expr: &Expr) -> Result<RType, Error> {
         ExprKind::Call(call) => codegen_call(ctx, call),
         ExprKind::StructLit(lit) => codegen_struct_lit(ctx, lit),
         ExprKind::FieldAccess(fa) => codegen_field_access(ctx, fa),
-        ExprKind::Borrow(inner) => {
+        ExprKind::Borrow { inner, mutable } => {
             let inner_ty = codegen_expr(ctx, inner)?;
-            Ok(RType::Ref(Box::new(inner_ty)))
+            Ok(RType::Ref {
+                inner: Box::new(inner_ty),
+                mutable: *mutable,
+            })
         }
         ExprKind::Block(block) => codegen_block_expr(ctx, block.as_ref()),
     }
@@ -363,7 +495,7 @@ fn codegen_var(ctx: &mut FnCtx, name: &str) -> Result<RType, Error> {
 }
 
 fn codegen_call(ctx: &mut FnCtx, call: &Call) -> Result<RType, Error> {
-    let (func_idx, return_rt) = {
+    let (func_idx, return_rt, param_is_mut_ref) = {
         let mut full = clone_path(&ctx.current_module);
         let mut i = 0;
         while i < call.callee.segments.len() {
@@ -375,14 +507,46 @@ fn codegen_call(ctx: &mut FnCtx, call: &Call) -> Result<RType, Error> {
             Some(rt) => rtype_clone(rt),
             None => unreachable!("typeck rejects unit functions used as values"),
         };
-        (entry.idx, rt)
+        let mut flags: Vec<bool> = Vec::new();
+        let mut k = 0;
+        while k < entry.param_types.len() {
+            flags.push(is_ref_mutable(&entry.param_types[k]));
+            k += 1;
+        }
+        (entry.idx, rt, flags)
     };
+    // Compute write-back ranges for each `&mut` arg before emitting code, so
+    // the source's locals are fully valid at call time.
+    let mut writebacks: Vec<(u32, u32)> = Vec::new();
+    let mut i = 0;
+    while i < call.args.len() {
+        if param_is_mut_ref[i] {
+            let r = mut_ref_source_range(ctx, &call.args[i])
+                .expect("typeck verified the &mut arg is a place expression");
+            writebacks.push(r);
+        }
+        i += 1;
+    }
+    // Push each arg's flat values onto the stack.
     let mut i = 0;
     while i < call.args.len() {
         codegen_expr(ctx, &call.args[i])?;
         i += 1;
     }
     ctx.instructions.push(wasm::Instruction::Call(func_idx));
+    // After the call, the stack has [result_flat..., wb_1_flat, wb_2_flat, ...].
+    // Pop each write-back range in reverse order back into source locals.
+    let mut i = writebacks.len();
+    while i > 0 {
+        i -= 1;
+        let (start, size) = writebacks[i];
+        let mut k = 0;
+        while k < size {
+            ctx.instructions
+                .push(wasm::Instruction::LocalSet(start + size - 1 - k));
+            k += 1;
+        }
+    }
     Ok(return_rt)
 }
 
@@ -476,7 +640,7 @@ fn codegen_field_access(ctx: &mut FnCtx, fa: &FieldAccess) -> Result<RType, Erro
 
     let struct_path = match &base_type {
         RType::Struct(p) => clone_path(p),
-        RType::Ref(inner) => match inner.as_ref() {
+        RType::Ref { inner, .. } => match inner.as_ref() {
             RType::Struct(p) => clone_path(p),
             _ => unreachable!("typeck rejects field access on non-struct"),
         },
