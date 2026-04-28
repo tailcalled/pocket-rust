@@ -1,4 +1,6 @@
-use crate::ast::{Block, Expr, ExprKind, Function, Item, Module, Stmt};
+use crate::ast::{
+    Block, Call, Expr, ExprKind, FieldAccess, Function, Item, LetStmt, Module, Stmt, StructLit,
+};
 use crate::span::{Error, Span};
 use crate::typeck::{FuncTable, RType, StructTable, clone_path, func_lookup, rtype_clone};
 
@@ -59,16 +61,6 @@ fn check_function(
     full.push(func.name.clone());
     let entry = func_lookup(funcs, &full).expect("typeck registered this function");
 
-    let mut locals: Vec<(String, RType)> = Vec::new();
-    let mut k = 0;
-    while k < func.params.len() {
-        locals.push((
-            func.params[k].name.clone(),
-            rtype_clone(&entry.param_types[k]),
-        ));
-        k += 1;
-    }
-
     let mut let_types: Vec<RType> = Vec::new();
     let mut k = 0;
     while k < entry.let_types.len() {
@@ -76,114 +68,250 @@ fn check_function(
         k += 1;
     }
 
-    let mut ctx = BorrowCtx {
+    let mut state = BorrowState {
+        holders: Vec::new(),
         moved: Vec::new(),
-        borrows: Vec::new(),
-        locals,
         let_types,
         let_idx: 0,
         file: current_file.to_string(),
     };
-    track_block_top(&mut ctx, &func.body)?;
+
+    let mut k = 0;
+    while k < func.params.len() {
+        state.holders.push(Holder {
+            name: Some(func.params[k].name.clone()),
+            rtype: Some(rtype_clone(&entry.param_types[k])),
+            holds: Vec::new(),
+        });
+        k += 1;
+    }
+
+    walk_stmts_and_tail(&mut state, &func.body)?;
     Ok(())
 }
 
-struct BorrowCtx {
+// ---------- State ----------
+
+struct BorrowState {
+    // Stack of holders. A holder either names a let/param binding (Some name)
+    // or is a synthetic call slot (None name). Each holder records the
+    // borrows it currently keeps alive (a list of place paths).
+    holders: Vec<Holder>,
+    // Permanent set of moved places (function-wide).
     moved: Vec<Vec<String>>,
-    borrows: Vec<Vec<String>>,
-    locals: Vec<(String, RType)>,
+    // Types of let-introduced bindings, in source-DFS order. Populated by typeck.
     let_types: Vec<RType>,
     let_idx: usize,
     file: String,
 }
 
-fn track_block_top(ctx: &mut BorrowCtx, block: &Block) -> Result<(), Error> {
-    track_block_inner(ctx, block)
+struct Holder {
+    name: Option<String>,
+    rtype: Option<RType>,
+    holds: Vec<Vec<String>>,
 }
 
-fn is_ref_local(locals: &Vec<(String, RType)>, name: &str) -> bool {
-    let mut i = 0;
-    while i < locals.len() {
-        if locals[i].0 == *name {
-            return matches!(locals[i].1, RType::Ref(_));
-        }
-        i += 1;
-    }
-    false
+// A descriptor of the borrows a value carries forward — i.e. which places this
+// expression's value, if it's a reference, refers to. For non-reference values,
+// always empty. The caller decides what to do with these (absorb into a binding,
+// attach to a call slot, drop on the floor).
+struct ValueDesc {
+    borrows: Vec<Vec<String>>,
 }
 
-fn track_expr(ctx: &mut BorrowCtx, expr: &Expr) -> Result<(), Error> {
-    match &expr.kind {
-        ExprKind::UsizeLit(_) => Ok(()),
-        ExprKind::Var(name) => {
-            if is_ref_local(&ctx.locals, name) {
-                Ok(())
-            } else {
-                let mut place: Vec<String> = Vec::new();
-                place.push(name.clone());
-                try_move(ctx, place, expr.span.copy())
-            }
-        }
-        ExprKind::FieldAccess(fa) => match extract_place(expr) {
-            Some(place) => {
-                if is_ref_local(&ctx.locals, &place[0]) {
-                    Ok(())
-                } else {
-                    try_move(ctx, place, expr.span.copy())
-                }
-            }
-            None => track_expr(ctx, &fa.base),
-        },
-        ExprKind::Call(call) => {
-            // Borrows created while evaluating args die when the call returns.
-            // Moves are permanent.
-            let borrow_mark = ctx.borrows.len();
-            let mut i = 0;
-            while i < call.args.len() {
-                track_expr(ctx, &call.args[i])?;
-                i += 1;
-            }
-            ctx.borrows.truncate(borrow_mark);
-            Ok(())
-        }
-        ExprKind::StructLit(lit) => {
-            let mut i = 0;
-            while i < lit.fields.len() {
-                track_expr(ctx, &lit.fields[i].value)?;
-                i += 1;
-            }
-            Ok(())
-        }
-        ExprKind::Borrow(inner) => match extract_place(inner) {
-            Some(place) => try_borrow(ctx, place, expr.span.copy()),
-            None => track_expr(ctx, inner),
-        },
-        ExprKind::Block(block) => {
-            let mark = ctx.locals.len();
-            track_block_inner(ctx, block.as_ref())?;
-            ctx.locals.truncate(mark);
-            Ok(())
-        }
+fn empty_desc() -> ValueDesc {
+    ValueDesc {
+        borrows: Vec::new(),
     }
 }
 
-fn track_block_inner(ctx: &mut BorrowCtx, block: &Block) -> Result<(), Error> {
+// ---------- Walk ----------
+
+fn walk_stmts_and_tail(state: &mut BorrowState, block: &Block) -> Result<ValueDesc, Error> {
     let mut i = 0;
     while i < block.stmts.len() {
         match &block.stmts[i] {
-            Stmt::Let(let_stmt) => {
-                track_expr(ctx, &let_stmt.value)?;
-                let ty = rtype_clone(&ctx.let_types[ctx.let_idx]);
-                ctx.locals.push((let_stmt.name.clone(), ty));
-                ctx.let_idx += 1;
-            }
+            Stmt::Let(let_stmt) => walk_let_stmt(state, let_stmt)?,
         }
         i += 1;
     }
-    if let Some(tail) = &block.tail {
-        track_expr(ctx, tail)?;
+    match &block.tail {
+        Some(tail) => walk_expr(state, tail),
+        None => Ok(empty_desc()),
     }
+}
+
+fn walk_let_stmt(state: &mut BorrowState, let_stmt: &LetStmt) -> Result<(), Error> {
+    let desc = walk_expr(state, &let_stmt.value)?;
+    let ty = rtype_clone(&state.let_types[state.let_idx]);
+    state.let_idx += 1;
+    state.holders.push(Holder {
+        name: Some(let_stmt.name.clone()),
+        rtype: Some(ty),
+        holds: desc.borrows,
+    });
     Ok(())
+}
+
+fn walk_expr(state: &mut BorrowState, expr: &Expr) -> Result<ValueDesc, Error> {
+    match &expr.kind {
+        ExprKind::UsizeLit(_) => Ok(empty_desc()),
+        ExprKind::Var(name) => walk_var(state, name, expr),
+        ExprKind::Call(call) => walk_call(state, call),
+        ExprKind::StructLit(lit) => walk_struct_lit(state, lit),
+        ExprKind::FieldAccess(fa) => walk_field_access(state, fa, expr),
+        ExprKind::Borrow(_) => walk_borrow(state, expr),
+        ExprKind::Block(block) => walk_block_expr(state, block.as_ref()),
+    }
+}
+
+fn walk_var(state: &mut BorrowState, name: &str, expr: &Expr) -> Result<ValueDesc, Error> {
+    let idx = find_binding(state, name).expect("typeck verified the variable exists");
+    if is_ref_holder(&state.holders[idx]) {
+        // Reading a ref: refs are Copy. The value carries the same borrows
+        // the binding holds; the caller may decide to add another holder for them.
+        let holds = clone_places(&state.holders[idx].holds);
+        Ok(ValueDesc { borrows: holds })
+    } else {
+        // Owned read: this is a move.
+        let mut place: Vec<String> = Vec::new();
+        place.push(name.to_string());
+        try_move(state, place, expr.span.copy())?;
+        Ok(empty_desc())
+    }
+}
+
+fn walk_call(state: &mut BorrowState, call: &Call) -> Result<ValueDesc, Error> {
+    // Push a synthetic call holder. Borrows produced by argument expressions
+    // become its holds for the duration of the call, then the holder is popped.
+    state.holders.push(Holder {
+        name: None,
+        rtype: None,
+        holds: Vec::new(),
+    });
+    let call_idx = state.holders.len() - 1;
+    let mut i = 0;
+    while i < call.args.len() {
+        let desc = walk_expr(state, &call.args[i])?;
+        let mut k = 0;
+        while k < desc.borrows.len() {
+            state.holders[call_idx]
+                .holds
+                .push(clone_path(&desc.borrows[k]));
+            k += 1;
+        }
+        i += 1;
+    }
+    state.holders.truncate(call_idx);
+    // Functions can't return references (typeck-rejected), so result carries no borrows.
+    Ok(empty_desc())
+}
+
+fn walk_struct_lit(state: &mut BorrowState, lit: &StructLit) -> Result<ValueDesc, Error> {
+    // Struct fields can't be references (typeck-rejected), so the constructed
+    // struct value carries no borrows. We still walk each field to surface
+    // moves / borrow registrations inside their initializer expressions.
+    let mut i = 0;
+    while i < lit.fields.len() {
+        walk_expr(state, &lit.fields[i].value)?;
+        i += 1;
+    }
+    Ok(empty_desc())
+}
+
+fn walk_field_access(
+    state: &mut BorrowState,
+    fa: &FieldAccess,
+    expr: &Expr,
+) -> Result<ValueDesc, Error> {
+    match extract_place(expr) {
+        Some(place) => {
+            let root_idx =
+                find_binding(state, &place[0]).expect("typeck verified the variable exists");
+            if is_ref_holder(&state.holders[root_idx]) {
+                // Navigation through a reference. Field is Copy (typeck), so
+                // the result is plain data with no carried borrows; the ref
+                // itself is unchanged.
+                Ok(empty_desc())
+            } else {
+                // Partial-move out of an owned struct.
+                try_move(state, place, expr.span.copy())?;
+                Ok(empty_desc())
+            }
+        }
+        None => {
+            // Field access on a non-place base (e.g. a call result). Walk the
+            // base for its side effects; the field result is Copy.
+            walk_expr(state, &fa.base)?;
+            Ok(empty_desc())
+        }
+    }
+}
+
+fn walk_borrow(state: &mut BorrowState, expr: &Expr) -> Result<ValueDesc, Error> {
+    let inner = match &expr.kind {
+        ExprKind::Borrow(i) => i,
+        _ => unreachable!("walk_borrow called on non-Borrow"),
+    };
+    match extract_place(inner) {
+        Some(place) => {
+            // Refuse to borrow a place whose root has already been moved.
+            let mut i = 0;
+            while i < state.moved.len() {
+                if paths_share_prefix(&state.moved[i], &place) {
+                    return Err(Error {
+                        file: state.file.clone(),
+                        message: format!(
+                            "cannot borrow `{}`: it has been moved",
+                            place_to_string(&place)
+                        ),
+                        span: expr.span.copy(),
+                    });
+                }
+                i += 1;
+            }
+            let mut borrows = Vec::new();
+            borrows.push(place);
+            Ok(ValueDesc { borrows })
+        }
+        None => {
+            // Borrowing a non-place expression (e.g. `&fresh_struct_lit()`).
+            // We still walk inner for its move-tracking side effects, but
+            // don't track the borrow (no place to point at).
+            walk_expr(state, inner)?;
+            Ok(empty_desc())
+        }
+    }
+}
+
+fn walk_block_expr(state: &mut BorrowState, block: &Block) -> Result<ValueDesc, Error> {
+    // The block introduces a fresh local scope. Any holders pushed inside
+    // (let bindings) are dropped when the block ends. The block's tail value
+    // descriptor is returned to the caller — its borrows survive the scope
+    // because the *caller* will turn them into a holder of its own.
+    let mark = state.holders.len();
+    let desc = walk_stmts_and_tail(state, block)?;
+    state.holders.truncate(mark);
+    Ok(desc)
+}
+
+// ---------- Helpers ----------
+
+fn find_binding(state: &BorrowState, name: &str) -> Option<usize> {
+    let mut i = state.holders.len();
+    while i > 0 {
+        i -= 1;
+        if let Some(n) = &state.holders[i].name {
+            if n == name {
+                return Some(i);
+            }
+        }
+    }
+    None
+}
+
+fn is_ref_holder(h: &Holder) -> bool {
+    matches!(h.rtype, Some(RType::Ref(_)))
 }
 
 fn extract_place(expr: &Expr) -> Option<Vec<String>> {
@@ -210,52 +338,37 @@ fn extract_place(expr: &Expr) -> Option<Vec<String>> {
     }
 }
 
-fn try_move(ctx: &mut BorrowCtx, place: Vec<String>, span: Span) -> Result<(), Error> {
+fn try_move(state: &mut BorrowState, place: Vec<String>, span: Span) -> Result<(), Error> {
     let mut i = 0;
-    while i < ctx.moved.len() {
-        if paths_share_prefix(&ctx.moved[i], &place) {
+    while i < state.moved.len() {
+        if paths_share_prefix(&state.moved[i], &place) {
             return Err(Error {
-                file: ctx.file.clone(),
+                file: state.file.clone(),
                 message: format!("`{}` was already moved", place_to_string(&place)),
                 span,
             });
         }
         i += 1;
     }
-    let mut i = 0;
-    while i < ctx.borrows.len() {
-        if paths_share_prefix(&ctx.borrows[i], &place) {
-            return Err(Error {
-                file: ctx.file.clone(),
-                message: format!(
-                    "cannot move `{}` while it is borrowed",
-                    place_to_string(&place)
-                ),
-                span,
-            });
+    let mut h = 0;
+    while h < state.holders.len() {
+        let mut k = 0;
+        while k < state.holders[h].holds.len() {
+            if paths_share_prefix(&state.holders[h].holds[k], &place) {
+                return Err(Error {
+                    file: state.file.clone(),
+                    message: format!(
+                        "cannot move `{}` while it is borrowed",
+                        place_to_string(&place)
+                    ),
+                    span,
+                });
+            }
+            k += 1;
         }
-        i += 1;
+        h += 1;
     }
-    ctx.moved.push(place);
-    Ok(())
-}
-
-fn try_borrow(ctx: &mut BorrowCtx, place: Vec<String>, span: Span) -> Result<(), Error> {
-    let mut i = 0;
-    while i < ctx.moved.len() {
-        if paths_share_prefix(&ctx.moved[i], &place) {
-            return Err(Error {
-                file: ctx.file.clone(),
-                message: format!(
-                    "cannot borrow `{}`: it has been moved",
-                    place_to_string(&place)
-                ),
-                span,
-            });
-        }
-        i += 1;
-    }
-    ctx.borrows.push(place);
+    state.moved.push(place);
     Ok(())
 }
 
@@ -282,4 +395,14 @@ fn place_to_string(p: &Vec<String>) -> String {
         i += 1;
     }
     s
+}
+
+fn clone_places(places: &Vec<Vec<String>>) -> Vec<Vec<String>> {
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < places.len() {
+        out.push(clone_path(&places[i]));
+        i += 1;
+    }
+    out
 }
