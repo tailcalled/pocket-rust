@@ -4,15 +4,122 @@ use crate::ast::{
 };
 use crate::span::{Error, Span};
 
-pub enum RType {
+// ----- Public RType used by borrowck and codegen -----
+
+pub enum IntKind {
+    U8,
+    I8,
+    U16,
+    I16,
+    U32,
+    I32,
+    U64,
+    I64,
+    U128,
+    I128,
     Usize,
+    Isize,
+}
+
+pub fn int_kind_copy(k: &IntKind) -> IntKind {
+    match k {
+        IntKind::U8 => IntKind::U8,
+        IntKind::I8 => IntKind::I8,
+        IntKind::U16 => IntKind::U16,
+        IntKind::I16 => IntKind::I16,
+        IntKind::U32 => IntKind::U32,
+        IntKind::I32 => IntKind::I32,
+        IntKind::U64 => IntKind::U64,
+        IntKind::I64 => IntKind::I64,
+        IntKind::U128 => IntKind::U128,
+        IntKind::I128 => IntKind::I128,
+        IntKind::Usize => IntKind::Usize,
+        IntKind::Isize => IntKind::Isize,
+    }
+}
+
+pub fn int_kind_eq(a: &IntKind, b: &IntKind) -> bool {
+    match (a, b) {
+        (IntKind::U8, IntKind::U8) => true,
+        (IntKind::I8, IntKind::I8) => true,
+        (IntKind::U16, IntKind::U16) => true,
+        (IntKind::I16, IntKind::I16) => true,
+        (IntKind::U32, IntKind::U32) => true,
+        (IntKind::I32, IntKind::I32) => true,
+        (IntKind::U64, IntKind::U64) => true,
+        (IntKind::I64, IntKind::I64) => true,
+        (IntKind::U128, IntKind::U128) => true,
+        (IntKind::I128, IntKind::I128) => true,
+        (IntKind::Usize, IntKind::Usize) => true,
+        (IntKind::Isize, IntKind::Isize) => true,
+        _ => false,
+    }
+}
+
+pub fn int_kind_name(k: &IntKind) -> &'static str {
+    match k {
+        IntKind::U8 => "u8",
+        IntKind::I8 => "i8",
+        IntKind::U16 => "u16",
+        IntKind::I16 => "i16",
+        IntKind::U32 => "u32",
+        IntKind::I32 => "i32",
+        IntKind::U64 => "u64",
+        IntKind::I64 => "i64",
+        IntKind::U128 => "u128",
+        IntKind::I128 => "i128",
+        IntKind::Usize => "usize",
+        IntKind::Isize => "isize",
+    }
+}
+
+fn int_kind_from_name(name: &str) -> Option<IntKind> {
+    match name {
+        "u8" => Some(IntKind::U8),
+        "i8" => Some(IntKind::I8),
+        "u16" => Some(IntKind::U16),
+        "i16" => Some(IntKind::I16),
+        "u32" => Some(IntKind::U32),
+        "i32" => Some(IntKind::I32),
+        "u64" => Some(IntKind::U64),
+        "i64" => Some(IntKind::I64),
+        "u128" => Some(IntKind::U128),
+        "i128" => Some(IntKind::I128),
+        "usize" => Some(IntKind::Usize),
+        "isize" => Some(IntKind::Isize),
+        _ => None,
+    }
+}
+
+// Maximum value that fits in this integer kind. We don't have negative literals,
+// so we only care about the non-negative range.
+fn int_kind_max(k: &IntKind) -> u128 {
+    match k {
+        IntKind::U8 => u8::MAX as u128,
+        IntKind::I8 => i8::MAX as u128,
+        IntKind::U16 => u16::MAX as u128,
+        IntKind::I16 => i16::MAX as u128,
+        IntKind::U32 => u32::MAX as u128,
+        IntKind::I32 => i32::MAX as u128,
+        IntKind::U64 => u64::MAX as u128,
+        IntKind::I64 => i64::MAX as u128,
+        IntKind::U128 => u128::MAX,
+        IntKind::I128 => i128::MAX as u128,
+        // wasm32: usize/isize are 32-bit.
+        IntKind::Usize => u32::MAX as u128,
+        IntKind::Isize => i32::MAX as u128,
+    }
+}
+
+pub enum RType {
+    Int(IntKind),
     Struct(Vec<String>),
     Ref(Box<RType>),
 }
 
 pub fn rtype_clone(t: &RType) -> RType {
     match t {
-        RType::Usize => RType::Usize,
+        RType::Int(k) => RType::Int(int_kind_copy(k)),
         RType::Struct(p) => RType::Struct(clone_path(p)),
         RType::Ref(inner) => RType::Ref(Box::new(rtype_clone(inner))),
     }
@@ -20,7 +127,7 @@ pub fn rtype_clone(t: &RType) -> RType {
 
 pub fn rtype_eq(a: &RType, b: &RType) -> bool {
     match (a, b) {
-        (RType::Usize, RType::Usize) => true,
+        (RType::Int(ka), RType::Int(kb)) => int_kind_eq(ka, kb),
         (RType::Struct(pa), RType::Struct(pb)) => path_eq(pa, pb),
         (RType::Ref(ia), RType::Ref(ib)) => rtype_eq(ia, ib),
         _ => false,
@@ -29,7 +136,7 @@ pub fn rtype_eq(a: &RType, b: &RType) -> bool {
 
 pub fn rtype_to_string(t: &RType) -> String {
     match t {
-        RType::Usize => "usize".to_string(),
+        RType::Int(k) => int_kind_name(k).to_string(),
         RType::Struct(p) => place_to_string(p),
         RType::Ref(inner) => format!("&{}", rtype_to_string(inner)),
     }
@@ -37,7 +144,10 @@ pub fn rtype_to_string(t: &RType) -> String {
 
 pub fn rtype_size(ty: &RType, structs: &StructTable) -> u32 {
     match ty {
-        RType::Usize => 1,
+        RType::Int(k) => match k {
+            IntKind::U128 | IntKind::I128 => 2,
+            _ => 1,
+        },
         RType::Struct(p) => {
             let entry = struct_lookup(structs, p).expect("resolved struct");
             let mut s: u32 = 0;
@@ -54,7 +164,14 @@ pub fn rtype_size(ty: &RType, structs: &StructTable) -> u32 {
 
 pub fn flatten_rtype(ty: &RType, structs: &StructTable, out: &mut Vec<crate::wasm::ValType>) {
     match ty {
-        RType::Usize => out.push(crate::wasm::ValType::I32),
+        RType::Int(k) => match k {
+            IntKind::U64 | IntKind::I64 => out.push(crate::wasm::ValType::I64),
+            IntKind::U128 | IntKind::I128 => {
+                out.push(crate::wasm::ValType::I64);
+                out.push(crate::wasm::ValType::I64);
+            }
+            _ => out.push(crate::wasm::ValType::I32),
+        },
         RType::Struct(p) => {
             let entry = struct_lookup(structs, p).expect("resolved struct");
             let mut i = 0;
@@ -69,7 +186,7 @@ pub fn flatten_rtype(ty: &RType, structs: &StructTable, out: &mut Vec<crate::was
 
 pub fn is_copy(t: &RType) -> bool {
     match t {
-        RType::Usize => true,
+        RType::Int(_) => true,
         RType::Struct(_) => false,
         RType::Ref(_) => true,
     }
@@ -109,6 +226,7 @@ pub struct FnSymbol {
     pub param_types: Vec<RType>,
     pub return_type: Option<RType>,
     pub let_types: Vec<RType>,
+    pub lit_types: Vec<RType>,
 }
 
 pub struct FuncTable {
@@ -183,8 +301,12 @@ pub fn resolve_type(
     file: &str,
 ) -> Result<RType, Error> {
     match &ty.kind {
-        TypeKind::Usize => Ok(RType::Usize),
-        TypeKind::Struct(path) => {
+        TypeKind::Path(path) => {
+            if path.segments.len() == 1 {
+                if let Some(k) = int_kind_from_name(&path.segments[0].name) {
+                    return Ok(RType::Int(k));
+                }
+            }
             let mut full = clone_path(current_module);
             let mut i = 0;
             while i < path.segments.len() {
@@ -208,7 +330,7 @@ pub fn resolve_type(
     }
 }
 
-// ----- Top-level entry point -----
+// ----- Inference machinery -----
 
 pub fn check(
     root: &Module,
@@ -281,8 +403,7 @@ fn resolve_struct_fields(
                 let mut resolved: Vec<RTypedField> = Vec::new();
                 let mut k = 0;
                 while k < sd.fields.len() {
-                    let rt =
-                        resolve_type(&sd.fields[k].ty, path, table, &module.source_file)?;
+                    let rt = resolve_type(&sd.fields[k].ty, path, table, &module.source_file)?;
                     if let RType::Ref(_) = &rt {
                         return Err(Error {
                             file: module.source_file.clone(),
@@ -334,12 +455,7 @@ fn collect_funcs(
                 let mut param_types: Vec<RType> = Vec::new();
                 let mut k = 0;
                 while k < f.params.len() {
-                    let rt = resolve_type(
-                        &f.params[k].ty,
-                        path,
-                        structs,
-                        &module.source_file,
-                    )?;
+                    let rt = resolve_type(&f.params[k].ty, path, structs, &module.source_file)?;
                     param_types.push(rt);
                     k += 1;
                 }
@@ -363,6 +479,7 @@ fn collect_funcs(
                     param_types,
                     return_type,
                     let_types: Vec::new(),
+                    lit_types: Vec::new(),
                 });
                 *next_idx += 1;
             }
@@ -378,11 +495,176 @@ fn collect_funcs(
     Ok(())
 }
 
-// ----- Body check pass -----
+// ----- InferType -----
+
+enum InferType {
+    Var(u32),
+    Int(IntKind),
+    Struct(Vec<String>),
+    Ref(Box<InferType>),
+}
+
+fn infer_clone(t: &InferType) -> InferType {
+    match t {
+        InferType::Var(v) => InferType::Var(*v),
+        InferType::Int(k) => InferType::Int(int_kind_copy(k)),
+        InferType::Struct(p) => InferType::Struct(clone_path(p)),
+        InferType::Ref(inner) => InferType::Ref(Box::new(infer_clone(inner))),
+    }
+}
+
+fn rtype_to_infer(rt: &RType) -> InferType {
+    match rt {
+        RType::Int(k) => InferType::Int(int_kind_copy(k)),
+        RType::Struct(p) => InferType::Struct(clone_path(p)),
+        RType::Ref(inner) => InferType::Ref(Box::new(rtype_to_infer(inner))),
+    }
+}
+
+fn infer_to_string(t: &InferType) -> String {
+    match t {
+        InferType::Var(v) => format!("?{}", v),
+        InferType::Int(k) => int_kind_name(k).to_string(),
+        InferType::Struct(p) => place_to_string(p),
+        InferType::Ref(inner) => format!("&{}", infer_to_string(inner)),
+    }
+}
+
+struct Subst {
+    bindings: Vec<Option<InferType>>,
+    // Per-var "integer class" flag. A var with this flag set must unify with
+    // an integer concrete type; trying to unify it with anything else is an
+    // immediate error rather than a later "literal couldn't be resolved" check.
+    is_integer: Vec<bool>,
+}
+
+impl Subst {
+    fn fresh_int(&mut self) -> u32 {
+        let id = self.bindings.len() as u32;
+        self.bindings.push(None);
+        self.is_integer.push(true);
+        id
+    }
+
+    fn substitute(&self, ty: &InferType) -> InferType {
+        match ty {
+            InferType::Var(v) => match &self.bindings[*v as usize] {
+                Some(t) => self.substitute(t),
+                None => InferType::Var(*v),
+            },
+            InferType::Int(k) => InferType::Int(int_kind_copy(k)),
+            InferType::Struct(p) => InferType::Struct(clone_path(p)),
+            InferType::Ref(inner) => InferType::Ref(Box::new(self.substitute(inner))),
+        }
+    }
+
+    fn bind_var(
+        &mut self,
+        v: u32,
+        other: InferType,
+        span: &Span,
+        file: &str,
+    ) -> Result<(), Error> {
+        if self.is_integer[v as usize] {
+            match &other {
+                InferType::Int(_) => {}
+                InferType::Var(other_v) => {
+                    self.is_integer[*other_v as usize] = true;
+                }
+                _ => {
+                    return Err(Error {
+                        file: file.to_string(),
+                        message: format!(
+                            "type mismatch: expected `{}`, got integer",
+                            infer_to_string(&other)
+                        ),
+                        span: span.copy(),
+                    });
+                }
+            }
+        }
+        self.bindings[v as usize] = Some(other);
+        Ok(())
+    }
+
+    fn unify(&mut self, a: &InferType, b: &InferType, span: &Span, file: &str) -> Result<(), Error> {
+        let a = self.substitute(a);
+        let b = self.substitute(b);
+        match (a, b) {
+            (InferType::Var(va), InferType::Var(vb)) => {
+                if va == vb {
+                    Ok(())
+                } else {
+                    self.bind_var(va, InferType::Var(vb), span, file)
+                }
+            }
+            (InferType::Var(v), other) => self.bind_var(v, other, span, file),
+            (other, InferType::Var(v)) => self.bind_var(v, other, span, file),
+            (InferType::Int(ka), InferType::Int(kb)) => {
+                if int_kind_eq(&ka, &kb) {
+                    Ok(())
+                } else {
+                    Err(Error {
+                        file: file.to_string(),
+                        message: format!(
+                            "type mismatch: expected `{}`, got `{}`",
+                            int_kind_name(&kb),
+                            int_kind_name(&ka)
+                        ),
+                        span: span.copy(),
+                    })
+                }
+            }
+            (InferType::Struct(pa), InferType::Struct(pb)) => {
+                if path_eq(&pa, &pb) {
+                    Ok(())
+                } else {
+                    Err(Error {
+                        file: file.to_string(),
+                        message: format!(
+                            "type mismatch: expected `{}`, got `{}`",
+                            place_to_string(&pb),
+                            place_to_string(&pa)
+                        ),
+                        span: span.copy(),
+                    })
+                }
+            }
+            (InferType::Ref(ia), InferType::Ref(ib)) => self.unify(&ia, &ib, span, file),
+            (a, b) => Err(Error {
+                file: file.to_string(),
+                message: format!(
+                    "type mismatch: expected `{}`, got `{}`",
+                    infer_to_string(&b),
+                    infer_to_string(&a)
+                ),
+                span: span.copy(),
+            }),
+        }
+    }
+
+    fn finalize(&self, ty: &InferType) -> RType {
+        match self.substitute(ty) {
+            InferType::Var(_) => RType::Int(IntKind::I32),
+            InferType::Int(k) => RType::Int(k),
+            InferType::Struct(p) => RType::Struct(p),
+            InferType::Ref(inner) => RType::Ref(Box::new(self.finalize(&inner))),
+        }
+    }
+}
+
+struct LitConstraint {
+    var: u32,
+    value: u64,
+    span: Span,
+}
 
 struct CheckCtx<'a> {
-    locals: Vec<(String, RType)>,
-    let_types: Vec<RType>,
+    locals: Vec<(String, InferType)>,
+    let_vars: Vec<InferType>,
+    lit_vars: Vec<u32>,
+    lit_constraints: Vec<LitConstraint>,
+    subst: Subst,
     current_module: &'a Vec<String>,
     current_file: &'a str,
     structs: &'a StructTable,
@@ -422,11 +704,12 @@ fn check_function(
     structs: &StructTable,
     funcs: &mut FuncTable,
 ) -> Result<(), Error> {
-    let mut locals: Vec<(String, RType)> = Vec::new();
+    // Build initial locals from params.
+    let mut locals: Vec<(String, InferType)> = Vec::new();
     let mut k = 0;
     while k < func.params.len() {
         let rt = resolve_type(&func.params[k].ty, current_module, structs, current_file)?;
-        locals.push((func.params[k].name.clone(), rt));
+        locals.push((func.params[k].name.clone(), rtype_to_infer(&rt)));
         k += 1;
     }
     let return_rt: Option<RType> = match &func.return_type {
@@ -434,25 +717,78 @@ fn check_function(
         None => None,
     };
 
-    let let_types = {
+    let (let_vars, lit_vars, lit_constraints, subst) = {
         let mut ctx = CheckCtx {
             locals,
-            let_types: Vec::new(),
+            let_vars: Vec::new(),
+            lit_vars: Vec::new(),
+            lit_constraints: Vec::new(),
+            subst: Subst {
+                bindings: Vec::new(),
+                is_integer: Vec::new(),
+            },
             current_module,
             current_file,
             structs,
             funcs: &*funcs,
         };
         check_block(&mut ctx, &func.body, &return_rt)?;
-        ctx.let_types
+        (ctx.let_vars, ctx.lit_vars, ctx.lit_constraints, ctx.subst)
     };
 
+    // Range-check each integer literal against its (now resolved) type.
+    let mut i = 0;
+    while i < lit_constraints.len() {
+        let lc = &lit_constraints[i];
+        let resolved = subst.substitute(&InferType::Var(lc.var));
+        let kind = match resolved {
+            InferType::Var(_) => IntKind::I32,
+            InferType::Int(k) => k,
+            _ => {
+                return Err(Error {
+                    file: current_file.to_string(),
+                    message: "integer literal could not be resolved to an integer type"
+                        .to_string(),
+                    span: lc.span.copy(),
+                });
+            }
+        };
+        if (lc.value as u128) > int_kind_max(&kind) {
+            return Err(Error {
+                file: current_file.to_string(),
+                message: format!(
+                    "integer literal `{}` does not fit in `{}`",
+                    lc.value,
+                    int_kind_name(&kind)
+                ),
+                span: lc.span.copy(),
+            });
+        }
+        i += 1;
+    }
+
+    // Finalize types.
+    let mut let_types: Vec<RType> = Vec::new();
+    let mut i = 0;
+    while i < let_vars.len() {
+        let_types.push(subst.finalize(&let_vars[i]));
+        i += 1;
+    }
+    let mut lit_types: Vec<RType> = Vec::new();
+    let mut i = 0;
+    while i < lit_vars.len() {
+        lit_types.push(subst.finalize(&InferType::Var(lit_vars[i])));
+        i += 1;
+    }
+
+    // Store on the FnSymbol.
     let mut full = clone_path(current_module);
     full.push(func.name.clone());
     let mut e = 0;
     while e < funcs.entries.len() {
         if path_eq(&funcs.entries[e].path, &full) {
             funcs.entries[e].let_types = let_types;
+            funcs.entries[e].lit_types = lit_types;
             break;
         }
         e += 1;
@@ -468,17 +804,9 @@ fn check_block(
     let actual = check_block_inner(ctx, block)?;
     match (actual, return_type) {
         (Some(a), Some(e)) => {
-            if !rtype_eq(&a, e) {
-                return Err(Error {
-                    file: ctx.current_file.to_string(),
-                    message: format!(
-                        "expected return type `{}`, got `{}`",
-                        rtype_to_string(e),
-                        rtype_to_string(&a)
-                    ),
-                    span: tail_span_or_block(block),
-                });
-            }
+            let expected_infer = rtype_to_infer(e);
+            ctx.subst
+                .unify(&a, &expected_infer, &tail_span_or_block(block), ctx.current_file)?;
             Ok(())
         }
         (None, None) => Ok(()),
@@ -495,7 +823,7 @@ fn check_block(
     }
 }
 
-fn check_block_inner(ctx: &mut CheckCtx, block: &Block) -> Result<Option<RType>, Error> {
+fn check_block_inner(ctx: &mut CheckCtx, block: &Block) -> Result<Option<InferType>, Error> {
     let mut i = 0;
     while i < block.stmts.len() {
         match &block.stmts[i] {
@@ -509,7 +837,7 @@ fn check_block_inner(ctx: &mut CheckCtx, block: &Block) -> Result<Option<RType>,
     }
 }
 
-fn check_block_expr(ctx: &mut CheckCtx, block: &Block) -> Result<RType, Error> {
+fn check_block_expr(ctx: &mut CheckCtx, block: &Block) -> Result<InferType, Error> {
     let mark = ctx.locals.len();
     let result = check_block_inner(ctx, block)?;
     ctx.locals.truncate(mark);
@@ -535,52 +863,48 @@ fn check_let_stmt(ctx: &mut CheckCtx, let_stmt: &LetStmt) -> Result<(), Error> {
     let value_ty = check_expr(ctx, &let_stmt.value)?;
     let final_ty = match &let_stmt.ty {
         Some(annotation) => {
-            let annot_ty = resolve_type(
+            let annot_rt = resolve_type(
                 annotation,
                 ctx.current_module,
                 ctx.structs,
                 ctx.current_file,
             )?;
-            if !rtype_eq(&value_ty, &annot_ty) {
-                return Err(Error {
-                    file: ctx.current_file.to_string(),
-                    message: format!(
-                        "let initializer has type `{}`, expected `{}`",
-                        rtype_to_string(&value_ty),
-                        rtype_to_string(&annot_ty)
-                    ),
-                    span: let_stmt.value.span.copy(),
-                });
-            }
-            annot_ty
+            let annot_infer = rtype_to_infer(&annot_rt);
+            ctx.subst.unify(
+                &value_ty,
+                &annot_infer,
+                &let_stmt.value.span,
+                ctx.current_file,
+            )?;
+            annot_infer
         }
         None => value_ty,
     };
     ctx.locals
-        .push((let_stmt.name.clone(), rtype_clone(&final_ty)));
-    ctx.let_types.push(final_ty);
+        .push((let_stmt.name.clone(), infer_clone(&final_ty)));
+    ctx.let_vars.push(final_ty);
     Ok(())
 }
 
-fn check_expr(ctx: &mut CheckCtx, expr: &Expr) -> Result<RType, Error> {
+fn check_expr(ctx: &mut CheckCtx, expr: &Expr) -> Result<InferType, Error> {
     match &expr.kind {
-        ExprKind::UsizeLit(n) => {
-            if *n > (u32::MAX as u64) {
-                return Err(Error {
-                    file: ctx.current_file.to_string(),
-                    message: format!("usize literal out of range: {}", n),
-                    span: expr.span.copy(),
-                });
-            }
-            Ok(RType::Usize)
+        ExprKind::IntLit(n) => {
+            let v = ctx.subst.fresh_int();
+            ctx.lit_vars.push(v);
+            ctx.lit_constraints.push(LitConstraint {
+                var: v,
+                value: *n,
+                span: expr.span.copy(),
+            });
+            Ok(InferType::Var(v))
         }
         ExprKind::Var(name) => {
-            let mut i = 0;
-            while i < ctx.locals.len() {
+            let mut i = ctx.locals.len();
+            while i > 0 {
+                i -= 1;
                 if ctx.locals[i].0 == *name {
-                    return Ok(rtype_clone(&ctx.locals[i].1));
+                    return Ok(infer_clone(&ctx.locals[i].1));
                 }
-                i += 1;
             }
             Err(Error {
                 file: ctx.current_file.to_string(),
@@ -593,13 +917,13 @@ fn check_expr(ctx: &mut CheckCtx, expr: &Expr) -> Result<RType, Error> {
         ExprKind::FieldAccess(fa) => check_field_access(ctx, fa, expr),
         ExprKind::Borrow(inner) => {
             let inner_ty = check_expr(ctx, inner)?;
-            Ok(RType::Ref(Box::new(inner_ty)))
+            Ok(InferType::Ref(Box::new(inner_ty)))
         }
         ExprKind::Block(block) => check_block_expr(ctx, block.as_ref()),
     }
 }
 
-fn check_call(ctx: &mut CheckCtx, call: &Call, call_expr: &Expr) -> Result<RType, Error> {
+fn check_call(ctx: &mut CheckCtx, call: &Call, call_expr: &Expr) -> Result<InferType, Error> {
     let mut full = clone_path(ctx.current_module);
     let mut i = 0;
     while i < call.callee.segments.len() {
@@ -631,37 +955,30 @@ fn check_call(ctx: &mut CheckCtx, call: &Call, call_expr: &Expr) -> Result<RType
             span: call_expr.span.copy(),
         });
     }
-    let mut param_types: Vec<RType> = Vec::new();
+    let mut param_infer: Vec<InferType> = Vec::new();
     let mut k = 0;
     while k < entry.param_types.len() {
-        param_types.push(rtype_clone(&entry.param_types[k]));
+        param_infer.push(rtype_to_infer(&entry.param_types[k]));
         k += 1;
     }
-    let return_rt = match &entry.return_type {
-        Some(rt) => Some(rtype_clone(rt)),
+    let return_infer: Option<InferType> = match &entry.return_type {
+        Some(rt) => Some(rtype_to_infer(rt)),
         None => None,
     };
 
     let mut i = 0;
     while i < call.args.len() {
         let arg_ty = check_expr(ctx, &call.args[i])?;
-        if !rtype_eq(&arg_ty, &param_types[i]) {
-            return Err(Error {
-                file: ctx.current_file.to_string(),
-                message: format!(
-                    "argument {} to `{}` has type `{}`, expected `{}`",
-                    i + 1,
-                    segments_to_string(&call.callee.segments),
-                    rtype_to_string(&arg_ty),
-                    rtype_to_string(&param_types[i])
-                ),
-                span: call.args[i].span.copy(),
-            });
-        }
+        ctx.subst.unify(
+            &arg_ty,
+            &param_infer[i],
+            &call.args[i].span,
+            ctx.current_file,
+        )?;
         i += 1;
     }
 
-    match return_rt {
+    match return_infer {
         Some(rt) => Ok(rt),
         None => Err(Error {
             file: ctx.current_file.to_string(),
@@ -678,7 +995,7 @@ fn check_struct_lit(
     ctx: &mut CheckCtx,
     lit: &StructLit,
     lit_expr: &Expr,
-) -> Result<RType, Error> {
+) -> Result<InferType, Error> {
     let mut full = clone_path(ctx.current_module);
     let mut i = 0;
     while i < lit.path.segments.len() {
@@ -708,7 +1025,7 @@ fn check_struct_lit(
         k += 1;
     }
 
-    // No unknown fields and no duplicates.
+    // Validate field shape.
     let mut i = 0;
     while i < lit.fields.len() {
         let mut found = false;
@@ -744,7 +1061,6 @@ fn check_struct_lit(
         }
         i += 1;
     }
-    // Every def field initialized.
     let mut i = 0;
     while i < def_field_names.len() {
         let mut present = false;
@@ -766,25 +1082,17 @@ fn check_struct_lit(
         i += 1;
     }
 
-    // Each init's type matches the declared field type.
+    // Type-check inits in source order.
     let mut i = 0;
-    while i < def_field_names.len() {
+    while i < lit.fields.len() {
+        let init = &lit.fields[i];
+        let init_ty = check_expr(ctx, &init.value)?;
         let mut k = 0;
-        while k < lit.fields.len() {
-            if lit.fields[k].name == def_field_names[i] {
-                let init_ty = check_expr(ctx, &lit.fields[k].value)?;
-                if !rtype_eq(&init_ty, &def_field_types[i]) {
-                    return Err(Error {
-                        file: ctx.current_file.to_string(),
-                        message: format!(
-                            "field `{}` has type `{}`, expected `{}`",
-                            def_field_names[i],
-                            rtype_to_string(&init_ty),
-                            rtype_to_string(&def_field_types[i])
-                        ),
-                        span: lit.fields[k].value.span.copy(),
-                    });
-                }
+        while k < def_field_names.len() {
+            if def_field_names[k] == init.name {
+                let expected = rtype_to_infer(&def_field_types[k]);
+                ctx.subst
+                    .unify(&init_ty, &expected, &init.value.span, ctx.current_file)?;
                 break;
             }
             k += 1;
@@ -792,19 +1100,20 @@ fn check_struct_lit(
         i += 1;
     }
 
-    Ok(RType::Struct(full))
+    Ok(InferType::Struct(full))
 }
 
 fn check_field_access(
     ctx: &mut CheckCtx,
     fa: &FieldAccess,
     _fa_expr: &Expr,
-) -> Result<RType, Error> {
-    let base_type = check_expr(ctx, &fa.base)?;
-    let (struct_path, through_ref) = match &base_type {
-        RType::Struct(p) => (clone_path(p), false),
-        RType::Ref(inner) => match inner.as_ref() {
-            RType::Struct(p) => (clone_path(p), true),
+) -> Result<InferType, Error> {
+    let base_ty = check_expr(ctx, &fa.base)?;
+    let resolved = ctx.subst.substitute(&base_ty);
+    let (struct_path, through_ref) = match resolved {
+        InferType::Struct(p) => (p, false),
+        InferType::Ref(inner) => match *inner {
+            InferType::Struct(p) => (p, true),
             _ => {
                 return Err(Error {
                     file: ctx.current_file.to_string(),
@@ -813,7 +1122,7 @@ fn check_field_access(
                 });
             }
         },
-        RType::Usize => {
+        _ => {
             return Err(Error {
                 file: ctx.current_file.to_string(),
                 message: "field access on non-struct value".to_string(),
@@ -838,7 +1147,7 @@ fn check_field_access(
                     span: fa.field_span.copy(),
                 });
             }
-            return Ok(field_ty);
+            return Ok(rtype_to_infer(&field_ty));
         }
         i += 1;
     }

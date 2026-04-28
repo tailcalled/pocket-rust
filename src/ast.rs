@@ -45,8 +45,7 @@ pub struct Type {
 }
 
 pub enum TypeKind {
-    Usize,
-    Struct(Path),
+    Path(Path),
     Ref(Box<Type>),
 }
 
@@ -73,7 +72,7 @@ pub struct Expr {
 }
 
 pub enum ExprKind {
-    UsizeLit(u64),
+    IntLit(u64),
     Call(Call),
     Var(String),
     StructLit(StructLit),

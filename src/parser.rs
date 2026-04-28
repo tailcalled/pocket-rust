@@ -149,18 +149,11 @@ impl Parser {
             });
         }
         let path = self.parse_path()?;
-        if path.segments.len() == 1 && path.segments[0].name == "usize" {
-            Ok(Type {
-                kind: TypeKind::Usize,
-                span: path.span,
-            })
-        } else {
-            let span = path.span.copy();
-            Ok(Type {
-                kind: TypeKind::Struct(path),
-                span,
-            })
-        }
+        let span = path.span.copy();
+        Ok(Type {
+            kind: TypeKind::Path(path),
+            span,
+        })
     }
 
     fn parse_block(&mut self) -> Result<Block, Error> {
@@ -278,7 +271,7 @@ impl Parser {
                 let span = tok.span.copy();
                 self.pos += 1;
                 Ok(Expr {
-                    kind: ExprKind::UsizeLit(value),
+                    kind: ExprKind::IntLit(value),
                     span,
                 })
             }

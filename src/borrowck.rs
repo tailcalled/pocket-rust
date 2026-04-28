@@ -155,7 +155,7 @@ fn walk_let_stmt(state: &mut BorrowState, let_stmt: &LetStmt) -> Result<(), Erro
 
 fn walk_expr(state: &mut BorrowState, expr: &Expr) -> Result<ValueDesc, Error> {
     match &expr.kind {
-        ExprKind::UsizeLit(_) => Ok(empty_desc()),
+        ExprKind::IntLit(_) => Ok(empty_desc()),
         ExprKind::Var(name) => walk_var(state, name, expr),
         ExprKind::Call(call) => walk_call(state, call),
         ExprKind::StructLit(lit) => walk_struct_lit(state, lit),

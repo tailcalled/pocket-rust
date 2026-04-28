@@ -152,7 +152,7 @@ fn arg_type_mismatch_struct_for_usize() {
         "struct Point { x: usize, y: usize }\nfn id(n: usize) -> usize { n }\nfn f(p: Point) -> usize { id(p) }",
     );
     assert!(
-        err.contains("argument 1 to `id` has type `Point`, expected `usize`"),
+        err.contains("expected `usize`, got `Point`"),
         "expected arg-type mismatch detail, got: {}",
         err
     );
@@ -176,7 +176,7 @@ fn struct_field_init_type_mismatch() {
         "struct Point { x: usize, y: usize }\nstruct Pair { a: Point, b: Point }\nfn f() -> Pair { Pair { a: 1, b: 2 } }",
     );
     assert!(
-        err.contains("field `a` has type `usize`, expected `Point`"),
+        err.contains("expected `Point`, got integer"),
         "expected field-type mismatch, got: {}",
         err
     );
@@ -188,7 +188,7 @@ fn return_type_mismatch() {
         "struct Point { x: usize, y: usize }\nfn make() -> Point { Point { x: 1, y: 2 } }\nfn f() -> usize { make() }",
     );
     assert!(
-        err.contains("expected return type `usize`, got `Point`"),
+        err.contains("expected `usize`, got `Point`"),
         "expected return-type mismatch, got: {}",
         err
     );
@@ -274,7 +274,7 @@ fn let_annotation_type_mismatch_is_rejected() {
         "struct Point { x: usize, y: usize }\nfn f() -> usize { let x: usize = Point { x: 1, y: 2 }; x }",
     );
     assert!(
-        err.contains("let initializer has type"),
+        err.contains("expected `usize`, got `Point`"),
         "expected let-annotation mismatch, got: {}",
         err
     );
@@ -308,6 +308,29 @@ fn let_out_of_scope_after_block_is_rejected() {
     assert!(
         err.contains("unknown variable: `y`"),
         "expected out-of-scope error, got: {}",
+        err
+    );
+}
+
+#[test]
+fn integer_literal_too_big_for_u8() {
+    let err = compile_source("fn f() -> u8 { 300 }");
+    assert!(
+        err.contains("does not fit"),
+        "expected fit-check error, got: {}",
+        err
+    );
+}
+
+#[test]
+fn integer_literal_defaults_to_i32() {
+    // `x` is never used, so its type variable is unconstrained and defaults to
+    // i32. 4_000_000_000 doesn't fit in i32, so the post-solve range check
+    // catches it — proving the default fired.
+    let err = compile_source("fn f() -> u32 { let x = 4000000000; 0 }");
+    assert!(
+        err.contains("does not fit"),
+        "expected default-overflow error, got: {}",
         err
     );
 }

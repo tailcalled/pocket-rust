@@ -3,7 +3,7 @@ use crate::ast::{
 };
 use crate::span::Error;
 use crate::typeck::{
-    FuncTable, RType, StructTable, clone_path, flatten_rtype, func_lookup, rtype_clone,
+    FuncTable, IntKind, RType, StructTable, clone_path, flatten_rtype, func_lookup, rtype_clone,
     rtype_size, struct_lookup,
 };
 use crate::wasm;
@@ -41,6 +41,10 @@ struct FnCtx<'a> {
     structs: &'a StructTable,
     funcs: &'a FuncTable,
     current_module: Vec<String>,
+    let_types: &'a Vec<RType>,
+    lit_types: &'a Vec<RType>,
+    let_idx: usize,
+    lit_idx: usize,
 }
 
 fn emit_module(
@@ -119,6 +123,10 @@ fn emit_function(
         structs,
         funcs,
         current_module: clone_path(current_module),
+        let_types: &entry.let_types,
+        lit_types: &entry.lit_types,
+        let_idx: 0,
+        lit_idx: 0,
     };
     codegen_block(&mut ctx, &func.body)?;
 
@@ -154,12 +162,16 @@ fn codegen_block(ctx: &mut FnCtx, block: &Block) -> Result<(), Error> {
 }
 
 fn codegen_let_stmt(ctx: &mut FnCtx, let_stmt: &LetStmt) -> Result<(), Error> {
-    let value_ty = codegen_expr(ctx, &let_stmt.value)?;
-    let size = rtype_size(&value_ty, ctx.structs);
+    codegen_expr(ctx, &let_stmt.value)?;
+    let value_ty = rtype_clone(&ctx.let_types[ctx.let_idx]);
+    ctx.let_idx += 1;
+    let mut value_valtypes: Vec<wasm::ValType> = Vec::new();
+    flatten_rtype(&value_ty, ctx.structs, &mut value_valtypes);
+    let size = value_valtypes.len() as u32;
     let start = ctx.next_local;
     let mut k = 0;
-    while k < size {
-        ctx.extra_locals.push(wasm::ValType::I32);
+    while k < value_valtypes.len() {
+        ctx.extra_locals.push(value_valtypes[k].copy());
         ctx.next_local += 1;
         k += 1;
     }
@@ -180,11 +192,11 @@ fn codegen_let_stmt(ctx: &mut FnCtx, let_stmt: &LetStmt) -> Result<(), Error> {
 
 fn codegen_expr(ctx: &mut FnCtx, expr: &Expr) -> Result<RType, Error> {
     match &expr.kind {
-        ExprKind::UsizeLit(n) => {
-            let bits = *n as u32;
-            ctx.instructions
-                .push(wasm::Instruction::I32Const(bits as i32));
-            Ok(RType::Usize)
+        ExprKind::IntLit(n) => {
+            let ty = rtype_clone(&ctx.lit_types[ctx.lit_idx]);
+            ctx.lit_idx += 1;
+            emit_int_lit(ctx, &ty, *n);
+            Ok(ty)
         }
         ExprKind::Var(name) => codegen_var(ctx, name),
         ExprKind::Call(call) => codegen_call(ctx, call),
@@ -195,6 +207,30 @@ fn codegen_expr(ctx: &mut FnCtx, expr: &Expr) -> Result<RType, Error> {
             Ok(RType::Ref(Box::new(inner_ty)))
         }
         ExprKind::Block(block) => codegen_block_expr(ctx, block.as_ref()),
+    }
+}
+
+fn emit_int_lit(ctx: &mut FnCtx, ty: &RType, value: u64) {
+    let kind = match ty {
+        RType::Int(k) => k,
+        _ => unreachable!("typeck assigned a non-int type to an integer literal"),
+    };
+    match kind {
+        IntKind::U64 | IntKind::I64 => {
+            ctx.instructions
+                .push(wasm::Instruction::I64Const(value as i64));
+        }
+        IntKind::U128 | IntKind::I128 => {
+            // Layout: [low, high]. Literal value fits in u64, high half is 0.
+            ctx.instructions
+                .push(wasm::Instruction::I64Const(value as i64));
+            ctx.instructions.push(wasm::Instruction::I64Const(0));
+        }
+        _ => {
+            // u8/i8/u16/i16/u32/i32/usize/isize all live in a single i32 slot.
+            ctx.instructions
+                .push(wasm::Instruction::I32Const(value as u32 as i32));
+        }
     }
 }
 
@@ -267,27 +303,76 @@ fn codegen_struct_lit(ctx: &mut FnCtx, lit: &StructLit) -> Result<RType, Error> 
         i += 1;
     }
 
-    let def_field_names: Vec<String> = {
+    // Field layouts in declaration order: (name, offset_in_wasm_scalars, valtypes).
+    struct FieldLayout {
+        name: String,
+        offset: u32,
+        valtypes: Vec<wasm::ValType>,
+    }
+    let layouts: Vec<FieldLayout> = {
         let entry = struct_lookup(ctx.structs, &full).expect("typeck resolved this struct");
-        let mut names: Vec<String> = Vec::new();
+        let mut out: Vec<FieldLayout> = Vec::new();
+        let mut offset: u32 = 0;
         let mut i = 0;
         while i < entry.fields.len() {
-            names.push(entry.fields[i].name.clone());
+            let mut vts: Vec<wasm::ValType> = Vec::new();
+            flatten_rtype(&entry.fields[i].ty, ctx.structs, &mut vts);
+            let size = vts.len() as u32;
+            out.push(FieldLayout {
+                name: entry.fields[i].name.clone(),
+                offset,
+                valtypes: vts,
+            });
+            offset += size;
             i += 1;
         }
-        names
+        out
     };
+    let total_size: u32 = layouts.iter().map(|l| l.valtypes.len() as u32).sum();
 
+    // Allocate temporary locals for the entire flat struct, sized by each field.
+    let temp_start = ctx.next_local;
+    let mut k = 0;
+    while k < layouts.len() {
+        let mut j = 0;
+        while j < layouts[k].valtypes.len() {
+            ctx.extra_locals.push(layouts[k].valtypes[j].copy());
+            ctx.next_local += 1;
+            j += 1;
+        }
+        k += 1;
+    }
+
+    // Walk fields in source order; codegen each value, then LocalSet into its
+    // declaration-order slot. This way the source-order walk lines up with
+    // typeck's lit_idx / let_idx counters but the struct is still laid out in
+    // declaration order on the stack.
     let mut i = 0;
-    while i < def_field_names.len() {
-        let mut k = 0;
-        while k < lit.fields.len() {
-            if lit.fields[k].name == def_field_names[i] {
-                codegen_expr(ctx, &lit.fields[k].value)?;
+    while i < lit.fields.len() {
+        codegen_expr(ctx, &lit.fields[i].value)?;
+        let mut layout_idx = 0;
+        while layout_idx < layouts.len() {
+            if layouts[layout_idx].name == lit.fields[i].name {
+                let size = layouts[layout_idx].valtypes.len() as u32;
+                let mut k = 0;
+                while k < size {
+                    ctx.instructions.push(wasm::Instruction::LocalSet(
+                        temp_start + layouts[layout_idx].offset + size - 1 - k,
+                    ));
+                    k += 1;
+                }
                 break;
             }
-            k += 1;
+            layout_idx += 1;
         }
+        i += 1;
+    }
+
+    // Read back in declaration order.
+    let mut i: u32 = 0;
+    while i < total_size {
+        ctx.instructions
+            .push(wasm::Instruction::LocalGet(temp_start + i));
         i += 1;
     }
 
@@ -304,19 +389,21 @@ fn codegen_field_access(ctx: &mut FnCtx, fa: &FieldAccess) -> Result<RType, Erro
             RType::Struct(p) => clone_path(p),
             _ => unreachable!("typeck rejects field access on non-struct"),
         },
-        RType::Usize => unreachable!("typeck rejects field access on non-struct"),
+        RType::Int(_) => unreachable!("typeck rejects field access on non-struct"),
     };
 
-    let (offset, size, field_ty) = {
+    let (offset, field_valtypes, field_ty) = {
         let entry = struct_lookup(ctx.structs, &struct_path).expect("resolved struct");
         let mut offset: u32 = 0;
-        let mut found: Option<(u32, u32, RType)> = None;
+        let mut found: Option<(u32, Vec<wasm::ValType>, RType)> = None;
         let mut i = 0;
         while i < entry.fields.len() {
             let f = &entry.fields[i];
-            let s = rtype_size(&f.ty, ctx.structs);
+            let mut vts: Vec<wasm::ValType> = Vec::new();
+            flatten_rtype(&f.ty, ctx.structs, &mut vts);
+            let s = vts.len() as u32;
             if f.name == fa.field {
-                found = Some((offset, s, rtype_clone(&f.ty)));
+                found = Some((offset, vts, rtype_clone(&f.ty)));
                 break;
             }
             offset += s;
@@ -324,6 +411,7 @@ fn codegen_field_access(ctx: &mut FnCtx, fa: &FieldAccess) -> Result<RType, Erro
         }
         found.expect("typeck verified field")
     };
+    let size = field_valtypes.len() as u32;
 
     let drop_top = total - offset - size;
     let mut i = 0;
@@ -334,8 +422,8 @@ fn codegen_field_access(ctx: &mut FnCtx, fa: &FieldAccess) -> Result<RType, Erro
 
     let stash_start = ctx.next_local;
     let mut k = 0;
-    while k < size {
-        ctx.extra_locals.push(wasm::ValType::I32);
+    while k < field_valtypes.len() {
+        ctx.extra_locals.push(field_valtypes[k].copy());
         ctx.next_local += 1;
         k += 1;
     }

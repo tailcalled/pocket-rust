@@ -12,6 +12,24 @@ pub struct FuncType {
 
 pub enum ValType {
     I32,
+    I64,
+}
+
+impl ValType {
+    pub fn copy(&self) -> ValType {
+        match self {
+            ValType::I32 => ValType::I32,
+            ValType::I64 => ValType::I64,
+        }
+    }
+}
+
+fn val_type_eq(a: &ValType, b: &ValType) -> bool {
+    match (a, b) {
+        (ValType::I32, ValType::I32) => true,
+        (ValType::I64, ValType::I64) => true,
+        _ => false,
+    }
 }
 
 pub struct Export {
@@ -31,6 +49,7 @@ pub struct FuncBody {
 
 pub enum Instruction {
     I32Const(i32),
+    I64Const(i64),
     LocalGet(u32),
     LocalSet(u32),
     Drop,
@@ -109,6 +128,7 @@ fn encode_func_type(out: &mut Vec<u8>, ft: &FuncType) {
 fn val_type_byte(t: &ValType) -> u8 {
     match t {
         ValType::I32 => 0x7f,
+        ValType::I64 => 0x7e,
     }
 }
 
@@ -161,13 +181,7 @@ fn encode_code_section(out: &mut Vec<u8>, bodies: &Vec<FuncBody>) {
 
 fn encode_func_body(out: &mut Vec<u8>, body: &FuncBody) {
     let mut buf: Vec<u8> = Vec::new();
-    if body.locals.is_empty() {
-        write_uleb128(&mut buf, 0);
-    } else {
-        write_uleb128(&mut buf, 1);
-        write_uleb128(&mut buf, body.locals.len() as u32);
-        buf.push(val_type_byte(&body.locals[0]));
-    }
+    encode_locals(&mut buf, &body.locals);
     let mut i = 0;
     while i < body.instructions.len() {
         encode_instruction(&mut buf, &body.instructions[i]);
@@ -178,11 +192,41 @@ fn encode_func_body(out: &mut Vec<u8>, body: &FuncBody) {
     push_bytes(out, &buf);
 }
 
+fn encode_locals(out: &mut Vec<u8>, locals: &Vec<ValType>) {
+    if locals.is_empty() {
+        write_uleb128(out, 0);
+        return;
+    }
+    let mut group_count: u32 = 1;
+    let mut i = 1;
+    while i < locals.len() {
+        if !val_type_eq(&locals[i], &locals[i - 1]) {
+            group_count += 1;
+        }
+        i += 1;
+    }
+    write_uleb128(out, group_count);
+    let mut start = 0;
+    while start < locals.len() {
+        let mut end = start + 1;
+        while end < locals.len() && val_type_eq(&locals[end], &locals[start]) {
+            end += 1;
+        }
+        write_uleb128(out, (end - start) as u32);
+        out.push(val_type_byte(&locals[start]));
+        start = end;
+    }
+}
+
 fn encode_instruction(out: &mut Vec<u8>, inst: &Instruction) {
     match inst {
         Instruction::I32Const(n) => {
             out.push(0x41);
             write_sleb128(out, *n);
+        }
+        Instruction::I64Const(n) => {
+            out.push(0x42);
+            write_sleb128_64(out, *n);
         }
         Instruction::LocalGet(idx) => {
             out.push(0x20);
@@ -223,6 +267,20 @@ fn write_uleb128(out: &mut Vec<u8>, mut value: u32) {
 }
 
 fn write_sleb128(out: &mut Vec<u8>, mut value: i32) {
+    loop {
+        let byte = (value & 0x7f) as u8;
+        value >>= 7;
+        let sign_bit_set = (byte & 0x40) != 0;
+        let done = (value == 0 && !sign_bit_set) || (value == -1 && sign_bit_set);
+        if done {
+            out.push(byte);
+            return;
+        }
+        out.push(byte | 0x80);
+    }
+}
+
+fn write_sleb128_64(out: &mut Vec<u8>, mut value: i64) {
     loop {
         let byte = (value & 0x7f) as u8;
         value >>= 7;

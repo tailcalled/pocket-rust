@@ -176,6 +176,39 @@ fn escaping_borrow_returns_42() {
 // the `let q = pt1;` move and `compile_example` panics. This test will
 // start passing the day we add per-binding borrow lifetimes.
 #[test]
+fn u8_literal_returns_200() {
+    let bytes = compile_example("u8_literal", "lib.rs");
+    let (mut store, instance) = instantiate(&bytes);
+    let answer = instance
+        .get_typed_func::<(), i32>(&store, "answer")
+        .expect("export `answer` not found / wrong signature");
+    let result = answer.call(&mut store, ()).expect("call failed");
+    assert_eq!(result, 200);
+}
+
+#[test]
+fn i64_literal_returns_9_000_000_000() {
+    let bytes = compile_example("i64_literal", "lib.rs");
+    let (mut store, instance) = instantiate(&bytes);
+    let answer = instance
+        .get_typed_func::<(), i64>(&store, "answer")
+        .expect("export `answer` not found / wrong signature");
+    let result = answer.call(&mut store, ()).expect("call failed");
+    assert_eq!(result, 9_000_000_000);
+}
+
+#[test]
+fn int_inference_returns_7() {
+    let bytes = compile_example("int_inference", "lib.rs");
+    let (mut store, instance) = instantiate(&bytes);
+    let answer = instance
+        .get_typed_func::<(), i32>(&store, "answer")
+        .expect("export `answer` not found / wrong signature");
+    let result = answer.call(&mut store, ()).expect("call failed");
+    assert_eq!(result, 7);
+}
+
+#[test]
 fn inner_borrow_lifetime_returns_5() {
     let bytes = compile_example("inner_borrow_lifetime", "lib.rs");
     let (mut store, instance) = instantiate(&bytes);
