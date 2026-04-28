@@ -3,6 +3,7 @@ mod borrowck;
 mod codegen;
 mod lexer;
 mod parser;
+mod safeck;
 mod span;
 mod typeck;
 pub mod wasm;
@@ -73,6 +74,17 @@ pub fn compile(
     };
     let mut next_idx: u32 = 0;
     let mut wasm_mod = wasm::Module::new();
+    // One linear memory, fixed at 1 page (64 KiB). Stack pointer global lives
+    // at index 0, initialized to the top of the page; shadow stack grows down.
+    wasm_mod.memories.push(wasm::Memory {
+        min_pages: 1,
+        max_pages: Some(1),
+    });
+    wasm_mod.globals.push(wasm::Global {
+        ty: wasm::ValType::I32,
+        mutable: true,
+        init: wasm::Instruction::I32Const(65536),
+    });
 
     let mut i = 0;
     while i < libraries.len() {
@@ -94,6 +106,9 @@ pub fn compile(
         if let Err(e) = borrowck::check(&lib_root, &structs, &funcs) {
             return Err(span::format_error(&e));
         }
+        if let Err(e) = safeck::check(&lib_root, &funcs) {
+            return Err(span::format_error(&e));
+        }
         if let Err(e) = codegen::emit(&mut wasm_mod, &lib_root, &structs, &funcs) {
             return Err(span::format_error(&e));
         }
@@ -109,6 +124,9 @@ pub fn compile(
         return Err(span::format_error(&e));
     }
     if let Err(e) = borrowck::check(&user_root, &structs, &funcs) {
+        return Err(span::format_error(&e));
+    }
+    if let Err(e) = safeck::check(&user_root, &funcs) {
         return Err(span::format_error(&e));
     }
     if let Err(e) = codegen::emit(&mut wasm_mod, &user_root, &structs, &funcs) {

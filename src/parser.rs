@@ -157,6 +157,31 @@ impl Parser {
                 span,
             });
         }
+        if self.peek_kind(&TokenKind::Star) {
+            let star_span = self.expect(&TokenKind::Star, "`*`")?;
+            let mutable = if self.peek_kind(&TokenKind::Mut) {
+                self.pos += 1;
+                true
+            } else if self.peek_kind(&TokenKind::Const) {
+                self.pos += 1;
+                false
+            } else {
+                return Err(Error {
+                    file: self.file.clone(),
+                    message: "expected `const` or `mut` after `*` in pointer type".to_string(),
+                    span: star_span,
+                });
+            };
+            let inner = self.parse_type()?;
+            let span = Span::new(star_span.start, inner.span.end.copy());
+            return Ok(Type {
+                kind: TypeKind::RawPtr {
+                    inner: Box::new(inner),
+                    mutable,
+                },
+                span,
+            });
+        }
         let path = self.parse_path()?;
         let span = path.span.copy();
         Ok(Type {
@@ -189,6 +214,13 @@ impl Parser {
                     rhs,
                     span,
                 }));
+                continue;
+            }
+            // Block-like expressions (`unsafe { … }` and `{ … }`) without a
+            // tail can sit as bare statements with no trailing `;`. They're
+            // unit-typed; we simply walk them for side effects in later passes.
+            if is_unit_block_like(&expr) && !self.peek_kind(&TokenKind::RBrace) {
+                stmts.push(Stmt::Expr(expr));
                 continue;
             }
             tail = Some(expr);
@@ -230,7 +262,24 @@ impl Parser {
     }
 
     fn parse_expr(&mut self) -> Result<Expr, Error> {
-        self.parse_unary()
+        self.parse_cast()
+    }
+
+    fn parse_cast(&mut self) -> Result<Expr, Error> {
+        let mut expr = self.parse_unary()?;
+        while self.peek_kind(&TokenKind::As) {
+            self.pos += 1;
+            let ty = self.parse_type()?;
+            let span = Span::new(expr.span.start.copy(), ty.span.end.copy());
+            expr = Expr {
+                kind: ExprKind::Cast {
+                    inner: Box::new(expr),
+                    ty,
+                },
+                span,
+            };
+        }
+        Ok(expr)
     }
 
     fn parse_unary(&mut self) -> Result<Expr, Error> {
@@ -249,6 +298,15 @@ impl Parser {
                     inner: Box::new(inner),
                     mutable,
                 },
+                span,
+            });
+        }
+        if self.peek_kind(&TokenKind::Star) {
+            let star_span = self.expect(&TokenKind::Star, "`*`")?;
+            let inner = self.parse_unary()?;
+            let span = Span::new(star_span.start, inner.span.end.copy());
+            return Ok(Expr {
+                kind: ExprKind::Deref(Box::new(inner)),
                 span,
             });
         }
@@ -285,6 +343,13 @@ impl Parser {
             TokenKind::IntLit(_) => self.parse_int_lit(),
             TokenKind::Ident(_) => self.parse_path_atom(),
             TokenKind::LBrace => self.parse_block_expr(),
+            TokenKind::Unsafe => self.parse_unsafe_block(),
+            TokenKind::LParen => {
+                self.pos += 1;
+                let expr = self.parse_expr()?;
+                self.expect(&TokenKind::RParen, "`)`")?;
+                Ok(expr)
+            }
             other => {
                 let msg = format!("expected expression, got {}", token_kind_name(other));
                 let span = self.tokens[self.pos].span.copy();
@@ -302,6 +367,21 @@ impl Parser {
         let span = block.span.copy();
         Ok(Expr {
             kind: ExprKind::Block(Box::new(block)),
+            span,
+        })
+    }
+
+    // Recognize "block-like, no tail" expressions that can sit as a statement
+    // in a block without a trailing `;`. Right now that's just `unsafe { … }`
+    // and `{ … }` — both with `tail.is_none()`.
+
+
+    fn parse_unsafe_block(&mut self) -> Result<Expr, Error> {
+        let unsafe_span = self.expect(&TokenKind::Unsafe, "`unsafe`")?;
+        let block = self.parse_block()?;
+        let span = Span::new(unsafe_span.start, block.span.end.copy());
+        Ok(Expr {
+            kind: ExprKind::Unsafe(Box::new(block)),
             span,
         })
     }
@@ -499,8 +579,12 @@ impl Parser {
             (TokenKind::PathSep, TokenKind::PathSep) => true,
             (TokenKind::Comma, TokenKind::Comma) => true,
             (TokenKind::Amp, TokenKind::Amp) => true,
+            (TokenKind::Star, TokenKind::Star) => true,
             (TokenKind::Let, TokenKind::Let) => true,
             (TokenKind::Mut, TokenKind::Mut) => true,
+            (TokenKind::Const, TokenKind::Const) => true,
+            (TokenKind::As, TokenKind::As) => true,
+            (TokenKind::Unsafe, TokenKind::Unsafe) => true,
             (TokenKind::Eq, TokenKind::Eq) => true,
             _ => false,
         }
@@ -527,5 +611,13 @@ impl Parser {
             message: message.to_string(),
             span,
         }
+    }
+}
+
+fn is_unit_block_like(expr: &Expr) -> bool {
+    match &expr.kind {
+        ExprKind::Block(b) => b.tail.is_none(),
+        ExprKind::Unsafe(b) => b.tail.is_none(),
+        _ => false,
     }
 }

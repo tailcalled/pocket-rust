@@ -11,6 +11,9 @@ pub enum TokenKind {
     Struct,
     Let,
     Mut,
+    Const,
+    As,
+    Unsafe,
     Ident(String),
     LParen,
     RParen,
@@ -23,6 +26,7 @@ pub enum TokenKind {
     PathSep,
     Comma,
     Amp,
+    Star,
     Eq,
     IntLit(u64),
 }
@@ -34,6 +38,9 @@ pub fn token_kind_name(t: &TokenKind) -> &'static str {
         TokenKind::Struct => "`struct`",
         TokenKind::Let => "`let`",
         TokenKind::Mut => "`mut`",
+        TokenKind::Const => "`const`",
+        TokenKind::As => "`as`",
+        TokenKind::Unsafe => "`unsafe`",
         TokenKind::Ident(_) => "identifier",
         TokenKind::LParen => "`(`",
         TokenKind::RParen => "`)`",
@@ -46,6 +53,7 @@ pub fn token_kind_name(t: &TokenKind) -> &'static str {
         TokenKind::PathSep => "`::`",
         TokenKind::Comma => "`,`",
         TokenKind::Amp => "`&`",
+        TokenKind::Star => "`*`",
         TokenKind::Eq => "`=`",
         TokenKind::IntLit(_) => "integer literal",
     }
@@ -103,6 +111,21 @@ pub fn tokenize(file: &str, source: &str) -> Result<Vec<Token>, Error> {
                     kind: TokenKind::Mut,
                     span,
                 });
+            } else if text == "const" {
+                tokens.push(Token {
+                    kind: TokenKind::Const,
+                    span,
+                });
+            } else if text == "as" {
+                tokens.push(Token {
+                    kind: TokenKind::As,
+                    span,
+                });
+            } else if text == "unsafe" {
+                tokens.push(Token {
+                    kind: TokenKind::Unsafe,
+                    span,
+                });
             } else {
                 tokens.push(Token {
                     kind: TokenKind::Ident(text),
@@ -152,6 +175,9 @@ pub fn tokenize(file: &str, source: &str) -> Result<Vec<Token>, Error> {
             byte_pos += 1;
         } else if b == b'&' {
             push_single(&mut tokens, TokenKind::Amp, line, &mut col);
+            byte_pos += 1;
+        } else if b == b'*' {
+            push_single(&mut tokens, TokenKind::Star, line, &mut col);
             byte_pos += 1;
         } else if b == b'=' {
             push_single(&mut tokens, TokenKind::Eq, line, &mut col);

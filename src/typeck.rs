@@ -115,6 +115,7 @@ pub enum RType {
     Int(IntKind),
     Struct(Vec<String>),
     Ref { inner: Box<RType>, mutable: bool },
+    RawPtr { inner: Box<RType>, mutable: bool },
 }
 
 pub fn rtype_clone(t: &RType) -> RType {
@@ -122,6 +123,10 @@ pub fn rtype_clone(t: &RType) -> RType {
         RType::Int(k) => RType::Int(int_kind_copy(k)),
         RType::Struct(p) => RType::Struct(clone_path(p)),
         RType::Ref { inner, mutable } => RType::Ref {
+            inner: Box::new(rtype_clone(inner)),
+            mutable: *mutable,
+        },
+        RType::RawPtr { inner, mutable } => RType::RawPtr {
             inner: Box::new(rtype_clone(inner)),
             mutable: *mutable,
         },
@@ -142,6 +147,16 @@ pub fn rtype_eq(a: &RType, b: &RType) -> bool {
                 mutable: mb,
             },
         ) => ma == mb && rtype_eq(ia, ib),
+        (
+            RType::RawPtr {
+                inner: ia,
+                mutable: ma,
+            },
+            RType::RawPtr {
+                inner: ib,
+                mutable: mb,
+            },
+        ) => ma == mb && rtype_eq(ia, ib),
         _ => false,
     }
 }
@@ -155,6 +170,13 @@ pub fn rtype_to_string(t: &RType) -> String {
                 format!("&mut {}", rtype_to_string(inner))
             } else {
                 format!("&{}", rtype_to_string(inner))
+            }
+        }
+        RType::RawPtr { inner, mutable } => {
+            if *mutable {
+                format!("*mut {}", rtype_to_string(inner))
+            } else {
+                format!("*const {}", rtype_to_string(inner))
             }
         }
     }
@@ -176,7 +198,7 @@ pub fn rtype_size(ty: &RType, structs: &StructTable) -> u32 {
             }
             s
         }
-        RType::Ref { inner, .. } => rtype_size(inner, structs),
+        RType::Ref { .. } | RType::RawPtr { .. } => 1,
     }
 }
 
@@ -198,7 +220,30 @@ pub fn flatten_rtype(ty: &RType, structs: &StructTable, out: &mut Vec<crate::was
                 i += 1;
             }
         }
-        RType::Ref { inner, .. } => flatten_rtype(inner, structs, out),
+        RType::Ref { .. } | RType::RawPtr { .. } => out.push(crate::wasm::ValType::I32),
+    }
+}
+
+pub fn byte_size_of(rt: &RType, structs: &StructTable) -> u32 {
+    match rt {
+        RType::Int(k) => match k {
+            IntKind::U8 | IntKind::I8 => 1,
+            IntKind::U16 | IntKind::I16 => 2,
+            IntKind::U32 | IntKind::I32 | IntKind::Usize | IntKind::Isize => 4,
+            IntKind::U64 | IntKind::I64 => 8,
+            IntKind::U128 | IntKind::I128 => 16,
+        },
+        RType::Ref { .. } | RType::RawPtr { .. } => 4,
+        RType::Struct(p) => {
+            let entry = struct_lookup(structs, p).expect("resolved struct");
+            let mut total: u32 = 0;
+            let mut i = 0;
+            while i < entry.fields.len() {
+                total += byte_size_of(&entry.fields[i].ty, structs);
+                i += 1;
+            }
+            total
+        }
     }
 }
 
@@ -207,7 +252,12 @@ pub fn is_copy(t: &RType) -> bool {
         RType::Int(_) => true,
         RType::Struct(_) => false,
         RType::Ref { .. } => true,
+        RType::RawPtr { .. } => true,
     }
+}
+
+pub fn is_raw_ptr(t: &RType) -> bool {
+    matches!(t, RType::RawPtr { .. })
 }
 
 pub fn is_ref_mutable(t: &RType) -> bool {
@@ -249,6 +299,10 @@ pub struct FnSymbol {
     pub return_type: Option<RType>,
     pub let_types: Vec<RType>,
     pub lit_types: Vec<RType>,
+    // For each `Deref` expression in the body, in source-DFS order: `true`
+    // iff the operand resolved to a raw pointer (`*const T` / `*mut T`).
+    // Safeck reads this in lockstep to flag derefs outside `unsafe` blocks.
+    pub deref_is_raw: Vec<bool>,
 }
 
 pub struct FuncTable {
@@ -348,6 +402,13 @@ pub fn resolve_type(
         TypeKind::Ref { inner, mutable } => {
             let r = resolve_type(inner, current_module, structs, file)?;
             Ok(RType::Ref {
+                inner: Box::new(r),
+                mutable: *mutable,
+            })
+        }
+        TypeKind::RawPtr { inner, mutable } => {
+            let r = resolve_type(inner, current_module, structs, file)?;
+            Ok(RType::RawPtr {
                 inner: Box::new(r),
                 mutable: *mutable,
             })
@@ -505,6 +566,7 @@ fn collect_funcs(
                     return_type,
                     let_types: Vec::new(),
                     lit_types: Vec::new(),
+                    deref_is_raw: Vec::new(),
                 });
                 *next_idx += 1;
             }
@@ -527,6 +589,7 @@ enum InferType {
     Int(IntKind),
     Struct(Vec<String>),
     Ref { inner: Box<InferType>, mutable: bool },
+    RawPtr { inner: Box<InferType>, mutable: bool },
 }
 
 fn infer_clone(t: &InferType) -> InferType {
@@ -538,6 +601,10 @@ fn infer_clone(t: &InferType) -> InferType {
             inner: Box::new(infer_clone(inner)),
             mutable: *mutable,
         },
+        InferType::RawPtr { inner, mutable } => InferType::RawPtr {
+            inner: Box::new(infer_clone(inner)),
+            mutable: *mutable,
+        },
     }
 }
 
@@ -546,6 +613,10 @@ fn rtype_to_infer(rt: &RType) -> InferType {
         RType::Int(k) => InferType::Int(int_kind_copy(k)),
         RType::Struct(p) => InferType::Struct(clone_path(p)),
         RType::Ref { inner, mutable } => InferType::Ref {
+            inner: Box::new(rtype_to_infer(inner)),
+            mutable: *mutable,
+        },
+        RType::RawPtr { inner, mutable } => InferType::RawPtr {
             inner: Box::new(rtype_to_infer(inner)),
             mutable: *mutable,
         },
@@ -562,6 +633,13 @@ fn infer_to_string(t: &InferType) -> String {
                 format!("&mut {}", infer_to_string(inner))
             } else {
                 format!("&{}", infer_to_string(inner))
+            }
+        }
+        InferType::RawPtr { inner, mutable } => {
+            if *mutable {
+                format!("*mut {}", infer_to_string(inner))
+            } else {
+                format!("*const {}", infer_to_string(inner))
             }
         }
     }
@@ -592,6 +670,10 @@ impl Subst {
             InferType::Int(k) => InferType::Int(int_kind_copy(k)),
             InferType::Struct(p) => InferType::Struct(clone_path(p)),
             InferType::Ref { inner, mutable } => InferType::Ref {
+                inner: Box::new(self.substitute(inner)),
+                mutable: *mutable,
+            },
+            InferType::RawPtr { inner, mutable } => InferType::RawPtr {
                 inner: Box::new(self.substitute(inner)),
                 mutable: *mutable,
             },
@@ -701,6 +783,37 @@ impl Subst {
                 }
                 self.unify(&ia, &ib, span, file)
             }
+            (
+                InferType::RawPtr {
+                    inner: ia,
+                    mutable: ma,
+                },
+                InferType::RawPtr {
+                    inner: ib,
+                    mutable: mb,
+                },
+            ) => {
+                if ma != mb {
+                    return Err(Error {
+                        file: file.to_string(),
+                        message: format!(
+                            "type mismatch: expected `{}`, got `{}`",
+                            if mb {
+                                format!("*mut {}", infer_to_string(&ib))
+                            } else {
+                                format!("*const {}", infer_to_string(&ib))
+                            },
+                            if ma {
+                                format!("*mut {}", infer_to_string(&ia))
+                            } else {
+                                format!("*const {}", infer_to_string(&ia))
+                            }
+                        ),
+                        span: span.copy(),
+                    });
+                }
+                self.unify(&ia, &ib, span, file)
+            }
             (a, b) => Err(Error {
                 file: file.to_string(),
                 message: format!(
@@ -719,6 +832,10 @@ impl Subst {
             InferType::Int(k) => RType::Int(k),
             InferType::Struct(p) => RType::Struct(p),
             InferType::Ref { inner, mutable } => RType::Ref {
+                inner: Box::new(self.finalize(&inner)),
+                mutable,
+            },
+            InferType::RawPtr { inner, mutable } => RType::RawPtr {
                 inner: Box::new(self.finalize(&inner)),
                 mutable,
             },
@@ -743,6 +860,7 @@ struct CheckCtx<'a> {
     let_vars: Vec<InferType>,
     lit_vars: Vec<u32>,
     lit_constraints: Vec<LitConstraint>,
+    deref_is_raw: Vec<bool>,
     subst: Subst,
     current_module: &'a Vec<String>,
     current_file: &'a str,
@@ -800,12 +918,13 @@ fn check_function(
         None => None,
     };
 
-    let (let_vars, lit_vars, lit_constraints, subst) = {
+    let (let_vars, lit_vars, lit_constraints, deref_is_raw, subst) = {
         let mut ctx = CheckCtx {
             locals,
             let_vars: Vec::new(),
             lit_vars: Vec::new(),
             lit_constraints: Vec::new(),
+            deref_is_raw: Vec::new(),
             subst: Subst {
                 bindings: Vec::new(),
                 is_integer: Vec::new(),
@@ -816,7 +935,13 @@ fn check_function(
             funcs: &*funcs,
         };
         check_block(&mut ctx, &func.body, &return_rt)?;
-        (ctx.let_vars, ctx.lit_vars, ctx.lit_constraints, ctx.subst)
+        (
+            ctx.let_vars,
+            ctx.lit_vars,
+            ctx.lit_constraints,
+            ctx.deref_is_raw,
+            ctx.subst,
+        )
     };
 
     // Range-check each integer literal against its (now resolved) type.
@@ -872,6 +997,7 @@ fn check_function(
         if path_eq(&funcs.entries[e].path, &full) {
             funcs.entries[e].let_types = let_types;
             funcs.entries[e].lit_types = lit_types;
+            funcs.entries[e].deref_is_raw = deref_is_raw;
             break;
         }
         e += 1;
@@ -912,6 +1038,7 @@ fn check_block_inner(ctx: &mut CheckCtx, block: &Block) -> Result<Option<InferTy
         match &block.stmts[i] {
             Stmt::Let(let_stmt) => check_let_stmt(ctx, let_stmt)?,
             Stmt::Assign(assign) => check_assign_stmt(ctx, assign)?,
+            Stmt::Expr(expr) => check_expr_stmt(ctx, expr)?,
         }
         i += 1;
     }
@@ -919,6 +1046,20 @@ fn check_block_inner(ctx: &mut CheckCtx, block: &Block) -> Result<Option<InferTy
         Some(expr) => Ok(Some(check_expr(ctx, expr)?)),
         None => Ok(None),
     }
+}
+
+// Statement-position check for block-like expressions (`unsafe { … }`,
+// `{ … }`) that don't carry a tail value. Walks the inner stmts but skips
+// the "must end with a tail" check that `check_block_expr` enforces.
+fn check_expr_stmt(ctx: &mut CheckCtx, expr: &Expr) -> Result<(), Error> {
+    let block = match &expr.kind {
+        ExprKind::Block(b) | ExprKind::Unsafe(b) => b.as_ref(),
+        _ => unreachable!("parser guarantees Stmt::Expr is a block-like"),
+    };
+    let mark = ctx.locals.len();
+    let _ = check_block_inner(ctx, block)?;
+    ctx.locals.truncate(mark);
+    Ok(())
 }
 
 fn check_block_expr(ctx: &mut CheckCtx, block: &Block) -> Result<InferType, Error> {
@@ -974,6 +1115,12 @@ fn check_let_stmt(ctx: &mut CheckCtx, let_stmt: &LetStmt) -> Result<(), Error> {
 }
 
 fn check_assign_stmt(ctx: &mut CheckCtx, assign: &AssignStmt) -> Result<(), Error> {
+    // Two flavors of LHS:
+    //   1. Var-rooted chain: `x` or `x.f.g.h`.
+    //   2. Deref-rooted chain: `*p` or `(*p).f.g.h`.
+    if let Some((root_expr, fields)) = extract_deref_rooted_chain(&assign.lhs) {
+        return check_deref_rooted_assign(ctx, root_expr, &fields, assign);
+    }
     // LHS must be a place expression (Var or Var-rooted FieldAccess chain).
     let chain = match extract_place_for_assign(&assign.lhs) {
         Some(c) => c,
@@ -1049,6 +1196,122 @@ fn check_assign_stmt(ctx: &mut CheckCtx, assign: &AssignStmt) -> Result<(), Erro
     let rhs_ty = check_expr(ctx, &assign.rhs)?;
     ctx.subst
         .unify(&rhs_ty, &lhs_ty, &assign.rhs.span, ctx.current_file)?;
+    Ok(())
+}
+
+// Returns (deref_target, field_chain) if the LHS is `*expr` or
+// `(*expr).field…`. The deref_target is the expression being dereferenced
+// (typically a Var bound to a `&mut T` / `*mut T`); the field_chain is the
+// list of fields walked after the deref.
+fn extract_deref_rooted_chain<'a>(expr: &'a Expr) -> Option<(&'a Expr, Vec<String>)> {
+    let mut fields: Vec<String> = Vec::new();
+    let mut current = expr;
+    loop {
+        match &current.kind {
+            ExprKind::Deref(inner) => {
+                let mut reversed: Vec<String> = Vec::new();
+                let mut i = fields.len();
+                while i > 0 {
+                    i -= 1;
+                    reversed.push(fields[i].clone());
+                }
+                return Some((inner.as_ref(), reversed));
+            }
+            ExprKind::FieldAccess(fa) => {
+                fields.push(fa.field.clone());
+                current = &fa.base;
+            }
+            _ => return None,
+        }
+    }
+}
+
+fn check_deref_rooted_assign(
+    ctx: &mut CheckCtx,
+    root_expr: &Expr,
+    fields: &Vec<String>,
+    assign: &AssignStmt,
+) -> Result<(), Error> {
+    // The root must type as `&mut T` or `*mut T` — otherwise the deref isn't
+    // assignable. (We don't allow whole-place assignment through `*const T`
+    // or `&T`, matching Rust.)
+    let root_infer = check_expr(ctx, root_expr)?;
+    let resolved = ctx.subst.substitute(&root_infer);
+    let inner_infer = match resolved {
+        InferType::Ref { inner, mutable: true } => {
+            ctx.deref_is_raw.push(false);
+            *inner
+        }
+        InferType::RawPtr { inner, mutable: true } => {
+            ctx.deref_is_raw.push(true);
+            *inner
+        }
+        InferType::Ref { mutable: false, .. } => {
+            return Err(Error {
+                file: ctx.current_file.to_string(),
+                message: "cannot assign through a shared reference".to_string(),
+                span: assign.lhs.span.copy(),
+            });
+        }
+        InferType::RawPtr { mutable: false, .. } => {
+            return Err(Error {
+                file: ctx.current_file.to_string(),
+                message: "cannot assign through a `*const T` raw pointer".to_string(),
+                span: assign.lhs.span.copy(),
+            });
+        }
+        other => {
+            return Err(Error {
+                file: ctx.current_file.to_string(),
+                message: format!(
+                    "cannot dereference `{}` for assignment",
+                    infer_to_string(&other)
+                ),
+                span: assign.lhs.span.copy(),
+            });
+        }
+    };
+    // Walk fields starting from the pointed-at type to find the LHS type.
+    let mut current = inner_infer;
+    let mut i = 0;
+    while i < fields.len() {
+        let struct_path = match &current {
+            InferType::Struct(p) => clone_path(p),
+            _ => {
+                return Err(Error {
+                    file: ctx.current_file.to_string(),
+                    message: "field assignment on non-struct value".to_string(),
+                    span: assign.lhs.span.copy(),
+                });
+            }
+        };
+        let entry = struct_lookup(ctx.structs, &struct_path).expect("resolved struct");
+        let mut found = false;
+        let mut k = 0;
+        while k < entry.fields.len() {
+            if entry.fields[k].name == fields[i] {
+                current = rtype_to_infer(&entry.fields[k].ty);
+                found = true;
+                break;
+            }
+            k += 1;
+        }
+        if !found {
+            return Err(Error {
+                file: ctx.current_file.to_string(),
+                message: format!(
+                    "no field `{}` on `{}`",
+                    fields[i],
+                    place_to_string(&struct_path)
+                ),
+                span: assign.lhs.span.copy(),
+            });
+        }
+        i += 1;
+    }
+    let rhs_ty = check_expr(ctx, &assign.rhs)?;
+    ctx.subst
+        .unify(&rhs_ty, &current, &assign.rhs.span, ctx.current_file)?;
     Ok(())
 }
 
@@ -1169,8 +1432,90 @@ fn check_expr(ctx: &mut CheckCtx, expr: &Expr) -> Result<InferType, Error> {
                 mutable: *mutable,
             })
         }
+        ExprKind::Cast { inner, ty } => check_cast(ctx, inner, ty, expr),
+        ExprKind::Deref(inner) => check_deref(ctx, inner, expr),
+        ExprKind::Unsafe(block) => check_block_expr(ctx, block.as_ref()),
         ExprKind::Block(block) => check_block_expr(ctx, block.as_ref()),
     }
+}
+
+// `*p` reads the pointed-to value. Result type = inner of the ref/raw-ptr.
+// We don't enforce Copy here — that check kicks in only when the deref is
+// USED as a value (the caller can decide). `(*p).field` access still applies
+// the Copy rule via `check_field_access`'s "through reference" branch.
+fn check_deref(ctx: &mut CheckCtx, inner: &Expr, deref_expr: &Expr) -> Result<InferType, Error> {
+    let inner_ty = check_expr(ctx, inner)?;
+    let resolved = ctx.subst.substitute(&inner_ty);
+    match resolved {
+        InferType::Ref { inner, .. } => {
+            ctx.deref_is_raw.push(false);
+            Ok(*inner)
+        }
+        InferType::RawPtr { inner, .. } => {
+            ctx.deref_is_raw.push(true);
+            Ok(*inner)
+        }
+        other => Err(Error {
+            file: ctx.current_file.to_string(),
+            message: format!(
+                "cannot dereference `{}` — only references and raw pointers can be dereferenced",
+                infer_to_string(&other)
+            ),
+            span: deref_expr.span.copy(),
+        }),
+    }
+}
+
+// Casts in our subset: any of {integer, &T, &mut T, *const T, *mut T} can be
+// cast to any of {*const T, *mut T}. Integer-class type vars get pinned to
+// usize at the cast site (matches Rust's "integers cast to ptr-sized") so the
+// underlying ABI is i32. Everything else is a type-level reinterpret.
+fn check_cast(
+    ctx: &mut CheckCtx,
+    inner: &Expr,
+    ty: &Type,
+    cast_expr: &Expr,
+) -> Result<InferType, Error> {
+    let target = resolve_type(ty, ctx.current_module, ctx.structs, ctx.current_file)?;
+    if !is_raw_ptr(&target) {
+        return Err(Error {
+            file: ctx.current_file.to_string(),
+            message: format!(
+                "casts are only allowed to raw pointer types, got `{}`",
+                rtype_to_string(&target)
+            ),
+            span: ty.span.copy(),
+        });
+    }
+    let src_ty = check_expr(ctx, inner)?;
+    let resolved_src = ctx.subst.substitute(&src_ty);
+    let ok = matches!(
+        &resolved_src,
+        InferType::Ref { .. } | InferType::RawPtr { .. } | InferType::Int(_) | InferType::Var(_)
+    );
+    if !ok {
+        return Err(Error {
+            file: ctx.current_file.to_string(),
+            message: format!(
+                "cannot cast `{}` to a raw pointer",
+                infer_to_string(&resolved_src)
+            ),
+            span: cast_expr.span.copy(),
+        });
+    }
+    if let InferType::Var(v) = &resolved_src {
+        // Pin an unresolved integer literal to usize so the runtime ABI is i32.
+        if ctx.subst.is_integer[*v as usize] {
+            ctx.subst
+                .unify(
+                    &InferType::Var(*v),
+                    &InferType::Int(IntKind::Usize),
+                    &cast_expr.span,
+                    ctx.current_file,
+                )?;
+        }
+    }
+    Ok(rtype_to_infer(&target))
 }
 
 fn check_call(ctx: &mut CheckCtx, call: &Call, call_expr: &Expr) -> Result<InferType, Error> {
@@ -1358,10 +1703,14 @@ fn check_field_access(
     fa: &FieldAccess,
     _fa_expr: &Expr,
 ) -> Result<InferType, Error> {
+    // Field access through a deref expression — `(*p).field` — applies the
+    // same "Copy fields only" rule as auto-deref `r.field` does. Detect it
+    // syntactically before walking the base.
+    let through_explicit_deref = matches!(&fa.base.kind, ExprKind::Deref(_));
     let base_ty = check_expr(ctx, &fa.base)?;
     let resolved = ctx.subst.substitute(&base_ty);
     let (struct_path, through_ref) = match resolved {
-        InferType::Struct(p) => (p, false),
+        InferType::Struct(p) => (p, through_explicit_deref),
         InferType::Ref { inner, .. } => match *inner {
             InferType::Struct(p) => (p, true),
             _ => {

@@ -47,6 +47,7 @@ pub struct Type {
 pub enum TypeKind {
     Path(Path),
     Ref { inner: Box<Type>, mutable: bool },
+    RawPtr { inner: Box<Type>, mutable: bool },
 }
 
 pub struct Block {
@@ -58,6 +59,7 @@ pub struct Block {
 pub enum Stmt {
     Let(LetStmt),
     Assign(AssignStmt),
+    Expr(Expr),
 }
 
 pub struct LetStmt {
@@ -86,6 +88,9 @@ pub enum ExprKind {
     StructLit(StructLit),
     FieldAccess(FieldAccess),
     Borrow { inner: Box<Expr>, mutable: bool },
+    Cast { inner: Box<Expr>, ty: Type },
+    Deref(Box<Expr>),
+    Unsafe(Box<Block>),
     Block(Box<Block>),
 }
 

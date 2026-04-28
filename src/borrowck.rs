@@ -139,6 +139,9 @@ fn walk_stmts_and_tail(state: &mut BorrowState, block: &Block) -> Result<ValueDe
         match &block.stmts[i] {
             Stmt::Let(let_stmt) => walk_let_stmt(state, let_stmt)?,
             Stmt::Assign(assign) => walk_assign_stmt(state, assign)?,
+            Stmt::Expr(expr) => {
+                walk_expr(state, expr)?;
+            }
         }
         i += 1;
     }
@@ -149,6 +152,16 @@ fn walk_stmts_and_tail(state: &mut BorrowState, block: &Block) -> Result<ValueDe
 }
 
 fn walk_assign_stmt(state: &mut BorrowState, assign: &AssignStmt) -> Result<(), Error> {
+    // Deref-rooted writes (`*p = …;`, `(*p).f = …;`): writing through a
+    // ref/raw-ptr exclusively (`&mut`/`*mut`) is authorized by typeck. Borrow
+    // tracking can't precisely identify the underlying place (we'd need alias
+    // analysis), so we just walk the inner deref target and the RHS for their
+    // side effects and skip the conflict scan.
+    if is_deref_rooted_assign(&assign.lhs) {
+        walk_assign_lhs(state, &assign.lhs)?;
+        walk_expr(state, &assign.rhs)?;
+        return Ok(());
+    }
     let chain = extract_place(&assign.lhs)
         .expect("typeck verified the assignment LHS is a place expression");
     // Reject if any holder has an overlapping path — assignment can't proceed
@@ -260,14 +273,35 @@ fn walk_expr(state: &mut BorrowState, expr: &Expr) -> Result<ValueDesc, Error> {
         ExprKind::StructLit(lit) => walk_struct_lit(state, lit),
         ExprKind::FieldAccess(fa) => walk_field_access(state, fa, expr),
         ExprKind::Borrow { .. } => walk_borrow(state, expr),
+        ExprKind::Cast { inner, .. } => {
+            // The inner produces side effects (moves, registered borrows) that
+            // we still want to surface, but the cast itself yields a raw
+            // pointer with no compile-time lifetime tracking — drop the
+            // borrows so they don't get re-attached downstream.
+            walk_expr(state, inner)?;
+            Ok(empty_desc())
+        }
+        ExprKind::Deref(inner) => {
+            // Deref reads through a ref/raw-ptr and yields the pointed-at
+            // value. Refs/raw-ptrs are Copy, so reading them clones the
+            // borrow handle — but typeck rejects deref of non-Copy inner, so
+            // the resulting value carries no borrows of its own.
+            walk_expr(state, inner)?;
+            Ok(empty_desc())
+        }
+        ExprKind::Unsafe(block) => walk_block_expr(state, block.as_ref()),
         ExprKind::Block(block) => walk_block_expr(state, block.as_ref()),
     }
 }
 
 fn walk_var(state: &mut BorrowState, name: &str, expr: &Expr) -> Result<ValueDesc, Error> {
     let idx = find_binding(state, name).expect("typeck verified the variable exists");
-    // For ref bindings, also reject reads of a binding that's been moved.
+    if is_raw_ptr_holder(&state.holders[idx]) {
+        // Raw pointers are Copy and carry no borrow handles.
+        return Ok(empty_desc());
+    }
     if is_ref_holder(&state.holders[idx]) {
+        // Reject reads of a ref binding that's been moved.
         let mut place: Vec<String> = Vec::new();
         place.push(name.to_string());
         let mut i = 0;
@@ -275,29 +309,28 @@ fn walk_var(state: &mut BorrowState, name: &str, expr: &Expr) -> Result<ValueDes
             if paths_share_prefix(&state.moved[i], &place) {
                 return Err(Error {
                     file: state.file.clone(),
-                    message: format!(
-                        "`{}` was already moved",
-                        place_to_string(&place)
-                    ),
+                    message: format!("`{}` was already moved", place_to_string(&place)),
                     span: expr.span.copy(),
                 });
             }
             i += 1;
         }
         if is_mut_ref_holder(&state.holders[idx]) {
-            // Reading a `&mut` binding consumes it: take its holds, mark it moved,
-            // and propagate the borrow to whichever consumer we end up in.
+            // `&mut T` is non-Copy: reading the binding moves its borrow into
+            // whatever consumes it. The binding becomes unusable afterward.
+            // (Without this, lexical borrows extend past the binding's last
+            // use and shadow any subsequent direct access to the source.)
             let mut taken: Vec<HeldBorrow> = Vec::new();
             std::mem::swap(&mut taken, &mut state.holders[idx].holds);
             state.moved.push(place);
             Ok(ValueDesc { borrows: taken })
         } else {
-            // Reading a `&` binding: refs are Copy, clone the holds.
+            // `&T` is Copy: cloning the borrow handle is fine.
             let holds = clone_held_borrows(&state.holders[idx].holds);
             Ok(ValueDesc { borrows: holds })
         }
     } else {
-        // Owned read: this is a move.
+        // Owned read: tracked as a move.
         let mut place: Vec<String> = Vec::new();
         place.push(name.to_string());
         try_move(state, place, expr.span.copy())?;
@@ -480,8 +513,41 @@ fn is_ref_holder(h: &Holder) -> bool {
     matches!(h.rtype, Some(RType::Ref { .. }))
 }
 
+fn is_raw_ptr_holder(h: &Holder) -> bool {
+    matches!(h.rtype, Some(RType::RawPtr { .. }))
+}
+
 fn is_mut_ref_holder(h: &Holder) -> bool {
     matches!(h.rtype, Some(RType::Ref { mutable: true, .. }))
+}
+
+
+fn is_deref_rooted_assign(expr: &Expr) -> bool {
+    let mut current = expr;
+    loop {
+        match &current.kind {
+            ExprKind::Deref(_) => return true,
+            ExprKind::FieldAccess(fa) => current = &fa.base,
+            _ => return false,
+        }
+    }
+}
+
+// Walk the deref-rooted LHS for its side effects: typically the chain of
+// FieldAccess/Deref nodes ends at a Var (the &mut binding being written
+// through), and we want to surface that read.
+fn walk_assign_lhs(state: &mut BorrowState, expr: &Expr) -> Result<(), Error> {
+    match &expr.kind {
+        ExprKind::Deref(inner) => {
+            walk_expr(state, inner)?;
+            Ok(())
+        }
+        ExprKind::FieldAccess(fa) => walk_assign_lhs(state, &fa.base),
+        _ => {
+            walk_expr(state, expr)?;
+            Ok(())
+        }
+    }
 }
 
 fn extract_place(expr: &Expr) -> Option<Vec<String>> {

@@ -1,8 +1,21 @@
 pub struct Module {
     pub types: Vec<FuncType>,
     pub functions: Vec<u32>,
+    pub memories: Vec<Memory>,
+    pub globals: Vec<Global>,
     pub exports: Vec<Export>,
     pub code: Vec<FuncBody>,
+}
+
+pub struct Memory {
+    pub min_pages: u32,
+    pub max_pages: Option<u32>,
+}
+
+pub struct Global {
+    pub ty: ValType,
+    pub mutable: bool,
+    pub init: Instruction,
 }
 
 pub struct FuncType {
@@ -52,8 +65,22 @@ pub enum Instruction {
     I64Const(i64),
     LocalGet(u32),
     LocalSet(u32),
+    GlobalGet(u32),
+    GlobalSet(u32),
     Drop,
     Call(u32),
+    I32Add,
+    I32Sub,
+    I32Load { align: u32, offset: u32 },
+    I32Load8U { align: u32, offset: u32 },
+    I32Load8S { align: u32, offset: u32 },
+    I32Load16U { align: u32, offset: u32 },
+    I32Load16S { align: u32, offset: u32 },
+    I64Load { align: u32, offset: u32 },
+    I32Store { align: u32, offset: u32 },
+    I32Store8 { align: u32, offset: u32 },
+    I32Store16 { align: u32, offset: u32 },
+    I64Store { align: u32, offset: u32 },
 }
 
 impl Module {
@@ -61,6 +88,8 @@ impl Module {
         Module {
             types: Vec::new(),
             functions: Vec::new(),
+            memories: Vec::new(),
+            globals: Vec::new(),
             exports: Vec::new(),
             code: Vec::new(),
         }
@@ -81,6 +110,12 @@ impl Module {
         }
         if !self.functions.is_empty() {
             encode_function_section(&mut bytes, &self.functions);
+        }
+        if !self.memories.is_empty() {
+            encode_memory_section(&mut bytes, &self.memories);
+        }
+        if !self.globals.is_empty() {
+            encode_global_section(&mut bytes, &self.globals);
         }
         if !self.exports.is_empty() {
             encode_export_section(&mut bytes, &self.exports);
@@ -141,6 +176,45 @@ fn encode_function_section(out: &mut Vec<u8>, funcs: &Vec<u32>) {
         i += 1;
     }
     encode_section(out, 3, payload);
+}
+
+fn encode_memory_section(out: &mut Vec<u8>, mems: &Vec<Memory>) {
+    let mut payload: Vec<u8> = Vec::new();
+    write_uleb128(&mut payload, mems.len() as u32);
+    let mut i = 0;
+    while i < mems.len() {
+        encode_limits(&mut payload, mems[i].min_pages, &mems[i].max_pages);
+        i += 1;
+    }
+    encode_section(out, 5, payload);
+}
+
+fn encode_limits(out: &mut Vec<u8>, min: u32, max: &Option<u32>) {
+    match max {
+        Some(m) => {
+            out.push(0x01);
+            write_uleb128(out, min);
+            write_uleb128(out, *m);
+        }
+        None => {
+            out.push(0x00);
+            write_uleb128(out, min);
+        }
+    }
+}
+
+fn encode_global_section(out: &mut Vec<u8>, globals: &Vec<Global>) {
+    let mut payload: Vec<u8> = Vec::new();
+    write_uleb128(&mut payload, globals.len() as u32);
+    let mut i = 0;
+    while i < globals.len() {
+        payload.push(val_type_byte(&globals[i].ty));
+        payload.push(if globals[i].mutable { 0x01 } else { 0x00 });
+        encode_instruction(&mut payload, &globals[i].init);
+        payload.push(0x0b); // end of init expr
+        i += 1;
+    }
+    encode_section(out, 6, payload);
 }
 
 fn encode_export_section(out: &mut Vec<u8>, exports: &Vec<Export>) {
@@ -242,6 +316,70 @@ fn encode_instruction(out: &mut Vec<u8>, inst: &Instruction) {
         Instruction::Call(idx) => {
             out.push(0x10);
             write_uleb128(out, *idx);
+        }
+        Instruction::GlobalGet(idx) => {
+            out.push(0x23);
+            write_uleb128(out, *idx);
+        }
+        Instruction::GlobalSet(idx) => {
+            out.push(0x24);
+            write_uleb128(out, *idx);
+        }
+        Instruction::I32Add => {
+            out.push(0x6a);
+        }
+        Instruction::I32Sub => {
+            out.push(0x6b);
+        }
+        Instruction::I32Load { align, offset } => {
+            out.push(0x28);
+            write_uleb128(out, *align);
+            write_uleb128(out, *offset);
+        }
+        Instruction::I32Load8U { align, offset } => {
+            out.push(0x2d);
+            write_uleb128(out, *align);
+            write_uleb128(out, *offset);
+        }
+        Instruction::I32Load8S { align, offset } => {
+            out.push(0x2c);
+            write_uleb128(out, *align);
+            write_uleb128(out, *offset);
+        }
+        Instruction::I32Load16U { align, offset } => {
+            out.push(0x2f);
+            write_uleb128(out, *align);
+            write_uleb128(out, *offset);
+        }
+        Instruction::I32Load16S { align, offset } => {
+            out.push(0x2e);
+            write_uleb128(out, *align);
+            write_uleb128(out, *offset);
+        }
+        Instruction::I64Load { align, offset } => {
+            out.push(0x29);
+            write_uleb128(out, *align);
+            write_uleb128(out, *offset);
+        }
+        Instruction::I32Store { align, offset } => {
+            out.push(0x36);
+            write_uleb128(out, *align);
+            write_uleb128(out, *offset);
+        }
+        Instruction::I32Store8 { align, offset } => {
+            out.push(0x3a);
+            write_uleb128(out, *align);
+            write_uleb128(out, *offset);
+        }
+        Instruction::I32Store16 { align, offset } => {
+            out.push(0x3b);
+            write_uleb128(out, *align);
+            write_uleb128(out, *offset);
+        }
+        Instruction::I64Store { align, offset } => {
+            out.push(0x37);
+            write_uleb128(out, *align);
+            write_uleb128(out, *offset);
         }
     }
 }
