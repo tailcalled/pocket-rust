@@ -1,6 +1,6 @@
 use crate::ast::{
-    Block, Call, Expr, ExprKind, FieldAccess, Function, Item, LetStmt, Module, PathSegment, Stmt,
-    StructLit, Type, TypeKind,
+    AssignStmt, Block, Call, Expr, ExprKind, FieldAccess, Function, Item, LetStmt, Module,
+    PathSegment, Stmt, StructLit, Type, TypeKind,
 };
 use crate::span::{Error, Span};
 
@@ -659,8 +659,14 @@ struct LitConstraint {
     span: Span,
 }
 
+struct LocalEntry {
+    name: String,
+    ty: InferType,
+    mutable: bool,
+}
+
 struct CheckCtx<'a> {
-    locals: Vec<(String, InferType)>,
+    locals: Vec<LocalEntry>,
     let_vars: Vec<InferType>,
     lit_vars: Vec<u32>,
     lit_constraints: Vec<LitConstraint>,
@@ -704,12 +710,16 @@ fn check_function(
     structs: &StructTable,
     funcs: &mut FuncTable,
 ) -> Result<(), Error> {
-    // Build initial locals from params.
-    let mut locals: Vec<(String, InferType)> = Vec::new();
+    // Build initial locals from params (params are immutable bindings in our subset).
+    let mut locals: Vec<LocalEntry> = Vec::new();
     let mut k = 0;
     while k < func.params.len() {
         let rt = resolve_type(&func.params[k].ty, current_module, structs, current_file)?;
-        locals.push((func.params[k].name.clone(), rtype_to_infer(&rt)));
+        locals.push(LocalEntry {
+            name: func.params[k].name.clone(),
+            ty: rtype_to_infer(&rt),
+            mutable: false,
+        });
         k += 1;
     }
     let return_rt: Option<RType> = match &func.return_type {
@@ -828,6 +838,7 @@ fn check_block_inner(ctx: &mut CheckCtx, block: &Block) -> Result<Option<InferTy
     while i < block.stmts.len() {
         match &block.stmts[i] {
             Stmt::Let(let_stmt) => check_let_stmt(ctx, let_stmt)?,
+            Stmt::Assign(assign) => check_assign_stmt(ctx, assign)?,
         }
         i += 1;
     }
@@ -880,10 +891,154 @@ fn check_let_stmt(ctx: &mut CheckCtx, let_stmt: &LetStmt) -> Result<(), Error> {
         }
         None => value_ty,
     };
-    ctx.locals
-        .push((let_stmt.name.clone(), infer_clone(&final_ty)));
+    ctx.locals.push(LocalEntry {
+        name: let_stmt.name.clone(),
+        ty: infer_clone(&final_ty),
+        mutable: let_stmt.mutable,
+    });
     ctx.let_vars.push(final_ty);
     Ok(())
+}
+
+fn check_assign_stmt(ctx: &mut CheckCtx, assign: &AssignStmt) -> Result<(), Error> {
+    // LHS must be a place expression (Var or Var-rooted FieldAccess chain).
+    let chain = match extract_place_for_assign(&assign.lhs) {
+        Some(c) => c,
+        None => {
+            return Err(Error {
+                file: ctx.current_file.to_string(),
+                message: "left-hand side of assignment must be a place expression".to_string(),
+                span: assign.lhs.span.copy(),
+            });
+        }
+    };
+    // Find root binding (search reverse for innermost shadow).
+    let mut found_idx: Option<usize> = None;
+    let mut i = ctx.locals.len();
+    while i > 0 {
+        i -= 1;
+        if ctx.locals[i].name == chain[0] {
+            found_idx = Some(i);
+            break;
+        }
+    }
+    let idx = match found_idx {
+        Some(i) => i,
+        None => {
+            return Err(Error {
+                file: ctx.current_file.to_string(),
+                message: format!("unknown variable: `{}`", chain[0]),
+                span: assign.lhs.span.copy(),
+            });
+        }
+    };
+    if !ctx.locals[idx].mutable {
+        return Err(Error {
+            file: ctx.current_file.to_string(),
+            message: format!(
+                "cannot assign to `{}`: not declared as `mut`",
+                chain[0]
+            ),
+            span: assign.lhs.span.copy(),
+        });
+    }
+    // Field assignments only valid on owned structs (no ref-rooted assignments).
+    if chain.len() > 1 {
+        let resolved = ctx.subst.substitute(&ctx.locals[idx].ty);
+        if matches!(resolved, InferType::Ref(_)) {
+            return Err(Error {
+                file: ctx.current_file.to_string(),
+                message: format!(
+                    "cannot assign through `{}`: assignment through references is not supported",
+                    chain[0]
+                ),
+                span: assign.lhs.span.copy(),
+            });
+        }
+    }
+    // Walk the chain to determine the LHS type.
+    let lhs_ty = walk_chain_type(
+        &ctx.locals[idx].ty,
+        &chain,
+        ctx.structs,
+        ctx.current_file,
+        &assign.lhs.span,
+    )?;
+    let rhs_ty = check_expr(ctx, &assign.rhs)?;
+    ctx.subst
+        .unify(&rhs_ty, &lhs_ty, &assign.rhs.span, ctx.current_file)?;
+    Ok(())
+}
+
+fn extract_place_for_assign(expr: &Expr) -> Option<Vec<String>> {
+    let mut chain: Vec<String> = Vec::new();
+    let mut current = expr;
+    loop {
+        match &current.kind {
+            ExprKind::Var(name) => {
+                chain.push(name.clone());
+                let mut reversed: Vec<String> = Vec::new();
+                let mut i = chain.len();
+                while i > 0 {
+                    i -= 1;
+                    reversed.push(chain[i].clone());
+                }
+                return Some(reversed);
+            }
+            ExprKind::FieldAccess(fa) => {
+                chain.push(fa.field.clone());
+                current = &fa.base;
+            }
+            _ => return None,
+        }
+    }
+}
+
+fn walk_chain_type(
+    start: &InferType,
+    chain: &Vec<String>,
+    structs: &StructTable,
+    file: &str,
+    span: &Span,
+) -> Result<InferType, Error> {
+    let mut current = infer_clone(start);
+    let mut i = 1;
+    while i < chain.len() {
+        let struct_path = match &current {
+            InferType::Struct(p) => clone_path(p),
+            _ => {
+                return Err(Error {
+                    file: file.to_string(),
+                    message: "field assignment on non-struct value".to_string(),
+                    span: span.copy(),
+                });
+            }
+        };
+        let entry = struct_lookup(structs, &struct_path).expect("resolved struct");
+        let mut found = false;
+        let mut k = 0;
+        while k < entry.fields.len() {
+            if entry.fields[k].name == chain[i] {
+                current = rtype_to_infer(&entry.fields[k].ty);
+                found = true;
+                break;
+            }
+            k += 1;
+        }
+        if !found {
+            return Err(Error {
+                file: file.to_string(),
+                message: format!(
+                    "no field `{}` on `{}`",
+                    chain[i],
+                    place_to_string(&struct_path)
+                ),
+                span: span.copy(),
+            });
+        }
+        i += 1;
+    }
+    Ok(current)
 }
 
 fn check_expr(ctx: &mut CheckCtx, expr: &Expr) -> Result<InferType, Error> {
@@ -902,8 +1057,8 @@ fn check_expr(ctx: &mut CheckCtx, expr: &Expr) -> Result<InferType, Error> {
             let mut i = ctx.locals.len();
             while i > 0 {
                 i -= 1;
-                if ctx.locals[i].0 == *name {
-                    return Ok(infer_clone(&ctx.locals[i].1));
+                if ctx.locals[i].name == *name {
+                    return Ok(infer_clone(&ctx.locals[i].ty));
                 }
             }
             Err(Error {

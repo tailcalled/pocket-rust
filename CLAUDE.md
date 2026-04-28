@@ -62,8 +62,12 @@ Examples live in `examples/<name>/`. Integration tests live in `tests/`, split b
 The Rust subset currently supported:
 
 - Functions: `fn NAME(P1: T1, P2: T2, …)` with an optional return type. No visibility modifiers, no attributes, no generics.
-- Function body: a block — a sequence of `let` statements followed by an optional tail expression. (No expression statements yet.)
-- Statements: `let NAME = EXPR;` and `let NAME: TYPE = EXPR;`. The optional type annotation is checked against the value's inferred type. The bound name is in scope for subsequent statements and the tail expression. No `mut`, no patterns, no shadowing checks (a duplicate name within a scope shadows incompletely — move tracking can't tell two same-named bindings apart).
+- Function body: a block — a sequence of `let` and assignment statements followed by an optional tail expression. (No bare expression statements yet.)
+- Statements:
+  - `let NAME = EXPR;` / `let NAME: TYPE = EXPR;` — immutable binding. Optional annotation is unified with the value's inferred type.
+  - `let mut NAME = EXPR;` / `let mut NAME: TYPE = EXPR;` — mutable binding (eligible for assignment).
+  - `PLACE = EXPR;` — assignment. The LHS must be a place expression (a `Var` or a `Var`-rooted `FieldAccess` chain). The root binding must be declared `mut`. Field assignments through a `&T`-typed binding are rejected (no `&mut` yet).
+  Names are in scope for subsequent statements and the tail expression. No patterns, no shadowing checks.
 - Expressions: usize integer literals (parsed as `u64`, range-checked into `u32`, emitted as `i32.const`); function calls of the form `path::to::func(arg, arg, …)`; bare-identifier variable references that resolve to the enclosing function's parameters or `let` bindings (emitted as `local.get`); struct literals `Path { field: expr, … }`; field access `expr.field`, chainable; `&expr` to take a shared reference; block expressions `{ stmts; tail_expr }` whose value is the tail expression.
 - Block expressions: same shape as a function body block, but the tail expression is **required** (we don't have a unit value yet). Each block introduces its own local scope — `let` bindings inside don't escape. Borrows created inside a block expression follow the same call-scoped rule as anywhere else.
 - Types: integers (u8, i8, u16, i16, u32, i32, u64, i64, u128, i128, usize, isize), structs, and `&T`. WASM layout: ≤32-bit integers (and usize/isize, since we target wasm32) flatten to 1 `i32`; 64-bit integers flatten to 1 `i64`; 128-bit integers flatten to two `i64`s (low half then high half). Structs flatten in declaration order, recursively — a `Point { x: u32, y: u64 }` is `[i32, i64]`. `&T` has the same layout as `T` (refs are a pure compile-time concept; we have no linear memory). All function params and return values that flatten to more than one WASM scalar become multi-value signatures.
@@ -80,6 +84,7 @@ Move and borrow tracking (in `borrowck.rs`): walk every function body with a sta
 - Walking an expression returns a `ValueDesc { borrows: Vec<Path> }`. `&place` produces a desc carrying that place. Reading a ref-typed `Var` produces the desc of borrows the binding currently holds (refs are `Copy`, so reads don't move). Everything else produces an empty desc — calls and struct literals can't return references, so their values never carry borrows out.
 - The caller of `walk_expr` chooses what to do with the desc: a `let` makes a new binding holder absorb the desc's borrows; a call's argument absorbs them into the synthetic call holder; a block-expression's tail returns its desc up to whatever consumes the block. When a holder is dropped (block scope ends, call returns, function ends), the borrows it kept alive die with it.
 - A move of place `P` is a conflict if any prior move or any *currently held* borrow shares a path prefix with `P`. A `&P` is a conflict if `P` has been moved.
+- An assignment to place `P` (LHS of `P = EXPR;`) is a conflict if any holder still keeps a borrow that overlaps `P`. On success, every entry in `moved` whose path has `P` as a prefix is purged — the spot has a fresh value, so any sub-paths are valid again. Whole-binding reassignments (`x = …;`) thus "reset" `x` even if it had been moved.
 - Reads of owned-type locals are tracked as moves (current overstrictness — `usize` should be `Copy` but we don't honor that yet).
 
 Concretely:

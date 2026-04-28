@@ -1,5 +1,6 @@
 use crate::ast::{
-    Block, Call, Expr, ExprKind, FieldAccess, Function, Item, LetStmt, Module, Stmt, StructLit,
+    AssignStmt, Block, Call, Expr, ExprKind, FieldAccess, Function, Item, LetStmt, Module, Stmt,
+    StructLit,
 };
 use crate::span::Error;
 use crate::typeck::{
@@ -152,6 +153,7 @@ fn codegen_block(ctx: &mut FnCtx, block: &Block) -> Result<(), Error> {
     while i < block.stmts.len() {
         match &block.stmts[i] {
             Stmt::Let(let_stmt) => codegen_let_stmt(ctx, let_stmt)?,
+            Stmt::Assign(assign) => codegen_assign_stmt(ctx, assign)?,
         }
         i += 1;
     }
@@ -159,6 +161,94 @@ fn codegen_block(ctx: &mut FnCtx, block: &Block) -> Result<(), Error> {
         codegen_expr(ctx, expr)?;
     }
     Ok(())
+}
+
+fn codegen_assign_stmt(ctx: &mut FnCtx, assign: &AssignStmt) -> Result<(), Error> {
+    // Codegen RHS first; the value sits on the stack.
+    codegen_expr(ctx, &assign.rhs)?;
+    // Walk the LHS chain to find the binding and the offset/size to write.
+    let chain = extract_place(&assign.lhs).expect("typeck verified");
+    let mut binding_idx = 0;
+    let mut found = false;
+    let mut k = ctx.locals.len();
+    while k > 0 {
+        k -= 1;
+        if ctx.locals[k].name == chain[0] {
+            binding_idx = k;
+            found = true;
+            break;
+        }
+    }
+    if !found {
+        unreachable!("typeck verified the binding exists");
+    }
+    let mut offset: u32 = 0;
+    let mut current_ty = rtype_clone(&ctx.locals[binding_idx].rtype);
+    let mut i = 1;
+    while i < chain.len() {
+        let struct_path = match &current_ty {
+            RType::Struct(p) => clone_path(p),
+            _ => unreachable!("typeck verified field assignment is on a struct"),
+        };
+        let entry = struct_lookup(ctx.structs, &struct_path).expect("resolved struct");
+        let mut field_offset: u32 = 0;
+        let mut found_field = false;
+        let mut j = 0;
+        while j < entry.fields.len() {
+            let mut vts: Vec<wasm::ValType> = Vec::new();
+            flatten_rtype(&entry.fields[j].ty, ctx.structs, &mut vts);
+            let s = vts.len() as u32;
+            if entry.fields[j].name == chain[i] {
+                offset += field_offset;
+                current_ty = rtype_clone(&entry.fields[j].ty);
+                found_field = true;
+                break;
+            }
+            field_offset += s;
+            j += 1;
+        }
+        if !found_field {
+            unreachable!("typeck verified the field exists");
+        }
+        i += 1;
+    }
+    let mut target_valtypes: Vec<wasm::ValType> = Vec::new();
+    flatten_rtype(&current_ty, ctx.structs, &mut target_valtypes);
+    let size = target_valtypes.len() as u32;
+    let target_start = ctx.locals[binding_idx].wasm_start + offset;
+    // LocalSet pops from the top of the stack; the rightmost scalar of the
+    // value is the highest-indexed slot.
+    let mut k = 0;
+    while k < size {
+        ctx.instructions
+            .push(wasm::Instruction::LocalSet(target_start + size - 1 - k));
+        k += 1;
+    }
+    Ok(())
+}
+
+fn extract_place(expr: &Expr) -> Option<Vec<String>> {
+    let mut chain: Vec<String> = Vec::new();
+    let mut current = expr;
+    loop {
+        match &current.kind {
+            ExprKind::Var(name) => {
+                chain.push(name.clone());
+                let mut reversed: Vec<String> = Vec::new();
+                let mut i = chain.len();
+                while i > 0 {
+                    i -= 1;
+                    reversed.push(chain[i].clone());
+                }
+                return Some(reversed);
+            }
+            ExprKind::FieldAccess(fa) => {
+                chain.push(fa.field.clone());
+                current = &fa.base;
+            }
+            _ => return None,
+        }
+    }
 }
 
 fn codegen_let_stmt(ctx: &mut FnCtx, let_stmt: &LetStmt) -> Result<(), Error> {
@@ -240,6 +330,7 @@ fn codegen_block_expr(ctx: &mut FnCtx, block: &Block) -> Result<RType, Error> {
     while i < block.stmts.len() {
         match &block.stmts[i] {
             Stmt::Let(let_stmt) => codegen_let_stmt(ctx, let_stmt)?,
+            Stmt::Assign(assign) => codegen_assign_stmt(ctx, assign)?,
         }
         i += 1;
     }

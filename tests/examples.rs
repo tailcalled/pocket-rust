@@ -198,6 +198,39 @@ fn i64_literal_returns_9_000_000_000() {
 }
 
 #[test]
+fn let_mut_scalar_returns_99() {
+    let bytes = compile_example("let_mut_scalar", "lib.rs");
+    let (mut store, instance) = instantiate(&bytes);
+    let answer = instance
+        .get_typed_func::<(), i32>(&store, "answer")
+        .expect("export `answer` not found / wrong signature");
+    let result = answer.call(&mut store, ()).expect("call failed");
+    assert_eq!(result, 99);
+}
+
+#[test]
+fn let_mut_record_returns_99() {
+    let bytes = compile_example("let_mut_record", "lib.rs");
+    let (mut store, instance) = instantiate(&bytes);
+    let answer = instance
+        .get_typed_func::<(), i32>(&store, "answer")
+        .expect("export `answer` not found / wrong signature");
+    let result = answer.call(&mut store, ()).expect("call failed");
+    assert_eq!(result, 99);
+}
+
+#[test]
+fn let_mut_nested_returns_99() {
+    let bytes = compile_example("let_mut_nested", "lib.rs");
+    let (mut store, instance) = instantiate(&bytes);
+    let answer = instance
+        .get_typed_func::<(), i32>(&store, "answer")
+        .expect("export `answer` not found / wrong signature");
+    let result = answer.call(&mut store, ()).expect("call failed");
+    assert_eq!(result, 99);
+}
+
+#[test]
 fn int_inference_returns_7() {
     let bytes = compile_example("int_inference", "lib.rs");
     let (mut store, instance) = instantiate(&bytes);

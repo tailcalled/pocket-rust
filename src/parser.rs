@@ -1,6 +1,6 @@
 use crate::ast::{
-    Block, Call, Expr, ExprKind, FieldAccess, FieldInit, Function, LetStmt, Param, Path,
-    PathSegment, Stmt, StructDef, StructField, StructLit, Type, TypeKind,
+    AssignStmt, Block, Call, Expr, ExprKind, FieldAccess, FieldInit, Function, LetStmt, Param,
+    Path, PathSegment, Stmt, StructDef, StructField, StructLit, Type, TypeKind,
 };
 use crate::lexer::{Token, TokenKind, token_kind_name};
 use crate::span::{Error, Pos, Span};
@@ -159,14 +159,32 @@ impl Parser {
     fn parse_block(&mut self) -> Result<Block, Error> {
         let lb = self.expect(&TokenKind::LBrace, "`{`")?;
         let mut stmts: Vec<Stmt> = Vec::new();
-        while self.peek_kind(&TokenKind::Let) {
-            stmts.push(self.parse_let_stmt()?);
+        let tail;
+        loop {
+            if self.peek_kind(&TokenKind::Let) {
+                stmts.push(self.parse_let_stmt()?);
+                continue;
+            }
+            if self.peek_kind(&TokenKind::RBrace) {
+                tail = None;
+                break;
+            }
+            let expr = self.parse_expr()?;
+            if self.peek_kind(&TokenKind::Eq) {
+                self.pos += 1;
+                let rhs = self.parse_expr()?;
+                let semi = self.expect(&TokenKind::Semi, "`;`")?;
+                let span = Span::new(expr.span.start.copy(), semi.end);
+                stmts.push(Stmt::Assign(AssignStmt {
+                    lhs: expr,
+                    rhs,
+                    span,
+                }));
+                continue;
+            }
+            tail = Some(expr);
+            break;
         }
-        let tail = if self.peek_kind(&TokenKind::RBrace) {
-            None
-        } else {
-            Some(self.parse_expr()?)
-        };
         let rb = self.expect(&TokenKind::RBrace, "`}`")?;
         Ok(Block {
             stmts,
@@ -177,6 +195,12 @@ impl Parser {
 
     fn parse_let_stmt(&mut self) -> Result<Stmt, Error> {
         self.expect(&TokenKind::Let, "`let`")?;
+        let mutable = if self.peek_kind(&TokenKind::Mut) {
+            self.pos += 1;
+            true
+        } else {
+            false
+        };
         let (name, name_span) = self.expect_ident()?;
         let ty = if self.peek_kind(&TokenKind::Colon) {
             self.pos += 1;
@@ -190,6 +214,7 @@ impl Parser {
         Ok(Stmt::Let(LetStmt {
             name,
             name_span,
+            mutable,
             ty,
             value,
         }))
@@ -457,6 +482,7 @@ impl Parser {
             (TokenKind::Comma, TokenKind::Comma) => true,
             (TokenKind::Amp, TokenKind::Amp) => true,
             (TokenKind::Let, TokenKind::Let) => true,
+            (TokenKind::Mut, TokenKind::Mut) => true,
             (TokenKind::Eq, TokenKind::Eq) => true,
             _ => false,
         }

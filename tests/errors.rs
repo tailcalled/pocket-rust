@@ -313,6 +313,40 @@ fn let_out_of_scope_after_block_is_rejected() {
 }
 
 #[test]
+fn assignment_to_immutable_binding_is_rejected() {
+    let err = compile_source("fn f() -> u32 { let x = 5; x = 6; x }");
+    assert!(
+        err.contains("not declared as `mut`"),
+        "expected mut-required error, got: {}",
+        err
+    );
+}
+
+#[test]
+fn field_assignment_to_immutable_record_is_rejected() {
+    let err = compile_source(
+        "struct Point { x: u32, y: u32 }\nfn f() -> u32 { let p = Point { x: 1, y: 2 }; p.x = 99; p.x }",
+    );
+    assert!(
+        err.contains("not declared as `mut`"),
+        "expected mut-required error, got: {}",
+        err
+    );
+}
+
+#[test]
+fn assignment_while_borrowed_is_rejected() {
+    let err = compile_source(
+        "struct Point { x: u32, y: u32 }\nfn x_of(p: &Point) -> u32 { p.x }\nfn use_borrow(p: &Point, q: u32) -> u32 { q }\nfn f() -> u32 { let mut p = Point { x: 1, y: 2 }; let r = &p; use_borrow(r, { p.x = 99; p.x }) }",
+    );
+    assert!(
+        err.contains("borrowed"),
+        "expected borrow-conflict error, got: {}",
+        err
+    );
+}
+
+#[test]
 fn integer_literal_too_big_for_u8() {
     let err = compile_source("fn f() -> u8 { 300 }");
     assert!(

@@ -57,13 +57,21 @@ pub struct Block {
 
 pub enum Stmt {
     Let(LetStmt),
+    Assign(AssignStmt),
 }
 
 pub struct LetStmt {
     pub name: String,
     pub name_span: Span,
+    pub mutable: bool,
     pub ty: Option<Type>,
     pub value: Expr,
+}
+
+pub struct AssignStmt {
+    pub lhs: Expr,
+    pub rhs: Expr,
+    pub span: Span,
 }
 
 pub struct Expr {

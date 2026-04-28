@@ -1,5 +1,6 @@
 use crate::ast::{
-    Block, Call, Expr, ExprKind, FieldAccess, Function, Item, LetStmt, Module, Stmt, StructLit,
+    AssignStmt, Block, Call, Expr, ExprKind, FieldAccess, Function, Item, LetStmt, Module, Stmt,
+    StructLit,
 };
 use crate::span::{Error, Span};
 use crate::typeck::{FuncTable, RType, StructTable, clone_path, func_lookup, rtype_clone};
@@ -132,6 +133,7 @@ fn walk_stmts_and_tail(state: &mut BorrowState, block: &Block) -> Result<ValueDe
     while i < block.stmts.len() {
         match &block.stmts[i] {
             Stmt::Let(let_stmt) => walk_let_stmt(state, let_stmt)?,
+            Stmt::Assign(assign) => walk_assign_stmt(state, assign)?,
         }
         i += 1;
     }
@@ -139,6 +141,72 @@ fn walk_stmts_and_tail(state: &mut BorrowState, block: &Block) -> Result<ValueDe
         Some(tail) => walk_expr(state, tail),
         None => Ok(empty_desc()),
     }
+}
+
+fn walk_assign_stmt(state: &mut BorrowState, assign: &AssignStmt) -> Result<(), Error> {
+    let chain = extract_place(&assign.lhs)
+        .expect("typeck verified the assignment LHS is a place expression");
+    // Reject if any holder has an overlapping path — assignment can't proceed
+    // while the target memory is borrowed.
+    let mut h = 0;
+    while h < state.holders.len() {
+        let mut k = 0;
+        while k < state.holders[h].holds.len() {
+            if paths_share_prefix(&state.holders[h].holds[k], &chain) {
+                return Err(Error {
+                    file: state.file.clone(),
+                    message: format!(
+                        "cannot assign to `{}` while it is borrowed",
+                        place_to_string(&chain)
+                    ),
+                    span: assign.span.copy(),
+                });
+            }
+            k += 1;
+        }
+        h += 1;
+    }
+    // Walk the RHS for its move/borrow effects.
+    let desc = walk_expr(state, &assign.rhs)?;
+    // RHS desc would carry borrows iff the result is a ref. Assignment to a
+    // non-ref binding can't accept ref-typed values (typeck enforced); assignment
+    // to a ref binding (e.g. `let mut r: &T; r = …;`) treats the new value the
+    // same way the binding's `let` would have. For simplicity, drop the desc
+    // here — the binding is already a holder, and reassignment doesn't change
+    // which holder owns existing borrows. (This means once-borrowed-always-tied
+    // for a ref binding; we can refine later.)
+    let _ = desc;
+    // The assigned place is now fresh; clear any moves recorded on it or below.
+    let mut new_moved: Vec<Vec<String>> = Vec::new();
+    let mut i = 0;
+    while i < state.moved.len() {
+        if !chain_is_prefix_of(&chain, &state.moved[i]) {
+            let mut copy: Vec<String> = Vec::new();
+            let mut k = 0;
+            while k < state.moved[i].len() {
+                copy.push(state.moved[i][k].clone());
+                k += 1;
+            }
+            new_moved.push(copy);
+        }
+        i += 1;
+    }
+    state.moved = new_moved;
+    Ok(())
+}
+
+fn chain_is_prefix_of(prefix: &Vec<String>, full: &Vec<String>) -> bool {
+    if prefix.len() > full.len() {
+        return false;
+    }
+    let mut i = 0;
+    while i < prefix.len() {
+        if prefix[i] != full[i] {
+            return false;
+        }
+        i += 1;
+    }
+    true
 }
 
 fn walk_let_stmt(state: &mut BorrowState, let_stmt: &LetStmt) -> Result<(), Error> {

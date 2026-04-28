@@ -10,6 +10,7 @@ pub enum TokenKind {
     Mod,
     Struct,
     Let,
+    Mut,
     Ident(String),
     LParen,
     RParen,
@@ -32,6 +33,7 @@ pub fn token_kind_name(t: &TokenKind) -> &'static str {
         TokenKind::Mod => "`mod`",
         TokenKind::Struct => "`struct`",
         TokenKind::Let => "`let`",
+        TokenKind::Mut => "`mut`",
         TokenKind::Ident(_) => "identifier",
         TokenKind::LParen => "`(`",
         TokenKind::RParen => "`)`",
@@ -94,6 +96,11 @@ pub fn tokenize(file: &str, source: &str) -> Result<Vec<Token>, Error> {
             } else if text == "let" {
                 tokens.push(Token {
                     kind: TokenKind::Let,
+                    span,
+                });
+            } else if text == "mut" {
+                tokens.push(Token {
+                    kind: TokenKind::Mut,
                     span,
                 });
             } else {
