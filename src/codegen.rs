@@ -237,7 +237,7 @@ fn collect_leaves(
             signed: false,
             valtype: wasm::ValType::I32,
         }),
-        RType::Struct { path, type_args } => {
+        RType::Struct { path, type_args, .. } => {
             let entry = struct_lookup(structs, path).expect("resolved struct");
             let env = make_struct_env(&entry.type_params, type_args);
             let mut off = base_offset;
@@ -491,9 +491,18 @@ fn emit_module(
                     impl_param_args.push(RType::Param(ib.type_params[k].name.clone()));
                     k += 1;
                 }
+                let mut impl_lifetime_args: Vec<crate::typeck::LifetimeRepr> = Vec::new();
+                let mut k = 0;
+                while k < ib.lifetime_params.len() {
+                    impl_lifetime_args.push(crate::typeck::LifetimeRepr::Named(
+                        ib.lifetime_params[k].name.clone(),
+                    ));
+                    k += 1;
+                }
                 let target_rt = RType::Struct {
                     path: target_path,
                     type_args: impl_param_args,
+                    lifetime_args: impl_lifetime_args,
                 };
                 let impl_is_generic = !ib.type_params.is_empty();
                 let mut k = 0;
@@ -556,9 +565,12 @@ fn emit_monomorphic(
                 self_args.push(rtype_clone(&work.type_args[i]));
                 i += 1;
             }
+            // Phase D: codegen substitution doesn't need real lifetime args
+            // (lifetimes don't drive layout). Empty placeholders are fine.
             Some(RType::Struct {
                 path: parent_path,
                 type_args: self_args,
+                lifetime_args: Vec::new(),
             })
         } else {
             None
@@ -1143,7 +1155,7 @@ fn codegen_assign_stmt(ctx: &mut FnCtx, assign: &AssignStmt) -> Result<(), Error
     let mut i = 1;
     while i < chain.len() {
         let (struct_path, struct_args) = match &current_ty {
-            RType::Struct { path, type_args } => (clone_path(path), rtype_vec_clone(type_args)),
+            RType::Struct { path, type_args, .. } => (clone_path(path), rtype_vec_clone(type_args)),
             _ => unreachable!("typeck verified chain navigates structs"),
         };
         let entry = struct_lookup(ctx.structs, &struct_path).expect("resolved struct");
@@ -1220,7 +1232,7 @@ fn flat_chain_offset(ctx: &FnCtx, chain: &Vec<String>, binding_idx: usize) -> u3
     let mut i = 1;
     while i < chain.len() {
         let (struct_path, struct_args) = match &current_ty {
-            RType::Struct { path, type_args } => (clone_path(path), rtype_vec_clone(type_args)),
+            RType::Struct { path, type_args, .. } => (clone_path(path), rtype_vec_clone(type_args)),
             _ => unreachable!("typeck verified chain navigates structs"),
         };
         let entry = struct_lookup(ctx.structs, &struct_path).expect("resolved struct");
@@ -1299,7 +1311,7 @@ fn codegen_deref_assign(
     let mut i = 0;
     while i < fields.len() {
         let (struct_path, struct_args) = match &current_ty {
-            RType::Struct { path, type_args } => (clone_path(path), rtype_vec_clone(type_args)),
+            RType::Struct { path, type_args, .. } => (clone_path(path), rtype_vec_clone(type_args)),
             _ => unreachable!("typeck verified chain navigates structs"),
         };
         let entry = struct_lookup(ctx.structs, &struct_path).expect("resolved struct");
@@ -1625,7 +1637,7 @@ fn codegen_struct_lit(
     );
     let recorded_ty = substitute_rtype(&recorded_ty, &ctx.env);
     let (full, struct_args) = match &recorded_ty {
-        RType::Struct { path, type_args } => (clone_path(path), rtype_vec_clone(type_args)),
+        RType::Struct { path, type_args, .. } => (clone_path(path), rtype_vec_clone(type_args)),
         _ => unreachable!("expr_types entry for a struct literal must be a Struct"),
     };
 
@@ -1714,6 +1726,7 @@ fn codegen_struct_lit(
     Ok(RType::Struct {
         path: full,
         type_args: struct_args,
+        lifetime_args: Vec::new(),
     })
 }
 
@@ -1793,7 +1806,7 @@ fn codegen_place_chain_load(
     let mut i = 1;
     while i < chain.len() {
         let (struct_path, struct_args) = match &current_ty {
-            RType::Struct { path, type_args } => (clone_path(path), rtype_vec_clone(type_args)),
+            RType::Struct { path, type_args, .. } => (clone_path(path), rtype_vec_clone(type_args)),
             _ => unreachable!("typeck verified chain navigates structs"),
         };
         let entry = struct_lookup(ctx.structs, &struct_path).expect("resolved struct");
@@ -1884,9 +1897,9 @@ fn extract_field_from_stack(
 ) -> Result<RType, Error> {
     // Compute total flat size, field flat offset, field flat size, field type.
     let (struct_path, struct_args) = match base_type {
-        RType::Struct { path, type_args } => (clone_path(path), rtype_vec_clone(type_args)),
+        RType::Struct { path, type_args, .. } => (clone_path(path), rtype_vec_clone(type_args)),
         RType::Ref { inner, .. } => match inner.as_ref() {
-            RType::Struct { path, type_args } => (clone_path(path), rtype_vec_clone(type_args)),
+            RType::Struct { path, type_args, .. } => (clone_path(path), rtype_vec_clone(type_args)),
             _ => unreachable!("typeck rejects field access on non-struct"),
         },
         _ => unreachable!("typeck rejects field access on non-struct"),
@@ -1990,7 +2003,7 @@ fn codegen_borrow(ctx: &mut FnCtx, inner: &Expr, mutable: bool) -> Result<RType,
     let mut i = 1;
     while i < chain.len() {
         let (struct_path, struct_args) = match &current_ty {
-            RType::Struct { path, type_args } => (clone_path(path), rtype_vec_clone(type_args)),
+            RType::Struct { path, type_args, .. } => (clone_path(path), rtype_vec_clone(type_args)),
             _ => unreachable!("typeck verified chain navigates structs"),
         };
         let entry = struct_lookup(ctx.structs, &struct_path).expect("resolved struct");
@@ -2046,6 +2059,8 @@ fn codegen_borrow(ctx: &mut FnCtx, inner: &Expr, mutable: bool) -> Result<RType,
     Ok(RType::Ref {
         inner: Box::new(current_ty),
         mutable,
+        // Codegen doesn't track lifetimes — `Inferred(0)` placeholder.
+        lifetime: crate::typeck::LifetimeRepr::Inferred(0),
     })
 }
 

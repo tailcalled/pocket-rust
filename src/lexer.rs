@@ -20,6 +20,8 @@ pub enum TokenKind {
     LAngle,
     RAngle,
     Ident(String),
+    // `'name` — a lifetime token. The string is the bare name (no leading apostrophe).
+    Lifetime(String),
     LParen,
     RParen,
     LBrace,
@@ -52,6 +54,7 @@ pub fn token_kind_name(t: &TokenKind) -> &'static str {
         TokenKind::LAngle => "`<`",
         TokenKind::RAngle => "`>`",
         TokenKind::Ident(_) => "identifier",
+        TokenKind::Lifetime(_) => "lifetime",
         TokenKind::LParen => "`(`",
         TokenKind::RParen => "`)`",
         TokenKind::LBrace => "`{`",
@@ -213,6 +216,33 @@ pub fn tokenize(file: &str, source: &str) -> Result<Vec<Token>, Error> {
         } else if b == b'>' {
             push_single(&mut tokens, TokenKind::RAngle, line, &mut col);
             byte_pos += 1;
+        } else if b == b'\'' {
+            // `'name` — a lifetime. Single quote followed by an ident.
+            // (We don't have char literals, so the syntax is unambiguous.)
+            let start = Pos::new(line, col);
+            let apos_pos = byte_pos;
+            byte_pos += 1;
+            col += 1;
+            if byte_pos >= bytes.len() || !is_ident_start(bytes[byte_pos]) {
+                let end = Pos::new(line, col);
+                return Err(Error {
+                    file: file.to_string(),
+                    message: "expected lifetime name after `'`".to_string(),
+                    span: Span::new(start, end),
+                });
+            }
+            let name_start = byte_pos;
+            while byte_pos < bytes.len() && is_ident_continue(bytes[byte_pos]) {
+                byte_pos += 1;
+                col += 1;
+            }
+            let name = source[name_start..byte_pos].to_string();
+            let end = Pos::new(line, col);
+            let _ = apos_pos;
+            tokens.push(Token {
+                kind: TokenKind::Lifetime(name),
+                span: Span::new(start, end),
+            });
         } else if b == b'-' && (byte_pos + 1) < bytes.len() && bytes[byte_pos + 1] == b'>' {
             let start = Pos::new(line, col);
             col += 2;

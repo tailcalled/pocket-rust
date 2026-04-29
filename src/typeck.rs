@@ -116,8 +116,21 @@ pub enum RType {
     Struct {
         path: Vec<String>,
         type_args: Vec<RType>,
+        // Lifetimes provided to the struct's `<'a, ...>` params, in order.
+        // Empty for non-lifetime-generic structs. Carry-only for now —
+        // borrowck reads them via `find_lifetime_source` to propagate
+        // borrows when a returned ref's lifetime ties to one of these.
+        lifetime_args: Vec<LifetimeRepr>,
     },
-    Ref { inner: Box<RType>, mutable: bool },
+    Ref {
+        inner: Box<RType>,
+        mutable: bool,
+        // Phase B: structural carry only. `Named(_)` records a user-written
+        // `'a` annotation; `Inferred(_)` is a placeholder for elided refs.
+        // Type equality and unification currently ignore this field — Phase C
+        // is when lifetimes start participating in any check.
+        lifetime: LifetimeRepr,
+    },
     RawPtr { inner: Box<RType>, mutable: bool },
     // An opaque type parameter inside a generic body. Carries the param's
     // name. Codegen substitutes these to concrete types during monomorphization;
@@ -125,16 +138,240 @@ pub enum RType {
     Param(String),
 }
 
+#[derive(Clone)]
+pub enum LifetimeRepr {
+    // A `'name` annotation written in source. Resolution is by-name only:
+    // the named lifetime must be in scope at the type's appearance site
+    // (Phase C will enforce that; Phase B accepts any name).
+    Named(String),
+    // A lifetime allocated for an elided / inferred reference. Phase B uses
+    // 0 as a placeholder for everything; Phase C allocates fresh ids per
+    // function so different elided refs are distinguishable.
+    Inferred(u32),
+}
+
+pub fn lifetime_repr_clone(lr: &LifetimeRepr) -> LifetimeRepr {
+    match lr {
+        LifetimeRepr::Named(n) => LifetimeRepr::Named(n.clone()),
+        LifetimeRepr::Inferred(id) => LifetimeRepr::Inferred(*id),
+    }
+}
+
+pub fn lifetime_repr_vec_clone(v: &Vec<LifetimeRepr>) -> Vec<LifetimeRepr> {
+    let mut out: Vec<LifetimeRepr> = Vec::new();
+    let mut i = 0;
+    while i < v.len() {
+        out.push(lifetime_repr_clone(&v[i]));
+        i += 1;
+    }
+    out
+}
+
+pub fn lifetime_repr_eq(a: &LifetimeRepr, b: &LifetimeRepr) -> bool {
+    match (a, b) {
+        (LifetimeRepr::Named(na), LifetimeRepr::Named(nb)) => na == nb,
+        (LifetimeRepr::Inferred(ia), LifetimeRepr::Inferred(ib)) => ia == ib,
+        _ => false,
+    }
+}
+
+// Outermost lifetime of a ref type. Returns None for non-ref types.
+pub fn outer_lifetime(rt: &RType) -> Option<LifetimeRepr> {
+    match rt {
+        RType::Ref { lifetime, .. } => Some(lifetime_repr_clone(lifetime)),
+        _ => None,
+    }
+}
+
+pub fn clone_param_lifetimes(
+    pls: &Vec<Option<LifetimeRepr>>,
+) -> Vec<Option<LifetimeRepr>> {
+    let mut out: Vec<Option<LifetimeRepr>> = Vec::new();
+    let mut i = 0;
+    while i < pls.len() {
+        out.push(pls[i].as_ref().map(lifetime_repr_clone));
+        i += 1;
+    }
+    out
+}
+
+// Returns indices of every param whose outermost ref lifetime equals
+// `target`. Empty if no param matches. Phase D returns multiple matches:
+// when `'a` ties multiple ref params to the return, all those args'
+// borrows propagate into the result (the "combined borrow sets" rule).
+pub fn find_lifetime_source(
+    param_lifetimes: &Vec<Option<LifetimeRepr>>,
+    target: &LifetimeRepr,
+) -> Vec<usize> {
+    let mut out: Vec<usize> = Vec::new();
+    let mut i = 0;
+    while i < param_lifetimes.len() {
+        if let Some(plt) = &param_lifetimes[i] {
+            if lifetime_repr_eq(plt, target) {
+                out.push(i);
+            }
+        }
+        i += 1;
+    }
+    out
+}
+
+// Walks an RType, replacing every `LifetimeRepr::Inferred(0)` placeholder
+// with a fresh `Inferred(N)` allocated from `next_id`. Used per function
+// during signature resolution to give each elided ref a unique id. Also
+// freshens struct `lifetime_args` so e.g. `Wrapper<'_, T>` elided slots
+// get distinct ids.
+fn freshen_inferred_lifetimes(rt: &mut RType, next_id: &mut u32) {
+    match rt {
+        RType::Ref { inner, lifetime, .. } => {
+            if let LifetimeRepr::Inferred(id) = lifetime {
+                if *id == 0 {
+                    *id = *next_id;
+                    *next_id += 1;
+                }
+            }
+            freshen_inferred_lifetimes(inner, next_id);
+        }
+        RType::RawPtr { inner, .. } => freshen_inferred_lifetimes(inner, next_id),
+        RType::Struct { type_args, lifetime_args, .. } => {
+            let mut i = 0;
+            while i < lifetime_args.len() {
+                if let LifetimeRepr::Inferred(id) = &mut lifetime_args[i] {
+                    if *id == 0 {
+                        *id = *next_id;
+                        *next_id += 1;
+                    }
+                }
+                i += 1;
+            }
+            let mut i = 0;
+            while i < type_args.len() {
+                freshen_inferred_lifetimes(&mut type_args[i], next_id);
+                i += 1;
+            }
+        }
+        RType::Int(_) | RType::Param(_) => {}
+    }
+}
+
+// Rejects an `RType` carrying any `LifetimeRepr::Inferred(_)` lifetime.
+// Used for struct field types — Rust requires explicit lifetime annotations
+// on refs inside struct fields, so an elided lifetime there is an error.
+fn require_no_inferred_lifetimes(
+    rt: &RType,
+    span: &Span,
+    file: &str,
+) -> Result<(), Error> {
+    match rt {
+        RType::Ref { inner, lifetime, .. } => {
+            if matches!(lifetime, LifetimeRepr::Inferred(_)) {
+                return Err(Error {
+                    file: file.to_string(),
+                    message: "missing lifetime specifier on reference in struct field"
+                        .to_string(),
+                    span: span.copy(),
+                });
+            }
+            require_no_inferred_lifetimes(inner, span, file)
+        }
+        RType::RawPtr { inner, .. } => require_no_inferred_lifetimes(inner, span, file),
+        RType::Struct { type_args, lifetime_args, .. } => {
+            let mut i = 0;
+            while i < lifetime_args.len() {
+                if matches!(lifetime_args[i], LifetimeRepr::Inferred(_)) {
+                    return Err(Error {
+                        file: file.to_string(),
+                        message: "missing lifetime argument on struct in field type"
+                            .to_string(),
+                        span: span.copy(),
+                    });
+                }
+                i += 1;
+            }
+            let mut i = 0;
+            while i < type_args.len() {
+                require_no_inferred_lifetimes(&type_args[i], span, file)?;
+                i += 1;
+            }
+            Ok(())
+        }
+        RType::Int(_) | RType::Param(_) => Ok(()),
+    }
+}
+
+// Validates that every `LifetimeRepr::Named` inside an `RType` references a
+// lifetime declared in `lifetime_params`. Used to reject signatures that
+// reference an undeclared `'a`.
+fn validate_named_lifetimes(
+    rt: &RType,
+    lifetime_params: &Vec<String>,
+    span: &Span,
+    file: &str,
+) -> Result<(), Error> {
+    match rt {
+        RType::Ref { inner, lifetime, .. } => {
+            check_named_in_scope(lifetime, lifetime_params, span, file)?;
+            validate_named_lifetimes(inner, lifetime_params, span, file)
+        }
+        RType::RawPtr { inner, .. } => {
+            validate_named_lifetimes(inner, lifetime_params, span, file)
+        }
+        RType::Struct { type_args, lifetime_args, .. } => {
+            let mut i = 0;
+            while i < lifetime_args.len() {
+                check_named_in_scope(&lifetime_args[i], lifetime_params, span, file)?;
+                i += 1;
+            }
+            let mut i = 0;
+            while i < type_args.len() {
+                validate_named_lifetimes(&type_args[i], lifetime_params, span, file)?;
+                i += 1;
+            }
+            Ok(())
+        }
+        RType::Int(_) | RType::Param(_) => Ok(()),
+    }
+}
+
+fn check_named_in_scope(
+    lt: &LifetimeRepr,
+    lifetime_params: &Vec<String>,
+    span: &Span,
+    file: &str,
+) -> Result<(), Error> {
+    if let LifetimeRepr::Named(name) = lt {
+        let mut found = false;
+        let mut i = 0;
+        while i < lifetime_params.len() {
+            if lifetime_params[i] == *name {
+                found = true;
+                break;
+            }
+            i += 1;
+        }
+        if !found {
+            return Err(Error {
+                file: file.to_string(),
+                message: format!("undeclared lifetime `'{}`", name),
+                span: span.copy(),
+            });
+        }
+    }
+    Ok(())
+}
+
 pub fn rtype_clone(t: &RType) -> RType {
     match t {
         RType::Int(k) => RType::Int(int_kind_copy(k)),
-        RType::Struct { path, type_args } => RType::Struct {
+        RType::Struct { path, type_args, lifetime_args } => RType::Struct {
             path: clone_path(path),
             type_args: rtype_vec_clone(type_args),
+            lifetime_args: lifetime_repr_vec_clone(lifetime_args),
         },
-        RType::Ref { inner, mutable } => RType::Ref {
+        RType::Ref { inner, mutable, lifetime } => RType::Ref {
             inner: Box::new(rtype_clone(inner)),
             mutable: *mutable,
+            lifetime: lifetime_repr_clone(lifetime),
         },
         RType::RawPtr { inner, mutable } => RType::RawPtr {
             inner: Box::new(rtype_clone(inner)),
@@ -175,20 +412,24 @@ pub fn rtype_eq(a: &RType, b: &RType) -> bool {
             RType::Struct {
                 path: pa,
                 type_args: aa,
+                ..
             },
             RType::Struct {
                 path: pb,
                 type_args: ab,
+                ..
             },
         ) => path_eq(pa, pb) && rtype_vec_eq(aa, ab),
         (
             RType::Ref {
                 inner: ia,
                 mutable: ma,
+                ..
             },
             RType::Ref {
                 inner: ib,
                 mutable: mb,
+                ..
             },
         ) => ma == mb && rtype_eq(ia, ib),
         (
@@ -209,7 +450,7 @@ pub fn rtype_eq(a: &RType, b: &RType) -> bool {
 pub fn rtype_to_string(t: &RType) -> String {
     match t {
         RType::Int(k) => int_kind_name(k).to_string(),
-        RType::Struct { path, type_args } => {
+        RType::Struct { path, type_args, .. } => {
             if type_args.is_empty() {
                 place_to_string(path)
             } else {
@@ -227,7 +468,7 @@ pub fn rtype_to_string(t: &RType) -> String {
                 s
             }
         }
-        RType::Ref { inner, mutable } => {
+        RType::Ref { inner, mutable, .. } => {
             if *mutable {
                 format!("&mut {}", rtype_to_string(inner))
             } else {
@@ -251,7 +492,7 @@ pub fn rtype_size(ty: &RType, structs: &StructTable) -> u32 {
             IntKind::U128 | IntKind::I128 => 2,
             _ => 1,
         },
-        RType::Struct { path, type_args } => {
+        RType::Struct { path, type_args, .. } => {
             let entry = struct_lookup(structs, path).expect("resolved struct");
             let env = struct_env(&entry.type_params, type_args);
             let mut s: u32 = 0;
@@ -293,7 +534,7 @@ pub fn flatten_rtype(ty: &RType, structs: &StructTable, out: &mut Vec<crate::was
             }
             _ => out.push(crate::wasm::ValType::I32),
         },
-        RType::Struct { path, type_args } => {
+        RType::Struct { path, type_args, .. } => {
             let entry = struct_lookup(structs, path).expect("resolved struct");
             let env = struct_env(&entry.type_params, type_args);
             let mut i = 0;
@@ -318,7 +559,7 @@ pub fn byte_size_of(rt: &RType, structs: &StructTable) -> u32 {
             IntKind::U128 | IntKind::I128 => 16,
         },
         RType::Ref { .. } | RType::RawPtr { .. } => 4,
-        RType::Struct { path, type_args } => {
+        RType::Struct { path, type_args, .. } => {
             let entry = struct_lookup(structs, path).expect("resolved struct");
             let env = struct_env(&entry.type_params, type_args);
             let mut total: u32 = 0;
@@ -341,7 +582,7 @@ pub fn byte_size_of(rt: &RType, structs: &StructTable) -> u32 {
 pub fn substitute_rtype(rt: &RType, env: &Vec<(String, RType)>) -> RType {
     match rt {
         RType::Int(k) => RType::Int(int_kind_copy(k)),
-        RType::Struct { path, type_args } => {
+        RType::Struct { path, type_args, lifetime_args } => {
             let mut subst_args: Vec<RType> = Vec::new();
             let mut i = 0;
             while i < type_args.len() {
@@ -351,11 +592,13 @@ pub fn substitute_rtype(rt: &RType, env: &Vec<(String, RType)>) -> RType {
             RType::Struct {
                 path: clone_path(path),
                 type_args: subst_args,
+                lifetime_args: lifetime_repr_vec_clone(lifetime_args),
             }
         }
-        RType::Ref { inner, mutable } => RType::Ref {
+        RType::Ref { inner, mutable, lifetime } => RType::Ref {
             inner: Box::new(substitute_rtype(inner, env)),
             mutable: *mutable,
+            lifetime: lifetime_repr_clone(lifetime),
         },
         RType::RawPtr { inner, mutable } => RType::RawPtr {
             inner: Box::new(substitute_rtype(inner, env)),
@@ -404,6 +647,11 @@ pub struct StructEntry {
     pub name_span: Span,
     pub file: String,
     pub type_params: Vec<String>,
+    // Lifetime params declared on the struct (e.g., `struct Holder<'a, T>`
+    // gives `lifetime_params = ["a"]`). Empty for non-lifetime-generic
+    // structs. Used to validate lifetime args at type-position uses and to
+    // build a substitution env when reading field types.
+    pub lifetime_params: Vec<String>,
     pub fields: Vec<RTypedField>,
 }
 
@@ -435,9 +683,13 @@ pub struct FnSymbol {
     // literals), safeck reads `Deref(inner).inner.id`'s entry to detect
     // raw-pointer derefs.
     pub expr_types: Vec<Option<RType>>,
-    // Lifetime elision: index of the source ref param whose lifetime flows to
-    // the output ref. Rule 3 (self) takes precedence over rule 2 (single ref).
-    pub ret_ref_source: Option<usize>,
+    // Outermost lifetime of each param's ref type, or None for non-ref
+    // params. Used by borrowck to map a returned ref's lifetime back to the
+    // arg slot(s) whose borrows it inherits.
+    pub param_lifetimes: Vec<Option<LifetimeRepr>>,
+    // Outermost lifetime of the return ref, or None if the return type isn't
+    // a ref. Set by lifetime elision (or copied from a user `'a` annotation).
+    pub ret_lifetime: Option<LifetimeRepr>,
     // Per `MethodCall` expression, indexed by Expr.id. Some(_) at MethodCall
     // node ids; None elsewhere.
     pub method_resolutions: Vec<Option<MethodResolution>>,
@@ -471,7 +723,8 @@ pub struct GenericTemplate {
     pub param_types: Vec<RType>,
     pub return_type: Option<RType>,
     pub expr_types: Vec<Option<RType>>,
-    pub ret_ref_source: Option<usize>,
+    pub param_lifetimes: Vec<Option<LifetimeRepr>>,
+    pub ret_lifetime: Option<LifetimeRepr>,
     pub method_resolutions: Vec<Option<MethodResolution>>,
     pub call_resolutions: Vec<Option<CallResolution>>,
 }
@@ -660,6 +913,39 @@ pub fn resolve_type(
                     span: path.span.copy(),
                 });
             }
+            // Lifetime args: either match the struct's lifetime_params 1:1
+            // (Named annotations) or are entirely omitted (treated as elided
+            // — fresh `Inferred(0)` placeholders, freshened by the signature
+            // walker before storage).
+            let lifetime_args: Vec<LifetimeRepr> = if last.lifetime_args.is_empty() {
+                let mut out: Vec<LifetimeRepr> = Vec::new();
+                let mut i = 0;
+                while i < entry.lifetime_params.len() {
+                    out.push(LifetimeRepr::Inferred(0));
+                    i += 1;
+                }
+                out
+            } else {
+                if last.lifetime_args.len() != entry.lifetime_params.len() {
+                    return Err(Error {
+                        file: file.to_string(),
+                        message: format!(
+                            "wrong number of lifetime arguments for `{}`: expected {}, got {}",
+                            place_to_string(&full),
+                            entry.lifetime_params.len(),
+                            last.lifetime_args.len()
+                        ),
+                        span: path.span.copy(),
+                    });
+                }
+                let mut out: Vec<LifetimeRepr> = Vec::new();
+                let mut i = 0;
+                while i < last.lifetime_args.len() {
+                    out.push(LifetimeRepr::Named(last.lifetime_args[i].name.clone()));
+                    i += 1;
+                }
+                out
+            };
             let mut type_args: Vec<RType> = Vec::new();
             let mut i = 0;
             while i < last.args.len() {
@@ -671,13 +957,22 @@ pub fn resolve_type(
             Ok(RType::Struct {
                 path: full,
                 type_args,
+                lifetime_args,
             })
         }
-        TypeKind::Ref { inner, mutable } => {
+        TypeKind::Ref { inner, mutable, lifetime } => {
             let r = resolve_type(inner, current_module, structs, self_target, type_params, file)?;
+            // Phase B: structurally carry the lifetime — `'a` becomes
+            // `Named("a")`; elided refs use the `Inferred(0)` placeholder.
+            // Phase C is when these start participating in any check.
+            let lt = match lifetime {
+                Some(lt) => LifetimeRepr::Named(lt.name.clone()),
+                None => LifetimeRepr::Inferred(0),
+            };
             Ok(RType::Ref {
                 inner: Box::new(r),
                 mutable: *mutable,
+                lifetime: lt,
             })
         }
         TypeKind::RawPtr { inner, mutable } => {
@@ -744,11 +1039,17 @@ fn collect_struct_names(module: &Module, path: &mut Vec<String>, table: &mut Str
                     .iter()
                     .map(|p| p.name.clone())
                     .collect();
+                let lifetime_param_names: Vec<String> = sd
+                    .lifetime_params
+                    .iter()
+                    .map(|p| p.name.clone())
+                    .collect();
                 table.entries.push(StructEntry {
                     path: full,
                     name_span: sd.name_span.copy(),
                     file: module.source_file.clone(),
                     type_params: type_param_names,
+                    lifetime_params: lifetime_param_names,
                     fields: Vec::new(),
                 });
             }
@@ -780,6 +1081,11 @@ fn resolve_struct_fields(
                     .iter()
                     .map(|p| p.name.clone())
                     .collect();
+                let lifetime_param_names: Vec<String> = sd
+                    .lifetime_params
+                    .iter()
+                    .map(|p| p.name.clone())
+                    .collect();
                 let mut resolved: Vec<RTypedField> = Vec::new();
                 let mut k = 0;
                 while k < sd.fields.len() {
@@ -791,13 +1097,21 @@ fn resolve_struct_fields(
                         &type_param_names,
                         &module.source_file,
                     )?;
-                    if let RType::Ref { .. } = &rt {
-                        return Err(Error {
-                            file: module.source_file.clone(),
-                            message: "struct fields cannot have reference types".to_string(),
-                            span: sd.fields[k].ty.span.copy(),
-                        });
-                    }
+                    // Phase D: refs are allowed in struct fields. Their
+                    // lifetimes must be `Named` and declared in the struct's
+                    // `<'a, ...>` params — elided refs in field types aren't
+                    // permitted (Rust requires explicit lifetimes there too).
+                    require_no_inferred_lifetimes(
+                        &rt,
+                        &sd.fields[k].ty.span,
+                        &module.source_file,
+                    )?;
+                    validate_named_lifetimes(
+                        &rt,
+                        &lifetime_param_names,
+                        &sd.fields[k].ty.span,
+                        &module.source_file,
+                    )?;
                     resolved.push(RTypedField {
                         name: sd.fields[k].name.clone(),
                         name_span: sd.fields[k].name_span.copy(),
@@ -844,6 +1158,7 @@ fn collect_funcs(
                     path,
                     None,
                     &Vec::new(),
+                    &Vec::new(),
                     funcs,
                     next_idx,
                     structs,
@@ -860,6 +1175,8 @@ fn collect_funcs(
                 let target_rt = resolve_impl_target(ib, path, structs, &module.source_file)?;
                 let impl_type_params: Vec<String> =
                     ib.type_params.iter().map(|p| p.name.clone()).collect();
+                let impl_lifetime_params: Vec<String> =
+                    ib.lifetime_params.iter().map(|p| p.name.clone()).collect();
                 let target_name = ib.target.segments[0].name.clone();
                 let mut method_prefix = clone_path(path);
                 method_prefix.push(target_name);
@@ -871,6 +1188,7 @@ fn collect_funcs(
                         &method_prefix,   // FnSymbol/Template path prefix
                         Some(&target_rt),
                         &impl_type_params,
+                        &impl_lifetime_params,
                         funcs,
                         next_idx,
                         structs,
@@ -965,9 +1283,19 @@ fn resolve_impl_target(
         type_args.push(RType::Param(impl_param_names[i].clone()));
         i += 1;
     }
+    // Lifetime args mirror the impl's lifetime params — same restriction
+    // as type args (1:1, in order). Phase D structural: just propagate
+    // them onto the resolved target type.
+    let mut lifetime_args: Vec<LifetimeRepr> = Vec::new();
+    let mut i = 0;
+    while i < ib.lifetime_params.len() {
+        lifetime_args.push(LifetimeRepr::Named(ib.lifetime_params[i].name.clone()));
+        i += 1;
+    }
     Ok(RType::Struct {
         path: target_path,
         type_args,
+        lifetime_args,
     })
 }
 
@@ -977,6 +1305,7 @@ fn register_function(
     path_prefix: &Vec<String>,
     self_target: Option<&RType>,
     impl_type_params: &Vec<String>,
+    impl_lifetime_params: &Vec<String>,
     funcs: &mut FuncTable,
     next_idx: &mut u32,
     structs: &StructTable,
@@ -991,6 +1320,18 @@ fn register_function(
     let mut i = 0;
     while i < f.type_params.len() {
         type_param_names.push(f.type_params[i].name.clone());
+        i += 1;
+    }
+    // Lifetime params in scope: impl's then this fn's.
+    let mut lifetime_param_names: Vec<String> = Vec::new();
+    let mut i = 0;
+    while i < impl_lifetime_params.len() {
+        lifetime_param_names.push(impl_lifetime_params[i].clone());
+        i += 1;
+    }
+    let mut i = 0;
+    while i < f.lifetime_params.len() {
+        lifetime_param_names.push(f.lifetime_params[i].name.clone());
         i += 1;
     }
     let is_generic = !type_param_names.is_empty();
@@ -1010,7 +1351,7 @@ fn register_function(
         param_types.push(rt);
         k += 1;
     }
-    let return_type = match &f.return_type {
+    let mut return_type = match &f.return_type {
         Some(ty) => Some(resolve_type(
             ty,
             current_module,
@@ -1021,16 +1362,76 @@ fn register_function(
         )?),
         None => None,
     };
+    // Per-function fresh-id counter for elided lifetimes. 0 stays as the
+    // "placeholder pre-resolution" sentinel; real ids start at 1.
+    let mut next_lt: u32 = 1;
+    let mut k = 0;
+    while k < param_types.len() {
+        freshen_inferred_lifetimes(&mut param_types[k], &mut next_lt);
+        k += 1;
+    }
+    // Validate Named lifetimes in params now that they're fully shaped.
+    let mut k = 0;
+    while k < param_types.len() {
+        validate_named_lifetimes(
+            &param_types[k],
+            &lifetime_param_names,
+            &f.params[k].ty.span,
+            source_file,
+        )?;
+        k += 1;
+    }
+    // For the return type: freshen INNER refs, then handle the outermost
+    // lifetime via elision (if the outer is `Inferred(0)`, i.e. user wrote
+    // an elided ref). A user-written `&'a T` outermost is already `Named`.
     let self_idx = if !f.params.is_empty() && f.params[0].name == "self" {
         Some(0)
     } else {
         None
     };
-    let ret_ref_source = match (&return_type, &f.return_type) {
-        (Some(rt), Some(ret_ty)) => {
-            check_ret_ref_elision(rt, &param_types, self_idx, &ret_ty.span, source_file)?
+    if let (Some(rt), Some(ret_ty)) = (return_type.as_mut(), f.return_type.as_ref()) {
+        // Freshen inner refs first (skip outermost if rt is itself a ref).
+        match &mut *rt {
+            RType::Ref { inner, .. } => {
+                freshen_inferred_lifetimes(inner, &mut next_lt);
+            }
+            other => freshen_inferred_lifetimes(other, &mut next_lt),
         }
-        _ => None,
+        // Apply elision / lifetime tying for the outermost ref.
+        if let RType::Ref {
+            mutable: ret_mut,
+            lifetime: ret_lt,
+            ..
+        } = &mut *rt
+        {
+            let need_elision = matches!(ret_lt, LifetimeRepr::Inferred(0));
+            if need_elision {
+                let src_idx = find_elision_source(
+                    &param_types,
+                    self_idx,
+                    *ret_mut,
+                    &ret_ty.span,
+                    source_file,
+                )?;
+                let src_lt =
+                    outer_lifetime(&param_types[src_idx]).expect("elision source is a ref");
+                *ret_lt = src_lt;
+            }
+        }
+        // Validate Named lifetimes in the return type (including the outer
+        // one if user-written).
+        validate_named_lifetimes(rt, &lifetime_param_names, &ret_ty.span, source_file)?;
+    }
+    // Compute param_lifetimes / ret_lifetime now that signature is final.
+    let mut param_lifetimes: Vec<Option<LifetimeRepr>> = Vec::new();
+    let mut k = 0;
+    while k < param_types.len() {
+        param_lifetimes.push(outer_lifetime(&param_types[k]));
+        k += 1;
+    }
+    let ret_lifetime: Option<LifetimeRepr> = match &return_type {
+        Some(rt) => outer_lifetime(rt),
+        None => None,
     };
     if is_generic {
         funcs.templates.push(GenericTemplate {
@@ -1042,7 +1443,8 @@ fn register_function(
             param_types,
             return_type,
             expr_types: Vec::new(),
-            ret_ref_source,
+            param_lifetimes,
+            ret_lifetime,
             method_resolutions: Vec::new(),
             call_resolutions: Vec::new(),
         });
@@ -1053,7 +1455,8 @@ fn register_function(
             param_types,
             return_type,
             expr_types: Vec::new(),
-            ret_ref_source,
+            param_lifetimes,
+            ret_lifetime,
             method_resolutions: Vec::new(),
             call_resolutions: Vec::new(),
         });
@@ -1062,21 +1465,19 @@ fn register_function(
     Ok(())
 }
 
-// Lifetime elision for ref return types. Rule 3: when a method has `&self` /
-// `&mut self`, the output borrow's lifetime is `self`'s, regardless of other
-// ref params. Rule 2: otherwise, exactly one input ref param → its lifetime.
-// `&mut T -> &U` is allowed (downgrade); `&T -> &mut U` is rejected.
-fn check_ret_ref_elision(
-    return_type: &RType,
+// Lifetime elision for an elided return ref. Rule 3: when a method has
+// `&self` / `&mut self`, the output borrow's lifetime is `self`'s,
+// regardless of other ref params. Rule 2: otherwise, exactly one input ref
+// param → its lifetime. `&mut T -> &U` is allowed (downgrade); `&T -> &mut U`
+// is rejected. Returns the source param index; the caller copies that
+// param's outermost lifetime into the return ref.
+fn find_elision_source(
     param_types: &Vec<RType>,
     self_idx: Option<usize>,
+    ret_mutable: bool,
     ret_span: &Span,
     file: &str,
-) -> Result<Option<usize>, Error> {
-    let ret_mutable = match return_type {
-        RType::Ref { mutable, .. } => *mutable,
-        _ => return Ok(None),
-    };
+) -> Result<usize, Error> {
     // Rule 3: a self-receiver that's a ref shorts the search.
     if let Some(idx) = self_idx {
         if let RType::Ref {
@@ -1091,7 +1492,7 @@ fn check_ret_ref_elision(
                     span: ret_span.copy(),
                 });
             }
-            return Ok(Some(idx));
+            return Ok(idx);
         }
         // Self is owned (consuming) — fall through to rule 2.
     }
@@ -1127,7 +1528,7 @@ fn check_ret_ref_elision(
             span: ret_span.copy(),
         });
     }
-    Ok(Some(src_idx))
+    Ok(src_idx)
 }
 
 // ----- InferType -----
@@ -1138,8 +1539,17 @@ enum InferType {
     Struct {
         path: Vec<String>,
         type_args: Vec<InferType>,
+        // Mirrors `RType::Struct.lifetime_args`. Carry-only for inference;
+        // unification ignores lifetimes (Phase D structural).
+        lifetime_args: Vec<LifetimeRepr>,
     },
-    Ref { inner: Box<InferType>, mutable: bool },
+    Ref {
+        inner: Box<InferType>,
+        mutable: bool,
+        // Phase B: structural carry only. Mirrors `RType::Ref.lifetime`;
+        // unification ignores it.
+        lifetime: LifetimeRepr,
+    },
     RawPtr { inner: Box<InferType>, mutable: bool },
     Param(String),
 }
@@ -1148,13 +1558,15 @@ fn infer_clone(t: &InferType) -> InferType {
     match t {
         InferType::Var(v) => InferType::Var(*v),
         InferType::Int(k) => InferType::Int(int_kind_copy(k)),
-        InferType::Struct { path, type_args } => InferType::Struct {
+        InferType::Struct { path, type_args, lifetime_args } => InferType::Struct {
             path: clone_path(path),
             type_args: infer_vec_clone(type_args),
+            lifetime_args: lifetime_repr_vec_clone(lifetime_args),
         },
-        InferType::Ref { inner, mutable } => InferType::Ref {
+        InferType::Ref { inner, mutable, lifetime } => InferType::Ref {
             inner: Box::new(infer_clone(inner)),
             mutable: *mutable,
+            lifetime: lifetime_repr_clone(lifetime),
         },
         InferType::RawPtr { inner, mutable } => InferType::RawPtr {
             inner: Box::new(infer_clone(inner)),
@@ -1195,7 +1607,7 @@ fn build_infer_env(type_params: &Vec<String>, type_args: &Vec<InferType>) -> Vec
 fn rtype_to_infer(rt: &RType) -> InferType {
     match rt {
         RType::Int(k) => InferType::Int(int_kind_copy(k)),
-        RType::Struct { path, type_args } => {
+        RType::Struct { path, type_args, lifetime_args } => {
             let mut infer_args: Vec<InferType> = Vec::new();
             let mut i = 0;
             while i < type_args.len() {
@@ -1205,11 +1617,13 @@ fn rtype_to_infer(rt: &RType) -> InferType {
             InferType::Struct {
                 path: clone_path(path),
                 type_args: infer_args,
+                lifetime_args: lifetime_repr_vec_clone(lifetime_args),
             }
         }
-        RType::Ref { inner, mutable } => InferType::Ref {
+        RType::Ref { inner, mutable, lifetime } => InferType::Ref {
             inner: Box::new(rtype_to_infer(inner)),
             mutable: *mutable,
+            lifetime: lifetime_repr_clone(lifetime),
         },
         RType::RawPtr { inner, mutable } => InferType::RawPtr {
             inner: Box::new(rtype_to_infer(inner)),
@@ -1226,7 +1640,7 @@ fn infer_substitute(t: &InferType, env: &Vec<(String, InferType)>) -> InferType 
     match t {
         InferType::Var(v) => InferType::Var(*v),
         InferType::Int(k) => InferType::Int(int_kind_copy(k)),
-        InferType::Struct { path, type_args } => {
+        InferType::Struct { path, type_args, lifetime_args } => {
             let mut subst_args: Vec<InferType> = Vec::new();
             let mut i = 0;
             while i < type_args.len() {
@@ -1236,11 +1650,13 @@ fn infer_substitute(t: &InferType, env: &Vec<(String, InferType)>) -> InferType 
             InferType::Struct {
                 path: clone_path(path),
                 type_args: subst_args,
+                lifetime_args: lifetime_repr_vec_clone(lifetime_args),
             }
         }
-        InferType::Ref { inner, mutable } => InferType::Ref {
+        InferType::Ref { inner, mutable, lifetime } => InferType::Ref {
             inner: Box::new(infer_substitute(inner, env)),
             mutable: *mutable,
+            lifetime: lifetime_repr_clone(lifetime),
         },
         InferType::RawPtr { inner, mutable } => InferType::RawPtr {
             inner: Box::new(infer_substitute(inner, env)),
@@ -1263,7 +1679,7 @@ fn infer_to_string(t: &InferType) -> String {
     match t {
         InferType::Var(v) => format!("?{}", v),
         InferType::Int(k) => int_kind_name(k).to_string(),
-        InferType::Struct { path, type_args } => {
+        InferType::Struct { path, type_args, .. } => {
             if type_args.is_empty() {
                 place_to_string(path)
             } else {
@@ -1281,7 +1697,7 @@ fn infer_to_string(t: &InferType) -> String {
                 s
             }
         }
-        InferType::Ref { inner, mutable } => {
+        InferType::Ref { inner, mutable, .. } => {
             if *mutable {
                 format!("&mut {}", infer_to_string(inner))
             } else {
@@ -1329,7 +1745,7 @@ impl Subst {
                 None => InferType::Var(*v),
             },
             InferType::Int(k) => InferType::Int(int_kind_copy(k)),
-            InferType::Struct { path, type_args } => {
+            InferType::Struct { path, type_args, lifetime_args } => {
                 let mut subst_args: Vec<InferType> = Vec::new();
                 let mut i = 0;
                 while i < type_args.len() {
@@ -1339,11 +1755,13 @@ impl Subst {
                 InferType::Struct {
                     path: clone_path(path),
                     type_args: subst_args,
+                    lifetime_args: lifetime_repr_vec_clone(lifetime_args),
                 }
             }
-            InferType::Ref { inner, mutable } => InferType::Ref {
+            InferType::Ref { inner, mutable, lifetime } => InferType::Ref {
                 inner: Box::new(self.substitute(inner)),
                 mutable: *mutable,
+                lifetime: lifetime_repr_clone(lifetime),
             },
             InferType::RawPtr { inner, mutable } => InferType::RawPtr {
                 inner: Box::new(self.substitute(inner)),
@@ -1415,10 +1833,12 @@ impl Subst {
                 InferType::Struct {
                     path: pa,
                     type_args: aa,
+                    ..
                 },
                 InferType::Struct {
                     path: pb,
                     type_args: ab,
+                    ..
                 },
             ) => {
                 if !path_eq(&pa, &pb) {
@@ -1455,10 +1875,12 @@ impl Subst {
                 InferType::Ref {
                     inner: ia,
                     mutable: ma,
+                    ..
                 },
                 InferType::Ref {
                     inner: ib,
                     mutable: mb,
+                    ..
                 },
             ) => {
                 if ma != mb {
@@ -1543,7 +1965,7 @@ impl Subst {
         match self.substitute(ty) {
             InferType::Var(_) => RType::Int(IntKind::I32),
             InferType::Int(k) => RType::Int(k),
-            InferType::Struct { path, type_args } => {
+            InferType::Struct { path, type_args, lifetime_args } => {
                 let mut concrete: Vec<RType> = Vec::new();
                 let mut i = 0;
                 while i < type_args.len() {
@@ -1553,12 +1975,14 @@ impl Subst {
                 RType::Struct {
                     path,
                     type_args: concrete,
+                    lifetime_args,
                 }
             }
             InferType::Param(n) => RType::Param(n),
-            InferType::Ref { inner, mutable } => RType::Ref {
+            InferType::Ref { inner, mutable, lifetime } => RType::Ref {
                 inner: Box::new(self.finalize(&inner)),
                 mutable,
+                lifetime,
             },
             InferType::RawPtr { inner, mutable } => RType::RawPtr {
                 inner: Box::new(self.finalize(&inner)),
@@ -2125,7 +2549,7 @@ fn check_deref_rooted_assign(
     let root_infer = check_expr(ctx, root_expr)?;
     let resolved = ctx.subst.substitute(&root_infer);
     let inner_infer = match resolved {
-        InferType::Ref { inner, mutable: true } => *inner,
+        InferType::Ref { inner, mutable: true, .. } => *inner,
         InferType::RawPtr { inner, mutable: true } => *inner,
         InferType::Ref { mutable: false, .. } => {
             return Err(Error {
@@ -2157,7 +2581,7 @@ fn check_deref_rooted_assign(
     let mut i = 0;
     while i < fields.len() {
         let (struct_path, type_args) = match &current {
-            InferType::Struct { path, type_args } => (clone_path(path), infer_vec_clone(type_args)),
+            InferType::Struct { path, type_args, .. } => (clone_path(path), infer_vec_clone(type_args)),
             _ => {
                 return Err(Error {
                     file: ctx.current_file.to_string(),
@@ -2233,9 +2657,9 @@ fn walk_chain_type(
     let mut i = 1;
     while i < chain.len() {
         let (struct_path, type_args) = match &current {
-            InferType::Struct { path, type_args } => (clone_path(path), infer_vec_clone(type_args)),
+            InferType::Struct { path, type_args, .. } => (clone_path(path), infer_vec_clone(type_args)),
             InferType::Ref { inner, .. } => match inner.as_ref() {
-                InferType::Struct { path, type_args } => {
+                InferType::Struct { path, type_args, .. } => {
                     (clone_path(path), infer_vec_clone(type_args))
                 }
                 _ => {
@@ -2324,9 +2748,13 @@ fn check_expr_inner(ctx: &mut CheckCtx, expr: &Expr) -> Result<InferType, Error>
             // place doesn't move out, so the "Copy through ref" check that
             // applies to value-position field access doesn't fire here.
             let inner_ty = check_place_expr(ctx, inner)?;
+            // Phase B: borrow expressions get an `Inferred(0)` placeholder
+            // lifetime; refining this into per-borrow fresh lifetimes is
+            // Phase C's job.
             Ok(InferType::Ref {
                 inner: Box::new(inner_ty),
                 mutable: *mutable,
+                lifetime: LifetimeRepr::Inferred(0),
             })
         }
         ExprKind::Cast { inner, ty } => check_cast(ctx, inner, ty, expr),
@@ -2353,9 +2781,9 @@ fn check_method_call(
     // them to the impl's type params when the method is generic).
     let (recv_kind, struct_path, recv_type_args): (RecvShape, Vec<String>, Vec<InferType>) =
         match resolved_recv {
-            InferType::Struct { path, type_args } => (RecvShape::Owned, path, type_args),
-            InferType::Ref { inner, mutable } => match *inner {
-                InferType::Struct { path, type_args } => (
+            InferType::Struct { path, type_args, .. } => (RecvShape::Owned, path, type_args),
+            InferType::Ref { inner, mutable, .. } => match *inner {
+                InferType::Struct { path, type_args, .. } => (
                     if mutable {
                         RecvShape::MutRef
                     } else {
@@ -2399,30 +2827,40 @@ fn check_method_call(
     // Snapshot the method's signature data; for templates, also build a
     // type-arg env mapping the method's type_params to fresh inference vars
     // (with the impl's params bound to the receiver's type_args first).
-    let (mp_param_types, mp_return_type, mp_type_params, mp_callee_idx, mp_ret_ref_source, mp_is_template, mp_template_idx) =
-        if from_entry {
-            let entry = func_lookup(ctx.funcs, &method_path).unwrap();
-            (
-                rtype_vec_clone(&entry.param_types),
-                entry.return_type.as_ref().map(rtype_clone),
-                Vec::new(),
-                entry.idx,
-                entry.ret_ref_source,
-                false,
-                0usize,
-            )
-        } else {
-            let (idx, t) = template_lookup(ctx.funcs, &method_path).unwrap();
-            (
-                rtype_vec_clone(&t.param_types),
-                t.return_type.as_ref().map(rtype_clone),
-                t.type_params.clone(),
-                0u32,
-                t.ret_ref_source,
-                true,
-                idx,
-            )
-        };
+    let (
+        mp_param_types,
+        mp_return_type,
+        mp_type_params,
+        mp_callee_idx,
+        mp_param_lifetimes,
+        mp_ret_lifetime,
+        mp_is_template,
+        mp_template_idx,
+    ) = if from_entry {
+        let entry = func_lookup(ctx.funcs, &method_path).unwrap();
+        (
+            rtype_vec_clone(&entry.param_types),
+            entry.return_type.as_ref().map(rtype_clone),
+            Vec::new(),
+            entry.idx,
+            clone_param_lifetimes(&entry.param_lifetimes),
+            entry.ret_lifetime.as_ref().map(lifetime_repr_clone),
+            false,
+            0usize,
+        )
+    } else {
+        let (idx, t) = template_lookup(ctx.funcs, &method_path).unwrap();
+        (
+            rtype_vec_clone(&t.param_types),
+            t.return_type.as_ref().map(rtype_clone),
+            t.type_params.clone(),
+            0u32,
+            clone_param_lifetimes(&t.param_lifetimes),
+            t.ret_lifetime.as_ref().map(lifetime_repr_clone),
+            true,
+            idx,
+        )
+    };
     if mp_param_types.is_empty() {
         return Err(Error {
             file: ctx.current_file.to_string(),
@@ -2514,7 +2952,15 @@ fn check_method_call(
         });
     }
     let callee_idx = mp_callee_idx;
-    let callee_ret_source = mp_ret_ref_source;
+    // Phase D: a return ref's lifetime may match more than one param when
+    // the user writes `fn longest<'a>(&'a self, other: &'a u32) -> &'a u32`.
+    // For method-call propagation we still surface only the
+    // receiver-vs-not bit (`ret_borrows_receiver`) — non-receiver source
+    // borrows fall through normal call-slot handling, same as today.
+    let callee_ret_sources: Vec<usize> = match &mp_ret_lifetime {
+        Some(rt_lt) => find_lifetime_source(&mp_param_lifetimes, rt_lt),
+        None => Vec::new(),
+    };
     let mut method_param_infer: Vec<InferType> = Vec::new();
     let mut k = 0;
     while k < mp_param_types.len() {
@@ -2574,7 +3020,7 @@ fn check_method_call(
     }
     // Record whether this call's result borrow should be attributed to the
     // receiver place (for borrowck propagation through ref-returning methods).
-    let ret_borrows_recv = matches!(callee_ret_source, Some(0))
+    let ret_borrows_recv = callee_ret_sources.iter().any(|&i| i == 0)
         && matches!(
             ctx.method_resolutions[call_expr.id as usize].as_ref().unwrap().recv_adjust,
             ReceiverAdjust::BorrowImm
@@ -2730,9 +3176,9 @@ fn check_place_inner(ctx: &mut CheckCtx, expr: &Expr) -> Result<InferType, Error
             // Auto-deref one level through `&T` / `&mut T` (matches the
             // value-position field-access behavior).
             let (struct_path, struct_type_args) = match resolved {
-                InferType::Struct { path, type_args } => (path, type_args),
+                InferType::Struct { path, type_args, .. } => (path, type_args),
                 InferType::Ref { inner, .. } => match *inner {
-                    InferType::Struct { path, type_args } => (path, type_args),
+                    InferType::Struct { path, type_args, .. } => (path, type_args),
                     _ => {
                         return Err(Error {
                             file: ctx.current_file.to_string(),
@@ -3222,9 +3668,20 @@ fn check_struct_lit(
         i += 1;
     }
 
+    // Struct literals allocate fresh `Inferred(0)` placeholders for their
+    // lifetime args — Phase D doesn't unify struct lifetimes (carry-only),
+    // and borrowck reads field borrows directly from the holder's per-slot
+    // data rather than from these placeholders.
+    let mut lit_lifetime_args: Vec<LifetimeRepr> = Vec::new();
+    let mut i = 0;
+    while i < entry.lifetime_params.len() {
+        lit_lifetime_args.push(LifetimeRepr::Inferred(0));
+        i += 1;
+    }
     Ok(InferType::Struct {
         path: full,
         type_args: type_arg_infers,
+        lifetime_args: lit_lifetime_args,
     })
 }
 
@@ -3240,9 +3697,9 @@ fn check_field_access(
     let base_ty = check_expr(ctx, &fa.base)?;
     let resolved = ctx.subst.substitute(&base_ty);
     let (struct_path, struct_type_args, through_ref) = match resolved {
-        InferType::Struct { path, type_args } => (path, type_args, through_explicit_deref),
+        InferType::Struct { path, type_args, .. } => (path, type_args, through_explicit_deref),
         InferType::Ref { inner, .. } => match *inner {
-            InferType::Struct { path, type_args } => (path, type_args, true),
+            InferType::Struct { path, type_args, .. } => (path, type_args, true),
             _ => {
                 return Err(Error {
                     file: ctx.current_file.to_string(),

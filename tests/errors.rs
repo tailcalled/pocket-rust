@@ -262,13 +262,15 @@ fn move_out_of_borrow_is_rejected() {
 }
 
 #[test]
-fn ref_in_struct_field_is_rejected() {
+fn ref_in_struct_field_without_lifetime_is_rejected() {
+    // Phase D allows refs in struct fields, but their lifetimes must be
+    // explicit and declared on the struct (Rust's standard requirement).
     let err = compile_source(
         "struct Point { x: usize, y: usize }\nstruct Bad { p: &Point }",
     );
     assert!(
-        err.contains("struct fields cannot have reference types"),
-        "expected struct-field-ref error, got: {}",
+        err.contains("missing lifetime specifier"),
+        "expected missing-lifetime-specifier error, got: {}",
         err
     );
 }
@@ -646,6 +648,89 @@ fn assign_through_shared_ref_is_rejected() {
     assert!(
         err.contains("shared reference") || err.contains("not mutable"),
         "expected shared-ref assignment rejection, got: {}",
+        err
+    );
+}
+
+// Phase E error tests — lifetimes.
+
+#[test]
+fn undeclared_lifetime_is_rejected() {
+    // `'a` not declared in the fn's `<'a, ...>` params.
+    let err = compile_source(
+        "fn bad(x: &'a u32) -> &'a u32 { x }",
+    );
+    assert!(
+        err.contains("undeclared lifetime"),
+        "expected undeclared-lifetime error, got: {}",
+        err
+    );
+}
+
+#[test]
+fn lifetime_param_after_type_param_is_rejected() {
+    // Lifetimes must come before type params (Rust convention).
+    let err = compile_source(
+        "fn bad<T, 'a>(x: &'a T) -> &'a T { x }",
+    );
+    assert!(
+        err.contains("lifetime parameters must come before"),
+        "expected lifetime-after-type rejection, got: {}",
+        err
+    );
+}
+
+#[test]
+fn struct_field_ref_without_lifetime_is_rejected_already_listed() {
+    // (Covered above by `ref_in_struct_field_without_lifetime_is_rejected`.)
+    // Spot-check that a *typed* lifetime works for the same shape:
+    let err = compile_source(
+        "struct Inner { x: u32 }\nstruct Bad { p: &Inner }",
+    );
+    assert!(
+        err.contains("missing lifetime specifier"),
+        "expected missing-lifetime error, got: {}",
+        err
+    );
+}
+
+#[test]
+fn wrong_struct_lifetime_arg_count_is_rejected() {
+    // `Holder<'a>` declared, used with two lifetime args.
+    let err = compile_source(
+        "struct Holder<'a> { r: &'a u32 }\nfn bad<'a, 'b>(h: Holder<'a, 'b>) -> u32 { 0 }",
+    );
+    assert!(
+        err.contains("lifetime arguments"),
+        "expected wrong-lifetime-arg-count error, got: {}",
+        err
+    );
+}
+
+#[test]
+fn move_through_combined_borrow_is_rejected() {
+    // `longer<'a>(x, y)` ties both args to the result; moving either while
+    // the result is live conflicts.
+    let err = compile_source(
+        "struct B { v: u32 }\nfn longer<'a>(x: &'a u32, y: &'a u32) -> &'a u32 { x }\nfn f() -> u32 { let a: B = B { v: 1 }; let b: B = B { v: 2 }; let r: &u32 = longer(&a.v, &b.v); let b2: B = b; *r }",
+    );
+    assert!(
+        err.contains("while it is borrowed") || err.contains("borrowed"),
+        "expected move-while-borrowed error, got: {}",
+        err
+    );
+}
+
+#[test]
+fn move_through_struct_field_borrow_is_rejected() {
+    // Moving the place borrowed by a struct's ref field is rejected as long
+    // as the wrapper is still live.
+    let err = compile_source(
+        "struct Inner { x: u32 }\nstruct Wrapper<'a> { r: &'a Inner }\nfn f() -> u32 { let i: Inner = Inner { x: 1 }; let w: Wrapper<'_> = Wrapper { r: &i }; let i2: Inner = i; let r: &Inner = w.r; r.x }",
+    );
+    assert!(
+        err.contains("while it is borrowed") || err.contains("borrowed"),
+        "expected move-while-field-borrowed error, got: {}",
         err
     );
 }

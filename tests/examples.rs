@@ -405,3 +405,55 @@ fn uses_std_generic_returns_42() {
     let result = answer.call(&mut store, ()).expect("call failed");
     assert_eq!(result, 42);
 }
+
+// Named lifetimes on functions tie param to return type. `pick_first<'a>`
+// picks `x`'s lifetime; the elided y arg gets a fresh inferred one and
+// doesn't constrain the result.
+#[test]
+fn lifetime_named_returns_42() {
+    let bytes = compile_example("lifetime_named", "lib.rs");
+    let (mut store, instance) = instantiate(&bytes);
+    let answer = instance
+        .get_typed_func::<(), i32>(&store, "answer")
+        .expect("export `answer` not found / wrong signature");
+    let result = answer.call(&mut store, ()).expect("call failed");
+    assert_eq!(result, 42);
+}
+
+// Refs in struct fields: a generic `Wrapper<'a>` holds `&'a Inner` and a
+// field-access produces the held borrow.
+#[test]
+fn lifetime_struct_field_returns_42() {
+    let bytes = compile_example("lifetime_struct_field", "lib.rs");
+    let (mut store, instance) = instantiate(&bytes);
+    let answer = instance
+        .get_typed_func::<(), i32>(&store, "answer")
+        .expect("export `answer` not found / wrong signature");
+    let result = answer.call(&mut store, ()).expect("call failed");
+    assert_eq!(result, 42);
+}
+
+// `&'a self` receiver tied to the impl's lifetime param routes the
+// receiver's borrow into the return ref.
+#[test]
+fn lifetime_self_receiver_returns_42() {
+    let bytes = compile_example("lifetime_self_receiver", "lib.rs");
+    let (mut store, instance) = instantiate(&bytes);
+    let answer = instance
+        .get_typed_func::<(), i32>(&store, "answer")
+        .expect("export `answer` not found / wrong signature");
+    let result = answer.call(&mut store, ()).expect("call failed");
+    assert_eq!(result, 42);
+}
+
+// Two ref params share `'a`; the result borrows both.
+#[test]
+fn lifetime_combined_returns_42() {
+    let bytes = compile_example("lifetime_combined", "lib.rs");
+    let (mut store, instance) = instantiate(&bytes);
+    let answer = instance
+        .get_typed_func::<(), i32>(&store, "answer")
+        .expect("export `answer` not found / wrong signature");
+    let result = answer.call(&mut store, ()).expect("call failed");
+    assert_eq!(result, 42);
+}

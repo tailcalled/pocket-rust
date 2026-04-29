@@ -23,6 +23,7 @@ pub enum Item {
 
 #[derive(Clone)]
 pub struct ImplBlock {
+    pub lifetime_params: Vec<LifetimeParam>,
     pub type_params: Vec<TypeParam>,
     pub target: Path,
     pub methods: Vec<Function>,
@@ -33,6 +34,7 @@ pub struct ImplBlock {
 pub struct StructDef {
     pub name: String,
     pub name_span: Span,
+    pub lifetime_params: Vec<LifetimeParam>,
     pub type_params: Vec<TypeParam>,
     pub fields: Vec<StructField>,
 }
@@ -48,6 +50,7 @@ pub struct StructField {
 pub struct Function {
     pub name: String,
     pub name_span: Span,
+    pub lifetime_params: Vec<LifetimeParam>,
     pub type_params: Vec<TypeParam>,
     pub params: Vec<Param>,
     pub return_type: Option<Type>,
@@ -61,6 +64,18 @@ pub struct Function {
 pub struct TypeParam {
     pub name: String,
     pub name_span: Span,
+}
+
+#[derive(Clone)]
+pub struct LifetimeParam {
+    pub name: String,
+    pub name_span: Span,
+}
+
+#[derive(Clone)]
+pub struct Lifetime {
+    pub name: String,
+    pub span: Span,
 }
 
 #[derive(Clone)]
@@ -79,7 +94,13 @@ pub struct Type {
 #[derive(Clone)]
 pub enum TypeKind {
     Path(Path),
-    Ref { inner: Box<Type>, mutable: bool },
+    Ref {
+        inner: Box<Type>,
+        mutable: bool,
+        // None when the lifetime is elided. Resolved to a concrete
+        // `LifetimeRepr` during typeck (named-in-scope or fresh-inferred).
+        lifetime: Option<Lifetime>,
+    },
     RawPtr { inner: Box<Type>, mutable: bool },
     SelfType,
 }
@@ -181,5 +202,7 @@ pub struct Path {
 pub struct PathSegment {
     pub name: String,
     pub span: Span,
+    // Lifetime args first (Rust convention), then type args. Either may be empty.
+    pub lifetime_args: Vec<Lifetime>,
     pub args: Vec<Type>,
 }

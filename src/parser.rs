@@ -1,7 +1,7 @@
 use crate::ast::{
     AssignStmt, Block, Call, Expr, ExprKind, FieldAccess, FieldInit, Function, ImplBlock, LetStmt,
-    MethodCall, Param, Path, PathSegment, Stmt, StructDef, StructField, StructLit, Type, TypeKind,
-    TypeParam,
+    Lifetime, LifetimeParam, MethodCall, Param, Path, PathSegment, Stmt, StructDef, StructField,
+    StructLit, Type, TypeKind, TypeParam,
 };
 use crate::lexer::{Token, TokenKind, token_kind_name};
 use crate::span::{Error, Pos, Span};
@@ -56,10 +56,10 @@ impl Parser {
 
     fn parse_impl_block(&mut self) -> Result<ImplBlock, Error> {
         let impl_span = self.expect(&TokenKind::Impl, "`impl`")?;
-        let type_params = if self.peek_kind(&TokenKind::LAngle) {
-            self.parse_type_params()?
+        let (lifetime_params, type_params) = if self.peek_kind(&TokenKind::LAngle) {
+            self.parse_generic_params()?
         } else {
-            Vec::new()
+            (Vec::new(), Vec::new())
         };
         let target = self.parse_path_with_type_args()?;
         self.expect(&TokenKind::LBrace, "`{`")?;
@@ -72,6 +72,7 @@ impl Parser {
         }
         let rb = self.expect(&TokenKind::RBrace, "`}`")?;
         Ok(ImplBlock {
+            lifetime_params,
             type_params,
             target,
             methods,
@@ -85,9 +86,10 @@ impl Parser {
     fn parse_path_with_type_args(&mut self) -> Result<Path, Error> {
         let mut path = self.parse_path()?;
         if self.peek_kind(&TokenKind::LAngle) {
-            let args = self.parse_angle_type_args()?;
+            let (lifetime_args, args) = self.parse_angle_args()?;
             // Attach to the last segment.
             let last = path.segments.len() - 1;
+            path.segments[last].lifetime_args = lifetime_args;
             path.segments[last].args = args;
             // Extend the path's span to cover the args.
             if let Some(end_pos) = self.tokens.get(self.pos.saturating_sub(1)) {
@@ -97,21 +99,40 @@ impl Parser {
         Ok(path)
     }
 
-    fn parse_angle_type_args(&mut self) -> Result<Vec<Type>, Error> {
+    // Parse `<'a, 'b, T1, T2>` — lifetime args first (Rust convention),
+    // then type args. Either list may be empty. Used for type-position
+    // generic args, intermediate path turbofish, and method-call turbofish.
+    fn parse_angle_args(&mut self) -> Result<(Vec<Lifetime>, Vec<Type>), Error> {
         self.expect(&TokenKind::LAngle, "`<`")?;
+        let mut lifetime_args: Vec<Lifetime> = Vec::new();
         let mut args: Vec<Type> = Vec::new();
         if !self.peek_kind(&TokenKind::RAngle) {
-            args.push(self.parse_type()?);
-            while self.peek_kind(&TokenKind::Comma) {
+            // Lifetime args run first, while we still see `'name` tokens.
+            while self.peek_lifetime() {
+                let (name, span) = self.expect_lifetime()?;
+                lifetime_args.push(Lifetime { name, span });
+                if !self.peek_kind(&TokenKind::Comma) {
+                    break;
+                }
                 self.pos += 1;
                 if self.peek_kind(&TokenKind::RAngle) {
                     break;
                 }
+            }
+            // Then type args.
+            if !self.peek_kind(&TokenKind::RAngle) {
                 args.push(self.parse_type()?);
+                while self.peek_kind(&TokenKind::Comma) {
+                    self.pos += 1;
+                    if self.peek_kind(&TokenKind::RAngle) {
+                        break;
+                    }
+                    args.push(self.parse_type()?);
+                }
             }
         }
         self.expect(&TokenKind::RAngle, "`>`")?;
-        Ok(args)
+        Ok((lifetime_args, args))
     }
 
     fn parse_mod_decl(&mut self) -> Result<RawItem, Error> {
@@ -124,10 +145,10 @@ impl Parser {
     fn parse_struct_def(&mut self) -> Result<StructDef, Error> {
         self.expect(&TokenKind::Struct, "`struct`")?;
         let (name, name_span) = self.expect_ident()?;
-        let type_params = if self.peek_kind(&TokenKind::LAngle) {
-            self.parse_type_params()?
+        let (lifetime_params, type_params) = if self.peek_kind(&TokenKind::LAngle) {
+            self.parse_generic_params()?
         } else {
-            Vec::new()
+            (Vec::new(), Vec::new())
         };
         self.expect(&TokenKind::LBrace, "`{`")?;
         let mut fields = Vec::new();
@@ -145,6 +166,7 @@ impl Parser {
         Ok(StructDef {
             name,
             name_span,
+            lifetime_params,
             type_params,
             fields,
         })
@@ -164,10 +186,10 @@ impl Parser {
     fn parse_function(&mut self) -> Result<Function, Error> {
         self.expect(&TokenKind::Fn, "`fn`")?;
         let (name, name_span) = self.expect_ident()?;
-        let type_params = if self.peek_kind(&TokenKind::LAngle) {
-            self.parse_type_params()?
+        let (lifetime_params, type_params) = if self.peek_kind(&TokenKind::LAngle) {
+            self.parse_generic_params()?
         } else {
-            Vec::new()
+            (Vec::new(), Vec::new())
         };
         self.expect(&TokenKind::LParen, "`(`")?;
         let params = if self.peek_kind(&TokenKind::RParen) {
@@ -191,6 +213,7 @@ impl Parser {
         Ok(Function {
             name,
             name_span,
+            lifetime_params,
             type_params,
             params,
             return_type,
@@ -205,21 +228,57 @@ impl Parser {
         id
     }
 
-    fn parse_type_params(&mut self) -> Result<Vec<TypeParam>, Error> {
+    // Parse a generic-params list `<'a, 'b, T1, T2>`. Lifetime params come
+    // first (Rust convention); a lifetime after a type param is rejected.
+    fn parse_generic_params(&mut self) -> Result<(Vec<LifetimeParam>, Vec<TypeParam>), Error> {
         self.expect(&TokenKind::LAngle, "`<`")?;
-        let mut params: Vec<TypeParam> = Vec::new();
+        let mut lifetime_params: Vec<LifetimeParam> = Vec::new();
+        let mut type_params: Vec<TypeParam> = Vec::new();
         if !self.peek_kind(&TokenKind::RAngle) {
-            params.push(self.parse_type_param()?);
-            while self.peek_kind(&TokenKind::Comma) {
+            // Lifetime params, while we still see `'name`.
+            while self.peek_lifetime() {
+                let (name, name_span) = self.expect_lifetime()?;
+                lifetime_params.push(LifetimeParam { name, name_span });
+                if !self.peek_kind(&TokenKind::Comma) {
+                    break;
+                }
                 self.pos += 1;
                 if self.peek_kind(&TokenKind::RAngle) {
                     break;
                 }
-                params.push(self.parse_type_param()?);
+            }
+            // Then type params; lifetimes interleaved here are rejected.
+            if !self.peek_kind(&TokenKind::RAngle) {
+                if self.peek_lifetime() {
+                    let span = self.tokens[self.pos].span.copy();
+                    return Err(Error {
+                        file: self.file.clone(),
+                        message: "lifetime parameters must come before type parameters"
+                            .to_string(),
+                        span,
+                    });
+                }
+                type_params.push(self.parse_type_param()?);
+                while self.peek_kind(&TokenKind::Comma) {
+                    self.pos += 1;
+                    if self.peek_kind(&TokenKind::RAngle) {
+                        break;
+                    }
+                    if self.peek_lifetime() {
+                        let span = self.tokens[self.pos].span.copy();
+                        return Err(Error {
+                            file: self.file.clone(),
+                            message: "lifetime parameters must come before type parameters"
+                                .to_string(),
+                            span,
+                        });
+                    }
+                    type_params.push(self.parse_type_param()?);
+                }
             }
         }
         self.expect(&TokenKind::RAngle, "`>`")?;
-        Ok(params)
+        Ok((lifetime_params, type_params))
     }
 
     fn parse_type_param(&mut self) -> Result<TypeParam, Error> {
@@ -264,6 +323,13 @@ impl Parser {
             let save_pos = self.pos;
             let amp_span = self.tokens[self.pos].span.copy();
             self.pos += 1;
+            // Optional lifetime annotation: `&'a self` / `&'a mut self`.
+            let lifetime = if self.peek_lifetime() {
+                let (name, span) = self.expect_lifetime()?;
+                Some(Lifetime { name, span })
+            } else {
+                None
+            };
             let mutable = if self.peek_kind(&TokenKind::Mut) {
                 self.pos += 1;
                 true
@@ -285,6 +351,7 @@ impl Parser {
                         kind: TypeKind::Ref {
                             inner: Box::new(inner),
                             mutable,
+                            lifetime,
                         },
                         span: outer,
                     },
@@ -318,6 +385,12 @@ impl Parser {
         }
         if self.peek_kind(&TokenKind::Amp) {
             let amp_span = self.expect(&TokenKind::Amp, "`&`")?;
+            let lifetime = if self.peek_lifetime() {
+                let (name, span) = self.expect_lifetime()?;
+                Some(Lifetime { name, span })
+            } else {
+                None
+            };
             let mutable = if self.peek_kind(&TokenKind::Mut) {
                 self.pos += 1;
                 true
@@ -330,6 +403,7 @@ impl Parser {
                 kind: TypeKind::Ref {
                     inner: Box::new(inner),
                     mutable,
+                    lifetime,
                 },
                 span,
             });
@@ -501,10 +575,12 @@ impl Parser {
         while self.peek_kind(&TokenKind::Dot) {
             self.pos += 1;
             let (field, field_span) = self.expect_ident()?;
-            // Optional method-call turbofish: `.method::<T1, T2>(args)`.
+            // Optional method-call turbofish: `.method::<'a, T>(args)`.
+            // Lifetime args are parsed but ignored (Phase A).
             let turbofish_args = if self.peek_two(&TokenKind::PathSep, &TokenKind::LAngle) {
                 self.pos += 1; // skip `::`
-                self.parse_angle_type_args()?
+                let (_lifetime_args, args) = self.parse_angle_args()?;
+                args
             } else {
                 Vec::new()
             };
@@ -742,15 +818,17 @@ impl Parser {
         segments.push(PathSegment {
             name: first_name,
             span: first_span,
+            lifetime_args: Vec::new(),
             args: Vec::new(),
         });
         loop {
-            // Intermediate turbofish: `Pair::<T>::method` — args attach to
-            // the immediately preceding segment, then we continue parsing.
+            // Intermediate turbofish: `Pair::<'a, T>::method` — args attach
+            // to the immediately preceding segment, then we keep parsing.
             if self.peek_two(&TokenKind::PathSep, &TokenKind::LAngle) {
                 self.pos += 1; // skip `::`
-                let args = self.parse_angle_type_args()?;
+                let (lifetime_args, args) = self.parse_angle_args()?;
                 let last = segments.len() - 1;
+                segments[last].lifetime_args = lifetime_args;
                 segments[last].args = args;
                 if self.pos > 0 {
                     end = self.tokens[self.pos - 1].span.end.copy();
@@ -765,6 +843,7 @@ impl Parser {
                 segments.push(PathSegment {
                     name,
                     span,
+                    lifetime_args: Vec::new(),
                     args: Vec::new(),
                 });
                 continue;
@@ -813,6 +892,39 @@ impl Parser {
                 message: msg,
                 span,
             })
+        }
+    }
+
+    fn peek_lifetime(&self) -> bool {
+        if self.pos >= self.tokens.len() {
+            return false;
+        }
+        matches!(self.tokens[self.pos].kind, TokenKind::Lifetime(_))
+    }
+
+    fn expect_lifetime(&mut self) -> Result<(String, Span), Error> {
+        if self.pos >= self.tokens.len() {
+            return Err(Error {
+                file: self.file.clone(),
+                message: "expected lifetime, got end of input".to_string(),
+                span: self.eof_span(),
+            });
+        }
+        let span = self.tokens[self.pos].span.copy();
+        match &self.tokens[self.pos].kind {
+            TokenKind::Lifetime(s) => {
+                let name = s.clone();
+                self.pos += 1;
+                Ok((name, span))
+            }
+            other => {
+                let msg = format!("expected lifetime, got {}", token_kind_name(other));
+                Err(Error {
+                    file: self.file.clone(),
+                    message: msg,
+                    span,
+                })
+            }
         }
     }
 

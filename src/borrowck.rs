@@ -5,7 +5,7 @@ use crate::ast::{
 use crate::span::{Error, Span};
 use crate::typeck::{
     CallResolution, FuncTable, MethodResolution, RType, ReceiverAdjust, StructTable, clone_path,
-    func_lookup, is_copy, rtype_clone, template_lookup,
+    find_lifetime_source, func_lookup, is_copy, rtype_clone, template_lookup,
 };
 
 pub fn check(
@@ -68,9 +68,18 @@ fn check_module(
                     impl_param_args.push(RType::Param(ib.type_params[k].name.clone()));
                     k += 1;
                 }
+                let mut impl_lifetime_args: Vec<crate::typeck::LifetimeRepr> = Vec::new();
+                let mut k = 0;
+                while k < ib.lifetime_params.len() {
+                    impl_lifetime_args.push(crate::typeck::LifetimeRepr::Named(
+                        ib.lifetime_params[k].name.clone(),
+                    ));
+                    k += 1;
+                }
                 let target_rt = RType::Struct {
                     path: target_full,
                     type_args: impl_param_args,
+                    lifetime_args: impl_lifetime_args,
                 };
                 let mut k = 0;
                 while k < ib.methods.len() {
@@ -145,6 +154,7 @@ fn check_function(
             name: Some(func.params[k].name.clone()),
             rtype: Some(rtype_clone(&param_types[k])),
             holds: Vec::new(),
+            field_holds: Vec::new(),
         });
         k += 1;
     }
@@ -188,6 +198,12 @@ struct Holder {
     name: Option<String>,
     rtype: Option<RType>,
     holds: Vec<HeldBorrow>,
+    // Per-slot borrows for struct-typed bindings whose fields hold refs.
+    // Each entry tags a field path with the borrows tied to that slot. A
+    // read of `binding.field` (where field is ref-typed) returns the
+    // matching entry's borrows; moving the binding transfers them to the
+    // new holder.
+    field_holds: Vec<FieldHold>,
 }
 
 struct HeldBorrow {
@@ -195,18 +211,44 @@ struct HeldBorrow {
     mutable: bool,
 }
 
+// One per-slot record: a field path within a struct holder, plus the
+// borrows tied to that slot. Phase D's minimal scheme uses single-segment
+// `field` paths (top-level fields only); nested struct-with-ref fields
+// aren't tracked at the holder level.
+struct FieldHold {
+    field: String,
+    borrows: Vec<HeldBorrow>,
+}
+
 // A descriptor of the borrows a value carries forward — i.e. which places this
 // expression's value, if it's a reference, refers to. For non-reference values,
-// always empty. The caller decides what to do with these (absorb into a binding,
-// attach to a call slot, drop on the floor).
+// `borrows` is empty; if the value is a struct with ref fields,
+// `field_borrows` records the per-slot borrows so a binding holder can
+// preserve them under the per-slot tracking model. The caller decides what
+// to do with these (absorb into a binding, attach to a call slot, drop).
 struct ValueDesc {
     borrows: Vec<HeldBorrow>,
+    field_borrows: Vec<FieldHold>,
 }
 
 fn empty_desc() -> ValueDesc {
     ValueDesc {
         borrows: Vec::new(),
+        field_borrows: Vec::new(),
     }
+}
+
+fn clone_field_holds(v: &Vec<FieldHold>) -> Vec<FieldHold> {
+    let mut out: Vec<FieldHold> = Vec::new();
+    let mut i = 0;
+    while i < v.len() {
+        out.push(FieldHold {
+            field: v[i].field.clone(),
+            borrows: clone_held_borrows(&v[i].borrows),
+        });
+        i += 1;
+    }
+    out
 }
 
 // ---------- Walk ----------
@@ -477,6 +519,7 @@ fn walk_let_stmt(state: &mut BorrowState, let_stmt: &LetStmt) -> Result<(), Erro
         name: Some(let_stmt.name.clone()),
         rtype: Some(ty),
         holds: desc.borrows,
+        field_holds: desc.field_borrows,
     });
     Ok(())
 }
@@ -531,6 +574,7 @@ fn walk_method_call(
         name: None,
         rtype: None,
         holds: Vec::new(),
+        field_holds: Vec::new(),
     });
     let call_idx = state.holders.len() - 1;
     // Process the receiver per recv_adjust.
@@ -574,7 +618,8 @@ fn walk_method_call(
             snapshot
         }
     };
-    // Process remaining args.
+    // Process remaining args. Per-slot field_borrows from struct args are
+    // flattened into the call slot alongside direct borrows.
     let mut i = 0;
     while i < mc.args.len() {
         let desc = walk_expr(state, &mc.args[i])?;
@@ -588,12 +633,27 @@ fn walk_method_call(
             state.holders[call_idx].holds.push(new);
             k += 1;
         }
+        let mut f = 0;
+        while f < desc.field_borrows.len() {
+            let mut k = 0;
+            while k < desc.field_borrows[f].borrows.len() {
+                let new = HeldBorrow {
+                    place: clone_path(&desc.field_borrows[f].borrows[k].place),
+                    mutable: desc.field_borrows[f].borrows[k].mutable,
+                };
+                check_borrow_conflict(state, &new, &mc.args[i].span)?;
+                state.holders[call_idx].holds.push(new);
+                k += 1;
+            }
+            f += 1;
+        }
         i += 1;
     }
     state.holders.truncate(call_idx);
     if ret_borrows_recv {
         Ok(ValueDesc {
             borrows: recv_borrows,
+            field_borrows: Vec::new(),
         })
     } else {
         Ok(empty_desc())
@@ -671,11 +731,11 @@ fn walk_var(state: &mut BorrowState, name: &str, expr: &Expr) -> Result<ValueDes
             let mut taken: Vec<HeldBorrow> = Vec::new();
             std::mem::swap(&mut taken, &mut state.holders[idx].holds);
             state.moved.push(place);
-            Ok(ValueDesc { borrows: taken })
+            Ok(ValueDesc { borrows: taken, field_borrows: Vec::new() })
         } else {
             // `&T` is Copy: cloning the borrow handle is fine.
             let holds = clone_held_borrows(&state.holders[idx].holds);
-            Ok(ValueDesc { borrows: holds })
+            Ok(ValueDesc { borrows: holds, field_borrows: Vec::new() })
         }
     } else if is_owned_copy_holder(&state.holders[idx]) {
         // Owned Copy primitive (ints, etc.): reading is a value copy, no move,
@@ -685,11 +745,19 @@ fn walk_var(state: &mut BorrowState, name: &str, expr: &Expr) -> Result<ValueDes
         check_not_moved(state, &place, &expr.span)?;
         Ok(empty_desc())
     } else {
-        // Owned non-Copy (struct): tracked as a move.
+        // Owned non-Copy (struct): tracked as a move. If the holder has
+        // per-slot field_holds (Phase D: struct with ref fields), transfer
+        // them into the consumer's desc so the new binding/call slot keeps
+        // those borrows alive.
         let mut place: Vec<String> = Vec::new();
         place.push(name.to_string());
         try_move(state, place, expr.span.copy())?;
-        Ok(empty_desc())
+        let mut taken: Vec<FieldHold> = Vec::new();
+        std::mem::swap(&mut taken, &mut state.holders[idx].field_holds);
+        Ok(ValueDesc {
+            borrows: Vec::new(),
+            field_borrows: taken,
+        })
     }
 }
 
@@ -698,13 +766,28 @@ fn walk_call(
     call: &Call,
     node_id: crate::ast::NodeId,
 ) -> Result<ValueDesc, Error> {
-    let ret_ref_source = match state.call_resolutions[node_id as usize]
+    // Phase D: borrow propagation through ref-returning calls flows along
+    // lifetimes. Look up the callee's `ret_lifetime`; collect every param
+    // whose outermost lifetime matches — those args' borrows all propagate
+    // into the result (combined borrow sets when one lifetime ties to
+    // multiple args).
+    let ret_ref_sources: Vec<usize> = match state.call_resolutions[node_id as usize]
         .as_ref()
         .expect("typeck registered this call")
     {
-        CallResolution::Direct(idx) => state.funcs.entries[*idx].ret_ref_source,
+        CallResolution::Direct(idx) => {
+            let entry = &state.funcs.entries[*idx];
+            match &entry.ret_lifetime {
+                Some(rl) => find_lifetime_source(&entry.param_lifetimes, rl),
+                None => Vec::new(),
+            }
+        }
         CallResolution::Generic { template_idx, .. } => {
-            state.funcs.templates[*template_idx].ret_ref_source
+            let t = &state.funcs.templates[*template_idx];
+            match &t.ret_lifetime {
+                Some(rl) => find_lifetime_source(&t.param_lifetimes, rl),
+                None => Vec::new(),
+            }
         }
     };
 
@@ -714,21 +797,37 @@ fn walk_call(
         name: None,
         rtype: None,
         holds: Vec::new(),
+        field_holds: Vec::new(),
     });
     let call_idx = state.holders.len() - 1;
-    // Snapshot each arg's borrows before they're absorbed into the call slot,
-    // so we can later attach the source arg's borrows to the result desc.
+    // Snapshot each arg's borrows (including any per-slot field borrows
+    // flattened together) before they're absorbed into the call slot, so
+    // we can later attach the source arg's borrows to the result desc.
     let mut arg_borrow_snapshots: Vec<Vec<HeldBorrow>> = Vec::new();
     let mut i = 0;
     while i < call.args.len() {
         let desc = walk_expr(state, &call.args[i])?;
-        arg_borrow_snapshots.push(clone_held_borrows(&desc.borrows));
+        // Combine direct + per-slot borrows into one flat snapshot.
+        let mut combined: Vec<HeldBorrow> = clone_held_borrows(&desc.borrows);
+        let mut f = 0;
+        while f < desc.field_borrows.len() {
+            let mut k = 0;
+            while k < desc.field_borrows[f].borrows.len() {
+                combined.push(HeldBorrow {
+                    place: clone_path(&desc.field_borrows[f].borrows[k].place),
+                    mutable: desc.field_borrows[f].borrows[k].mutable,
+                });
+                k += 1;
+            }
+            f += 1;
+        }
+        arg_borrow_snapshots.push(clone_held_borrows(&combined));
         let mut k = 0;
-        while k < desc.borrows.len() {
+        while k < combined.len() {
             // Conflict-check the new borrow against every other holder's holds.
             let new = HeldBorrow {
-                place: clone_path(&desc.borrows[k].place),
-                mutable: desc.borrows[k].mutable,
+                place: clone_path(&combined[k].place),
+                mutable: combined[k].mutable,
             };
             check_borrow_conflict(state, &new, &call.args[i].span)?;
             state.holders[call_idx].holds.push(new);
@@ -737,12 +836,28 @@ fn walk_call(
         i += 1;
     }
     state.holders.truncate(call_idx);
-    match ret_ref_source {
-        Some(idx) => Ok(ValueDesc {
-            borrows: clone_held_borrows(&arg_borrow_snapshots[idx]),
-        }),
-        None => Ok(empty_desc()),
+    if ret_ref_sources.is_empty() {
+        return Ok(empty_desc());
     }
+    // Combine borrow sets from every matching arg slot.
+    let mut combined: Vec<HeldBorrow> = Vec::new();
+    let mut s = 0;
+    while s < ret_ref_sources.len() {
+        let idx = ret_ref_sources[s];
+        let mut k = 0;
+        while k < arg_borrow_snapshots[idx].len() {
+            combined.push(HeldBorrow {
+                place: clone_path(&arg_borrow_snapshots[idx][k].place),
+                mutable: arg_borrow_snapshots[idx][k].mutable,
+            });
+            k += 1;
+        }
+        s += 1;
+    }
+    Ok(ValueDesc {
+        borrows: combined,
+        field_borrows: Vec::new(),
+    })
 }
 
 fn check_borrow_conflict(
@@ -773,21 +888,88 @@ fn check_borrow_conflict(
             }
             k += 1;
         }
+        // Phase D: per-slot field_holds also count as live borrows.
+        let mut f = 0;
+        while f < state.holders[h].field_holds.len() {
+            let mut k = 0;
+            while k < state.holders[h].field_holds[f].borrows.len() {
+                let other = &state.holders[h].field_holds[f].borrows[k];
+                if paths_share_prefix(&other.place, &new.place)
+                    && (other.mutable || new.mutable)
+                {
+                    let kind = if new.mutable { "mutable" } else { "shared" };
+                    let other_kind = if other.mutable { "mutable" } else { "shared" };
+                    return Err(Error {
+                        file: state.file.clone(),
+                        message: format!(
+                            "cannot borrow `{}` as {}: already borrowed as {}",
+                            place_to_string(&new.place),
+                            kind,
+                            other_kind
+                        ),
+                        span: span.copy(),
+                    });
+                }
+                k += 1;
+            }
+            f += 1;
+        }
         h += 1;
     }
     Ok(())
 }
 
 fn walk_struct_lit(state: &mut BorrowState, lit: &StructLit) -> Result<ValueDesc, Error> {
-    // Struct fields can't be references (typeck-rejected), so the constructed
-    // struct value carries no borrows. We still walk each field to surface
-    // moves / borrow registrations inside their initializer expressions.
+    // Phase D: a struct field may be a ref. Each field initializer's borrows
+    // get tagged with the field name and propagated as `field_borrows` of
+    // the resulting value, so a binding holder can keep per-slot tracking.
+    // While walking field initializers we push a synthetic holder so any
+    // in-flight borrows from earlier fields are visible to conflict checks
+    // in later fields' initializers.
+    state.holders.push(Holder {
+        name: None,
+        rtype: None,
+        holds: Vec::new(),
+        field_holds: Vec::new(),
+    });
+    let synth_idx = state.holders.len() - 1;
+    let mut field_borrows: Vec<FieldHold> = Vec::new();
     let mut i = 0;
     while i < lit.fields.len() {
-        walk_expr(state, &lit.fields[i].value)?;
+        let desc = walk_expr(state, &lit.fields[i].value)?;
+        if !desc.borrows.is_empty() {
+            // Tag this slot's borrows. Also register them in the synthetic
+            // holder so subsequent fields' borrows see the conflict.
+            let mut grouped: Vec<HeldBorrow> = Vec::new();
+            let mut k = 0;
+            while k < desc.borrows.len() {
+                let new = HeldBorrow {
+                    place: clone_path(&desc.borrows[k].place),
+                    mutable: desc.borrows[k].mutable,
+                };
+                check_borrow_conflict(state, &new, &lit.fields[i].value.span)?;
+                state.holders[synth_idx].holds.push(new);
+                grouped.push(HeldBorrow {
+                    place: clone_path(&desc.borrows[k].place),
+                    mutable: desc.borrows[k].mutable,
+                });
+                k += 1;
+            }
+            field_borrows.push(FieldHold {
+                field: lit.fields[i].name.clone(),
+                borrows: grouped,
+            });
+        }
+        // Phase D minimal: nested per-slot (struct-with-ref inside another
+        // struct-with-ref) isn't tracked; field initializer's own
+        // `field_borrows` are dropped here.
         i += 1;
     }
-    Ok(empty_desc())
+    state.holders.truncate(synth_idx);
+    Ok(ValueDesc {
+        borrows: Vec::new(),
+        field_borrows,
+    })
 }
 
 fn walk_field_access(
@@ -805,17 +987,35 @@ fn walk_field_access(
                 // itself is unchanged.
                 Ok(empty_desc())
             } else {
-                // Field access on an owned root. If the field's resolved type
-                // is Copy, this is just a value copy — no move tracking, but
-                // we still have to refuse reads from places that have already
-                // been moved. Otherwise it's a partial move out of the owning
-                // struct.
-                let field_is_copy = state.expr_types[expr.id as usize]
+                // Field access on an owned root.
+                let field_ty = state.expr_types[expr.id as usize]
                     .as_ref()
-                    .map(is_copy)
-                    .unwrap_or(false);
+                    .map(rtype_clone);
+                let field_is_ref = matches!(&field_ty, Some(RType::Ref { .. }));
+                let field_is_copy = field_ty.as_ref().map(is_copy).unwrap_or(false);
+                check_not_moved(state, &place, &expr.span)?;
+                // Phase D: if the field is ref-typed and a top-level field
+                // (path length == 2: root + field), look up the holder's
+                // per-slot field_holds and propagate those borrows.
+                if field_is_ref && place.len() == 2 {
+                    let mut found_borrows: Vec<HeldBorrow> = Vec::new();
+                    let mut k = 0;
+                    while k < state.holders[root_idx].field_holds.len() {
+                        if state.holders[root_idx].field_holds[k].field == place[1] {
+                            found_borrows = clone_held_borrows(
+                                &state.holders[root_idx].field_holds[k].borrows,
+                            );
+                            break;
+                        }
+                        k += 1;
+                    }
+                    return Ok(ValueDesc {
+                        borrows: found_borrows,
+                        field_borrows: Vec::new(),
+                    });
+                }
                 if field_is_copy {
-                    check_not_moved(state, &place, &expr.span)?;
+                    // already checked not-moved above
                 } else {
                     try_move(state, place, expr.span.copy())?;
                 }
@@ -860,7 +1060,7 @@ fn walk_borrow(state: &mut BorrowState, expr: &Expr) -> Result<ValueDesc, Error>
             check_borrow_conflict(state, &new, &expr.span)?;
             let mut borrows = Vec::new();
             borrows.push(HeldBorrow { place, mutable });
-            Ok(ValueDesc { borrows })
+            Ok(ValueDesc { borrows, field_borrows: Vec::new() })
         }
         None => {
             // Borrowing a non-place expression (e.g. `&fresh_struct_lit()`).
@@ -1022,6 +1222,28 @@ fn try_move(state: &mut BorrowState, place: Vec<String>, span: Span) -> Result<(
                 });
             }
             k += 1;
+        }
+        // Also scan per-slot field_holds (Phase D).
+        let mut f = 0;
+        while f < state.holders[h].field_holds.len() {
+            let mut k = 0;
+            while k < state.holders[h].field_holds[f].borrows.len() {
+                if paths_share_prefix(
+                    &state.holders[h].field_holds[f].borrows[k].place,
+                    &place,
+                ) {
+                    return Err(Error {
+                        file: state.file.clone(),
+                        message: format!(
+                            "cannot move `{}` while it is borrowed",
+                            place_to_string(&place)
+                        ),
+                        span,
+                    });
+                }
+                k += 1;
+            }
+            f += 1;
         }
         h += 1;
     }
