@@ -4,10 +4,10 @@
 // happen inside an `unsafe { ... }` block. Dereferencing a reference
 // (`&T` / `&mut T`) is always safe.
 //
-// We don't redo type analysis here — typeck records, per `Deref` expression
-// in source-DFS order, whether the operand resolved to a raw pointer
-// (`FnSymbol.deref_is_raw`). Safeck walks the AST in lockstep with that
-// vector, tracking an `in_unsafe` boolean across `unsafe { ... }` boundaries.
+// We don't redo type analysis here — typeck records each Expr's resolved
+// type at `FnSymbol.expr_types[expr.id]`. For a `Deref(inner)`, safeck reads
+// the inner expr's type at its NodeId and flags raw-pointer derefs outside
+// `unsafe { ... }` blocks.
 
 use crate::ast::{Block, Call, Expr, ExprKind, Function, Item, MethodCall, Module, Stmt, StructLit};
 use crate::span::Error;
@@ -73,16 +73,16 @@ fn check_function(
 ) -> Result<(), Error> {
     let mut full = clone_path(current_module);
     full.push(func.name.clone());
-    let deref_is_raw: &Vec<bool> = if let Some(entry) = func_lookup(funcs, &full) {
-        &entry.deref_is_raw
-    } else if let Some((_, t)) = template_lookup(funcs, &full) {
-        &t.deref_is_raw
-    } else {
-        unreachable!("typeck registered this function");
-    };
+    let expr_types: &Vec<Option<crate::typeck::RType>> =
+        if let Some(entry) = func_lookup(funcs, &full) {
+            &entry.expr_types
+        } else if let Some((_, t)) = template_lookup(funcs, &full) {
+            &t.expr_types
+        } else {
+            unreachable!("typeck registered this function");
+        };
     let mut state = SafeState {
-        deref_is_raw,
-        deref_idx: 0,
+        expr_types,
         in_unsafe: false,
         file: current_file.to_string(),
     };
@@ -91,8 +91,7 @@ fn check_function(
 }
 
 struct SafeState<'a> {
-    deref_is_raw: &'a Vec<bool>,
-    deref_idx: usize,
+    expr_types: &'a Vec<Option<crate::typeck::RType>>,
     in_unsafe: bool,
     file: String,
 }
@@ -123,8 +122,11 @@ fn walk_expr(state: &mut SafeState, expr: &Expr) -> Result<(), Error> {
         ExprKind::Cast { inner, .. } => walk_expr(state, inner),
         ExprKind::Deref(inner) => {
             walk_expr(state, inner)?;
-            let is_raw = state.deref_is_raw[state.deref_idx];
-            state.deref_idx += 1;
+            // Inner's resolved type tells us if this is a raw-ptr deref.
+            let is_raw = matches!(
+                state.expr_types[inner.id as usize].as_ref(),
+                Some(crate::typeck::RType::RawPtr { .. })
+            );
             if is_raw && !state.in_unsafe {
                 return Err(Error {
                     file: state.file.clone(),

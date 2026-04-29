@@ -427,24 +427,22 @@ pub struct FnSymbol {
     pub idx: u32,
     pub param_types: Vec<RType>,
     pub return_type: Option<RType>,
-    pub let_types: Vec<RType>,
-    pub lit_types: Vec<RType>,
-    // Per `StructLit` expression in body, in source-DFS order: the final
-    // resolved struct type (with concrete `type_args`). Codegen reads these
-    // to compute layout for generic struct literals.
-    pub struct_lit_types: Vec<RType>,
-    // For each `Deref` expression in the body, in source-DFS order: `true`
-    // iff the operand resolved to a raw pointer (`*const T` / `*mut T`).
-    // Safeck reads this in lockstep to flag derefs outside `unsafe` blocks.
-    pub deref_is_raw: Vec<bool>,
+    // Per `Expr` node, indexed by `Expr.id`. Contains the resolved `RType`
+    // for nodes that carry a value type. `None` for nodes without one
+    // (currently unused — every Expr produces a value in our subset).
+    // Borrowck reads this for binding types (via `let_stmt.value.id`),
+    // codegen reads this for layout (let bindings, lit constants, struct
+    // literals), safeck reads `Deref(inner).inner.id`'s entry to detect
+    // raw-pointer derefs.
+    pub expr_types: Vec<Option<RType>>,
     // Lifetime elision: index of the source ref param whose lifetime flows to
     // the output ref. Rule 3 (self) takes precedence over rule 2 (single ref).
     pub ret_ref_source: Option<usize>,
-    // Per `MethodCall` expression in body, in source-DFS order: how to lower
-    // it. Borrowck and codegen consume this in lockstep.
-    pub method_resolutions: Vec<MethodResolution>,
-    // Per `Call` expression in body, in source-DFS order: which callee.
-    pub call_resolutions: Vec<CallResolution>,
+    // Per `MethodCall` expression, indexed by Expr.id. Some(_) at MethodCall
+    // node ids; None elsewhere.
+    pub method_resolutions: Vec<Option<MethodResolution>>,
+    // Per `Call` expression, indexed by Expr.id.
+    pub call_resolutions: Vec<Option<CallResolution>>,
 }
 
 // How a `Call` expression resolves to a callee. For non-generic functions
@@ -472,13 +470,10 @@ pub struct GenericTemplate {
     pub source_file: String,
     pub param_types: Vec<RType>,
     pub return_type: Option<RType>,
-    pub let_types: Vec<RType>,
-    pub lit_types: Vec<RType>,
-    pub struct_lit_types: Vec<RType>,
-    pub deref_is_raw: Vec<bool>,
+    pub expr_types: Vec<Option<RType>>,
     pub ret_ref_source: Option<usize>,
-    pub method_resolutions: Vec<MethodResolution>,
-    pub call_resolutions: Vec<CallResolution>,
+    pub method_resolutions: Vec<Option<MethodResolution>>,
+    pub call_resolutions: Vec<Option<CallResolution>>,
 }
 
 pub struct MethodResolution {
@@ -1043,10 +1038,7 @@ fn register_function(
             source_file: source_file.to_string(),
             param_types,
             return_type,
-            let_types: Vec::new(),
-            lit_types: Vec::new(),
-            struct_lit_types: Vec::new(),
-            deref_is_raw: Vec::new(),
+            expr_types: Vec::new(),
             ret_ref_source,
             method_resolutions: Vec::new(),
             call_resolutions: Vec::new(),
@@ -1057,10 +1049,7 @@ fn register_function(
             idx: *next_idx,
             param_types,
             return_type,
-            let_types: Vec::new(),
-            lit_types: Vec::new(),
-            struct_lit_types: Vec::new(),
-            deref_is_raw: Vec::new(),
+            expr_types: Vec::new(),
             ret_ref_source,
             method_resolutions: Vec::new(),
             call_resolutions: Vec::new(),
@@ -1590,14 +1579,14 @@ struct LocalEntry {
 
 struct CheckCtx<'a> {
     locals: Vec<LocalEntry>,
-    let_vars: Vec<InferType>,
-    lit_vars: Vec<u32>,
+    // Per-NodeId InferType (sized to func.node_count). After body check,
+    // each entry is finalized into the FnSymbol/GenericTemplate's expr_types.
+    expr_infer_types: Vec<Option<InferType>>,
     lit_constraints: Vec<LitConstraint>,
-    struct_lit_vars: Vec<InferType>,
     in_borrow: u32,
-    deref_is_raw: Vec<bool>,
-    method_resolutions: Vec<PendingMethodCall>,
-    call_resolutions: Vec<PendingCall>,
+    // Pending per-MethodCall and per-Call resolutions, indexed by Expr.id.
+    method_resolutions: Vec<Option<PendingMethodCall>>,
+    call_resolutions: Vec<Option<PendingCall>>,
     subst: Subst,
     current_module: &'a Vec<String>,
     current_file: &'a str,
@@ -1702,26 +1691,25 @@ fn check_function(
         None => None,
     };
 
-    let (
-        let_vars,
-        lit_vars,
-        lit_constraints,
-        struct_lit_vars,
-        deref_is_raw,
-        method_resolutions,
-        pending_calls,
-        subst,
-    ) = {
+    let node_count = func.node_count as usize;
+    let (expr_infer_types, lit_constraints, method_resolutions, call_resolutions, subst) = {
+        let mut method_res: Vec<Option<PendingMethodCall>> = Vec::with_capacity(node_count);
+        let mut call_res: Vec<Option<PendingCall>> = Vec::with_capacity(node_count);
+        let mut expr_infer: Vec<Option<InferType>> = Vec::with_capacity(node_count);
+        let mut i = 0;
+        while i < node_count {
+            method_res.push(None);
+            call_res.push(None);
+            expr_infer.push(None);
+            i += 1;
+        }
         let mut ctx = CheckCtx {
             locals,
-            let_vars: Vec::new(),
-            lit_vars: Vec::new(),
+            expr_infer_types: expr_infer,
             lit_constraints: Vec::new(),
-            struct_lit_vars: Vec::new(),
             in_borrow: 0,
-            deref_is_raw: Vec::new(),
-            method_resolutions: Vec::new(),
-            call_resolutions: Vec::new(),
+            method_resolutions: method_res,
+            call_resolutions: call_res,
             subst: Subst {
                 bindings: Vec::new(),
                 is_integer: Vec::new(),
@@ -1735,11 +1723,8 @@ fn check_function(
         };
         check_block(&mut ctx, &func.body, &return_rt)?;
         (
-            ctx.let_vars,
-            ctx.lit_vars,
+            ctx.expr_infer_types,
             ctx.lit_constraints,
-            ctx.struct_lit_vars,
-            ctx.deref_is_raw,
             ctx.method_resolutions,
             ctx.call_resolutions,
             ctx.subst,
@@ -1777,68 +1762,69 @@ fn check_function(
         i += 1;
     }
 
-    // Finalize types.
-    let mut let_types: Vec<RType> = Vec::new();
+    // Finalize per-NodeId expr types.
+    let mut expr_types: Vec<Option<RType>> = Vec::with_capacity(node_count);
     let mut i = 0;
-    while i < let_vars.len() {
-        let_types.push(subst.finalize(&let_vars[i]));
+    while i < expr_infer_types.len() {
+        match &expr_infer_types[i] {
+            Some(t) => expr_types.push(Some(subst.finalize(t))),
+            None => expr_types.push(None),
+        }
         i += 1;
     }
-    let mut lit_types: Vec<RType> = Vec::new();
-    let mut i = 0;
-    while i < lit_vars.len() {
-        lit_types.push(subst.finalize(&InferType::Var(lit_vars[i])));
-        i += 1;
-    }
-    let mut struct_lit_types: Vec<RType> = Vec::new();
-    let mut i = 0;
-    while i < struct_lit_vars.len() {
-        struct_lit_types.push(subst.finalize(&struct_lit_vars[i]));
-        i += 1;
-    }
-    // Finalize pending method calls into MethodResolution.
-    let mut method_resolutions_final: Vec<MethodResolution> = Vec::new();
+    // Finalize method resolutions (per-NodeId).
+    let mut method_resolutions_final: Vec<Option<MethodResolution>> =
+        Vec::with_capacity(node_count);
     let mut i = 0;
     while i < method_resolutions.len() {
-        let p = &method_resolutions[i];
-        let mut type_args: Vec<RType> = Vec::new();
-        let mut j = 0;
-        while j < p.type_arg_infers.len() {
-            type_args.push(subst.finalize(&p.type_arg_infers[j]));
-            j += 1;
+        match &method_resolutions[i] {
+            Some(p) => {
+                let mut type_args: Vec<RType> = Vec::new();
+                let mut j = 0;
+                while j < p.type_arg_infers.len() {
+                    type_args.push(subst.finalize(&p.type_arg_infers[j]));
+                    j += 1;
+                }
+                method_resolutions_final.push(Some(MethodResolution {
+                    callee_idx: p.callee_idx,
+                    callee_path: clone_path(&p.callee_path),
+                    recv_adjust: copy_recv_adjust_local(&p.recv_adjust),
+                    ret_borrows_receiver: p.ret_borrows_receiver,
+                    template_idx: p.template_idx,
+                    type_args,
+                }));
+            }
+            None => method_resolutions_final.push(None),
         }
-        method_resolutions_final.push(MethodResolution {
-            callee_idx: p.callee_idx,
-            callee_path: clone_path(&p.callee_path),
-            recv_adjust: copy_recv_adjust_local(&p.recv_adjust),
-            ret_borrows_receiver: p.ret_borrows_receiver,
-            template_idx: p.template_idx,
-            type_args,
-        });
         i += 1;
     }
     let method_resolutions = method_resolutions_final;
-    // Resolve pending generic call sites by finalizing each fresh type-arg var.
-    let mut call_resolutions: Vec<CallResolution> = Vec::new();
+    // Finalize call resolutions (per-NodeId).
+    let mut call_resolutions_final: Vec<Option<CallResolution>> =
+        Vec::with_capacity(node_count);
     let mut i = 0;
-    while i < pending_calls.len() {
-        match &pending_calls[i] {
-            PendingCall::Direct(idx) => call_resolutions.push(CallResolution::Direct(*idx)),
-            PendingCall::Generic { template_idx, type_var_ids } => {
+    while i < call_resolutions.len() {
+        match &call_resolutions[i] {
+            Some(PendingCall::Direct(idx)) => {
+                call_resolutions_final.push(Some(CallResolution::Direct(*idx)))
+            }
+            Some(PendingCall::Generic { template_idx, type_var_ids }) => {
                 let mut concrete: Vec<RType> = Vec::new();
                 let mut j = 0;
                 while j < type_var_ids.len() {
                     concrete.push(subst.finalize(&InferType::Var(type_var_ids[j])));
                     j += 1;
                 }
-                call_resolutions.push(CallResolution::Generic {
+                call_resolutions_final.push(Some(CallResolution::Generic {
                     template_idx: *template_idx,
                     type_args: concrete,
-                });
+                }));
             }
+            None => call_resolutions_final.push(None),
         }
         i += 1;
     }
+    let call_resolutions = call_resolutions_final;
 
     // Store on the FnSymbol or GenericTemplate.
     let mut full = clone_path(path_prefix);
@@ -1853,20 +1839,14 @@ fn check_function(
         e += 1;
     }
     if let Some(e) = entry_idx {
-        funcs.entries[e].let_types = let_types;
-        funcs.entries[e].lit_types = lit_types;
-        funcs.entries[e].struct_lit_types = struct_lit_types;
-        funcs.entries[e].deref_is_raw = deref_is_raw;
+        funcs.entries[e].expr_types = expr_types;
         funcs.entries[e].method_resolutions = method_resolutions;
         funcs.entries[e].call_resolutions = call_resolutions;
     } else {
         let mut t = 0;
         while t < funcs.templates.len() {
             if path_eq(&funcs.templates[t].path, &full) {
-                funcs.templates[t].let_types = let_types;
-                funcs.templates[t].lit_types = lit_types;
-                funcs.templates[t].struct_lit_types = struct_lit_types;
-                funcs.templates[t].deref_is_raw = deref_is_raw;
+                funcs.templates[t].expr_types = expr_types;
                 funcs.templates[t].method_resolutions = method_resolutions;
                 funcs.templates[t].call_resolutions = call_resolutions;
                 break;
@@ -2008,12 +1988,15 @@ fn check_let_stmt(ctx: &mut CheckCtx, let_stmt: &LetStmt) -> Result<(), Error> {
         }
         None => value_ty,
     };
+    // Overwrite the recorded type at the value expr's id with the final type
+    // (in case an annotation pinned it down). Codegen reads expr_types[value.id]
+    // to size the binding's storage.
+    ctx.expr_infer_types[let_stmt.value.id as usize] = Some(infer_clone(&final_ty));
     ctx.locals.push(LocalEntry {
         name: let_stmt.name.clone(),
-        ty: infer_clone(&final_ty),
+        ty: final_ty,
         mutable: let_stmt.mutable,
     });
-    ctx.let_vars.push(final_ty);
     Ok(())
 }
 
@@ -2141,14 +2124,8 @@ fn check_deref_rooted_assign(
     let root_infer = check_expr(ctx, root_expr)?;
     let resolved = ctx.subst.substitute(&root_infer);
     let inner_infer = match resolved {
-        InferType::Ref { inner, mutable: true } => {
-            ctx.deref_is_raw.push(false);
-            *inner
-        }
-        InferType::RawPtr { inner, mutable: true } => {
-            ctx.deref_is_raw.push(true);
-            *inner
-        }
+        InferType::Ref { inner, mutable: true } => *inner,
+        InferType::RawPtr { inner, mutable: true } => *inner,
         InferType::Ref { mutable: false, .. } => {
             return Err(Error {
                 file: ctx.current_file.to_string(),
@@ -2306,10 +2283,17 @@ fn walk_chain_type(
 }
 
 fn check_expr(ctx: &mut CheckCtx, expr: &Expr) -> Result<InferType, Error> {
+    let ty = check_expr_inner(ctx, expr)?;
+    // Record the resolved InferType under this Expr's NodeId. Finalized to
+    // RType at end-of-fn into FnSymbol/Template.expr_types.
+    ctx.expr_infer_types[expr.id as usize] = Some(infer_clone(&ty));
+    Ok(ty)
+}
+
+fn check_expr_inner(ctx: &mut CheckCtx, expr: &Expr) -> Result<InferType, Error> {
     match &expr.kind {
         ExprKind::IntLit(n) => {
             let v = ctx.subst.fresh_int();
-            ctx.lit_vars.push(v);
             ctx.lit_constraints.push(LitConstraint {
                 var: v,
                 value: *n,
@@ -2566,10 +2550,9 @@ fn check_method_call(
     } else {
         Vec::new()
     };
-    // Reserve the resolution slot in source-DFS order.
-    let resolution_idx = ctx.method_resolutions.len();
+    // Record the resolution at this MethodCall's NodeId.
     let template_idx_opt = if mp_is_template { Some(mp_template_idx) } else { None };
-    ctx.method_resolutions.push(PendingMethodCall {
+    ctx.method_resolutions[call_expr.id as usize] = Some(PendingMethodCall {
         callee_idx,
         callee_path: clone_path(&method_path),
         recv_adjust,
@@ -2593,12 +2576,12 @@ fn check_method_call(
     // receiver place (for borrowck propagation through ref-returning methods).
     let ret_borrows_recv = matches!(callee_ret_source, Some(0))
         && matches!(
-            ctx.method_resolutions[resolution_idx].recv_adjust,
+            ctx.method_resolutions[call_expr.id as usize].as_ref().unwrap().recv_adjust,
             ReceiverAdjust::BorrowImm
                 | ReceiverAdjust::BorrowMut
                 | ReceiverAdjust::ByRef
         );
-    ctx.method_resolutions[resolution_idx].ret_borrows_receiver = ret_borrows_recv;
+    ctx.method_resolutions[call_expr.id as usize].as_mut().unwrap().ret_borrows_receiver = ret_borrows_recv;
     match return_infer {
         Some(rt) => Ok(rt),
         None => Err(Error {
@@ -2711,14 +2694,8 @@ fn check_deref(ctx: &mut CheckCtx, inner: &Expr, deref_expr: &Expr) -> Result<In
     let inner_ty = check_expr(ctx, inner)?;
     let resolved = ctx.subst.substitute(&inner_ty);
     match resolved {
-        InferType::Ref { inner, .. } => {
-            ctx.deref_is_raw.push(false);
-            Ok(*inner)
-        }
-        InferType::RawPtr { inner, .. } => {
-            ctx.deref_is_raw.push(true);
-            Ok(*inner)
-        }
+        InferType::Ref { inner, .. } => Ok(*inner),
+        InferType::RawPtr { inner, .. } => Ok(*inner),
         other => Err(Error {
             file: ctx.current_file.to_string(),
             message: format!(
@@ -2839,7 +2816,7 @@ fn check_call(ctx: &mut CheckCtx, call: &Call, call_expr: &Expr) -> Result<Infer
             Some(rt) => Some(rtype_to_infer(rt)),
             None => None,
         };
-        ctx.call_resolutions.push(PendingCall::Direct(entry_idx));
+        ctx.call_resolutions[call_expr.id as usize] = Some(PendingCall::Direct(entry_idx));
         let mut i = 0;
         while i < call.args.len() {
             let arg_ty = check_expr(ctx, &call.args[i])?;
@@ -2943,7 +2920,7 @@ fn check_call(ctx: &mut CheckCtx, call: &Call, call_expr: &Expr) -> Result<Infer
         let return_infer: Option<InferType> = tmpl_return_type
             .as_ref()
             .map(|rt| infer_substitute(&rtype_to_infer(rt), &env));
-        ctx.call_resolutions.push(PendingCall::Generic {
+        ctx.call_resolutions[call_expr.id as usize] = Some(PendingCall::Generic {
             template_idx,
             type_var_ids: var_ids,
         });
@@ -3063,16 +3040,8 @@ fn check_struct_lit(
         )?;
         k += 1;
     }
-    // Record this struct lit's type in source-DFS visit-first order: push
-    // BEFORE checking field initializers so nested struct lits get later
-    // indices, matching codegen's outer-first traversal.
-    let result = InferType::Struct {
-        path: clone_path(&full),
-        type_args: infer_vec_clone(&type_arg_infers),
-    };
-    let struct_lit_idx = ctx.struct_lit_vars.len();
-    ctx.struct_lit_vars.push(infer_clone(&result));
-    let _ = struct_lit_idx;
+    // (The wrapping `check_expr` will store our return value at this Expr's
+    // NodeId — that gives codegen the concrete type_args for layout.)
 
     // Validate field shape.
     let mut i = 0;

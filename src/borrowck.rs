@@ -105,18 +105,18 @@ fn check_function(
     let mut full = clone_path(path_prefix);
     full.push(func.name.clone());
     // The function may be a regular entry or a generic template — peel both.
-    let (param_types, let_types, method_resolutions, call_resolutions) =
+    let (param_types, expr_types, method_resolutions, call_resolutions) =
         if let Some(entry) = func_lookup(funcs, &full) {
             (
                 &entry.param_types,
-                &entry.let_types,
+                &entry.expr_types,
                 &entry.method_resolutions,
                 &entry.call_resolutions,
             )
         } else if let Some((_, t)) = template_lookup(funcs, &full) {
             (
                 &t.param_types,
-                &t.let_types,
+                &t.expr_types,
                 &t.method_resolutions,
                 &t.call_resolutions,
             )
@@ -124,22 +124,12 @@ fn check_function(
             unreachable!("typeck registered this function");
         };
 
-    let mut let_types_owned: Vec<RType> = Vec::new();
-    let mut k = 0;
-    while k < let_types.len() {
-        let_types_owned.push(rtype_clone(&let_types[k]));
-        k += 1;
-    }
-
     let mut state = BorrowState {
         holders: Vec::new(),
         moved: Vec::new(),
-        let_types: let_types_owned,
-        let_idx: 0,
+        expr_types,
         method_resolutions,
-        method_idx: 0,
         call_resolutions,
-        call_idx: 0,
         file: current_file.to_string(),
         funcs,
         current_module,
@@ -169,15 +159,11 @@ struct BorrowState<'a> {
     holders: Vec<Holder>,
     // Permanent set of moved places (function-wide).
     moved: Vec<Vec<String>>,
-    // Types of let-introduced bindings, in source-DFS order. Populated by typeck.
-    let_types: Vec<RType>,
-    let_idx: usize,
-    // Per `MethodCall` expression in source-DFS order, populated by typeck.
-    method_resolutions: &'a Vec<MethodResolution>,
-    method_idx: usize,
-    // Per `Call` expression in source-DFS order, populated by typeck.
-    call_resolutions: &'a Vec<CallResolution>,
-    call_idx: usize,
+    // Per-NodeId resolved types/resolutions populated by typeck. Borrowck
+    // looks up by `expr.id` rather than maintaining a source-DFS counter.
+    expr_types: &'a Vec<Option<RType>>,
+    method_resolutions: &'a Vec<Option<MethodResolution>>,
+    call_resolutions: &'a Vec<Option<CallResolution>>,
     file: String,
     funcs: &'a FuncTable,
     #[allow(dead_code)]
@@ -335,8 +321,11 @@ fn chain_is_prefix_of(prefix: &Vec<String>, full: &Vec<String>) -> bool {
 
 fn walk_let_stmt(state: &mut BorrowState, let_stmt: &LetStmt) -> Result<(), Error> {
     let desc = walk_expr(state, &let_stmt.value)?;
-    let ty = rtype_clone(&state.let_types[state.let_idx]);
-    state.let_idx += 1;
+    let ty = rtype_clone(
+        state.expr_types[let_stmt.value.id as usize]
+            .as_ref()
+            .expect("typeck recorded this binding's type"),
+    );
     state.holders.push(Holder {
         name: Some(let_stmt.name.clone()),
         rtype: Some(ty),
@@ -349,7 +338,7 @@ fn walk_expr(state: &mut BorrowState, expr: &Expr) -> Result<ValueDesc, Error> {
     match &expr.kind {
         ExprKind::IntLit(_) => Ok(empty_desc()),
         ExprKind::Var(name) => walk_var(state, name, expr),
-        ExprKind::Call(call) => walk_call(state, call),
+        ExprKind::Call(call) => walk_call(state, call, expr.id),
         ExprKind::StructLit(lit) => walk_struct_lit(state, lit),
         ExprKind::FieldAccess(fa) => walk_field_access(state, fa, expr),
         ExprKind::Borrow { .. } => walk_borrow(state, expr),
@@ -371,20 +360,25 @@ fn walk_expr(state: &mut BorrowState, expr: &Expr) -> Result<ValueDesc, Error> {
         }
         ExprKind::Unsafe(block) => walk_block_expr(state, block.as_ref()),
         ExprKind::Block(block) => walk_block_expr(state, block.as_ref()),
-        ExprKind::MethodCall(mc) => walk_method_call(state, mc),
+        ExprKind::MethodCall(mc) => walk_method_call(state, mc, expr.id),
     }
 }
 
-fn walk_method_call(state: &mut BorrowState, mc: &MethodCall) -> Result<ValueDesc, Error> {
-    let res_idx = state.method_idx;
-    state.method_idx += 1;
-    let recv_adjust = match &state.method_resolutions[res_idx].recv_adjust {
+fn walk_method_call(
+    state: &mut BorrowState,
+    mc: &MethodCall,
+    node_id: crate::ast::NodeId,
+) -> Result<ValueDesc, Error> {
+    let res = state.method_resolutions[node_id as usize]
+        .as_ref()
+        .expect("typeck registered this method call");
+    let recv_adjust = match &res.recv_adjust {
         ReceiverAdjust::Move => RecvAdjustLocal::Move,
         ReceiverAdjust::BorrowImm => RecvAdjustLocal::BorrowImm,
         ReceiverAdjust::BorrowMut => RecvAdjustLocal::BorrowMut,
         ReceiverAdjust::ByRef => RecvAdjustLocal::ByRef,
     };
-    let ret_borrows_recv = state.method_resolutions[res_idx].ret_borrows_receiver;
+    let ret_borrows_recv = res.ret_borrows_receiver;
     // Push synthetic call slot.
     state.holders.push(Holder {
         name: None,
@@ -553,10 +547,15 @@ fn walk_var(state: &mut BorrowState, name: &str, expr: &Expr) -> Result<ValueDes
     }
 }
 
-fn walk_call(state: &mut BorrowState, call: &Call) -> Result<ValueDesc, Error> {
-    let res_idx = state.call_idx;
-    state.call_idx += 1;
-    let ret_ref_source = match &state.call_resolutions[res_idx] {
+fn walk_call(
+    state: &mut BorrowState,
+    call: &Call,
+    node_id: crate::ast::NodeId,
+) -> Result<ValueDesc, Error> {
+    let ret_ref_source = match state.call_resolutions[node_id as usize]
+        .as_ref()
+        .expect("typeck registered this call")
+    {
         CallResolution::Direct(idx) => state.funcs.entries[*idx].ret_ref_source,
         CallResolution::Generic { template_idx, .. } => {
             state.funcs.templates[*template_idx].ret_ref_source

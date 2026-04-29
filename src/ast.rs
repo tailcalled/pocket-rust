@@ -1,5 +1,12 @@
 use crate::span::Span;
 
+// A per-function unique identifier for AST nodes that carry typing/resolution
+// info (currently only `Expr`). Allocated by the parser on a per-function
+// counter, captured as `Function.node_count`. Typeck sizes its side vectors
+// to `node_count` and indexes them by `Expr.id`; downstream passes look up
+// directly without needing to maintain source-DFS counters.
+pub type NodeId = u32;
+
 pub struct Module {
     pub name: String,
     pub name_span: Span,
@@ -45,6 +52,9 @@ pub struct Function {
     pub params: Vec<Param>,
     pub return_type: Option<Type>,
     pub body: Block,
+    // Number of NodeIds allocated within this function's body. Side vectors
+    // (typeck/borrowck/codegen) sized to this length, indexed by Expr.id.
+    pub node_count: u32,
 }
 
 #[derive(Clone)]
@@ -108,6 +118,7 @@ pub struct AssignStmt {
 pub struct Expr {
     pub kind: ExprKind,
     pub span: Span,
+    pub id: NodeId,
 }
 
 #[derive(Clone)]

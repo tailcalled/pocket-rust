@@ -18,6 +18,7 @@ pub fn parse(file: &str, tokens: Vec<Token>) -> Result<Vec<RawItem>, Error> {
         file: file.to_string(),
         tokens,
         pos: 0,
+        next_node_id: 0,
     };
     p.parse_items()
 }
@@ -26,6 +27,8 @@ struct Parser {
     file: String,
     tokens: Vec<Token>,
     pos: usize,
+    // Resets at parse_function entry; captured as Function.node_count at exit.
+    next_node_id: u32,
 }
 
 impl Parser {
@@ -179,7 +182,12 @@ impl Parser {
         } else {
             None
         };
+        // Reset per-function NodeId counter; capture node_count at exit.
+        let saved_node_id = self.next_node_id;
+        self.next_node_id = 0;
         let body = self.parse_block()?;
+        let node_count = self.next_node_id;
+        self.next_node_id = saved_node_id;
         Ok(Function {
             name,
             name_span,
@@ -187,7 +195,14 @@ impl Parser {
             params,
             return_type,
             body,
+            node_count,
         })
+    }
+
+    fn alloc_node_id(&mut self) -> crate::ast::NodeId {
+        let id = self.next_node_id;
+        self.next_node_id += 1;
+        id
     }
 
     fn parse_type_params(&mut self) -> Result<Vec<TypeParam>, Error> {
@@ -433,12 +448,14 @@ impl Parser {
             self.pos += 1;
             let ty = self.parse_type()?;
             let span = Span::new(expr.span.start.copy(), ty.span.end.copy());
+            let id = self.alloc_node_id();
             expr = Expr {
                 kind: ExprKind::Cast {
                     inner: Box::new(expr),
                     ty,
                 },
                 span,
+                id,
             };
         }
         Ok(expr)
@@ -455,21 +472,25 @@ impl Parser {
             };
             let inner = self.parse_unary()?;
             let span = Span::new(amp_span.start, inner.span.end.copy());
+            let id = self.alloc_node_id();
             return Ok(Expr {
                 kind: ExprKind::Borrow {
                     inner: Box::new(inner),
                     mutable,
                 },
                 span,
+                id,
             });
         }
         if self.peek_kind(&TokenKind::Star) {
             let star_span = self.expect(&TokenKind::Star, "`*`")?;
             let inner = self.parse_unary()?;
             let span = Span::new(star_span.start, inner.span.end.copy());
+            let id = self.alloc_node_id();
             return Ok(Expr {
                 kind: ExprKind::Deref(Box::new(inner)),
                 span,
+                id,
             });
         }
         self.parse_postfix()
@@ -491,6 +512,7 @@ impl Parser {
                 let args = self.parse_call_args()?;
                 let end = self.tokens[self.pos - 1].span.end.copy();
                 let span = Span::new(expr.span.start.copy(), end);
+                let id = self.alloc_node_id();
                 expr = Expr {
                     kind: ExprKind::MethodCall(MethodCall {
                         receiver: Box::new(expr),
@@ -500,6 +522,7 @@ impl Parser {
                         args,
                     }),
                     span,
+                    id,
                 };
             } else if !turbofish_args.is_empty() {
                 return Err(Error {
@@ -509,6 +532,7 @@ impl Parser {
                 });
             } else {
                 let span = Span::new(expr.span.start.copy(), field_span.end.copy());
+                let id = self.alloc_node_id();
                 expr = Expr {
                     kind: ExprKind::FieldAccess(FieldAccess {
                         base: Box::new(expr),
@@ -516,6 +540,7 @@ impl Parser {
                         field_span,
                     }),
                     span,
+                    id,
                 };
             }
         }
@@ -537,9 +562,11 @@ impl Parser {
             TokenKind::SelfLower => {
                 let span = self.tokens[self.pos].span.copy();
                 self.pos += 1;
+                let id = self.alloc_node_id();
                 Ok(Expr {
                     kind: ExprKind::Var("self".to_string()),
                     span,
+                    id,
                 })
             }
             TokenKind::LBrace => self.parse_block_expr(),
@@ -565,9 +592,11 @@ impl Parser {
     fn parse_block_expr(&mut self) -> Result<Expr, Error> {
         let block = self.parse_block()?;
         let span = block.span.copy();
+        let id = self.alloc_node_id();
         Ok(Expr {
             kind: ExprKind::Block(Box::new(block)),
             span,
+            id,
         })
     }
 
@@ -580,9 +609,11 @@ impl Parser {
         let unsafe_span = self.expect(&TokenKind::Unsafe, "`unsafe`")?;
         let block = self.parse_block()?;
         let span = Span::new(unsafe_span.start, block.span.end.copy());
+        let id = self.alloc_node_id();
         Ok(Expr {
             kind: ExprKind::Unsafe(Box::new(block)),
             span,
+            id,
         })
     }
 
@@ -593,9 +624,11 @@ impl Parser {
                 let value = *n;
                 let span = tok.span.copy();
                 self.pos += 1;
+                let id = self.alloc_node_id();
                 Ok(Expr {
                     kind: ExprKind::IntLit(value),
                     span,
+                    id,
                 })
             }
             _ => unreachable!(),
@@ -609,17 +642,21 @@ impl Parser {
             let args = self.parse_call_args()?;
             let end = self.tokens[self.pos - 1].span.end.copy();
             let span = Span::new(path.span.start.copy(), end);
+            let id = self.alloc_node_id();
             Ok(Expr {
                 kind: ExprKind::Call(Call { callee: path, args }),
                 span,
+                id,
             })
         } else if self.peek_kind(&TokenKind::LBrace) {
             let fields = self.parse_struct_init()?;
             let end = self.tokens[self.pos - 1].span.end.copy();
             let span = Span::new(path.span.start.copy(), end);
+            let id = self.alloc_node_id();
             Ok(Expr {
                 kind: ExprKind::StructLit(StructLit { path, fields }),
                 span,
+                id,
             })
         } else if had_turbofish {
             Err(Error {
@@ -629,9 +666,11 @@ impl Parser {
             })
         } else if path.segments.len() == 1 {
             let seg = &path.segments[0];
+            let id = self.alloc_node_id();
             Ok(Expr {
                 kind: ExprKind::Var(seg.name.clone()),
                 span: seg.span.copy(),
+                id,
             })
         } else {
             Err(Error {

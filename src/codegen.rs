@@ -165,17 +165,16 @@ struct FnCtx<'a> {
     structs: &'a StructTable,
     funcs: &'a FuncTable,
     current_module: Vec<String>,
-    let_types: Vec<RType>,
-    lit_types: Vec<RType>,
-    struct_lit_types: Vec<RType>,
+    // Per-NodeId types and resolutions, populated by typeck and substituted
+    // through the monomorphization env at emit_function entry. Each consumer
+    // (codegen_let_stmt, codegen_call, etc.) looks up by `expr.id`.
+    expr_types: Vec<Option<RType>>,
+    // Per-let `Some(frame_offset)` if the binding is spilled to the shadow
+    // stack, `None` otherwise. Indexed by `let_stmt.value.id`. Sized to
+    // `func.node_count`.
     let_offsets: Vec<Option<u32>>,
-    let_idx: usize,
-    lit_idx: usize,
-    struct_lit_idx: usize,
-    method_resolutions: Vec<MethodResolution>,
-    method_idx: usize,
-    call_resolutions: Vec<CallResolution>,
-    call_idx: usize,
+    method_resolutions: Vec<Option<MethodResolution>>,
+    call_resolutions: Vec<Option<CallResolution>>,
     self_target: Option<RType>,
     // Substitution map for the current monomorphization (empty for non-generic
     // functions). Walks of `Cast` and inner `Generic` callee resolutions apply
@@ -300,13 +299,16 @@ fn store_instr(leaf: &MemLeaf, base_offset: u32) -> wasm::Instruction {
 
 struct AddressInfo {
     param_addressed: Vec<bool>,
+    // Indexed by `let_stmt.value.id` (a per-function NodeId). `true` means
+    // some `&binding…` chain rooted at that let-binding takes its address;
+    // the binding then needs a shadow-stack slot.
     let_addressed: Vec<bool>,
 }
 
-fn analyze_addresses(func: &Function, let_count: usize) -> AddressInfo {
+fn analyze_addresses(func: &Function) -> AddressInfo {
     let mut info = AddressInfo {
         param_addressed: vec_of_false(func.params.len()),
-        let_addressed: vec_of_false(let_count),
+        let_addressed: vec_of_false(func.node_count as usize),
     };
     let mut stack: Vec<BindingRef> = Vec::new();
     let mut k = 0;
@@ -314,8 +316,7 @@ fn analyze_addresses(func: &Function, let_count: usize) -> AddressInfo {
         stack.push(BindingRef::Param(k, func.params[k].name.clone()));
         k += 1;
     }
-    let mut let_idx: usize = 0;
-    walk_block_addr(&func.body, &mut stack, &mut let_idx, &mut info);
+    walk_block_addr(&func.body, &mut stack, &mut info);
     info
 }
 
@@ -332,7 +333,9 @@ fn vec_of_false(n: usize) -> Vec<bool> {
 #[derive(Clone)]
 enum BindingRef {
     Param(usize, String),
-    Let(usize, String),
+    // Carries the let's value expr NodeId (used to key let_addressed /
+    // let_offsets).
+    Let(u32, String),
 }
 
 fn binding_ref_name<'a>(b: &'a BindingRef) -> &'a str {
@@ -344,7 +347,6 @@ fn binding_ref_name<'a>(b: &'a BindingRef) -> &'a str {
 fn walk_block_addr(
     block: &Block,
     stack: &mut Vec<BindingRef>,
-    let_idx: &mut usize,
     info: &mut AddressInfo,
 ) {
     let mark = stack.len();
@@ -352,21 +354,19 @@ fn walk_block_addr(
     while i < block.stmts.len() {
         match &block.stmts[i] {
             Stmt::Let(let_stmt) => {
-                walk_expr_addr(&let_stmt.value, stack, let_idx, info);
-                let id = *let_idx;
-                *let_idx += 1;
-                stack.push(BindingRef::Let(id, let_stmt.name.clone()));
+                walk_expr_addr(&let_stmt.value, stack, info);
+                stack.push(BindingRef::Let(let_stmt.value.id, let_stmt.name.clone()));
             }
             Stmt::Assign(assign) => {
-                walk_expr_addr(&assign.lhs, stack, let_idx, info);
-                walk_expr_addr(&assign.rhs, stack, let_idx, info);
+                walk_expr_addr(&assign.lhs, stack, info);
+                walk_expr_addr(&assign.rhs, stack, info);
             }
-            Stmt::Expr(expr) => walk_expr_addr(expr, stack, let_idx, info),
+            Stmt::Expr(expr) => walk_expr_addr(expr, stack, info),
         }
         i += 1;
     }
     if let Some(tail) = &block.tail {
-        walk_expr_addr(tail, stack, let_idx, info);
+        walk_expr_addr(tail, stack, info);
     }
     while stack.len() > mark {
         stack.pop();
@@ -376,7 +376,6 @@ fn walk_block_addr(
 fn walk_expr_addr(
     expr: &Expr,
     stack: &mut Vec<BindingRef>,
-    let_idx: &mut usize,
     info: &mut AddressInfo,
 ) {
     match &expr.kind {
@@ -390,35 +389,35 @@ fn walk_expr_addr(
                     if binding_ref_name(&stack[i]) == root {
                         match &stack[i] {
                             BindingRef::Param(idx, _) => info.param_addressed[*idx] = true,
-                            BindingRef::Let(idx, _) => info.let_addressed[*idx] = true,
+                            BindingRef::Let(id, _) => info.let_addressed[*id as usize] = true,
                         }
                         break;
                     }
                 }
             }
-            walk_expr_addr(inner, stack, let_idx, info);
+            walk_expr_addr(inner, stack, info);
         }
         ExprKind::Call(c) => {
             let mut i = 0;
             while i < c.args.len() {
-                walk_expr_addr(&c.args[i], stack, let_idx, info);
+                walk_expr_addr(&c.args[i], stack, info);
                 i += 1;
             }
         }
         ExprKind::StructLit(s) => {
             let mut i = 0;
             while i < s.fields.len() {
-                walk_expr_addr(&s.fields[i].value, stack, let_idx, info);
+                walk_expr_addr(&s.fields[i].value, stack, info);
                 i += 1;
             }
         }
         ExprKind::FieldAccess(fa) => {
-            walk_expr_addr(&fa.base, stack, let_idx, info);
+            walk_expr_addr(&fa.base, stack, info);
         }
-        ExprKind::Cast { inner, .. } => walk_expr_addr(inner, stack, let_idx, info),
-        ExprKind::Deref(inner) => walk_expr_addr(inner, stack, let_idx, info),
-        ExprKind::Unsafe(b) => walk_block_addr(b.as_ref(), stack, let_idx, info),
-        ExprKind::Block(b) => walk_block_addr(b.as_ref(), stack, let_idx, info),
+        ExprKind::Cast { inner, .. } => walk_expr_addr(inner, stack, info),
+        ExprKind::Deref(inner) => walk_expr_addr(inner, stack, info),
+        ExprKind::Unsafe(b) => walk_block_addr(b.as_ref(), stack, info),
+        ExprKind::Block(b) => walk_block_addr(b.as_ref(), stack, info),
         ExprKind::MethodCall(mc) => {
             // The receiver may be autoref'd (BorrowImm/BorrowMut) at codegen
             // time; that takes its address. Without consulting typeck's
@@ -433,16 +432,16 @@ fn walk_expr_addr(
                     if binding_ref_name(&stack[i]) == root {
                         match &stack[i] {
                             BindingRef::Param(idx, _) => info.param_addressed[*idx] = true,
-                            BindingRef::Let(idx, _) => info.let_addressed[*idx] = true,
+                            BindingRef::Let(id, _) => info.let_addressed[*id as usize] = true,
                         }
                         break;
                     }
                 }
             }
-            walk_expr_addr(&mc.receiver, stack, let_idx, info);
+            walk_expr_addr(&mc.receiver, stack, info);
             let mut i = 0;
             while i < mc.args.len() {
-                walk_expr_addr(&mc.args[i], stack, let_idx, info);
+                walk_expr_addr(&mc.args[i], stack, info);
                 i += 1;
             }
         }
@@ -538,11 +537,9 @@ fn emit_monomorphic(
     let env = build_env(&tmpl.type_params, &work.type_args);
     let param_types = subst_vec(&tmpl.param_types, &env);
     let return_type = tmpl.return_type.as_ref().map(|t| substitute_rtype(t, &env));
-    let let_types = subst_vec(&tmpl.let_types, &env);
-    let lit_types = subst_vec(&tmpl.lit_types, &env);
-    let struct_lit_types = subst_vec(&tmpl.struct_lit_types, &env);
-    let method_resolutions = clone_method_resolutions(&tmpl.method_resolutions, &env);
-    let call_resolutions = subst_call_resolutions(&tmpl.call_resolutions, &env);
+    let expr_types = subst_opt_vec(&tmpl.expr_types, &env);
+    let method_resolutions = opt_method_resolutions_clone(&tmpl.method_resolutions, &env);
+    let call_resolutions = opt_call_resolutions_clone(&tmpl.call_resolutions, &env);
     // Determine self_target for the body: if this template is a method (its
     // path ends with method_name and the parent path is a struct), we may need
     // to pass a Self target for resolve_type. For free generic fns, None.
@@ -580,9 +577,7 @@ fn emit_monomorphic(
         mono,
         param_types,
         return_type,
-        let_types,
-        lit_types,
-        struct_lit_types,
+        expr_types,
         method_resolutions,
         call_resolutions,
         env,
@@ -590,6 +585,85 @@ fn emit_monomorphic(
         work.wasm_idx,
         false, // monomorphic instances are never exported
     )
+}
+
+fn subst_opt_vec(v: &Vec<Option<RType>>, env: &Vec<(String, RType)>) -> Vec<Option<RType>> {
+    let mut out: Vec<Option<RType>> = Vec::new();
+    let mut i = 0;
+    while i < v.len() {
+        match &v[i] {
+            Some(t) => out.push(Some(substitute_rtype(t, env))),
+            None => out.push(None),
+        }
+        i += 1;
+    }
+    out
+}
+
+fn opt_vec_clone(v: &Vec<Option<RType>>) -> Vec<Option<RType>> {
+    let mut out: Vec<Option<RType>> = Vec::new();
+    let mut i = 0;
+    while i < v.len() {
+        match &v[i] {
+            Some(t) => out.push(Some(rtype_clone(t))),
+            None => out.push(None),
+        }
+        i += 1;
+    }
+    out
+}
+
+fn opt_method_resolutions_clone(
+    v: &Vec<Option<MethodResolution>>,
+    env: &Vec<(String, RType)>,
+) -> Vec<Option<MethodResolution>> {
+    let mut out: Vec<Option<MethodResolution>> = Vec::new();
+    let mut i = 0;
+    while i < v.len() {
+        match &v[i] {
+            Some(m) => {
+                let mut subst_args: Vec<RType> = Vec::new();
+                let mut j = 0;
+                while j < m.type_args.len() {
+                    subst_args.push(substitute_rtype(&m.type_args[j], env));
+                    j += 1;
+                }
+                out.push(Some(MethodResolution {
+                    callee_idx: m.callee_idx,
+                    callee_path: clone_path(&m.callee_path),
+                    recv_adjust: copy_recv_adjust(&m.recv_adjust),
+                    ret_borrows_receiver: m.ret_borrows_receiver,
+                    template_idx: m.template_idx,
+                    type_args: subst_args,
+                }));
+            }
+            None => out.push(None),
+        }
+        i += 1;
+    }
+    out
+}
+
+fn opt_call_resolutions_clone(
+    v: &Vec<Option<CallResolution>>,
+    env: &Vec<(String, RType)>,
+) -> Vec<Option<CallResolution>> {
+    let mut out: Vec<Option<CallResolution>> = Vec::new();
+    let mut i = 0;
+    while i < v.len() {
+        match &v[i] {
+            Some(CallResolution::Direct(idx)) => out.push(Some(CallResolution::Direct(*idx))),
+            Some(CallResolution::Generic { template_idx, type_args }) => {
+                out.push(Some(CallResolution::Generic {
+                    template_idx: *template_idx,
+                    type_args: subst_vec(type_args, env),
+                }));
+            }
+            None => out.push(None),
+        }
+        i += 1;
+    }
+    out
 }
 
 fn build_env(type_params: &Vec<String>, type_args: &Vec<RType>) -> Vec<(String, RType)> {
@@ -612,30 +686,61 @@ fn subst_vec(v: &Vec<RType>, env: &Vec<(String, RType)>) -> Vec<RType> {
     out
 }
 
-fn clone_method_resolutions(
-    v: &Vec<MethodResolution>,
-    env: &Vec<(String, RType)>,
-) -> Vec<MethodResolution> {
-    let mut out: Vec<MethodResolution> = Vec::new();
+// Walks the body in source order, appending each `LetStmt`'s value-expr
+// NodeId. Frame layout iterates this list to assign offsets in source order
+// while keying into NodeId-sized arrays.
+fn collect_let_value_ids(block: &Block, out: &mut Vec<u32>) {
     let mut i = 0;
-    while i < v.len() {
-        let mut subst_args: Vec<RType> = Vec::new();
-        let mut j = 0;
-        while j < v[i].type_args.len() {
-            subst_args.push(substitute_rtype(&v[i].type_args[j], env));
-            j += 1;
+    while i < block.stmts.len() {
+        match &block.stmts[i] {
+            Stmt::Let(let_stmt) => {
+                collect_lets_in_expr(&let_stmt.value, out);
+                out.push(let_stmt.value.id);
+            }
+            Stmt::Assign(assign) => {
+                collect_lets_in_expr(&assign.lhs, out);
+                collect_lets_in_expr(&assign.rhs, out);
+            }
+            Stmt::Expr(expr) => collect_lets_in_expr(expr, out),
         }
-        out.push(MethodResolution {
-            callee_idx: v[i].callee_idx,
-            callee_path: clone_path(&v[i].callee_path),
-            recv_adjust: copy_recv_adjust(&v[i].recv_adjust),
-            ret_borrows_receiver: v[i].ret_borrows_receiver,
-            template_idx: v[i].template_idx,
-            type_args: subst_args,
-        });
         i += 1;
     }
-    out
+    if let Some(tail) = &block.tail {
+        collect_lets_in_expr(tail, out);
+    }
+}
+
+fn collect_lets_in_expr(expr: &Expr, out: &mut Vec<u32>) {
+    match &expr.kind {
+        ExprKind::IntLit(_) | ExprKind::Var(_) => {}
+        ExprKind::Borrow { inner, .. } => collect_lets_in_expr(inner, out),
+        ExprKind::Cast { inner, .. } => collect_lets_in_expr(inner, out),
+        ExprKind::Deref(inner) => collect_lets_in_expr(inner, out),
+        ExprKind::FieldAccess(fa) => collect_lets_in_expr(&fa.base, out),
+        ExprKind::Call(c) => {
+            let mut i = 0;
+            while i < c.args.len() {
+                collect_lets_in_expr(&c.args[i], out);
+                i += 1;
+            }
+        }
+        ExprKind::StructLit(s) => {
+            let mut i = 0;
+            while i < s.fields.len() {
+                collect_lets_in_expr(&s.fields[i].value, out);
+                i += 1;
+            }
+        }
+        ExprKind::MethodCall(mc) => {
+            collect_lets_in_expr(&mc.receiver, out);
+            let mut i = 0;
+            while i < mc.args.len() {
+                collect_lets_in_expr(&mc.args[i], out);
+                i += 1;
+            }
+        }
+        ExprKind::Block(b) | ExprKind::Unsafe(b) => collect_let_value_ids(b.as_ref(), out),
+    }
 }
 
 fn copy_recv_adjust(r: &ReceiverAdjust) -> ReceiverAdjust {
@@ -645,25 +750,6 @@ fn copy_recv_adjust(r: &ReceiverAdjust) -> ReceiverAdjust {
         ReceiverAdjust::BorrowMut => ReceiverAdjust::BorrowMut,
         ReceiverAdjust::ByRef => ReceiverAdjust::ByRef,
     }
-}
-
-fn subst_call_resolutions(
-    v: &Vec<CallResolution>,
-    env: &Vec<(String, RType)>,
-) -> Vec<CallResolution> {
-    let mut out: Vec<CallResolution> = Vec::new();
-    let mut i = 0;
-    while i < v.len() {
-        out.push(match &v[i] {
-            CallResolution::Direct(idx) => CallResolution::Direct(*idx),
-            CallResolution::Generic { template_idx, type_args } => CallResolution::Generic {
-                template_idx: *template_idx,
-                type_args: subst_vec(type_args, env),
-            },
-        });
-        i += 1;
-    }
-    out
 }
 
 fn emit_function(
@@ -684,11 +770,9 @@ fn emit_function(
     // is empty (no Param substitution to do).
     let param_types = rtype_vec_clone(&entry.param_types);
     let return_type = entry.return_type.as_ref().map(rtype_clone);
-    let let_types = rtype_vec_clone(&entry.let_types);
-    let lit_types = rtype_vec_clone(&entry.lit_types);
-    let struct_lit_types = rtype_vec_clone(&entry.struct_lit_types);
-    let method_resolutions = clone_method_resolutions(&entry.method_resolutions, &Vec::new());
-    let call_resolutions = subst_call_resolutions(&entry.call_resolutions, &Vec::new());
+    let expr_types = opt_vec_clone(&entry.expr_types);
+    let method_resolutions = opt_method_resolutions_clone(&entry.method_resolutions, &Vec::new());
+    let call_resolutions = opt_call_resolutions_clone(&entry.call_resolutions, &Vec::new());
     let wasm_idx = entry.idx;
     let is_export = current_module.is_empty() && path_prefix.len() == current_module.len();
     emit_function_concrete(
@@ -702,9 +786,7 @@ fn emit_function(
         mono,
         param_types,
         return_type,
-        let_types,
-        lit_types,
-        struct_lit_types,
+        expr_types,
         method_resolutions,
         call_resolutions,
         Vec::new(),
@@ -725,19 +807,18 @@ fn emit_function_concrete(
     mono: &mut MonoState,
     param_types: Vec<RType>,
     return_type: Option<RType>,
-    let_types: Vec<RType>,
-    lit_types: Vec<RType>,
-    struct_lit_types: Vec<RType>,
-    method_resolutions: Vec<MethodResolution>,
-    call_resolutions: Vec<CallResolution>,
+    expr_types: Vec<Option<RType>>,
+    method_resolutions: Vec<Option<MethodResolution>>,
+    call_resolutions: Vec<Option<CallResolution>>,
     env: Vec<(String, RType)>,
     type_params: Vec<String>,
     wasm_idx: u32,
     is_export: bool,
 ) -> Result<(), Error> {
     let _ = path_prefix;
+    let node_count = func.node_count as usize;
     // Address-taken analysis: who needs to live in shadow-stack memory?
-    let address_info = analyze_addresses(func, let_types.len());
+    let address_info = analyze_addresses(func);
 
     // Compute frame layout: assign byte offsets to addressed params + lets.
     let mut frame_size: u32 = 0;
@@ -752,16 +833,28 @@ fn emit_function_concrete(
         }
         k += 1;
     }
-    let mut let_offsets: Vec<Option<u32>> = Vec::with_capacity(let_types.len());
-    let mut k = 0;
-    while k < let_types.len() {
-        if address_info.let_addressed[k] {
-            let_offsets.push(Some(frame_size));
-            frame_size += byte_size_of(&let_types[k], structs);
-        } else {
-            let_offsets.push(None);
+    // let_offsets keyed by let_stmt.value.id — sparse, sized to node_count.
+    let mut let_offsets: Vec<Option<u32>> = Vec::with_capacity(node_count);
+    let mut i = 0;
+    while i < node_count {
+        let_offsets.push(None);
+        i += 1;
+    }
+    {
+        let mut order: Vec<u32> = Vec::new();
+        collect_let_value_ids(&func.body, &mut order);
+        let mut k = 0;
+        while k < order.len() {
+            let id = order[k] as usize;
+            if address_info.let_addressed[id] {
+                let_offsets[id] = Some(frame_size);
+                let ty = expr_types[id]
+                    .as_ref()
+                    .expect("typeck recorded the let's type");
+                frame_size += byte_size_of(ty, structs);
+            }
+            k += 1;
         }
-        k += 1;
     }
 
     // Build the WASM signature: refs collapse to a single i32; everything else
@@ -831,17 +924,10 @@ fn emit_function_concrete(
         structs,
         funcs,
         current_module: clone_path(current_module),
-        let_types,
-        lit_types,
-        struct_lit_types,
+        expr_types,
         let_offsets,
-        let_idx: 0,
-        lit_idx: 0,
-        struct_lit_idx: 0,
         method_resolutions,
-        method_idx: 0,
         call_resolutions,
-        call_idx: 0,
         self_target: self_target.map(|rt| rtype_clone(rt)),
         env,
         type_params,
@@ -967,12 +1053,14 @@ fn codegen_unit_block_stmt(ctx: &mut FnCtx, block: &Block) -> Result<(), Error> 
 }
 
 fn codegen_let_stmt(ctx: &mut FnCtx, let_stmt: &LetStmt) -> Result<(), Error> {
-    // Codegen the RHS first — its own let_idx slots get consumed during the
-    // recursion. Our slot is whichever index is current after that returns.
     codegen_expr(ctx, &let_stmt.value)?;
-    let value_ty = rtype_clone(&ctx.let_types[ctx.let_idx]);
-    let frame_offset_opt = ctx.let_offsets[ctx.let_idx];
-    ctx.let_idx += 1;
+    let value_id = let_stmt.value.id as usize;
+    let value_ty = rtype_clone(
+        ctx.expr_types[value_id]
+            .as_ref()
+            .expect("typeck recorded the let's type"),
+    );
+    let frame_offset_opt = ctx.let_offsets[value_id];
 
     match frame_offset_opt {
         Some(frame_offset) => {
@@ -1277,14 +1365,17 @@ fn extract_place(expr: &Expr) -> Option<Vec<String>> {
 fn codegen_expr(ctx: &mut FnCtx, expr: &Expr) -> Result<RType, Error> {
     match &expr.kind {
         ExprKind::IntLit(n) => {
-            let ty = rtype_clone(&ctx.lit_types[ctx.lit_idx]);
-            ctx.lit_idx += 1;
+            let ty = rtype_clone(
+                ctx.expr_types[expr.id as usize]
+                    .as_ref()
+                    .expect("typeck recorded this literal's type"),
+            );
             emit_int_lit(ctx, &ty, *n);
             Ok(ty)
         }
         ExprKind::Var(name) => codegen_var(ctx, name),
-        ExprKind::Call(call) => codegen_call(ctx, call),
-        ExprKind::StructLit(lit) => codegen_struct_lit(ctx, lit),
+        ExprKind::Call(call) => codegen_call(ctx, call, expr.id),
+        ExprKind::StructLit(lit) => codegen_struct_lit(ctx, lit, expr.id),
         ExprKind::FieldAccess(fa) => codegen_field_access(ctx, fa),
         ExprKind::Borrow { inner, mutable } => codegen_borrow(ctx, inner, *mutable),
         ExprKind::Cast { inner, ty } => {
@@ -1305,16 +1396,23 @@ fn codegen_expr(ctx: &mut FnCtx, expr: &Expr) -> Result<RType, Error> {
         ExprKind::Deref(inner) => codegen_deref(ctx, inner),
         ExprKind::Unsafe(block) => codegen_block_expr(ctx, block.as_ref()),
         ExprKind::Block(block) => codegen_block_expr(ctx, block.as_ref()),
-        ExprKind::MethodCall(mc) => codegen_method_call(ctx, mc),
+        ExprKind::MethodCall(mc) => codegen_method_call(ctx, mc, expr.id),
     }
 }
 
-fn codegen_method_call(ctx: &mut FnCtx, mc: &MethodCall) -> Result<RType, Error> {
-    let res_idx = ctx.method_idx;
-    ctx.method_idx += 1;
+fn codegen_method_call(
+    ctx: &mut FnCtx,
+    mc: &MethodCall,
+    node_id: crate::ast::NodeId,
+) -> Result<RType, Error> {
+    let res_idx = node_id as usize;
     // Match on a copy of the resolution shape to avoid borrowing ctx through
     // the resolutions vec across our subsequent codegen mutations.
-    let recv_adjust_local = match &ctx.method_resolutions[res_idx].recv_adjust {
+    let recv_adjust_local = match &ctx.method_resolutions[res_idx]
+        .as_ref()
+        .expect("typeck registered this method call")
+        .recv_adjust
+    {
         ReceiverAdjust::Move => RecvAdjustLocal::Move,
         ReceiverAdjust::BorrowImm => RecvAdjustLocal::BorrowImm,
         ReceiverAdjust::BorrowMut => RecvAdjustLocal::BorrowMut,
@@ -1324,9 +1422,10 @@ fn codegen_method_call(ctx: &mut FnCtx, mc: &MethodCall) -> Result<RType, Error>
     // the recorded callee_idx directly. For template methods, substitute the
     // resolution's type_args under our env, intern via MonoState, and compute
     // the return type from the template's signature.
-    let template_idx_opt = ctx.method_resolutions[res_idx].template_idx;
+    let template_idx_opt = ctx.method_resolutions[res_idx].as_ref().unwrap().template_idx;
     let (callee_idx, return_rt) = if let Some(template_idx) = template_idx_opt {
-        let raw_args = rtype_vec_clone(&ctx.method_resolutions[res_idx].type_args);
+        let raw_args =
+            rtype_vec_clone(&ctx.method_resolutions[res_idx].as_ref().unwrap().type_args);
         let concrete = subst_vec(&raw_args, &ctx.env);
         let return_rt = {
             let tmpl = &ctx.funcs.templates[template_idx];
@@ -1339,7 +1438,7 @@ fn codegen_method_call(ctx: &mut FnCtx, mc: &MethodCall) -> Result<RType, Error>
         let idx = ctx.mono.intern(template_idx, concrete);
         (idx, return_rt)
     } else {
-        let callee_idx = ctx.method_resolutions[res_idx].callee_idx;
+        let callee_idx = ctx.method_resolutions[res_idx].as_ref().unwrap().callee_idx;
         let return_rt = {
             let entry = &ctx.funcs.entries[callee_idx_to_table_idx(ctx, callee_idx)];
             match &entry.return_type {
@@ -1462,10 +1561,16 @@ fn codegen_var(ctx: &mut FnCtx, name: &str) -> Result<RType, Error> {
     unreachable!("typeck verified the variable exists");
 }
 
-fn codegen_call(ctx: &mut FnCtx, call: &Call) -> Result<RType, Error> {
-    let res_idx = ctx.call_idx;
-    ctx.call_idx += 1;
-    let (func_idx, return_rt) = match &ctx.call_resolutions[res_idx] {
+fn codegen_call(
+    ctx: &mut FnCtx,
+    call: &Call,
+    node_id: crate::ast::NodeId,
+) -> Result<RType, Error> {
+    let res_idx = node_id as usize;
+    let (func_idx, return_rt) = match ctx.call_resolutions[res_idx]
+        .as_ref()
+        .expect("typeck registered this call")
+    {
         CallResolution::Direct(idx) => {
             let entry = &ctx.funcs.entries[*idx];
             let rt = match &entry.return_type {
@@ -1504,18 +1609,24 @@ fn codegen_call(ctx: &mut FnCtx, call: &Call) -> Result<RType, Error> {
     Ok(return_rt)
 }
 
-fn codegen_struct_lit(ctx: &mut FnCtx, lit: &StructLit) -> Result<RType, Error> {
-    // Read the resolved struct type recorded by typeck (in source-DFS order).
+fn codegen_struct_lit(
+    ctx: &mut FnCtx,
+    lit: &StructLit,
+    node_id: crate::ast::NodeId,
+) -> Result<RType, Error> {
+    // Read the resolved struct type recorded by typeck at this NodeId.
     // For generic structs, this carries the concrete type_args needed for
     // layout. Substitute under our env in case those args themselves reference
     // outer Param entries (mono of mono).
-    let recorded_idx = ctx.struct_lit_idx;
-    ctx.struct_lit_idx += 1;
-    let recorded_ty = rtype_clone(&ctx.struct_lit_types[recorded_idx]);
+    let recorded_ty = rtype_clone(
+        ctx.expr_types[node_id as usize]
+            .as_ref()
+            .expect("typeck recorded this struct lit's type"),
+    );
     let recorded_ty = substitute_rtype(&recorded_ty, &ctx.env);
     let (full, struct_args) = match &recorded_ty {
         RType::Struct { path, type_args } => (clone_path(path), rtype_vec_clone(type_args)),
-        _ => unreachable!("struct_lit_types must hold a Struct"),
+        _ => unreachable!("expr_types entry for a struct literal must be a Struct"),
     };
 
     // Field layouts: declaration-order (name, flat_offset, valtypes), with
