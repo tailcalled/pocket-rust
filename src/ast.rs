@@ -14,43 +14,57 @@ pub enum Item {
     Impl(ImplBlock),
 }
 
+#[derive(Clone)]
 pub struct ImplBlock {
     pub target: Path,
     pub methods: Vec<Function>,
     pub span: Span,
 }
 
+#[derive(Clone)]
 pub struct StructDef {
     pub name: String,
     pub name_span: Span,
     pub fields: Vec<StructField>,
 }
 
+#[derive(Clone)]
 pub struct StructField {
     pub name: String,
     pub name_span: Span,
     pub ty: Type,
 }
 
+#[derive(Clone)]
 pub struct Function {
     pub name: String,
     pub name_span: Span,
+    pub type_params: Vec<TypeParam>,
     pub params: Vec<Param>,
     pub return_type: Option<Type>,
     pub body: Block,
 }
 
+#[derive(Clone)]
+pub struct TypeParam {
+    pub name: String,
+    pub name_span: Span,
+}
+
+#[derive(Clone)]
 pub struct Param {
     pub name: String,
     pub name_span: Span,
     pub ty: Type,
 }
 
+#[derive(Clone)]
 pub struct Type {
     pub kind: TypeKind,
     pub span: Span,
 }
 
+#[derive(Clone)]
 pub enum TypeKind {
     Path(Path),
     Ref { inner: Box<Type>, mutable: bool },
@@ -58,18 +72,21 @@ pub enum TypeKind {
     SelfType,
 }
 
+#[derive(Clone)]
 pub struct Block {
     pub stmts: Vec<Stmt>,
     pub tail: Option<Expr>,
     pub span: Span,
 }
 
+#[derive(Clone)]
 pub enum Stmt {
     Let(LetStmt),
     Assign(AssignStmt),
     Expr(Expr),
 }
 
+#[derive(Clone)]
 pub struct LetStmt {
     pub name: String,
     pub name_span: Span,
@@ -78,17 +95,20 @@ pub struct LetStmt {
     pub value: Expr,
 }
 
+#[derive(Clone)]
 pub struct AssignStmt {
     pub lhs: Expr,
     pub rhs: Expr,
     pub span: Span,
 }
 
+#[derive(Clone)]
 pub struct Expr {
     pub kind: ExprKind,
     pub span: Span,
 }
 
+#[derive(Clone)]
 pub enum ExprKind {
     IntLit(u64),
     Call(Call),
@@ -103,6 +123,7 @@ pub enum ExprKind {
     MethodCall(MethodCall),
 }
 
+#[derive(Clone)]
 pub struct MethodCall {
     pub receiver: Box<Expr>,
     pub method: String,
@@ -110,33 +131,40 @@ pub struct MethodCall {
     pub args: Vec<Expr>,
 }
 
+#[derive(Clone)]
 pub struct Call {
     pub callee: Path,
+    pub generic_args: Vec<Type>,
     pub args: Vec<Expr>,
 }
 
+#[derive(Clone)]
 pub struct StructLit {
     pub path: Path,
     pub fields: Vec<FieldInit>,
 }
 
+#[derive(Clone)]
 pub struct FieldInit {
     pub name: String,
     pub name_span: Span,
     pub value: Expr,
 }
 
+#[derive(Clone)]
 pub struct FieldAccess {
     pub base: Box<Expr>,
     pub field: String,
     pub field_span: Span,
 }
 
+#[derive(Clone)]
 pub struct Path {
     pub segments: Vec<PathSegment>,
     pub span: Span,
 }
 
+#[derive(Clone)]
 pub struct PathSegment {
     pub name: String,
     pub span: Span,

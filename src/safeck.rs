@@ -11,7 +11,7 @@
 
 use crate::ast::{Block, Call, Expr, ExprKind, Function, Item, MethodCall, Module, Stmt, StructLit};
 use crate::span::Error;
-use crate::typeck::{FuncTable, clone_path, func_lookup};
+use crate::typeck::{FuncTable, clone_path, func_lookup, template_lookup};
 
 pub fn check(root: &Module, funcs: &FuncTable) -> Result<(), Error> {
     let mut path: Vec<String> = Vec::new();
@@ -73,9 +73,15 @@ fn check_function(
 ) -> Result<(), Error> {
     let mut full = clone_path(current_module);
     full.push(func.name.clone());
-    let entry = func_lookup(funcs, &full).expect("typeck registered this function");
+    let deref_is_raw: &Vec<bool> = if let Some(entry) = func_lookup(funcs, &full) {
+        &entry.deref_is_raw
+    } else if let Some((_, t)) = template_lookup(funcs, &full) {
+        &t.deref_is_raw
+    } else {
+        unreachable!("typeck registered this function");
+    };
     let mut state = SafeState {
-        deref_is_raw: &entry.deref_is_raw,
+        deref_is_raw,
         deref_idx: 0,
         in_unsafe: false,
         file: current_file.to_string(),

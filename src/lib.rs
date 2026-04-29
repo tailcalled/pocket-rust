@@ -71,6 +71,7 @@ pub fn compile(
     };
     let mut funcs = FuncTable {
         entries: Vec::new(),
+        templates: Vec::new(),
     };
     let mut next_idx: u32 = 0;
     let mut wasm_mod = wasm::Module::new();

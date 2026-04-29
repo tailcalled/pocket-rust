@@ -1,6 +1,7 @@
 use crate::ast::{
     AssignStmt, Block, Call, Expr, ExprKind, FieldAccess, FieldInit, Function, ImplBlock, LetStmt,
     MethodCall, Param, Path, PathSegment, Stmt, StructDef, StructField, StructLit, Type, TypeKind,
+    TypeParam,
 };
 use crate::lexer::{Token, TokenKind, token_kind_name};
 use crate::span::{Error, Pos, Span};
@@ -113,6 +114,11 @@ impl Parser {
     fn parse_function(&mut self) -> Result<Function, Error> {
         self.expect(&TokenKind::Fn, "`fn`")?;
         let (name, name_span) = self.expect_ident()?;
+        let type_params = if self.peek_kind(&TokenKind::LAngle) {
+            self.parse_type_params()?
+        } else {
+            Vec::new()
+        };
         self.expect(&TokenKind::LParen, "`(`")?;
         let params = if self.peek_kind(&TokenKind::RParen) {
             Vec::new()
@@ -130,10 +136,33 @@ impl Parser {
         Ok(Function {
             name,
             name_span,
+            type_params,
             params,
             return_type,
             body,
         })
+    }
+
+    fn parse_type_params(&mut self) -> Result<Vec<TypeParam>, Error> {
+        self.expect(&TokenKind::LAngle, "`<`")?;
+        let mut params: Vec<TypeParam> = Vec::new();
+        if !self.peek_kind(&TokenKind::RAngle) {
+            params.push(self.parse_type_param()?);
+            while self.peek_kind(&TokenKind::Comma) {
+                self.pos += 1;
+                if self.peek_kind(&TokenKind::RAngle) {
+                    break;
+                }
+                params.push(self.parse_type_param()?);
+            }
+        }
+        self.expect(&TokenKind::RAngle, "`>`")?;
+        Ok(params)
+    }
+
+    fn parse_type_param(&mut self) -> Result<TypeParam, Error> {
+        let (name, name_span) = self.expect_ident()?;
+        Ok(TypeParam { name, name_span })
     }
 
     fn parse_params(&mut self) -> Result<Vec<Param>, Error> {
@@ -514,6 +543,15 @@ impl Parser {
 
     fn parse_path_atom(&mut self) -> Result<Expr, Error> {
         let path = self.parse_path()?;
+        // Optional turbofish: `path::<T1, T2>(args)`. We've already consumed
+        // `path`; the `::<` here is `PathSep` followed by `LAngle`. If the
+        // user wrote `path::other` we'd have consumed both segments above.
+        let generic_args = if self.peek_two(&TokenKind::PathSep, &TokenKind::LAngle) {
+            self.pos += 1; // skip `::`
+            self.parse_turbofish_args()?
+        } else {
+            Vec::new()
+        };
         if self.peek_kind(&TokenKind::LParen) {
             let args = self.parse_call_args()?;
             let end = self.tokens[self.pos - 1].span.end.copy();
@@ -521,9 +559,17 @@ impl Parser {
             Ok(Expr {
                 kind: ExprKind::Call(Call {
                     callee: path,
+                    generic_args,
                     args,
                 }),
                 span,
+            })
+        } else if !generic_args.is_empty() {
+            // turbofish without a following call — illegal.
+            Err(Error {
+                file: self.file.clone(),
+                message: "expected `(` after turbofish `::<…>`".to_string(),
+                span: path.span.copy(),
             })
         } else if self.peek_kind(&TokenKind::LBrace) {
             let fields = self.parse_struct_init()?;
@@ -546,6 +592,29 @@ impl Parser {
                 span: path.span.copy(),
             })
         }
+    }
+
+    fn parse_turbofish_args(&mut self) -> Result<Vec<Type>, Error> {
+        self.expect(&TokenKind::LAngle, "`<`")?;
+        let mut args: Vec<Type> = Vec::new();
+        if !self.peek_kind(&TokenKind::RAngle) {
+            args.push(self.parse_type()?);
+            while self.peek_kind(&TokenKind::Comma) {
+                self.pos += 1;
+                if self.peek_kind(&TokenKind::RAngle) {
+                    break;
+                }
+                args.push(self.parse_type()?);
+            }
+        }
+        self.expect(&TokenKind::RAngle, "`>`")?;
+        Ok(args)
+    }
+
+    fn peek_two(&self, a: &TokenKind, b: &TokenKind) -> bool {
+        self.pos + 1 < self.tokens.len()
+            && Self::kind_eq(&self.tokens[self.pos].kind, a)
+            && Self::kind_eq(&self.tokens[self.pos + 1].kind, b)
     }
 
     fn parse_call_args(&mut self) -> Result<Vec<Expr>, Error> {
@@ -604,7 +673,10 @@ impl Parser {
             name: first_name,
             span: first_span,
         });
-        while self.peek_kind(&TokenKind::PathSep) {
+        // Don't consume `::<…>` (turbofish) — that's handled by the caller.
+        while self.peek_kind(&TokenKind::PathSep)
+            && !self.peek_two(&TokenKind::PathSep, &TokenKind::LAngle)
+        {
             self.pos += 1;
             let (name, span) = self.expect_path_segment()?;
             end = span.end.copy();
@@ -710,6 +782,8 @@ impl Parser {
             (TokenKind::Impl, TokenKind::Impl) => true,
             (TokenKind::SelfLower, TokenKind::SelfLower) => true,
             (TokenKind::SelfUpper, TokenKind::SelfUpper) => true,
+            (TokenKind::LAngle, TokenKind::LAngle) => true,
+            (TokenKind::RAngle, TokenKind::RAngle) => true,
             (TokenKind::Eq, TokenKind::Eq) => true,
             _ => false,
         }

@@ -4,8 +4,8 @@ use crate::ast::{
 };
 use crate::span::{Error, Span};
 use crate::typeck::{
-    FuncTable, MethodResolution, RType, ReceiverAdjust, StructTable, clone_path, func_lookup,
-    resolve_full_path, rtype_clone,
+    CallResolution, FuncTable, MethodResolution, RType, ReceiverAdjust, StructTable, clone_path,
+    func_lookup, rtype_clone, template_lookup,
 };
 
 pub fn check(
@@ -95,22 +95,42 @@ fn check_function(
 ) -> Result<(), Error> {
     let mut full = clone_path(path_prefix);
     full.push(func.name.clone());
-    let entry = func_lookup(funcs, &full).expect("typeck registered this function");
+    // The function may be a regular entry or a generic template — peel both.
+    let (param_types, let_types, method_resolutions, call_resolutions) =
+        if let Some(entry) = func_lookup(funcs, &full) {
+            (
+                &entry.param_types,
+                &entry.let_types,
+                &entry.method_resolutions,
+                &entry.call_resolutions,
+            )
+        } else if let Some((_, t)) = template_lookup(funcs, &full) {
+            (
+                &t.param_types,
+                &t.let_types,
+                &t.method_resolutions,
+                &t.call_resolutions,
+            )
+        } else {
+            unreachable!("typeck registered this function");
+        };
 
-    let mut let_types: Vec<RType> = Vec::new();
+    let mut let_types_owned: Vec<RType> = Vec::new();
     let mut k = 0;
-    while k < entry.let_types.len() {
-        let_types.push(rtype_clone(&entry.let_types[k]));
+    while k < let_types.len() {
+        let_types_owned.push(rtype_clone(&let_types[k]));
         k += 1;
     }
 
     let mut state = BorrowState {
         holders: Vec::new(),
         moved: Vec::new(),
-        let_types,
+        let_types: let_types_owned,
         let_idx: 0,
-        method_resolutions: &entry.method_resolutions,
+        method_resolutions,
         method_idx: 0,
+        call_resolutions,
+        call_idx: 0,
         file: current_file.to_string(),
         funcs,
         current_module,
@@ -121,7 +141,7 @@ fn check_function(
     while k < func.params.len() {
         state.holders.push(Holder {
             name: Some(func.params[k].name.clone()),
-            rtype: Some(rtype_clone(&entry.param_types[k])),
+            rtype: Some(rtype_clone(&param_types[k])),
             holds: Vec::new(),
         });
         k += 1;
@@ -146,9 +166,14 @@ struct BorrowState<'a> {
     // Per `MethodCall` expression in source-DFS order, populated by typeck.
     method_resolutions: &'a Vec<MethodResolution>,
     method_idx: usize,
+    // Per `Call` expression in source-DFS order, populated by typeck.
+    call_resolutions: &'a Vec<CallResolution>,
+    call_idx: usize,
     file: String,
     funcs: &'a FuncTable,
+    #[allow(dead_code)]
     current_module: &'a Vec<String>,
+    #[allow(dead_code)]
     self_target: Option<RType>,
 }
 
@@ -520,16 +545,13 @@ fn walk_var(state: &mut BorrowState, name: &str, expr: &Expr) -> Result<ValueDes
 }
 
 fn walk_call(state: &mut BorrowState, call: &Call) -> Result<ValueDesc, Error> {
-    // Look up the callee's elision info: if it returns a ref, ret_ref_source
-    // is the index of the source ref arg whose borrows the result inherits.
-    let ret_ref_source = {
-        let full = resolve_full_path(
-            state.current_module,
-            state.self_target.as_ref(),
-            &call.callee.segments,
-        );
-        let entry = func_lookup(state.funcs, &full).expect("typeck resolved this call");
-        entry.ret_ref_source
+    let res_idx = state.call_idx;
+    state.call_idx += 1;
+    let ret_ref_source = match &state.call_resolutions[res_idx] {
+        CallResolution::Direct(idx) => state.funcs.entries[*idx].ret_ref_source,
+        CallResolution::Generic { template_idx, .. } => {
+            state.funcs.templates[*template_idx].ret_ref_source
+        }
     };
 
     // Push a synthetic call holder. Borrows produced by argument expressions

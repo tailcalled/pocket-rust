@@ -1,3 +1,4 @@
+#[derive(Clone)]
 pub struct Pos {
     pub line: u32,
     pub col: u32,
@@ -16,6 +17,7 @@ impl Pos {
     }
 }
 
+#[derive(Clone)]
 pub struct Span {
     pub start: Pos,
     pub end: Pos,

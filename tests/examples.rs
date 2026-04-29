@@ -306,3 +306,25 @@ fn methods_returns_42() {
     let result = answer.call(&mut store, ()).expect("call failed");
     assert_eq!(result, 42);
 }
+
+#[test]
+fn generic_id_returns_100() {
+    let bytes = compile_example("generic_id", "lib.rs");
+    let (mut store, instance) = instantiate(&bytes);
+    let answer = instance
+        .get_typed_func::<(), i32>(&store, "answer")
+        .expect("export `answer` not found / wrong signature");
+    let result = answer.call(&mut store, ()).expect("call failed");
+    assert_eq!(result, 100);
+}
+
+#[test]
+fn uses_std_generic_returns_42() {
+    let bytes = compile_example("uses_std_generic", "lib.rs");
+    let (mut store, instance) = instantiate(&bytes);
+    let answer = instance
+        .get_typed_func::<(), i32>(&store, "answer")
+        .expect("export `answer` not found / wrong signature");
+    let result = answer.call(&mut store, ()).expect("call failed");
+    assert_eq!(result, 42);
+}

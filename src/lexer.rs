@@ -17,6 +17,8 @@ pub enum TokenKind {
     Impl,
     SelfLower,
     SelfUpper,
+    LAngle,
+    RAngle,
     Ident(String),
     LParen,
     RParen,
@@ -47,6 +49,8 @@ pub fn token_kind_name(t: &TokenKind) -> &'static str {
         TokenKind::Impl => "`impl`",
         TokenKind::SelfLower => "`self`",
         TokenKind::SelfUpper => "`Self`",
+        TokenKind::LAngle => "`<`",
+        TokenKind::RAngle => "`>`",
         TokenKind::Ident(_) => "identifier",
         TokenKind::LParen => "`(`",
         TokenKind::RParen => "`)`",
@@ -202,6 +206,12 @@ pub fn tokenize(file: &str, source: &str) -> Result<Vec<Token>, Error> {
             byte_pos += 1;
         } else if b == b'=' {
             push_single(&mut tokens, TokenKind::Eq, line, &mut col);
+            byte_pos += 1;
+        } else if b == b'<' {
+            push_single(&mut tokens, TokenKind::LAngle, line, &mut col);
+            byte_pos += 1;
+        } else if b == b'>' {
+            push_single(&mut tokens, TokenKind::RAngle, line, &mut col);
             byte_pos += 1;
         } else if b == b'-' && (byte_pos + 1) < bytes.len() && bytes[byte_pos + 1] == b'>' {
             let start = Pos::new(line, col);

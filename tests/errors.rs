@@ -370,6 +370,45 @@ fn method_call_borrow_outlives_source_is_rejected() {
 }
 
 #[test]
+fn field_access_on_generic_param_is_rejected() {
+    // Polymorphic body check: `t.field` where `t: T` has no shape — reject.
+    let err = compile_source(
+        "fn bad<T>(t: T) -> u32 { t.field }",
+    );
+    assert!(
+        err.contains("non-struct"),
+        "expected field-access-on-T error, got: {}",
+        err
+    );
+}
+
+#[test]
+fn turbofish_on_non_generic_is_rejected() {
+    let err = compile_source(
+        "fn plain() -> u32 { 7 }\n\
+         fn answer() -> u32 { plain::<u32>() }",
+    );
+    assert!(
+        err.contains("not a generic function") || err.contains("turbofish"),
+        "expected turbofish-on-non-generic error, got: {}",
+        err
+    );
+}
+
+#[test]
+fn wrong_type_arg_count_is_rejected() {
+    let err = compile_source(
+        "fn id<T>(x: T) -> T { x }\n\
+         fn answer() -> u32 { id::<u32, u64>(5) }",
+    );
+    assert!(
+        err.contains("type arguments"),
+        "expected wrong-type-arg-count error, got: {}",
+        err
+    );
+}
+
+#[test]
 fn self_outside_impl_is_rejected() {
     let err = compile_source(
         "fn answer() -> u32 { let x: Self = 0; x }",

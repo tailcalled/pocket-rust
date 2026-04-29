@@ -4,14 +4,97 @@ use crate::ast::{
 };
 use crate::span::Error;
 use crate::typeck::{
-    FuncTable, IntKind, MethodResolution, RType, ReceiverAdjust, StructTable, byte_size_of,
-    clone_path, flatten_rtype, func_lookup, is_ref_mutable, resolve_type, rtype_clone,
-    struct_lookup,
+    CallResolution, FuncTable, GenericTemplate, IntKind, MethodResolution, RType, ReceiverAdjust,
+    StructTable, byte_size_of, clone_path, flatten_rtype, func_lookup, is_ref_mutable,
+    resolve_type, rtype_clone, rtype_eq, struct_lookup, substitute_rtype,
 };
 use crate::wasm;
 
 // We seed the module with one global at index 0 — the shadow-stack pointer.
 const SP_GLOBAL: u32 = 0;
+
+// Tracks monomorphic instantiations of generic templates. Maps each
+// (template_idx, concrete type_args) to a wasm function index; queues new ones
+// for later emission. Codegen drains the queue after the AST walk.
+struct MonoState {
+    queue: Vec<MonoWork>,
+    map_template: Vec<usize>,
+    map_args: Vec<Vec<RType>>,
+    map_idx: Vec<u32>,
+    next_idx: u32,
+}
+
+struct MonoWork {
+    template_idx: usize,
+    type_args: Vec<RType>,
+    wasm_idx: u32,
+}
+
+impl MonoState {
+    fn new(start_idx: u32) -> Self {
+        Self {
+            queue: Vec::new(),
+            map_template: Vec::new(),
+            map_args: Vec::new(),
+            map_idx: Vec::new(),
+            next_idx: start_idx,
+        }
+    }
+
+    fn lookup(&self, template_idx: usize, type_args: &Vec<RType>) -> Option<u32> {
+        let mut i = 0;
+        while i < self.map_template.len() {
+            if self.map_template[i] == template_idx
+                && rtype_vec_eq(&self.map_args[i], type_args)
+            {
+                return Some(self.map_idx[i]);
+            }
+            i += 1;
+        }
+        None
+    }
+
+    fn intern(&mut self, template_idx: usize, type_args: Vec<RType>) -> u32 {
+        if let Some(idx) = self.lookup(template_idx, &type_args) {
+            return idx;
+        }
+        let idx = self.next_idx;
+        self.next_idx += 1;
+        self.map_template.push(template_idx);
+        self.map_args.push(rtype_vec_clone(&type_args));
+        self.map_idx.push(idx);
+        self.queue.push(MonoWork {
+            template_idx,
+            type_args,
+            wasm_idx: idx,
+        });
+        idx
+    }
+}
+
+fn rtype_vec_eq(a: &Vec<RType>, b: &Vec<RType>) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut i = 0;
+    while i < a.len() {
+        if !rtype_eq(&a[i], &b[i]) {
+            return false;
+        }
+        i += 1;
+    }
+    true
+}
+
+fn rtype_vec_clone(v: &Vec<RType>) -> Vec<RType> {
+    let mut out: Vec<RType> = Vec::new();
+    let mut i = 0;
+    while i < v.len() {
+        out.push(rtype_clone(&v[i]));
+        i += 1;
+    }
+    out
+}
 
 pub fn emit(
     wasm_mod: &mut wasm::Module,
@@ -21,7 +104,13 @@ pub fn emit(
 ) -> Result<(), Error> {
     let mut module_path: Vec<String> = Vec::new();
     push_root_name(&mut module_path, root);
-    emit_module(wasm_mod, root, &mut module_path, structs, funcs)?;
+    // Monomorphic instantiations get wasm idxs starting after the non-generic
+    // entries' idxs (which typeck assigned 0..entries.len()).
+    let mut mono = MonoState::new(funcs.entries.len() as u32);
+    emit_module(wasm_mod, root, &mut module_path, structs, funcs, &mut mono)?;
+    while let Some(work) = mono.queue.pop() {
+        emit_monomorphic(wasm_mod, work, structs, funcs, &mut mono)?;
+    }
     Ok(())
 }
 
@@ -57,14 +146,24 @@ struct FnCtx<'a> {
     structs: &'a StructTable,
     funcs: &'a FuncTable,
     current_module: Vec<String>,
-    let_types: &'a Vec<RType>,
-    lit_types: &'a Vec<RType>,
-    let_offsets: &'a Vec<Option<u32>>,
+    let_types: Vec<RType>,
+    lit_types: Vec<RType>,
+    let_offsets: Vec<Option<u32>>,
     let_idx: usize,
     lit_idx: usize,
-    method_resolutions: &'a Vec<MethodResolution>,
+    method_resolutions: Vec<MethodResolution>,
     method_idx: usize,
+    call_resolutions: Vec<CallResolution>,
+    call_idx: usize,
     self_target: Option<RType>,
+    // Substitution map for the current monomorphization (empty for non-generic
+    // functions). Walks of `Cast` and inner `Generic` callee resolutions apply
+    // this env to lower `Param("T")` to concrete RTypes.
+    env: Vec<(String, RType)>,
+    // Type-param names visible in this function (for `resolve_type` on Cast
+    // targets). Empty for non-generic.
+    type_params: Vec<String>,
+    mono: &'a mut MonoState,
 }
 
 // ============================================================================
@@ -127,6 +226,9 @@ fn collect_leaves(
                 off += byte_size_of(&entry.fields[i].ty, structs);
                 i += 1;
             }
+        }
+        RType::Param(_) => {
+            unreachable!("collect_leaves on unresolved type parameter — codegen should substitute first");
         }
     }
 }
@@ -334,14 +436,21 @@ fn emit_module(
     path: &mut Vec<String>,
     structs: &StructTable,
     funcs: &FuncTable,
+    mono: &mut MonoState,
 ) -> Result<(), Error> {
     let mut i = 0;
     while i < module.items.len() {
         match &module.items[i] {
-            Item::Function(f) => emit_function(wasm_mod, f, path, path, None, structs, funcs)?,
+            Item::Function(f) => {
+                if !f.type_params.is_empty() {
+                    // Generic template — skip; emitted lazily via mono queue.
+                } else {
+                    emit_function(wasm_mod, f, path, path, None, structs, funcs, mono)?;
+                }
+            }
             Item::Module(m) => {
                 path.push(m.name.clone());
-                emit_module(wasm_mod, m, path, structs, funcs)?;
+                emit_module(wasm_mod, m, path, structs, funcs, mono)?;
                 path.pop();
             }
             Item::Struct(_) => {}
@@ -365,6 +474,7 @@ fn emit_module(
                         Some(&target_rt),
                         structs,
                         funcs,
+                        mono,
                     )?;
                     k += 1;
                 }
@@ -375,6 +485,109 @@ fn emit_module(
     Ok(())
 }
 
+// Substitutes a template's polymorphic typeck artifacts (which may contain
+// `RType::Param`) with concrete types from `type_args`, then dispatches to
+// emit_function_concrete with the substituted artifacts.
+fn emit_monomorphic(
+    wasm_mod: &mut wasm::Module,
+    work: MonoWork,
+    structs: &StructTable,
+    funcs: &FuncTable,
+    mono: &mut MonoState,
+) -> Result<(), Error> {
+    let tmpl = &funcs.templates[work.template_idx];
+    let env = build_env(&tmpl.type_params, &work.type_args);
+    let param_types = subst_vec(&tmpl.param_types, &env);
+    let return_type = tmpl.return_type.as_ref().map(|t| substitute_rtype(t, &env));
+    let let_types = subst_vec(&tmpl.let_types, &env);
+    let lit_types = subst_vec(&tmpl.lit_types, &env);
+    let method_resolutions = clone_method_resolutions(&tmpl.method_resolutions);
+    let call_resolutions = subst_call_resolutions(&tmpl.call_resolutions, &env);
+    emit_function_concrete(
+        wasm_mod,
+        &tmpl.func,
+        &tmpl.enclosing_module,
+        &tmpl.enclosing_module,
+        None,
+        structs,
+        funcs,
+        mono,
+        param_types,
+        return_type,
+        let_types,
+        lit_types,
+        method_resolutions,
+        call_resolutions,
+        env,
+        tmpl.type_params.clone(),
+        work.wasm_idx,
+        false, // monomorphic instances are never exported
+    )
+}
+
+fn build_env(type_params: &Vec<String>, type_args: &Vec<RType>) -> Vec<(String, RType)> {
+    let mut env: Vec<(String, RType)> = Vec::new();
+    let mut i = 0;
+    while i < type_params.len() {
+        env.push((type_params[i].clone(), rtype_clone(&type_args[i])));
+        i += 1;
+    }
+    env
+}
+
+fn subst_vec(v: &Vec<RType>, env: &Vec<(String, RType)>) -> Vec<RType> {
+    let mut out: Vec<RType> = Vec::new();
+    let mut i = 0;
+    while i < v.len() {
+        out.push(substitute_rtype(&v[i], env));
+        i += 1;
+    }
+    out
+}
+
+fn clone_method_resolutions(v: &Vec<MethodResolution>) -> Vec<MethodResolution> {
+    let mut out: Vec<MethodResolution> = Vec::new();
+    let mut i = 0;
+    while i < v.len() {
+        out.push(MethodResolution {
+            callee_idx: v[i].callee_idx,
+            callee_path: clone_path(&v[i].callee_path),
+            recv_adjust: copy_recv_adjust(&v[i].recv_adjust),
+            ret_borrows_receiver: v[i].ret_borrows_receiver,
+        });
+        i += 1;
+    }
+    out
+}
+
+fn copy_recv_adjust(r: &ReceiverAdjust) -> ReceiverAdjust {
+    match r {
+        ReceiverAdjust::Move => ReceiverAdjust::Move,
+        ReceiverAdjust::BorrowImm => ReceiverAdjust::BorrowImm,
+        ReceiverAdjust::BorrowMut => ReceiverAdjust::BorrowMut,
+        ReceiverAdjust::ByRef => ReceiverAdjust::ByRef,
+    }
+}
+
+fn subst_call_resolutions(
+    v: &Vec<CallResolution>,
+    env: &Vec<(String, RType)>,
+) -> Vec<CallResolution> {
+    let mut out: Vec<CallResolution> = Vec::new();
+    let mut i = 0;
+    while i < v.len() {
+        out.push(match &v[i] {
+            CallResolution::Direct(idx) => CallResolution::Direct(*idx),
+            CallResolution::Generic { template_idx, type_args } => CallResolution::Generic {
+                template_idx: *template_idx,
+                type_args: subst_vec(type_args, env),
+            },
+        });
+        i += 1;
+    }
+    out
+}
+
 fn emit_function(
     wasm_mod: &mut wasm::Module,
     func: &Function,
@@ -383,33 +596,87 @@ fn emit_function(
     self_target: Option<&RType>,
     structs: &StructTable,
     funcs: &FuncTable,
+    mono: &mut MonoState,
 ) -> Result<(), Error> {
     let mut full = clone_path(path_prefix);
     full.push(func.name.clone());
     let entry = func_lookup(funcs, &full).expect("typeck registered this function");
+    // Snapshot all artifacts before entering the concrete emitter (which takes
+    // them by-value). For non-generic fns these are the entry's data; the env
+    // is empty (no Param substitution to do).
+    let param_types = rtype_vec_clone(&entry.param_types);
+    let return_type = entry.return_type.as_ref().map(rtype_clone);
+    let let_types = rtype_vec_clone(&entry.let_types);
+    let lit_types = rtype_vec_clone(&entry.lit_types);
+    let method_resolutions = clone_method_resolutions(&entry.method_resolutions);
+    let call_resolutions = subst_call_resolutions(&entry.call_resolutions, &Vec::new());
+    let wasm_idx = entry.idx;
+    let is_export = current_module.is_empty() && path_prefix.len() == current_module.len();
+    emit_function_concrete(
+        wasm_mod,
+        func,
+        current_module,
+        path_prefix,
+        self_target,
+        structs,
+        funcs,
+        mono,
+        param_types,
+        return_type,
+        let_types,
+        lit_types,
+        method_resolutions,
+        call_resolutions,
+        Vec::new(),
+        Vec::new(),
+        wasm_idx,
+        is_export,
+    )
+}
 
+fn emit_function_concrete(
+    wasm_mod: &mut wasm::Module,
+    func: &Function,
+    current_module: &Vec<String>,
+    path_prefix: &Vec<String>,
+    self_target: Option<&RType>,
+    structs: &StructTable,
+    funcs: &FuncTable,
+    mono: &mut MonoState,
+    param_types: Vec<RType>,
+    return_type: Option<RType>,
+    let_types: Vec<RType>,
+    lit_types: Vec<RType>,
+    method_resolutions: Vec<MethodResolution>,
+    call_resolutions: Vec<CallResolution>,
+    env: Vec<(String, RType)>,
+    type_params: Vec<String>,
+    wasm_idx: u32,
+    is_export: bool,
+) -> Result<(), Error> {
+    let _ = path_prefix;
     // Address-taken analysis: who needs to live in shadow-stack memory?
-    let address_info = analyze_addresses(func, entry.let_types.len());
+    let address_info = analyze_addresses(func, let_types.len());
 
     // Compute frame layout: assign byte offsets to addressed params + lets.
     let mut frame_size: u32 = 0;
     let mut param_offsets: Vec<Option<u32>> = Vec::with_capacity(func.params.len());
     let mut k = 0;
-    while k < entry.param_types.len() {
+    while k < param_types.len() {
         if address_info.param_addressed[k] {
             param_offsets.push(Some(frame_size));
-            frame_size += byte_size_of(&entry.param_types[k], structs);
+            frame_size += byte_size_of(&param_types[k], structs);
         } else {
             param_offsets.push(None);
         }
         k += 1;
     }
-    let mut let_offsets: Vec<Option<u32>> = Vec::with_capacity(entry.let_types.len());
+    let mut let_offsets: Vec<Option<u32>> = Vec::with_capacity(let_types.len());
     let mut k = 0;
-    while k < entry.let_types.len() {
+    while k < let_types.len() {
         if address_info.let_addressed[k] {
             let_offsets.push(Some(frame_size));
-            frame_size += byte_size_of(&entry.let_types[k], structs);
+            frame_size += byte_size_of(&let_types[k], structs);
         } else {
             let_offsets.push(None);
         }
@@ -423,7 +690,7 @@ fn emit_function(
     let mut locals: Vec<LocalBinding> = Vec::new();
     let mut k = 0;
     while k < func.params.len() {
-        let pty = rtype_clone(&entry.param_types[k]);
+        let pty = rtype_clone(&param_types[k]);
         let storage = match &param_offsets[k] {
             Some(off) => Storage::Memory { frame_offset: *off },
             None => {
@@ -442,9 +709,6 @@ fn emit_function(
                 }
             }
         };
-        // Spilled params: still come in via a flat-scalar incoming local. We
-        // reserve those slots in wasm_params now and copy them into memory in
-        // the prologue below.
         if let Some(_) = &param_offsets[k] {
             let mut vts: Vec<wasm::ValType> = Vec::new();
             flatten_rtype(&pty, structs, &mut vts);
@@ -464,7 +728,7 @@ fn emit_function(
     }
 
     let mut wasm_results: Vec<wasm::ValType> = Vec::new();
-    if let Some(rt) = &entry.return_type {
+    if let Some(rt) = &return_type {
         flatten_rtype(rt, structs, &mut wasm_results);
     }
 
@@ -475,7 +739,7 @@ fn emit_function(
     let type_idx = wasm_mod.types.len() as u32;
     wasm_mod.types.push(func_type);
 
-    let func_idx = wasm_mod.functions.len() as u32;
+    let func_idx = wasm_idx;
     wasm_mod.functions.push(type_idx);
 
     let mut ctx = FnCtx {
@@ -486,14 +750,19 @@ fn emit_function(
         structs,
         funcs,
         current_module: clone_path(current_module),
-        let_types: &entry.let_types,
-        lit_types: &entry.lit_types,
-        let_offsets: &let_offsets,
+        let_types,
+        lit_types,
+        let_offsets,
         let_idx: 0,
         lit_idx: 0,
-        method_resolutions: &entry.method_resolutions,
+        method_resolutions,
         method_idx: 0,
+        call_resolutions,
+        call_idx: 0,
         self_target: self_target.map(|rt| rtype_clone(rt)),
+        env,
+        type_params,
+        mono,
     };
 
     // Prologue: SP -= frame_size; copy spilled params from their incoming
@@ -512,7 +781,7 @@ fn emit_function(
         let mut p = 0;
         let mut wasm_local_cursor: u32 = 0;
         while p < func.params.len() {
-            let pty = rtype_clone(&entry.param_types[p]);
+            let pty = rtype_clone(&ctx.locals[p].rtype);
             let mut vts: Vec<wasm::ValType> = Vec::new();
             flatten_rtype(&pty, structs, &mut vts);
             let flat_size = vts.len() as u32;
@@ -558,10 +827,7 @@ fn emit_function(
     };
     wasm_mod.code.push(body);
 
-    // Export only crate-root free functions. Methods (path_prefix !=
-    // current_module) and items in submodules stay internal.
-    let is_method = path_prefix.len() != current_module.len();
-    if current_module.is_empty() && !is_method {
+    if is_export {
         wasm_mod.exports.push(wasm::Export {
             name: func.name.clone(),
             kind: wasm::ExportKind::Func,
@@ -944,6 +1210,7 @@ fn codegen_expr(ctx: &mut FnCtx, expr: &Expr) -> Result<RType, Error> {
                 &ctx.current_module,
                 ctx.structs,
                 ctx.self_target.as_ref(),
+                &Vec::new(),
                 "",
             )
             .map_err(|e| e)
@@ -1089,18 +1356,37 @@ fn codegen_var(ctx: &mut FnCtx, name: &str) -> Result<RType, Error> {
 }
 
 fn codegen_call(ctx: &mut FnCtx, call: &Call) -> Result<RType, Error> {
-    let (func_idx, return_rt) = {
-        let full = crate::typeck::resolve_full_path(
-            &ctx.current_module,
-            ctx.self_target.as_ref(),
-            &call.callee.segments,
-        );
-        let entry = func_lookup(ctx.funcs, &full).expect("typeck resolved this call");
-        let rt = match &entry.return_type {
-            Some(rt) => rtype_clone(rt),
-            None => unreachable!("typeck rejects unit functions used as values"),
-        };
-        (entry.idx, rt)
+    let res_idx = ctx.call_idx;
+    ctx.call_idx += 1;
+    let (func_idx, return_rt) = match &ctx.call_resolutions[res_idx] {
+        CallResolution::Direct(idx) => {
+            let entry = &ctx.funcs.entries[*idx];
+            let rt = match &entry.return_type {
+                Some(rt) => rtype_clone(rt),
+                None => unreachable!("typeck rejects unit functions used as values"),
+            };
+            (entry.idx, rt)
+        }
+        CallResolution::Generic { template_idx, type_args } => {
+            // Substitute the type_args under the current monomorphization env
+            // (in case the calling function is itself a monomorphic instance
+            // of a generic that called another generic with `T` flowing
+            // through). The substituted args are concrete.
+            let concrete = subst_vec(type_args, &ctx.env);
+            let template_idx_copy = *template_idx;
+            // Determine the callee's return type by substituting under the
+            // template's own type-param env.
+            let return_rt = {
+                let tmpl: &GenericTemplate = &ctx.funcs.templates[template_idx_copy];
+                let tmpl_env = build_env(&tmpl.type_params, &concrete);
+                match &tmpl.return_type {
+                    Some(rt) => substitute_rtype(rt, &tmpl_env),
+                    None => unreachable!("typeck rejects unit functions used as values"),
+                }
+            };
+            let idx = ctx.mono.intern(template_idx_copy, concrete);
+            (idx, return_rt)
+        }
     };
     let mut i = 0;
     while i < call.args.len() {
