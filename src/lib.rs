@@ -10,7 +10,7 @@ pub mod wasm;
 
 use ast::{Item, Module};
 use span::{Error, Pos, Span};
-use typeck::{FuncTable, StructTable};
+use typeck::{FuncTable, StructTable, TraitTable};
 
 pub struct File {
     pub path: String,
@@ -69,6 +69,10 @@ pub fn compile(
     let mut structs = StructTable {
         entries: Vec::new(),
     };
+    let mut traits = TraitTable {
+        entries: Vec::new(),
+        impls: Vec::new(),
+    };
     let mut funcs = FuncTable {
         entries: Vec::new(),
         templates: Vec::new(),
@@ -101,16 +105,16 @@ pub fn compile(
             Ok(m) => m,
             Err(e) => return Err(span::format_error(&e)),
         };
-        if let Err(e) = typeck::check(&lib_root, &mut structs, &mut funcs, &mut next_idx) {
+        if let Err(e) = typeck::check(&lib_root, &mut structs, &mut traits, &mut funcs, &mut next_idx) {
             return Err(span::format_error(&e));
         }
-        if let Err(e) = borrowck::check(&lib_root, &structs, &funcs) {
+        if let Err(e) = borrowck::check(&lib_root, &structs, &traits, &mut funcs) {
             return Err(span::format_error(&e));
         }
         if let Err(e) = safeck::check(&lib_root, &funcs) {
             return Err(span::format_error(&e));
         }
-        if let Err(e) = codegen::emit(&mut wasm_mod, &lib_root, &structs, &funcs) {
+        if let Err(e) = codegen::emit(&mut wasm_mod, &lib_root, &structs, &traits, &funcs) {
             return Err(span::format_error(&e));
         }
         i += 1;
@@ -121,16 +125,16 @@ pub fn compile(
         Ok(m) => m,
         Err(e) => return Err(span::format_error(&e)),
     };
-    if let Err(e) = typeck::check(&user_root, &mut structs, &mut funcs, &mut next_idx) {
+    if let Err(e) = typeck::check(&user_root, &mut structs, &mut traits, &mut funcs, &mut next_idx) {
         return Err(span::format_error(&e));
     }
-    if let Err(e) = borrowck::check(&user_root, &structs, &funcs) {
+    if let Err(e) = borrowck::check(&user_root, &structs, &traits, &mut funcs) {
         return Err(span::format_error(&e));
     }
     if let Err(e) = safeck::check(&user_root, &funcs) {
         return Err(span::format_error(&e));
     }
-    if let Err(e) = codegen::emit(&mut wasm_mod, &user_root, &structs, &funcs) {
+    if let Err(e) = codegen::emit(&mut wasm_mod, &user_root, &structs, &traits, &funcs) {
         return Err(span::format_error(&e));
     }
     Ok(wasm_mod)
@@ -151,6 +155,7 @@ fn resolve_module(
             parser::RawItem::Function(f) => items.push(Item::Function(f)),
             parser::RawItem::Struct(sd) => items.push(Item::Struct(sd)),
             parser::RawItem::Impl(ib) => items.push(Item::Impl(ib)),
+            parser::RawItem::Trait(td) => items.push(Item::Trait(td)),
             parser::RawItem::ModDecl {
                 name: child_name,
                 name_span: child_name_span,

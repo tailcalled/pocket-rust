@@ -19,15 +19,46 @@ pub enum Item {
     Module(Module),
     Struct(StructDef),
     Impl(ImplBlock),
+    Trait(TraitDef),
 }
 
 #[derive(Clone)]
 pub struct ImplBlock {
     pub lifetime_params: Vec<LifetimeParam>,
     pub type_params: Vec<TypeParam>,
-    pub target: Path,
+    // None for inherent impls (`impl Foo { ... }`); Some for trait impls
+    // (`impl Trait for Foo { ... }`). The path may carry generic args, e.g.
+    // `impl Show<i32> for Foo` (deferred — for now only path-only traits).
+    pub trait_path: Option<Path>,
+    // The type the impl applies to. For inherent impls this is restricted
+    // to a struct path (`Foo<T>`); for trait impls any type pattern is
+    // allowed (e.g., `&T`, `*const T`).
+    pub target: Type,
     pub methods: Vec<Function>,
     pub span: Span,
+}
+
+#[derive(Clone)]
+pub struct TraitDef {
+    pub name: String,
+    pub name_span: Span,
+    pub methods: Vec<TraitMethodSig>,
+    pub span: Span,
+}
+
+#[derive(Clone)]
+pub struct TraitMethodSig {
+    pub name: String,
+    pub name_span: Span,
+    pub lifetime_params: Vec<LifetimeParam>,
+    pub type_params: Vec<TypeParam>,
+    pub params: Vec<Param>,
+    pub return_type: Option<Type>,
+}
+
+#[derive(Clone)]
+pub struct TraitBound {
+    pub path: Path,
 }
 
 #[derive(Clone)]
@@ -64,6 +95,9 @@ pub struct Function {
 pub struct TypeParam {
     pub name: String,
     pub name_span: Span,
+    // Trait bounds attached to this type param (e.g. `<T: Show + Eq>`).
+    // Empty when no bounds were written.
+    pub bounds: Vec<TraitBound>,
 }
 
 #[derive(Clone)]

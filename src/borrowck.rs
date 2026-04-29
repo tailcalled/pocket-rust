@@ -4,19 +4,21 @@ use crate::ast::{
 };
 use crate::span::{Error, Span};
 use crate::typeck::{
-    CallResolution, FuncTable, MethodResolution, RType, ReceiverAdjust, StructTable, clone_path,
-    find_lifetime_source, func_lookup, is_copy, rtype_clone, template_lookup,
+    CallResolution, FuncTable, MethodResolution, RType, ReceiverAdjust, StructTable, TraitTable,
+    clone_path, find_lifetime_source, func_lookup, is_copy_with_bounds, path_eq, rtype_clone,
+    template_lookup,
 };
 
 pub fn check(
     root: &Module,
     structs: &StructTable,
-    funcs: &FuncTable,
+    traits: &TraitTable,
+    funcs: &mut FuncTable,
 ) -> Result<(), Error> {
     let mut current_file = root.source_file.clone();
     let mut current_module: Vec<String> = Vec::new();
     push_root_name(&mut current_module, root);
-    check_module(root, &mut current_module, &mut current_file, structs, funcs)?;
+    check_module(root, &mut current_module, &mut current_file, structs, traits, funcs)?;
     Ok(())
 }
 
@@ -31,7 +33,8 @@ fn check_module(
     current_module: &mut Vec<String>,
     current_file: &mut String,
     structs: &StructTable,
-    funcs: &FuncTable,
+    traits: &TraitTable,
+    funcs: &mut FuncTable,
 ) -> Result<(), Error> {
     let saved = current_file.clone();
     *current_file = module.source_file.clone();
@@ -45,19 +48,25 @@ fn check_module(
                 None,
                 current_file,
                 structs,
+                traits,
                 funcs,
             )?,
             Item::Module(m) => {
                 current_module.push(m.name.clone());
-                check_module(m, current_module, current_file, structs, funcs)?;
+                check_module(m, current_module, current_file, structs, traits, funcs)?;
                 current_module.pop();
             }
             Item::Struct(_) => {}
             Item::Impl(ib) => {
-                if ib.target.segments.len() != 1 {
-                    continue;
-                }
-                let target_name = ib.target.segments[0].name.clone();
+                let target_name = match &ib.target.kind {
+                    crate::ast::TypeKind::Path(p) if p.segments.len() == 1 => {
+                        p.segments[0].name.clone()
+                    }
+                    _ => {
+                        i += 1;
+                        continue;
+                    }
+                };
                 let mut method_prefix = clone_path(current_module);
                 method_prefix.push(target_name.clone());
                 let mut target_full = clone_path(current_module);
@@ -90,11 +99,13 @@ fn check_module(
                         Some(rtype_clone(&target_rt)),
                         current_file,
                         structs,
+                        traits,
                         funcs,
                     )?;
                     k += 1;
                 }
             }
+            Item::Trait(_) => {}
         }
         i += 1;
     }
@@ -109,58 +120,106 @@ fn check_function(
     self_target: Option<RType>,
     current_file: &str,
     _structs: &StructTable,
-    funcs: &FuncTable,
+    traits: &TraitTable,
+    funcs: &mut FuncTable,
 ) -> Result<(), Error> {
     let mut full = clone_path(path_prefix);
     full.push(func.name.clone());
-    // The function may be a regular entry or a generic template — peel both.
-    let (param_types, expr_types, method_resolutions, call_resolutions) =
-        if let Some(entry) = func_lookup(funcs, &full) {
-            (
-                &entry.param_types,
-                &entry.expr_types,
-                &entry.method_resolutions,
-                &entry.call_resolutions,
-            )
-        } else if let Some((_, t)) = template_lookup(funcs, &full) {
-            (
-                &t.param_types,
-                &t.expr_types,
-                &t.method_resolutions,
-                &t.call_resolutions,
-            )
-        } else {
-            unreachable!("typeck registered this function");
+
+    // Walk the body using an immutable view of `funcs`; capture state.moved
+    // from the resulting BorrowState, then drop the view so we can mutate
+    // `funcs` to write back the moved snapshot (T4.6).
+    let moved: Vec<Vec<String>>;
+    {
+        let funcs_ro: &FuncTable = &*funcs;
+        // The function may be a regular entry or a generic template — peel both.
+        let (param_types, expr_types, method_resolutions, call_resolutions, type_params, type_param_bounds) =
+            if let Some(entry) = func_lookup(funcs_ro, &full) {
+                (
+                    &entry.param_types,
+                    &entry.expr_types,
+                    &entry.method_resolutions,
+                    &entry.call_resolutions,
+                    Vec::<String>::new(),
+                    Vec::<Vec<Vec<String>>>::new(),
+                )
+            } else if let Some((_, t)) = template_lookup(funcs_ro, &full) {
+                let mut bounds_clone: Vec<Vec<Vec<String>>> = Vec::new();
+                let mut i = 0;
+                while i < t.type_param_bounds.len() {
+                    let mut row: Vec<Vec<String>> = Vec::new();
+                    let mut j = 0;
+                    while j < t.type_param_bounds[i].len() {
+                        row.push(t.type_param_bounds[i][j].clone());
+                        j += 1;
+                    }
+                    bounds_clone.push(row);
+                    i += 1;
+                }
+                (
+                    &t.param_types,
+                    &t.expr_types,
+                    &t.method_resolutions,
+                    &t.call_resolutions,
+                    t.type_params.clone(),
+                    bounds_clone,
+                )
+            } else {
+                unreachable!("typeck registered this function");
+            };
+
+        let liveness = compute_liveness(&func.body, &func.params);
+        let mut state = BorrowState {
+            holders: Vec::new(),
+            moved: Vec::new(),
+            expr_types,
+            method_resolutions,
+            call_resolutions,
+            file: current_file.to_string(),
+            funcs: funcs_ro,
+            traits,
+            current_module,
+            self_target,
+            type_params,
+            type_param_bounds,
+            liveness,
+            current_step: 0,
         };
 
-    let liveness = compute_liveness(&func.body, &func.params);
-    let mut state = BorrowState {
-        holders: Vec::new(),
-        moved: Vec::new(),
-        expr_types,
-        method_resolutions,
-        call_resolutions,
-        file: current_file.to_string(),
-        funcs,
-        current_module,
-        self_target,
-        liveness,
-        current_step: 0,
-    };
+        let mut k = 0;
+        while k < func.params.len() {
+            state.holders.push(Holder {
+                name: Some(func.params[k].name.clone()),
+                rtype: Some(rtype_clone(&param_types[k])),
+                holds: Vec::new(),
+                field_holds: Vec::new(),
+            });
+            k += 1;
+        }
 
-    let mut k = 0;
-    while k < func.params.len() {
-        state.holders.push(Holder {
-            name: Some(func.params[k].name.clone()),
-            rtype: Some(rtype_clone(&param_types[k])),
-            holds: Vec::new(),
-            field_holds: Vec::new(),
-        });
-        k += 1;
+        walk_stmts_and_tail(&mut state, &func.body)?;
+        moved = state.moved;
     }
 
-    walk_stmts_and_tail(&mut state, &func.body)?;
-    Ok(())
+    // Snapshot moved places onto the function's metadata so codegen can skip
+    // the implicit scope-end drop for any binding that ended up moved.
+    let mut k = 0;
+    while k < funcs.entries.len() {
+        if path_eq(&funcs.entries[k].path, &full) {
+            funcs.entries[k].moved_places = moved;
+            return Ok(());
+        }
+        k += 1;
+    }
+    let mut k = 0;
+    while k < funcs.templates.len() {
+        if path_eq(&funcs.templates[k].path, &full) {
+            funcs.templates[k].moved_places = moved;
+            return Ok(());
+        }
+        k += 1;
+    }
+    unreachable!("typeck registered this function");
 }
 
 // ---------- State ----------
@@ -179,6 +238,9 @@ struct BorrowState<'a> {
     call_resolutions: &'a Vec<Option<CallResolution>>,
     file: String,
     funcs: &'a FuncTable,
+    traits: &'a TraitTable,
+    type_params: Vec<String>,
+    type_param_bounds: Vec<Vec<Vec<String>>>,
     #[allow(dead_code)]
     current_module: &'a Vec<String>,
     #[allow(dead_code)]
@@ -211,12 +273,12 @@ struct HeldBorrow {
     mutable: bool,
 }
 
-// One per-slot record: a field path within a struct holder, plus the
-// borrows tied to that slot. Phase D's minimal scheme uses single-segment
-// `field` paths (top-level fields only); nested struct-with-ref fields
-// aren't tracked at the holder level.
+// One per-slot record: a multi-segment field path within a struct holder,
+// plus the borrows tied to that slot. A single-segment path like
+// `["r"]` records a top-level ref field; a nested path like `["b", "r"]`
+// records a ref reachable through an inner struct field.
 struct FieldHold {
-    field: String,
+    field: Vec<String>,
     borrows: Vec<HeldBorrow>,
 }
 
@@ -243,12 +305,28 @@ fn clone_field_holds(v: &Vec<FieldHold>) -> Vec<FieldHold> {
     let mut i = 0;
     while i < v.len() {
         out.push(FieldHold {
-            field: v[i].field.clone(),
+            field: clone_path(&v[i].field),
             borrows: clone_held_borrows(&v[i].borrows),
         });
         i += 1;
     }
     out
+}
+
+// Slice equality for the field-path of a FieldHold, used when looking up
+// nested per-slot borrows from a multi-segment field-access chain.
+fn field_path_matches(field: &Vec<String>, sub: &[String]) -> bool {
+    if field.len() != sub.len() {
+        return false;
+    }
+    let mut i = 0;
+    while i < field.len() {
+        if field[i] != sub[i] {
+            return false;
+        }
+        i += 1;
+    }
+    true
 }
 
 // ---------- Walk ----------
@@ -737,7 +815,12 @@ fn walk_var(state: &mut BorrowState, name: &str, expr: &Expr) -> Result<ValueDes
             let holds = clone_held_borrows(&state.holders[idx].holds);
             Ok(ValueDesc { borrows: holds, field_borrows: Vec::new() })
         }
-    } else if is_owned_copy_holder(&state.holders[idx]) {
+    } else if is_owned_copy_holder(
+        &state.holders[idx],
+        state.traits,
+        &state.type_params,
+        &state.type_param_bounds,
+    ) {
         // Owned Copy primitive (ints, etc.): reading is a value copy, no move,
         // no borrows to forward. Still must refuse reads from a moved place.
         let mut place: Vec<String> = Vec::new();
@@ -956,13 +1039,44 @@ fn walk_struct_lit(state: &mut BorrowState, lit: &StructLit) -> Result<ValueDesc
                 k += 1;
             }
             field_borrows.push(FieldHold {
-                field: lit.fields[i].name.clone(),
+                field: vec![lit.fields[i].name.clone()],
                 borrows: grouped,
             });
         }
-        // Phase D minimal: nested per-slot (struct-with-ref inside another
-        // struct-with-ref) isn't tracked; field initializer's own
-        // `field_borrows` are dropped here.
+        // Nested per-slot: when the field's initializer is itself a struct
+        // value carrying its own field_borrows, prepend the current field
+        // name to each entry's path so the outer holder can find the borrow
+        // through `outer.this_field.<inner...>`.
+        let mut f = 0;
+        while f < desc.field_borrows.len() {
+            let mut grouped: Vec<HeldBorrow> = Vec::new();
+            let mut k = 0;
+            while k < desc.field_borrows[f].borrows.len() {
+                let new = HeldBorrow {
+                    place: clone_path(&desc.field_borrows[f].borrows[k].place),
+                    mutable: desc.field_borrows[f].borrows[k].mutable,
+                };
+                check_borrow_conflict(state, &new, &lit.fields[i].value.span)?;
+                state.holders[synth_idx].holds.push(new);
+                grouped.push(HeldBorrow {
+                    place: clone_path(&desc.field_borrows[f].borrows[k].place),
+                    mutable: desc.field_borrows[f].borrows[k].mutable,
+                });
+                k += 1;
+            }
+            let mut nested: Vec<String> = Vec::new();
+            nested.push(lit.fields[i].name.clone());
+            let mut s = 0;
+            while s < desc.field_borrows[f].field.len() {
+                nested.push(desc.field_borrows[f].field[s].clone());
+                s += 1;
+            }
+            field_borrows.push(FieldHold {
+                field: nested,
+                borrows: grouped,
+            });
+            f += 1;
+        }
         i += 1;
     }
     state.holders.truncate(synth_idx);
@@ -992,16 +1106,29 @@ fn walk_field_access(
                     .as_ref()
                     .map(rtype_clone);
                 let field_is_ref = matches!(&field_ty, Some(RType::Ref { .. }));
-                let field_is_copy = field_ty.as_ref().map(is_copy).unwrap_or(false);
+                let field_is_copy = field_ty
+                    .as_ref()
+                    .map(|t| {
+                        is_copy_with_bounds(
+                            t,
+                            state.traits,
+                            &state.type_params,
+                            &state.type_param_bounds,
+                        )
+                    })
+                    .unwrap_or(false);
                 check_not_moved(state, &place, &expr.span)?;
-                // Phase D: if the field is ref-typed and a top-level field
-                // (path length == 2: root + field), look up the holder's
-                // per-slot field_holds and propagate those borrows.
-                if field_is_ref && place.len() == 2 {
+                // Per-slot lookup: if the leaf is ref-typed, find the
+                // FieldHold whose field path matches the chain after the
+                // root (e.g. `a.b.r` matches `field == ["b","r"]`) and
+                // propagate its borrows. Works for both top-level
+                // (`["r"]`) and nested (`["b","r"]`) entries.
+                if field_is_ref && place.len() >= 2 {
+                    let sub = &place[1..];
                     let mut found_borrows: Vec<HeldBorrow> = Vec::new();
                     let mut k = 0;
                     while k < state.holders[root_idx].field_holds.len() {
-                        if state.holders[root_idx].field_holds[k].field == place[1] {
+                        if field_path_matches(&state.holders[root_idx].field_holds[k].field, sub) {
                             found_borrows = clone_held_borrows(
                                 &state.holders[root_idx].field_holds[k].borrows,
                             );
@@ -1113,9 +1240,14 @@ fn is_mut_ref_holder(h: &Holder) -> bool {
 // True for owned Copy primitives (ints currently; not refs or raw pointers,
 // which are handled by their own dedicated branches in walk_var). Reading
 // such a binding produces a value copy — no move, no borrow to forward.
-fn is_owned_copy_holder(h: &Holder) -> bool {
+fn is_owned_copy_holder(
+    h: &Holder,
+    traits: &TraitTable,
+    type_params: &Vec<String>,
+    type_param_bounds: &Vec<Vec<Vec<String>>>,
+) -> bool {
     match &h.rtype {
-        Some(RType::Int(_)) => true,
+        Some(rt) => is_copy_with_bounds(rt, traits, type_params, type_param_bounds),
         _ => false,
     }
 }
@@ -1196,6 +1328,28 @@ fn check_not_moved(
 }
 
 fn try_move(state: &mut BorrowState, place: Vec<String>, span: Span) -> Result<(), Error> {
+    // T4.6: whole-binding moves of Drop types are allowed; codegen consults
+    // the moved set and skips the implicit scope-end drop for moved
+    // bindings, so only the final owner drops. Partial moves out of a Drop
+    // value are still rejected — Drop's destructor runs over the whole
+    // value, so leaving a hole would mean either dropping a partially-
+    // initialized value or silently leaking the still-live fields.
+    if place.len() > 1 {
+        if let Some(idx) = find_binding(state, &place[0]) {
+            if let Some(rt) = &state.holders[idx].rtype {
+                if crate::typeck::is_drop(rt, state.traits) {
+                    return Err(Error {
+                        file: state.file.clone(),
+                        message: format!(
+                            "cannot move out of `{}`: type implements `Drop`",
+                            place_to_string(&place)
+                        ),
+                        span,
+                    });
+                }
+            }
+        }
+    }
     let mut i = 0;
     while i < state.moved.len() {
         if paths_share_prefix(&state.moved[i], &place) {

@@ -1,9 +1,45 @@
-use pocket_rust::{Vfs, compile};
+use pocket_rust::{Library, Vfs, compile};
+use std::fs;
+use std::path::Path;
+
+fn load_stdlib() -> Library {
+    let stdlib_path = Path::new("lib/std");
+    let mut vfs = Vfs::new();
+    load_dir(stdlib_path, stdlib_path, &mut vfs);
+    Library {
+        name: "std".to_string(),
+        vfs,
+        entry: "lib.rs".to_string(),
+    }
+}
+
+fn load_dir(root: &Path, dir: &Path, vfs: &mut Vfs) {
+    for entry in fs::read_dir(dir).expect("read_dir") {
+        let entry = entry.expect("dir entry");
+        let path = entry.path();
+        let file_type = entry.file_type().expect("file_type");
+        if file_type.is_dir() {
+            load_dir(root, &path, vfs);
+        } else if file_type.is_file()
+            && path.extension().and_then(|s| s.to_str()) == Some("rs")
+        {
+            let rel = path.strip_prefix(root).expect("strip_prefix");
+            let key = rel
+                .components()
+                .map(|c| c.as_os_str().to_string_lossy().into_owned())
+                .collect::<Vec<_>>()
+                .join("/");
+            let source = fs::read_to_string(&path).expect("read source");
+            vfs.insert(key, source);
+        }
+    }
+}
 
 fn compile_source(source: &str) -> String {
     let mut vfs = Vfs::new();
     vfs.insert("lib.rs".to_string(), source.to_string());
-    compile(&[], &vfs, "lib.rs").err().expect("expected error")
+    let libs = vec![load_stdlib()];
+    compile(&libs, &vfs, "lib.rs").err().expect("expected error")
 }
 
 #[test]
@@ -402,19 +438,6 @@ fn wrong_struct_type_arg_count_is_rejected() {
 }
 
 #[test]
-fn impl_target_args_must_match_impl_params() {
-    let err = compile_source(
-        "struct Pair<T, U> { first: T, second: U }\n\
-         impl<A, B> Pair<u32, B> { fn x(&self) -> u32 { 0 } }",
-    );
-    assert!(
-        err.contains("must match the impl's type parameters"),
-        "expected impl-target-mismatch error, got: {}",
-        err
-    );
-}
-
-#[test]
 fn field_access_on_generic_param_is_rejected() {
     // Polymorphic body check: `t.field` where `t: T` has no shape — reject.
     let err = compile_source(
@@ -717,6 +740,282 @@ fn move_through_combined_borrow_is_rejected() {
     assert!(
         err.contains("while it is borrowed") || err.contains("borrowed"),
         "expected move-while-borrowed error, got: {}",
+        err
+    );
+}
+
+#[test]
+fn ambiguous_impl_method_dispatch_is_rejected() {
+    // Two impls' targets both match `Pair<u32, u32>` and both define `get`.
+    let err = compile_source(
+        "struct Pair<T, U> { first: T, second: U }\n\
+         impl<T> Pair<u32, T> { fn get(self) -> u32 { self.first } }\n\
+         impl<U> Pair<U, u32> { fn get(self) -> u32 { self.second } }\n\
+         fn f() -> u32 { let p: Pair<u32, u32> = Pair { first: 1, second: 2 }; p.get() }",
+    );
+    assert!(
+        err.contains("ambiguous method"),
+        "expected ambiguous-method error, got: {}",
+        err
+    );
+}
+
+#[test]
+fn duplicate_impl_block_is_rejected() {
+    // Two impls of the exact same target define the same method name.
+    let err = compile_source(
+        "struct Foo { x: u32 }\n\
+         impl Foo { fn get(self) -> u32 { self.x } }\n\
+         impl Foo { fn get(self) -> u32 { self.x } }\n\
+         fn f() -> u32 { let f: Foo = Foo { x: 7 }; f.get() }",
+    );
+    assert!(
+        err.contains("ambiguous method") || err.contains("duplicate"),
+        "expected duplicate/ambiguous-impl error, got: {}",
+        err
+    );
+}
+
+// Trait-level error tests (T1).
+
+#[test]
+fn missing_trait_method_in_impl_is_rejected() {
+    let err = compile_source(
+        "trait Show { fn show(self) -> u32; }\n\
+         struct Foo { x: u32 }\n\
+         impl Show for Foo {}\n\
+         fn f() -> u32 { 0 }",
+    );
+    assert!(
+        err.contains("missing trait method"),
+        "expected missing-method error, got: {}",
+        err
+    );
+}
+
+#[test]
+fn extra_method_in_trait_impl_is_rejected() {
+    let err = compile_source(
+        "trait Show {}\n\
+         struct Foo { x: u32 }\n\
+         impl Show for Foo { fn extra(self) -> u32 { self.x } }\n\
+         fn f() -> u32 { 0 }",
+    );
+    assert!(
+        err.contains("not a member of trait"),
+        "expected extra-method error, got: {}",
+        err
+    );
+}
+
+#[test]
+fn duplicate_trait_impl_is_rejected() {
+    let err = compile_source(
+        "trait Show { fn show(self) -> u32; }\n\
+         struct Foo { x: u32 }\n\
+         impl Show for Foo { fn show(self) -> u32 { self.x } }\n\
+         impl Show for Foo { fn show(self) -> u32 { self.x } }\n\
+         fn f() -> u32 { 0 }",
+    );
+    assert!(
+        err.contains("duplicate impl"),
+        "expected duplicate-impl error, got: {}",
+        err
+    );
+}
+
+#[test]
+fn integer_literal_on_non_num_type_is_rejected() {
+    let err = compile_source(
+        "struct NotNum { x: u32 }\n\
+         fn f() -> u32 { let n: NotNum = 5; 0 }",
+    );
+    assert!(
+        err.contains("expected `NotNum`, got integer"),
+        "expected literal-non-Num rejection, got: {}",
+        err
+    );
+}
+
+#[test]
+fn integer_literal_in_unbounded_generic_is_rejected() {
+    let err = compile_source(
+        "fn make<T>() -> T { 42 }\n\
+         fn f() -> u32 { 0 }",
+    );
+    assert!(
+        err.contains("expected `T`, got integer"),
+        "expected literal-unbounded-T rejection, got: {}",
+        err
+    );
+}
+
+#[test]
+fn drop_and_copy_are_mutually_exclusive() {
+    let err = compile_source(
+        "struct Foo { x: u32 }\n\
+         impl Copy for Foo {}\n\
+         impl Drop for Foo { fn drop(&mut self) {} }\n\
+         fn f() -> u32 { 0 }",
+    );
+    assert!(
+        err.contains("cannot be implemented") && err.contains("already implements"),
+        "expected drop/copy conflict error, got: {}",
+        err
+    );
+}
+
+#[test]
+fn trait_impl_concretizes_method_param_is_rejected() {
+    // T2.5b: when the trait method has its own type-param `<U>`, the
+    // impl must declare a matching one and use it polymorphically.
+    // Pre-fix this compiled silently; the validator skipped methods
+    // with type-params. Now it requires α-equivalent signatures.
+    let err = compile_source(
+        "trait Foo { fn bar<U>(self, u: U) -> U; }\n\
+         struct X {}\n\
+         impl Foo for X { fn bar(self, u: u32) -> u32 { u } }\n\
+         fn f() -> u32 { 0 }",
+    );
+    assert!(
+        err.contains("type parameters"),
+        "expected method type-param arity error, got: {}",
+        err
+    );
+}
+
+#[test]
+fn nested_borrow_blocks_conflicting_mut_borrow() {
+    // Lifetime cleanup: nested per-slot tracking. The inner borrow of
+    // `x` lives in `o`'s field_holds at path `["i","r"]`. Taking
+    // `&mut x` while `o` is still live (the tail reads `o.i.r`) must
+    // conflict. Pre-fix, the nested borrow was dropped during the
+    // `let o = Outer { i: ... }` move into `o`, so the conflict was
+    // silently missed.
+    let err = compile_source(
+        "struct Inner<'a> { r: &'a u32 }\n\
+         struct Outer<'a> { i: Inner<'a> }\n\
+         fn f() -> u32 {\n\
+             let mut x: u32 = 5;\n\
+             let o: Outer = Outer { i: Inner { r: &x } };\n\
+             let _m: &mut u32 = &mut x;\n\
+             *o.i.r\n\
+         }",
+    );
+    assert!(
+        err.contains("already borrowed"),
+        "expected borrow-conflict error, got: {}",
+        err
+    );
+}
+
+#[test]
+fn partial_move_of_drop_value_is_rejected() {
+    // T4.6: whole-binding moves of a Drop value are now allowed (codegen
+    // skips the implicit drop on the moved-from slot). Partial moves
+    // remain rejected — Drop's destructor runs over the whole value, so
+    // there's no sound way to drop a value with a hole punched in it.
+    let err = compile_source(
+        "struct Inner { x: u32 }\n\
+         struct Outer { i: Inner }\n\
+         impl Drop for Outer { fn drop(&mut self) {} }\n\
+         fn f() -> u32 {\n\
+             let o: Outer = Outer { i: Inner { x: 1 } };\n\
+             let i: Inner = o.i;\n\
+             0\n\
+         }",
+    );
+    assert!(
+        err.contains("type implements `Drop`"),
+        "expected drop partial-move error, got: {}",
+        err
+    );
+}
+
+#[test]
+fn trait_impl_method_return_type_mismatch_is_rejected() {
+    let err = compile_source(
+        "trait Show { fn show(self) -> u32; }\n\
+         struct Foo { x: u32 }\n\
+         impl Show for Foo { fn show(self) -> u64 { 0 } }\n\
+         fn f() -> u32 { 0 }",
+    );
+    assert!(
+        err.contains("wrong return type"),
+        "expected return-type-mismatch error, got: {}",
+        err
+    );
+}
+
+#[test]
+fn trait_impl_method_param_type_mismatch_is_rejected() {
+    let err = compile_source(
+        "trait Show { fn show(self, n: u32) -> u32; }\n\
+         struct Foo { x: u32 }\n\
+         impl Show for Foo { fn show(self, n: u64) -> u32 { 0 } }\n\
+         fn f() -> u32 { 0 }",
+    );
+    assert!(
+        err.contains("wrong parameter type"),
+        "expected param-type-mismatch error, got: {}",
+        err
+    );
+}
+
+#[test]
+fn generic_copy_impl_without_bound_is_rejected() {
+    let err = compile_source(
+        "struct Wrap<T> { inner: T }\n\
+         impl<T> Copy for Wrap<T> {}\n\
+         fn f() -> u32 { 0 }",
+    );
+    assert!(
+        err.contains("the trait `Copy` is not implemented"),
+        "expected non-Copy field error, got: {}",
+        err
+    );
+}
+
+#[test]
+fn impl_copy_for_struct_with_non_copy_field_is_rejected() {
+    let err = compile_source(
+        "struct Inner { x: u32 }\n\
+         struct Outer { i: Inner }\n\
+         impl Copy for Outer {}\n\
+         fn f() -> u32 { 0 }",
+    );
+    assert!(
+        err.contains("the trait `Copy` is not implemented"),
+        "expected non-Copy-field error, got: {}",
+        err
+    );
+}
+
+#[test]
+fn trait_method_without_bound_is_rejected() {
+    // Calling `t.show()` inside `fn f<T>(t: T)` (no `T: Show` bound)
+    // should be rejected.
+    let err = compile_source(
+        "trait Show { fn show(self) -> u32; }\n\
+         fn f<T>(t: T) -> u32 { t.show() }",
+    );
+    assert!(
+        err.contains("no method `show`") || err.contains("no trait bound"),
+        "expected missing-bound error, got: {}",
+        err
+    );
+}
+
+#[test]
+fn unknown_trait_in_impl_is_rejected() {
+    let err = compile_source(
+        "struct Foo { x: u32 }\n\
+         impl Bogus for Foo {}\n\
+         fn f() -> u32 { 0 }",
+    );
+    assert!(
+        err.contains("unknown trait"),
+        "expected unknown-trait error, got: {}",
         err
     );
 }

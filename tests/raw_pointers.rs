@@ -14,20 +14,57 @@
 //!      recursive types).
 //!   3. `safeck.rs` rejections — unsafe operations outside `unsafe` blocks.
 
-use pocket_rust::{Vfs, compile};
+use pocket_rust::{Library, Vfs, compile};
+use std::fs;
+use std::path::Path;
 use wasmi::{Engine, Linker, Module, Store};
+
+fn load_stdlib() -> Library {
+    let stdlib_path = Path::new("lib/std");
+    let mut vfs = Vfs::new();
+    load_dir(stdlib_path, stdlib_path, &mut vfs);
+    Library {
+        name: "std".to_string(),
+        vfs,
+        entry: "lib.rs".to_string(),
+    }
+}
+
+fn load_dir(root: &Path, dir: &Path, vfs: &mut Vfs) {
+    for entry in fs::read_dir(dir).expect("read_dir") {
+        let entry = entry.expect("dir entry");
+        let path = entry.path();
+        let file_type = entry.file_type().expect("file_type");
+        if file_type.is_dir() {
+            load_dir(root, &path, vfs);
+        } else if file_type.is_file()
+            && path.extension().and_then(|s| s.to_str()) == Some("rs")
+        {
+            let rel = path.strip_prefix(root).expect("strip_prefix");
+            let key = rel
+                .components()
+                .map(|c| c.as_os_str().to_string_lossy().into_owned())
+                .collect::<Vec<_>>()
+                .join("/");
+            let source = fs::read_to_string(&path).expect("read source");
+            vfs.insert(key, source);
+        }
+    }
+}
 
 fn compile_inline(source: &str) -> Vec<u8> {
     let mut vfs = Vfs::new();
     vfs.insert("lib.rs".to_string(), source.to_string());
-    let module = compile(&[], &vfs, "lib.rs").expect("compile failed");
+    let libs = vec![load_stdlib()];
+    let module = compile(&libs, &vfs, "lib.rs").expect("compile failed");
     module.encode()
 }
 
 fn compile_inline_err(source: &str) -> String {
     let mut vfs = Vfs::new();
     vfs.insert("lib.rs".to_string(), source.to_string());
-    compile(&[], &vfs, "lib.rs").err().expect("expected error")
+    let libs = vec![load_stdlib()];
+    compile(&libs, &vfs, "lib.rs").err().expect("expected error")
 }
 
 fn instantiate(bytes: &[u8]) -> (Store<()>, wasmi::Instance) {

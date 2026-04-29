@@ -71,6 +71,9 @@ pub enum Instruction {
     Call(u32),
     I32Add,
     I32Sub,
+    I32WrapI64,
+    I64ExtendI32S,
+    I64ExtendI32U,
     I32Load { align: u32, offset: u32 },
     I32Load8U { align: u32, offset: u32 },
     I32Load8S { align: u32, offset: u32 },
@@ -330,6 +333,15 @@ fn encode_instruction(out: &mut Vec<u8>, inst: &Instruction) {
         }
         Instruction::I32Sub => {
             out.push(0x6b);
+        }
+        Instruction::I32WrapI64 => {
+            out.push(0xa7);
+        }
+        Instruction::I64ExtendI32S => {
+            out.push(0xac);
+        }
+        Instruction::I64ExtendI32U => {
+            out.push(0xad);
         }
         Instruction::I32Load { align, offset } => {
             out.push(0x28);

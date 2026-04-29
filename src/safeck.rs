@@ -46,10 +46,19 @@ fn check_module(
             }
             Item::Struct(_) => {}
             Item::Impl(ib) => {
-                if ib.target.segments.len() != 1 {
+                if ib.trait_path.is_some() {
+                    i += 1;
                     continue;
                 }
-                let target_name = ib.target.segments[0].name.clone();
+                let target_name = match &ib.target.kind {
+                    crate::ast::TypeKind::Path(p) if p.segments.len() == 1 => {
+                        p.segments[0].name.clone()
+                    }
+                    _ => {
+                        i += 1;
+                        continue;
+                    }
+                };
                 path.push(target_name);
                 let mut k = 0;
                 while k < ib.methods.len() {
@@ -58,6 +67,7 @@ fn check_module(
                 }
                 path.pop();
             }
+            Item::Trait(_) => {}
         }
         i += 1;
     }

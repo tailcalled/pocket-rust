@@ -15,6 +15,8 @@ pub enum TokenKind {
     As,
     Unsafe,
     Impl,
+    Trait,
+    For,
     SelfLower,
     SelfUpper,
     LAngle,
@@ -34,6 +36,7 @@ pub enum TokenKind {
     Comma,
     Amp,
     Star,
+    Plus,
     Eq,
     IntLit(u64),
 }
@@ -49,6 +52,8 @@ pub fn token_kind_name(t: &TokenKind) -> &'static str {
         TokenKind::As => "`as`",
         TokenKind::Unsafe => "`unsafe`",
         TokenKind::Impl => "`impl`",
+        TokenKind::Trait => "`trait`",
+        TokenKind::For => "`for`",
         TokenKind::SelfLower => "`self`",
         TokenKind::SelfUpper => "`Self`",
         TokenKind::LAngle => "`<`",
@@ -67,6 +72,7 @@ pub fn token_kind_name(t: &TokenKind) -> &'static str {
         TokenKind::Comma => "`,`",
         TokenKind::Amp => "`&`",
         TokenKind::Star => "`*`",
+        TokenKind::Plus => "`+`",
         TokenKind::Eq => "`=`",
         TokenKind::IntLit(_) => "integer literal",
     }
@@ -144,6 +150,16 @@ pub fn tokenize(file: &str, source: &str) -> Result<Vec<Token>, Error> {
                     kind: TokenKind::Impl,
                     span,
                 });
+            } else if text == "trait" {
+                tokens.push(Token {
+                    kind: TokenKind::Trait,
+                    span,
+                });
+            } else if text == "for" {
+                tokens.push(Token {
+                    kind: TokenKind::For,
+                    span,
+                });
             } else if text == "self" {
                 tokens.push(Token {
                     kind: TokenKind::SelfLower,
@@ -206,6 +222,9 @@ pub fn tokenize(file: &str, source: &str) -> Result<Vec<Token>, Error> {
             byte_pos += 1;
         } else if b == b'*' {
             push_single(&mut tokens, TokenKind::Star, line, &mut col);
+            byte_pos += 1;
+        } else if b == b'+' {
+            push_single(&mut tokens, TokenKind::Plus, line, &mut col);
             byte_pos += 1;
         } else if b == b'=' {
             push_single(&mut tokens, TokenKind::Eq, line, &mut col);

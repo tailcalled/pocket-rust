@@ -1,7 +1,7 @@
 use crate::ast::{
     AssignStmt, Block, Call, Expr, ExprKind, FieldAccess, FieldInit, Function, ImplBlock, LetStmt,
     Lifetime, LifetimeParam, MethodCall, Param, Path, PathSegment, Stmt, StructDef, StructField,
-    StructLit, Type, TypeKind, TypeParam,
+    StructLit, TraitBound, TraitDef, TraitMethodSig, Type, TypeKind, TypeParam,
 };
 use crate::lexer::{Token, TokenKind, token_kind_name};
 use crate::span::{Error, Pos, Span};
@@ -11,6 +11,7 @@ pub enum RawItem {
     Struct(StructDef),
     ModDecl { name: String, name_span: Span },
     Impl(ImplBlock),
+    Trait(TraitDef),
 }
 
 pub fn parse(file: &str, tokens: Vec<Token>) -> Result<Vec<RawItem>, Error> {
@@ -49,8 +50,10 @@ impl Parser {
             Ok(RawItem::Struct(self.parse_struct_def()?))
         } else if self.peek_kind(&TokenKind::Impl) {
             Ok(RawItem::Impl(self.parse_impl_block()?))
+        } else if self.peek_kind(&TokenKind::Trait) {
+            Ok(RawItem::Trait(self.parse_trait_def()?))
         } else {
-            Err(self.error_at_current("expected `fn`, `mod`, `struct`, or `impl`"))
+            Err(self.error_at_current("expected `fn`, `mod`, `struct`, `impl`, or `trait`"))
         }
     }
 
@@ -61,7 +64,32 @@ impl Parser {
         } else {
             (Vec::new(), Vec::new())
         };
-        let target = self.parse_path_with_type_args()?;
+        // First, peek to distinguish `impl Trait for Target` from `impl Target`.
+        // We parse the first thing as a Type for the relaxed target case
+        // (`impl Show for &T`); if `for` follows, that Type was actually the
+        // trait — but trait paths are simpler (no `&`/`*`), so for `impl
+        // Trait for Target` we parse the trait as a path and the target as a
+        // full Type. We always try `Type` first, then if it's a Path-shaped
+        // type and `for` follows, treat as trait impl.
+        let first_type = self.parse_type()?;
+        let (trait_path, target) = if self.peek_kind(&TokenKind::For) {
+            self.pos += 1;
+            // first_type must have been a Path (a trait reference). Extract.
+            let trait_path = match first_type.kind {
+                TypeKind::Path(p) => p,
+                _ => {
+                    return Err(Error {
+                        file: self.file.clone(),
+                        message: "expected trait path before `for`".to_string(),
+                        span: first_type.span.copy(),
+                    });
+                }
+            };
+            let target = self.parse_type()?;
+            (Some(trait_path), target)
+        } else {
+            (None, first_type)
+        };
         self.expect(&TokenKind::LBrace, "`{`")?;
         let mut methods: Vec<Function> = Vec::new();
         while !self.peek_kind(&TokenKind::RBrace) {
@@ -74,9 +102,64 @@ impl Parser {
         Ok(ImplBlock {
             lifetime_params,
             type_params,
+            trait_path,
             target,
             methods,
             span: Span::new(impl_span.start, rb.end),
+        })
+    }
+
+    fn parse_trait_def(&mut self) -> Result<TraitDef, Error> {
+        let trait_kw = self.expect(&TokenKind::Trait, "`trait`")?;
+        let (name, name_span) = self.expect_ident()?;
+        self.expect(&TokenKind::LBrace, "`{`")?;
+        let mut methods: Vec<TraitMethodSig> = Vec::new();
+        while !self.peek_kind(&TokenKind::RBrace) {
+            if !self.peek_kind(&TokenKind::Fn) {
+                return Err(self.error_at_current("expected `fn` inside `trait` body"));
+            }
+            methods.push(self.parse_trait_method_sig()?);
+        }
+        let rb = self.expect(&TokenKind::RBrace, "`}`")?;
+        Ok(TraitDef {
+            name,
+            name_span,
+            methods,
+            span: Span::new(trait_kw.start, rb.end),
+        })
+    }
+
+    // Trait method signature: same shape as `parse_function` but ends in `;`
+    // (no body). Receiver shorthand allowed (`&self`, `&mut self`, `self`).
+    fn parse_trait_method_sig(&mut self) -> Result<TraitMethodSig, Error> {
+        self.expect(&TokenKind::Fn, "`fn`")?;
+        let (name, name_span) = self.expect_ident()?;
+        let (lifetime_params, type_params) = if self.peek_kind(&TokenKind::LAngle) {
+            self.parse_generic_params()?
+        } else {
+            (Vec::new(), Vec::new())
+        };
+        self.expect(&TokenKind::LParen, "`(`")?;
+        let params = if self.peek_kind(&TokenKind::RParen) {
+            Vec::new()
+        } else {
+            self.parse_params()?
+        };
+        self.expect(&TokenKind::RParen, "`)`")?;
+        let return_type = if self.peek_kind(&TokenKind::Arrow) {
+            self.pos += 1;
+            Some(self.parse_type()?)
+        } else {
+            None
+        };
+        self.expect(&TokenKind::Semi, "`;`")?;
+        Ok(TraitMethodSig {
+            name,
+            name_span,
+            lifetime_params,
+            type_params,
+            params,
+            return_type,
         })
     }
 
@@ -283,7 +366,25 @@ impl Parser {
 
     fn parse_type_param(&mut self) -> Result<TypeParam, Error> {
         let (name, name_span) = self.expect_ident()?;
-        Ok(TypeParam { name, name_span })
+        let mut bounds: Vec<TraitBound> = Vec::new();
+        if self.peek_kind(&TokenKind::Colon) {
+            self.pos += 1;
+            // First bound is required if `:` was present.
+            bounds.push(self.parse_trait_bound()?);
+            while self.peek_kind(&TokenKind::Plus) {
+                self.pos += 1;
+                bounds.push(self.parse_trait_bound()?);
+            }
+        }
+        Ok(TypeParam { name, name_span, bounds })
+    }
+
+    fn parse_trait_bound(&mut self) -> Result<TraitBound, Error> {
+        // For now: a bound is just a path (e.g. `Show` or `crate::Foo`). Trait
+        // generic args (e.g. `Iterator<Item>`) aren't supported yet — we only
+        // recognize path-shaped bounds.
+        let path = self.parse_path_with_type_args()?;
+        Ok(TraitBound { path })
     }
 
     fn parse_params(&mut self) -> Result<Vec<Param>, Error> {
@@ -470,8 +571,16 @@ impl Parser {
             // Block-like expressions (`unsafe { … }` and `{ … }`) without a
             // tail can sit as bare statements with no trailing `;`. They're
             // unit-typed; we simply walk them for side effects in later passes.
-            if is_unit_block_like(&expr) && !self.peek_kind(&TokenKind::RBrace) {
+            if is_unit_block_like(&expr) {
+                // Block-like exprs without a tail are unit-typed; pocket-
+                // rust has no unit value, so treat them as statements
+                // even when they sit at the very end of the enclosing
+                // block (which means the block has no tail).
                 stmts.push(Stmt::Expr(expr));
+                if self.peek_kind(&TokenKind::RBrace) {
+                    tail = None;
+                    break;
+                }
                 continue;
             }
             tail = Some(expr);
@@ -981,6 +1090,9 @@ impl Parser {
             (TokenKind::As, TokenKind::As) => true,
             (TokenKind::Unsafe, TokenKind::Unsafe) => true,
             (TokenKind::Impl, TokenKind::Impl) => true,
+            (TokenKind::Trait, TokenKind::Trait) => true,
+            (TokenKind::For, TokenKind::For) => true,
+            (TokenKind::Plus, TokenKind::Plus) => true,
             (TokenKind::SelfLower, TokenKind::SelfLower) => true,
             (TokenKind::SelfUpper, TokenKind::SelfUpper) => true,
             (TokenKind::LAngle, TokenKind::LAngle) => true,
