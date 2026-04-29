@@ -330,6 +330,39 @@ fn generic_pair_returns_7() {
 }
 
 #[test]
+fn copy_double_use_returns_7() {
+    let bytes = compile_example("copy_double_use", "lib.rs");
+    let (mut store, instance) = instantiate(&bytes);
+    let answer = instance
+        .get_typed_func::<(), i32>(&store, "answer")
+        .expect("export `answer` not found / wrong signature");
+    let result = answer.call(&mut store, ()).expect("call failed");
+    assert_eq!(result, 7);
+}
+
+#[test]
+fn nll_sequential_borrows_returns_7() {
+    let bytes = compile_example("nll_sequential_borrows", "lib.rs");
+    let (mut store, instance) = instantiate(&bytes);
+    let answer = instance
+        .get_typed_func::<(), i32>(&store, "answer")
+        .expect("export `answer` not found / wrong signature");
+    let result = answer.call(&mut store, ()).expect("call failed");
+    assert_eq!(result, 7);
+}
+
+#[test]
+fn nll_borrow_then_move_returns_7() {
+    let bytes = compile_example("nll_borrow_then_move", "lib.rs");
+    let (mut store, instance) = instantiate(&bytes);
+    let answer = instance
+        .get_typed_func::<(), i32>(&store, "answer")
+        .expect("export `answer` not found / wrong signature");
+    let result = answer.call(&mut store, ()).expect("call failed");
+    assert_eq!(result, 7);
+}
+
+#[test]
 fn uses_std_generic_struct_returns_42() {
     let bytes = compile_example("uses_std_generic_struct", "lib.rs");
     let (mut store, instance) = instantiate(&bytes);

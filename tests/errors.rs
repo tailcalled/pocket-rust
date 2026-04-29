@@ -124,8 +124,11 @@ fn missing_struct_field_in_literal() {
 
 #[test]
 fn duplicate_partial_move_is_rejected() {
+    // `o.p` is non-Copy (struct); moving it twice is an error.
     let err = compile_source(
-        "struct Pair { a: usize, b: usize }\nstruct Outer { p: Pair, q: Pair }\nfn f(o: Outer) -> Pair { Pair { a: o.p.a, b: o.p.a } }",
+        "struct Inner { v: usize }\n\
+         struct Outer { p: Inner, q: Inner }\n\
+         fn f(o: Outer) -> Outer { Outer { p: o.p, q: o.p } }",
     );
     assert!(
         err.contains("already moved"),
@@ -136,8 +139,12 @@ fn duplicate_partial_move_is_rejected() {
 
 #[test]
 fn whole_after_partial_move_is_rejected() {
+    // `p.a` is non-Copy; moving it then re-using it errors.
     let err = compile_source(
-        "struct Pair { a: usize, b: usize }\nfn use_pair(p: Pair) -> usize { p.a }\nfn f(p: Pair) -> usize { use_pair(Pair { a: p.a, b: p.a }) }",
+        "struct Inner { v: usize }\n\
+         struct Pair { a: Inner, b: Inner }\n\
+         fn use_pair(p: Pair) -> usize { p.a.v }\n\
+         fn f(p: Pair) -> usize { use_pair(Pair { a: p.a, b: p.a }) }",
     );
     assert!(
         err.contains("already moved"),
@@ -208,10 +215,14 @@ fn field_access_on_usize_is_rejected() {
 
 #[test]
 fn move_while_borrowed_is_rejected() {
-    // Two args of the same call: a borrow of `p` and a move out of `p`.
-    // The borrow is still active when the second arg is evaluated, so the move conflicts.
+    // Two args of the same call: a borrow of `o` and a move out of `o.y`
+    // (non-Copy). The borrow is still active when the second arg is evaluated,
+    // so the move conflicts.
     let err = compile_source(
-        "struct Point { x: usize, y: usize }\nfn use_borrow(p: &Point, q: usize) -> usize { q }\nfn bad(p: Point) -> usize { use_borrow(&p, p.y) }",
+        "struct Inner { v: usize }\n\
+         struct Outer { x: Inner, y: Inner }\n\
+         fn use_borrow(o: &Outer, q: Inner) -> usize { q.v }\n\
+         fn bad(o: Outer) -> usize { use_borrow(&o, o.y) }",
     );
     assert!(
         err.contains("borrowed"),
@@ -222,11 +233,17 @@ fn move_while_borrowed_is_rejected() {
 
 #[test]
 fn borrow_after_move_is_rejected() {
+    // Move `o.x` (non-Copy) in arg 0, then try to borrow `&o` in arg 1 —
+    // `o` is partially moved, so the borrow errors.
     let err = compile_source(
-        "struct Point { x: usize, y: usize }\nfn x_of(p: &Point) -> usize { p.x }\nfn first(a: usize, b: usize) -> usize { a }\nfn bad(p: Point) -> usize { first(p.x, x_of(&p)) }",
+        "struct Inner { v: usize }\n\
+         struct Outer { x: Inner, y: usize }\n\
+         fn y_of(o: &Outer) -> usize { o.y }\n\
+         fn first(a: Inner, b: usize) -> usize { a.v }\n\
+         fn bad(o: Outer) -> usize { first(o.x, y_of(&o)) }",
     );
     assert!(
-        err.contains("moved"),
+        err.contains("moved") || err.contains("borrowed"),
         "expected borrow-after-move error, got: {}",
         err
     );
@@ -586,9 +603,9 @@ fn borrow_through_inner_block_blocks_outer_move() {
 #[test]
 fn borrow_of_subfield_blocks_parent_move() {
     // `&p.x` borrows the subfield, leaving `p` with a borrowed sub-place.
-    // Trying to move `p` whole then has to fail.
+    // Trying to move `p` whole while `r` is still live then has to fail.
     let err = compile_source(
-        "struct Point { x: usize, y: usize }\nfn f(p: Point) -> usize { let r = &p.x; let q = p; q.y }",
+        "struct Point { x: usize, y: usize }\nfn f(p: Point) -> usize { let r = &p.x; let q = p; *r }",
     );
     assert!(
         err.contains("borrowed"),

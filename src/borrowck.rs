@@ -5,7 +5,7 @@ use crate::ast::{
 use crate::span::{Error, Span};
 use crate::typeck::{
     CallResolution, FuncTable, MethodResolution, RType, ReceiverAdjust, StructTable, clone_path,
-    func_lookup, rtype_clone, template_lookup,
+    func_lookup, is_copy, rtype_clone, template_lookup,
 };
 
 pub fn check(
@@ -124,6 +124,7 @@ fn check_function(
             unreachable!("typeck registered this function");
         };
 
+    let liveness = compute_liveness(&func.body, &func.params);
     let mut state = BorrowState {
         holders: Vec::new(),
         moved: Vec::new(),
@@ -134,6 +135,8 @@ fn check_function(
         funcs,
         current_module,
         self_target,
+        liveness,
+        current_step: 0,
     };
 
     let mut k = 0;
@@ -170,6 +173,15 @@ struct BorrowState<'a> {
     current_module: &'a Vec<String>,
     #[allow(dead_code)]
     self_target: Option<RType>,
+    // Liveness — name → last-use step, computed by a pre-pass over the body.
+    // Holders whose binding's last_use < current_step have their borrows
+    // garbage-collected (cleared) after each step.
+    liveness: Liveness,
+    current_step: u32,
+}
+
+struct Liveness {
+    last_use: Vec<(String, u32)>,
 }
 
 struct Holder {
@@ -209,11 +221,146 @@ fn walk_stmts_and_tail(state: &mut BorrowState, block: &Block) -> Result<ValueDe
                 walk_expr(state, expr)?;
             }
         }
+        state.current_step += 1;
+        gc_dead_holders(state);
         i += 1;
     }
     match &block.tail {
-        Some(tail) => walk_expr(state, tail),
+        Some(tail) => {
+            let desc = walk_expr(state, tail)?;
+            state.current_step += 1;
+            gc_dead_holders(state);
+            Ok(desc)
+        }
         None => Ok(empty_desc()),
+    }
+}
+
+// After each step, holders whose binding's last-use step is strictly less than
+// `current_step` are no longer live — their borrows are dropped. Implements
+// straight-line NLL: a borrow lives until the binding's last use, not until
+// scope end.
+fn gc_dead_holders(state: &mut BorrowState) {
+    let mut i = 0;
+    while i < state.holders.len() {
+        if let Some(name) = &state.holders[i].name {
+            let lu = liveness_lookup(&state.liveness, name);
+            match lu {
+                Some(s) if s >= state.current_step => {}
+                _ => state.holders[i].holds.clear(),
+            }
+        }
+        i += 1;
+    }
+}
+
+fn liveness_lookup(info: &Liveness, name: &str) -> Option<u32> {
+    let mut i = 0;
+    while i < info.last_use.len() {
+        if info.last_use[i].0 == name {
+            return Some(info.last_use[i].1);
+        }
+        i += 1;
+    }
+    None
+}
+
+fn liveness_record(info: &mut Liveness, name: &str, step: u32) {
+    let mut i = 0;
+    while i < info.last_use.len() {
+        if info.last_use[i].0 == name {
+            if info.last_use[i].1 < step {
+                info.last_use[i].1 = step;
+            }
+            return;
+        }
+        i += 1;
+    }
+    info.last_use.push((name.to_string(), step));
+}
+
+fn compute_liveness(body: &Block, params: &Vec<crate::ast::Param>) -> Liveness {
+    let mut info = Liveness {
+        last_use: Vec::new(),
+    };
+    // Seed each parameter at step 0 — their borrows are held by holders from
+    // the start; the GC pass should keep them around until they're actually
+    // referenced (or longer if referenced later).
+    let mut i = 0;
+    while i < params.len() {
+        liveness_record(&mut info, &params[i].name, 0);
+        i += 1;
+    }
+    let mut step: u32 = 0;
+    walk_block_for_liveness(body, &mut step, &mut info);
+    info
+}
+
+fn walk_block_for_liveness(block: &Block, step: &mut u32, info: &mut Liveness) {
+    let mut i = 0;
+    while i < block.stmts.len() {
+        match &block.stmts[i] {
+            Stmt::Let(let_stmt) => {
+                walk_expr_for_liveness(&let_stmt.value, step, info);
+                // Anchor the new binding's lifetime at the let-stmt's step;
+                // later reads bump it. Without this, an unused binding would
+                // never appear in `last_use` and `liveness_lookup` would return
+                // None — which the GC treats as "dead immediately." That's
+                // the desired behavior, but recording it explicitly keeps the
+                // semantics readable.
+                liveness_record(info, &let_stmt.name, *step);
+            }
+            Stmt::Assign(assign) => {
+                walk_expr_for_liveness(&assign.lhs, step, info);
+                walk_expr_for_liveness(&assign.rhs, step, info);
+            }
+            Stmt::Expr(expr) => walk_expr_for_liveness(expr, step, info),
+        }
+        *step += 1;
+        i += 1;
+    }
+    if let Some(tail) = &block.tail {
+        walk_expr_for_liveness(tail, step, info);
+        *step += 1;
+    }
+}
+
+fn walk_expr_for_liveness(expr: &Expr, step: &mut u32, info: &mut Liveness) {
+    match &expr.kind {
+        ExprKind::IntLit(_) => {}
+        ExprKind::Var(name) => liveness_record(info, name, *step),
+        ExprKind::Borrow { inner, .. } => walk_expr_for_liveness(inner, step, info),
+        ExprKind::FieldAccess(fa) => walk_expr_for_liveness(&fa.base, step, info),
+        ExprKind::Cast { inner, .. } => walk_expr_for_liveness(inner, step, info),
+        ExprKind::Deref(inner) => walk_expr_for_liveness(inner, step, info),
+        ExprKind::Call(c) => {
+            let mut i = 0;
+            while i < c.args.len() {
+                walk_expr_for_liveness(&c.args[i], step, info);
+                i += 1;
+            }
+        }
+        ExprKind::StructLit(s) => {
+            let mut i = 0;
+            while i < s.fields.len() {
+                walk_expr_for_liveness(&s.fields[i].value, step, info);
+                i += 1;
+            }
+        }
+        ExprKind::MethodCall(mc) => {
+            walk_expr_for_liveness(&mc.receiver, step, info);
+            let mut i = 0;
+            while i < mc.args.len() {
+                walk_expr_for_liveness(&mc.args[i], step, info);
+                i += 1;
+            }
+        }
+        ExprKind::Block(b) | ExprKind::Unsafe(b) => {
+            // Inner block stmts share the same step counter as the outer walk —
+            // borrowck's actual walk also advances `current_step` inside inner
+            // blocks (via walk_stmts_and_tail), so the two passes stay in sync.
+            walk_block_for_liveness(b.as_ref(), step, info);
+        }
     }
 }
 
@@ -510,25 +657,17 @@ fn walk_var(state: &mut BorrowState, name: &str, expr: &Expr) -> Result<ValueDes
         return Ok(empty_desc());
     }
     if is_ref_holder(&state.holders[idx]) {
-        // Reject reads of a ref binding that's been moved.
         let mut place: Vec<String> = Vec::new();
         place.push(name.to_string());
-        let mut i = 0;
-        while i < state.moved.len() {
-            if paths_share_prefix(&state.moved[i], &place) {
-                return Err(Error {
-                    file: state.file.clone(),
-                    message: format!("`{}` was already moved", place_to_string(&place)),
-                    span: expr.span.copy(),
-                });
-            }
-            i += 1;
-        }
+        check_not_moved(state, &place, &expr.span)?;
         if is_mut_ref_holder(&state.holders[idx]) {
-            // `&mut T` is non-Copy: reading the binding moves its borrow into
-            // whatever consumes it. The binding becomes unusable afterward.
-            // (Without this, lexical borrows extend past the binding's last
-            // use and shadow any subsequent direct access to the source.)
+            // `&mut T` is not really Copy under our borrow model — we don't
+            // implement implicit reborrow, so reading a `&mut` binding moves
+            // its borrow into the consumer (call slot or new binding) and the
+            // binding becomes unusable afterward. Liveness GC alone isn't
+            // sufficient because both the source binding and the consumer
+            // would otherwise hold the same exclusive borrow during arg
+            // evaluation.
             let mut taken: Vec<HeldBorrow> = Vec::new();
             std::mem::swap(&mut taken, &mut state.holders[idx].holds);
             state.moved.push(place);
@@ -538,8 +677,15 @@ fn walk_var(state: &mut BorrowState, name: &str, expr: &Expr) -> Result<ValueDes
             let holds = clone_held_borrows(&state.holders[idx].holds);
             Ok(ValueDesc { borrows: holds })
         }
+    } else if is_owned_copy_holder(&state.holders[idx]) {
+        // Owned Copy primitive (ints, etc.): reading is a value copy, no move,
+        // no borrows to forward. Still must refuse reads from a moved place.
+        let mut place: Vec<String> = Vec::new();
+        place.push(name.to_string());
+        check_not_moved(state, &place, &expr.span)?;
+        Ok(empty_desc())
     } else {
-        // Owned read: tracked as a move.
+        // Owned non-Copy (struct): tracked as a move.
         let mut place: Vec<String> = Vec::new();
         place.push(name.to_string());
         try_move(state, place, expr.span.copy())?;
@@ -659,8 +805,20 @@ fn walk_field_access(
                 // itself is unchanged.
                 Ok(empty_desc())
             } else {
-                // Partial-move out of an owned struct.
-                try_move(state, place, expr.span.copy())?;
+                // Field access on an owned root. If the field's resolved type
+                // is Copy, this is just a value copy — no move tracking, but
+                // we still have to refuse reads from places that have already
+                // been moved. Otherwise it's a partial move out of the owning
+                // struct.
+                let field_is_copy = state.expr_types[expr.id as usize]
+                    .as_ref()
+                    .map(is_copy)
+                    .unwrap_or(false);
+                if field_is_copy {
+                    check_not_moved(state, &place, &expr.span)?;
+                } else {
+                    try_move(state, place, expr.span.copy())?;
+                }
                 Ok(empty_desc())
             }
         }
@@ -752,6 +910,16 @@ fn is_mut_ref_holder(h: &Holder) -> bool {
     matches!(h.rtype, Some(RType::Ref { mutable: true, .. }))
 }
 
+// True for owned Copy primitives (ints currently; not refs or raw pointers,
+// which are handled by their own dedicated branches in walk_var). Reading
+// such a binding produces a value copy — no move, no borrow to forward.
+fn is_owned_copy_holder(h: &Holder) -> bool {
+    match &h.rtype {
+        Some(RType::Int(_)) => true,
+        _ => false,
+    }
+}
+
 
 fn is_deref_rooted_assign(expr: &Expr) -> bool {
     let mut current = expr;
@@ -803,6 +971,28 @@ fn extract_place(expr: &Expr) -> Option<Vec<String>> {
             _ => return None,
         }
     }
+}
+
+// Check that a place hasn't already been moved out of. Used for Copy reads
+// (which don't add to the moved set but still must refuse to read from a
+// moved place).
+fn check_not_moved(
+    state: &BorrowState,
+    place: &Vec<String>,
+    span: &Span,
+) -> Result<(), Error> {
+    let mut i = 0;
+    while i < state.moved.len() {
+        if paths_share_prefix(&state.moved[i], place) {
+            return Err(Error {
+                file: state.file.clone(),
+                message: format!("`{}` was already moved", place_to_string(place)),
+                span: span.copy(),
+            });
+        }
+        i += 1;
+    }
+    Ok(())
 }
 
 fn try_move(state: &mut BorrowState, place: Vec<String>, span: Span) -> Result<(), Error> {

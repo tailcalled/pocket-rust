@@ -93,7 +93,9 @@ Reference codegen — real pointers via a shadow stack. A reference value is an 
 
 Layout helpers in `typeck.rs`: `byte_size_of(rtype, structs)` returns the byte size used both for `frame_size` accounting and for chain offsets (1/2/4/8/16 bytes for ints, 4 for refs, sum-of-fields for structs). `flatten_rtype` returns flat WASM scalars for non-spilled bindings — refs flatten to `[I32]` (ABI), not the pointee's shape.
 
-Borrow tracking still treats `&mut T` as non-Copy: reading a `&mut` binding *moves* its borrow handle into the consumer (call slot or new binding) and marks the binding itself as moved. This keeps `let r = &mut p; f(r); p.x` accepted without needing NLL — `r`'s borrow ends with the call, `p`'s direct access afterward is fine.
+Borrow tracking treats `&mut T` as non-Copy: reading a `&mut` binding *moves* its borrow handle into the consumer (call slot or new binding) and marks the binding itself as moved. This is needed because we don't implement implicit reborrow — without the move, both the source binding and the consumer would simultaneously hold the same exclusive borrow during arg evaluation. Owned `Copy` primitives (ints, raw pointers) and shared refs do *not* move on read.
+
+NLL via a forward liveness pre-pass: before borrowck walks the body, `compute_liveness` assigns each statement (and the optional tail expression) a sequential step number — flat across nested block expressions — and records, per binding name, the maximum step at which the binding is referenced. As borrowck walks the same body, it tracks `current_step` and after each step does a GC pass: any holder whose binding's last-use step is strictly less than `current_step` has its `holds` cleared. So a borrow lives until the binding's last use, not until scope end. This is what lets `let r = &pt; let _v = read(&pt); let m = &mut pt;` work — `r`'s last use is at its declaration, so its borrow is dead before the `&mut pt` is taken. The pre-pass also seeds each parameter at step 0 and each let-binding at its declaration step so that an unused binding is dead immediately after its statement.
 
 Path resolution: every path in an expression is interpreted relative to the module containing the call. Single-segment identifiers without `(...)`/`{...}` are variable references; with `(...)` they're calls; with `{...}` they're struct literals. Multi-segment paths must be calls or struct literals. Only top-level (crate-root) functions are exported under their bare name.
 
@@ -104,7 +106,7 @@ Move and borrow tracking (in `borrowck.rs`): walk every function body with a sta
 - The caller of `walk_expr` chooses what to do with the desc: a `let` makes a new binding holder absorb the desc's borrows; a call's argument absorbs them into the synthetic call holder; a block-expression's tail returns its desc up to whatever consumes the block. When a holder is dropped (block scope ends, call returns, function ends), the borrows it kept alive die with it.
 - A move of place `P` is a conflict if any prior move or any *currently held* borrow shares a path prefix with `P`. A `&P` is a conflict if `P` has been moved.
 - An assignment to place `P` (LHS of `P = EXPR;`) is a conflict if any holder still keeps a borrow that overlaps `P`. On success, every entry in `moved` whose path has `P` as a prefix is purged — the spot has a fresh value, so any sub-paths are valid again. Whole-binding reassignments (`x = …;`) thus "reset" `x` even if it had been moved.
-- Reads of owned-type locals are tracked as moves (current overstrictness — `usize` should be `Copy` but we don't honor that yet).
+- Reads of owned `Copy` primitives (integer types) don't move; reads of owned non-Copy types (structs) move. Reading a moved binding is rejected.
 
 Concretely:
 
@@ -117,7 +119,7 @@ Each `Expr` carries a per-function `id: NodeId` (allocated by the parser, count 
 
 Each pass scopes a block expression by saving `locals.len()` (typeck/codegen) or `holders.len()` (borrowck) before entering and truncating back on exit, so let bindings inside a block aren't visible outside. The WASM locals allocated for those bindings remain in the function (we don't reuse local slots across scopes), but they're harmlessly unreferenced after the block ends.
 
-The remaining looseness vs Rust: reads of `Copy`-typed owned locals (any integer type, plus refs) are still tracked as moves; only refs currently get the "no-move" treatment. So `f(a, a)` where `a: u32` rejects in pocket-rust though Rust would copy. Fixing this is a one-line widening of `is_ref_holder` to `is_copy_holder` (using `typeck::is_copy`) — held off because several existing error tests assert the strict behavior on owned-int double-uses.
+Field-access move tracking is field-type-sensitive: a chain like `o.p.a` is a partial move if the chain's tail type is non-Copy, and a value copy (no move recorded — but still rejected if the place has been previously moved) if the tail is Copy. The field type is read from `expr_types[fa.id]`.
 
 Reads of `&T`-typed locals don't record moves (refs are `Copy`), and field-access chains rooted in a `&T` local are likewise treated as non-moving. So `Rect { top_left: d.primary.top_left, bottom_right: d.secondary.bottom_right }` is fine (disjoint paths), `Rect { top_left: d.primary, bottom_right: d.primary.top_left }` errors at the second use.
 
