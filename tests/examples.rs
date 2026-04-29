@@ -341,6 +341,28 @@ fn copy_double_use_returns_7() {
 }
 
 #[test]
+fn place_borrow_noncopy_field_returns_7() {
+    let bytes = compile_example("place_borrow_noncopy_field", "lib.rs");
+    let (mut store, instance) = instantiate(&bytes);
+    let answer = instance
+        .get_typed_func::<(), i32>(&store, "answer")
+        .expect("export `answer` not found / wrong signature");
+    let result = answer.call(&mut store, ()).expect("call failed");
+    assert_eq!(result, 7);
+}
+
+#[test]
+fn place_borrow_through_ref_returns_42() {
+    let bytes = compile_example("place_borrow_through_ref", "lib.rs");
+    let (mut store, instance) = instantiate(&bytes);
+    let answer = instance
+        .get_typed_func::<(), i32>(&store, "answer")
+        .expect("export `answer` not found / wrong signature");
+    let result = answer.call(&mut store, ()).expect("call failed");
+    assert_eq!(result, 42);
+}
+
+#[test]
 fn nll_sequential_borrows_returns_7() {
     let bytes = compile_example("nll_sequential_borrows", "lib.rs");
     let (mut store, instance) = instantiate(&bytes);

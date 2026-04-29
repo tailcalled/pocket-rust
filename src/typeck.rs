@@ -841,6 +841,7 @@ fn collect_funcs(
                 register_function(
                     f,
                     path,
+                    path,
                     None,
                     &Vec::new(),
                     funcs,
@@ -860,12 +861,14 @@ fn collect_funcs(
                 let impl_type_params: Vec<String> =
                     ib.type_params.iter().map(|p| p.name.clone()).collect();
                 let target_name = ib.target.segments[0].name.clone();
-                path.push(target_name);
+                let mut method_prefix = clone_path(path);
+                method_prefix.push(target_name);
                 let mut k = 0;
                 while k < ib.methods.len() {
                     register_function(
                         &ib.methods[k],
-                        path,
+                        path,             // outer module — for type resolution in signatures
+                        &method_prefix,   // FnSymbol/Template path prefix
                         Some(&target_rt),
                         &impl_type_params,
                         funcs,
@@ -875,7 +878,6 @@ fn collect_funcs(
                     )?;
                     k += 1;
                 }
-                path.pop();
             }
         }
         i += 1;
@@ -972,6 +974,7 @@ fn resolve_impl_target(
 fn register_function(
     f: &Function,
     current_module: &Vec<String>,
+    path_prefix: &Vec<String>,
     self_target: Option<&RType>,
     impl_type_params: &Vec<String>,
     funcs: &mut FuncTable,
@@ -991,7 +994,7 @@ fn register_function(
         i += 1;
     }
     let is_generic = !type_param_names.is_empty();
-    let mut full = clone_path(current_module);
+    let mut full = clone_path(path_prefix);
     full.push(f.name.clone());
     let mut param_types: Vec<RType> = Vec::new();
     let mut k = 0;
@@ -1583,7 +1586,6 @@ struct CheckCtx<'a> {
     // each entry is finalized into the FnSymbol/GenericTemplate's expr_types.
     expr_infer_types: Vec<Option<InferType>>,
     lit_constraints: Vec<LitConstraint>,
-    in_borrow: u32,
     // Pending per-MethodCall and per-Call resolutions, indexed by Expr.id.
     method_resolutions: Vec<Option<PendingMethodCall>>,
     call_resolutions: Vec<Option<PendingCall>>,
@@ -1707,7 +1709,6 @@ fn check_function(
             locals,
             expr_infer_types: expr_infer,
             lit_constraints: Vec::new(),
-            in_borrow: 0,
             method_resolutions: method_res,
             call_resolutions: call_res,
             subst: Subst {
@@ -2319,11 +2320,10 @@ fn check_expr_inner(ctx: &mut CheckCtx, expr: &Expr) -> Result<InferType, Error>
         ExprKind::StructLit(lit) => check_struct_lit(ctx, lit, expr),
         ExprKind::FieldAccess(fa) => check_field_access(ctx, fa, expr),
         ExprKind::Borrow { inner, mutable } => {
-            // Inside a Borrow's place chain, suppress the "non-Copy through ref"
-            // rejection — borrowing a place doesn't move out of it.
-            ctx.in_borrow += 1;
-            let inner_ty = check_expr(ctx, inner)?;
-            ctx.in_borrow -= 1;
+            // Walk the inner as a place expression — borrowing a non-Copy
+            // place doesn't move out, so the "Copy through ref" check that
+            // applies to value-position field access doesn't fire here.
+            let inner_ty = check_place_expr(ctx, inner)?;
             Ok(InferType::Ref {
                 inner: Box::new(inner_ty),
                 mutable: *mutable,
@@ -2690,6 +2690,107 @@ fn is_mutable_place(ctx: &CheckCtx, expr: &Expr) -> bool {
 // We don't enforce Copy here — that check kicks in only when the deref is
 // USED as a value (the caller can decide). `(*p).field` access still applies
 // the Copy rule via `check_field_access`'s "through reference" branch.
+// Walk an expression as a place (memory location). Used for the inner of
+// `&...` / `&mut...` so the "Copy through ref" rule on intermediate field
+// accesses doesn't fire — borrowing a non-Copy place is fine; only reading
+// a place into a value moves out. Place expressions are: `Var`, `FieldAccess`
+// on a place, `Deref` on a value (the value side is a ref/raw-ptr). For any
+// other shape (e.g., `&call()`), falls back to `check_expr` (treats the inner
+// as a value — borrowck won't track such borrows).
+fn check_place_expr(ctx: &mut CheckCtx, expr: &Expr) -> Result<InferType, Error> {
+    match &expr.kind {
+        ExprKind::Var(_) | ExprKind::FieldAccess(_) | ExprKind::Deref(_) => {
+            let ty = check_place_inner(ctx, expr)?;
+            ctx.expr_infer_types[expr.id as usize] = Some(infer_clone(&ty));
+            Ok(ty)
+        }
+        _ => check_expr(ctx, expr),
+    }
+}
+
+fn check_place_inner(ctx: &mut CheckCtx, expr: &Expr) -> Result<InferType, Error> {
+    match &expr.kind {
+        ExprKind::Var(name) => {
+            let mut i = ctx.locals.len();
+            while i > 0 {
+                i -= 1;
+                if ctx.locals[i].name == *name {
+                    return Ok(infer_clone(&ctx.locals[i].ty));
+                }
+            }
+            Err(Error {
+                file: ctx.current_file.to_string(),
+                message: format!("unknown variable: `{}`", name),
+                span: expr.span.copy(),
+            })
+        }
+        ExprKind::FieldAccess(fa) => {
+            let base_ty = check_place_expr(ctx, &fa.base)?;
+            let resolved = ctx.subst.substitute(&base_ty);
+            // Auto-deref one level through `&T` / `&mut T` (matches the
+            // value-position field-access behavior).
+            let (struct_path, struct_type_args) = match resolved {
+                InferType::Struct { path, type_args } => (path, type_args),
+                InferType::Ref { inner, .. } => match *inner {
+                    InferType::Struct { path, type_args } => (path, type_args),
+                    _ => {
+                        return Err(Error {
+                            file: ctx.current_file.to_string(),
+                            message: "field access on non-struct value".to_string(),
+                            span: fa.base.span.copy(),
+                        });
+                    }
+                },
+                _ => {
+                    return Err(Error {
+                        file: ctx.current_file.to_string(),
+                        message: "field access on non-struct value".to_string(),
+                        span: fa.base.span.copy(),
+                    });
+                }
+            };
+            let entry = struct_lookup(ctx.structs, &struct_path).expect("resolved struct");
+            let mut i = 0;
+            while i < entry.fields.len() {
+                if entry.fields[i].name == fa.field {
+                    let env = build_infer_env(&entry.type_params, &struct_type_args);
+                    let field_raw = rtype_to_infer(&entry.fields[i].ty);
+                    return Ok(infer_substitute(&field_raw, &env));
+                }
+                i += 1;
+            }
+            Err(Error {
+                file: ctx.current_file.to_string(),
+                message: format!(
+                    "no field `{}` on `{}`",
+                    fa.field,
+                    place_to_string(&struct_path)
+                ),
+                span: fa.field_span.copy(),
+            })
+        }
+        ExprKind::Deref(inner) => {
+            // The inner of a Deref is a value (a ref or raw-ptr that holds
+            // the place's address). Use check_expr to type-check the value.
+            let inner_ty = check_expr(ctx, inner)?;
+            let resolved = ctx.subst.substitute(&inner_ty);
+            match resolved {
+                InferType::Ref { inner, .. } => Ok(*inner),
+                InferType::RawPtr { inner, .. } => Ok(*inner),
+                other => Err(Error {
+                    file: ctx.current_file.to_string(),
+                    message: format!(
+                        "cannot dereference `{}` — only references and raw pointers can be dereferenced",
+                        infer_to_string(&other)
+                    ),
+                    span: expr.span.copy(),
+                }),
+            }
+        }
+        _ => unreachable!("check_place_inner only dispatches Var/FieldAccess/Deref"),
+    }
+}
+
 fn check_deref(ctx: &mut CheckCtx, inner: &Expr, deref_expr: &Expr) -> Result<InferType, Error> {
     let inner_ty = check_expr(ctx, inner)?;
     let resolved = ctx.subst.substitute(&inner_ty);
@@ -3170,9 +3271,10 @@ fn check_field_access(
             let field_infer_raw = rtype_to_infer(&field_ty_raw);
             let field_infer = infer_substitute(&field_infer_raw, &env);
             // Copy check: a non-Copy field accessed through a ref is a move
-            // out of borrow. Suppress when we're inside a `&...` (place
-            // borrow doesn't move).
-            if through_ref && ctx.in_borrow == 0 && !is_copy(&field_ty_raw) {
+            // out of borrow. Place borrows (`&...`) walk through
+            // `check_place_expr` and skip this branch entirely; only
+            // value-position field access reaches here.
+            if through_ref && !is_copy(&field_ty_raw) {
                 return Err(Error {
                     file: ctx.current_file.to_string(),
                     message: format!(
