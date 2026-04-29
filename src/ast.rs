@@ -11,6 +11,13 @@ pub enum Item {
     Function(Function),
     Module(Module),
     Struct(StructDef),
+    Impl(ImplBlock),
+}
+
+pub struct ImplBlock {
+    pub target: Path,
+    pub methods: Vec<Function>,
+    pub span: Span,
 }
 
 pub struct StructDef {
@@ -48,6 +55,7 @@ pub enum TypeKind {
     Path(Path),
     Ref { inner: Box<Type>, mutable: bool },
     RawPtr { inner: Box<Type>, mutable: bool },
+    SelfType,
 }
 
 pub struct Block {
@@ -92,6 +100,14 @@ pub enum ExprKind {
     Deref(Box<Expr>),
     Unsafe(Box<Block>),
     Block(Box<Block>),
+    MethodCall(MethodCall),
+}
+
+pub struct MethodCall {
+    pub receiver: Box<Expr>,
+    pub method: String,
+    pub method_span: Span,
+    pub args: Vec<Expr>,
 }
 
 pub struct Call {

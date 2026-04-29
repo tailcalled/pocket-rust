@@ -149,6 +149,7 @@ fn resolve_module(
         match raw {
             parser::RawItem::Function(f) => items.push(Item::Function(f)),
             parser::RawItem::Struct(sd) => items.push(Item::Struct(sd)),
+            parser::RawItem::Impl(ib) => items.push(Item::Impl(ib)),
             parser::RawItem::ModDecl {
                 name: child_name,
                 name_span: child_name_span,

@@ -298,6 +298,90 @@ fn ref_return_mut_from_shared_param_is_rejected() {
 }
 
 #[test]
+fn mut_method_through_shared_ref_is_rejected() {
+    let err = compile_source(
+        "struct Point { x: u32, y: u32 }\n\
+         impl Point { fn set(&mut self, v: u32) -> u32 { self.x = v; self.x } }\n\
+         fn answer() -> u32 { \
+             let pt = Point { x: 1, y: 2 }; \
+             let r: &Point = &pt; \
+             r.set(99) \
+         }",
+    );
+    assert!(
+        err.contains("&mut self") && err.contains("shared"),
+        "expected mut-method-through-shared error, got: {}",
+        err
+    );
+}
+
+#[test]
+fn mut_method_on_immutable_owned_is_rejected() {
+    let err = compile_source(
+        "struct Point { x: u32, y: u32 }\n\
+         impl Point { fn set(&mut self, v: u32) -> u32 { self.x = v; self.x } }\n\
+         fn answer() -> u32 { \
+             let pt = Point { x: 1, y: 2 }; \
+             pt.set(99) \
+         }",
+    );
+    assert!(
+        err.contains("immutable receiver"),
+        "expected immutable-receiver error, got: {}",
+        err
+    );
+}
+
+#[test]
+fn no_method_on_struct_is_rejected() {
+    let err = compile_source(
+        "struct Point { x: u32, y: u32 }\n\
+         fn answer() -> u32 { \
+             let pt = Point { x: 1, y: 2 }; \
+             pt.missing() \
+         }",
+    );
+    assert!(
+        err.contains("no method `missing`"),
+        "expected no-method error, got: {}",
+        err
+    );
+}
+
+#[test]
+fn method_call_borrow_outlives_source_is_rejected() {
+    // Borrow returned by `&self -> &u32` method should propagate the
+    // receiver's borrow, blocking subsequent moves of the receiver.
+    let err = compile_source(
+        "struct Point { x: u32, y: u32 }\n\
+         impl Point { fn x_ref(&self) -> &u32 { &self.x } }\n\
+         fn answer() -> u32 { \
+             let pt = Point { x: 1, y: 2 }; \
+             let r: &u32 = pt.x_ref(); \
+             let q = pt; \
+             *r \
+         }",
+    );
+    assert!(
+        err.contains("cannot move") && err.contains("borrowed"),
+        "expected propagated-method-borrow error, got: {}",
+        err
+    );
+}
+
+#[test]
+fn self_outside_impl_is_rejected() {
+    let err = compile_source(
+        "fn answer() -> u32 { let x: Self = 0; x }",
+    );
+    assert!(
+        err.contains("`Self` is only valid inside an `impl` block"),
+        "expected Self-outside-impl error, got: {}",
+        err
+    );
+}
+
+#[test]
 fn returned_borrow_outlives_source_is_rejected() {
     // Borrowck propagates the input borrow through the call: `r` carries a
     // borrow on `pt`, so moving `pt` afterward must conflict.

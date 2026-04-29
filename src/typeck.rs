@@ -303,11 +303,29 @@ pub struct FnSymbol {
     // iff the operand resolved to a raw pointer (`*const T` / `*mut T`).
     // Safeck reads this in lockstep to flag derefs outside `unsafe` blocks.
     pub deref_is_raw: Vec<bool>,
-    // Lifetime elision rule 2: when the return type is a reference and there
-    // is exactly one reference parameter, the output borrow inherits its
-    // lifetime from that parameter. Borrowck uses this to propagate borrows
-    // through ref-returning calls.
+    // Lifetime elision: index of the source ref param whose lifetime flows to
+    // the output ref. Rule 3 (self) takes precedence over rule 2 (single ref).
     pub ret_ref_source: Option<usize>,
+    // Per `MethodCall` expression in body, in source-DFS order: how to lower
+    // it. Borrowck and codegen consume this in lockstep.
+    pub method_resolutions: Vec<MethodResolution>,
+}
+
+pub struct MethodResolution {
+    pub callee_idx: u32,
+    pub callee_path: Vec<String>,
+    pub recv_adjust: ReceiverAdjust,
+    // Whether the callee's `ret_ref_source = Some(0)` (self-receiver lifetime
+    // flows out) AND the receiver is being autoref'd from a place — borrowck
+    // uses this to attribute the returned borrow to the receiver place.
+    pub ret_borrows_receiver: bool,
+}
+
+pub enum ReceiverAdjust {
+    Move,        // recv is consumed; method takes Self
+    BorrowImm,   // recv is owned; method takes &Self → emit &recv
+    BorrowMut,   // recv is owned; method takes &mut Self → emit &mut recv
+    ByRef,       // recv is &Self/&mut Self; pass i32 directly (incl. mut→imm downgrade)
 }
 
 pub struct FuncTable {
@@ -349,6 +367,33 @@ pub fn path_eq(a: &Vec<String>, b: &Vec<String>) -> bool {
     true
 }
 
+// Resolve a path expression's segments to an absolute lookup path. Handles
+// `Self::…` substitution: replaces a leading `Self` segment with the impl
+// target's struct name. Used by both typeck and codegen for call and struct
+// literal lookups.
+pub fn resolve_full_path(
+    current_module: &Vec<String>,
+    self_target: Option<&RType>,
+    segments: &Vec<PathSegment>,
+) -> Vec<String> {
+    let mut full = clone_path(current_module);
+    let mut start = 0;
+    if !segments.is_empty() && segments[0].name == "Self" {
+        if let Some(RType::Struct(target_path)) = self_target {
+            if let Some(last) = target_path.last() {
+                full.push(last.clone());
+                start = 1;
+            }
+        }
+    }
+    let mut i = start;
+    while i < segments.len() {
+        full.push(segments[i].name.clone());
+        i += 1;
+    }
+    full
+}
+
 pub fn segments_to_string(segs: &Vec<PathSegment>) -> String {
     let mut s = String::new();
     let mut i = 0;
@@ -379,6 +424,7 @@ pub fn resolve_type(
     ty: &Type,
     current_module: &Vec<String>,
     structs: &StructTable,
+    self_target: Option<&RType>,
     file: &str,
 ) -> Result<RType, Error> {
     match &ty.kind {
@@ -405,19 +451,27 @@ pub fn resolve_type(
             }
         }
         TypeKind::Ref { inner, mutable } => {
-            let r = resolve_type(inner, current_module, structs, file)?;
+            let r = resolve_type(inner, current_module, structs, self_target, file)?;
             Ok(RType::Ref {
                 inner: Box::new(r),
                 mutable: *mutable,
             })
         }
         TypeKind::RawPtr { inner, mutable } => {
-            let r = resolve_type(inner, current_module, structs, file)?;
+            let r = resolve_type(inner, current_module, structs, self_target, file)?;
             Ok(RType::RawPtr {
                 inner: Box::new(r),
                 mutable: *mutable,
             })
         }
+        TypeKind::SelfType => match self_target {
+            Some(rt) => Ok(rtype_clone(rt)),
+            None => Err(Error {
+                file: file.to_string(),
+                message: "`Self` is only valid inside an `impl` block".to_string(),
+                span: ty.span.copy(),
+            }),
+        },
     }
 }
 
@@ -475,6 +529,7 @@ fn collect_struct_names(module: &Module, path: &mut Vec<String>, table: &mut Str
                 path.pop();
             }
             Item::Function(_) => {}
+            Item::Impl(_) => {}
         }
         i += 1;
     }
@@ -494,7 +549,7 @@ fn resolve_struct_fields(
                 let mut resolved: Vec<RTypedField> = Vec::new();
                 let mut k = 0;
                 while k < sd.fields.len() {
-                    let rt = resolve_type(&sd.fields[k].ty, path, table, &module.source_file)?;
+                    let rt = resolve_type(&sd.fields[k].ty, path, table, None, &module.source_file)?;
                     if let RType::Ref { .. } = &rt {
                         return Err(Error {
                             file: module.source_file.clone(),
@@ -524,6 +579,7 @@ fn resolve_struct_fields(
                 path.pop();
             }
             Item::Function(_) => {}
+            Item::Impl(_) => {}
         }
         i += 1;
     }
@@ -541,36 +597,7 @@ fn collect_funcs(
     while i < module.items.len() {
         match &module.items[i] {
             Item::Function(f) => {
-                let mut full = clone_path(path);
-                full.push(f.name.clone());
-                let mut param_types: Vec<RType> = Vec::new();
-                let mut k = 0;
-                while k < f.params.len() {
-                    let rt = resolve_type(&f.params[k].ty, path, structs, &module.source_file)?;
-                    param_types.push(rt);
-                    k += 1;
-                }
-                let return_type = match &f.return_type {
-                    Some(ty) => Some(resolve_type(ty, path, structs, &module.source_file)?),
-                    None => None,
-                };
-                let ret_ref_source = match (&return_type, &f.return_type) {
-                    (Some(rt), Some(ret_ty)) => {
-                        check_ret_ref_elision(rt, &param_types, &ret_ty.span, &module.source_file)?
-                    }
-                    _ => None,
-                };
-                funcs.entries.push(FnSymbol {
-                    path: full,
-                    idx: *next_idx,
-                    param_types,
-                    return_type,
-                    let_types: Vec::new(),
-                    lit_types: Vec::new(),
-                    deref_is_raw: Vec::new(),
-                    ret_ref_source,
-                });
-                *next_idx += 1;
+                register_function(f, path, None, funcs, next_idx, structs, &module.source_file)?;
             }
             Item::Module(m) => {
                 path.push(m.name.clone());
@@ -578,20 +605,126 @@ fn collect_funcs(
                 path.pop();
             }
             Item::Struct(_) => {}
+            Item::Impl(ib) => {
+                let target_rt = resolve_impl_target(ib, path, structs, &module.source_file)?;
+                let target_name = ib.target.segments[0].name.clone();
+                path.push(target_name);
+                let mut k = 0;
+                while k < ib.methods.len() {
+                    register_function(
+                        &ib.methods[k],
+                        path,
+                        Some(&target_rt),
+                        funcs,
+                        next_idx,
+                        structs,
+                        &module.source_file,
+                    )?;
+                    k += 1;
+                }
+                path.pop();
+            }
         }
         i += 1;
     }
     Ok(())
 }
 
-// Validates a ref return type against the parameters and returns the index of
-// the source ref param. Implements lifetime elision rule 2: exactly one input
-// ref param → its lifetime flows to the output ref. `&mut T -> &U` is allowed
-// (downgrade); `&T -> &mut U` is rejected (would forge mutability). When the
-// return is not a ref, returns Ok(None) — nothing to elide.
+// Resolves an `impl Path { ... }` target to its struct type. We only support
+// single-segment paths naming a struct in the current module.
+fn resolve_impl_target(
+    ib: &crate::ast::ImplBlock,
+    current_module: &Vec<String>,
+    structs: &StructTable,
+    file: &str,
+) -> Result<RType, Error> {
+    if ib.target.segments.len() != 1 {
+        return Err(Error {
+            file: file.to_string(),
+            message: "impl target must be a single-segment path naming a struct in the current module".to_string(),
+            span: ib.target.span.copy(),
+        });
+    }
+    let mut target_path = clone_path(current_module);
+    target_path.push(ib.target.segments[0].name.clone());
+    if struct_lookup(structs, &target_path).is_none() {
+        return Err(Error {
+            file: file.to_string(),
+            message: format!("unknown struct: {}", ib.target.segments[0].name),
+            span: ib.target.span.copy(),
+        });
+    }
+    Ok(RType::Struct(target_path))
+}
+
+fn register_function(
+    f: &Function,
+    current_module: &Vec<String>,
+    self_target: Option<&RType>,
+    funcs: &mut FuncTable,
+    next_idx: &mut u32,
+    structs: &StructTable,
+    source_file: &str,
+) -> Result<(), Error> {
+    let mut full = clone_path(current_module);
+    full.push(f.name.clone());
+    let mut param_types: Vec<RType> = Vec::new();
+    let mut k = 0;
+    while k < f.params.len() {
+        let rt = resolve_type(
+            &f.params[k].ty,
+            current_module,
+            structs,
+            self_target,
+            source_file,
+        )?;
+        param_types.push(rt);
+        k += 1;
+    }
+    let return_type = match &f.return_type {
+        Some(ty) => Some(resolve_type(
+            ty,
+            current_module,
+            structs,
+            self_target,
+            source_file,
+        )?),
+        None => None,
+    };
+    let self_idx = if !f.params.is_empty() && f.params[0].name == "self" {
+        Some(0)
+    } else {
+        None
+    };
+    let ret_ref_source = match (&return_type, &f.return_type) {
+        (Some(rt), Some(ret_ty)) => {
+            check_ret_ref_elision(rt, &param_types, self_idx, &ret_ty.span, source_file)?
+        }
+        _ => None,
+    };
+    funcs.entries.push(FnSymbol {
+        path: full,
+        idx: *next_idx,
+        param_types,
+        return_type,
+        let_types: Vec::new(),
+        lit_types: Vec::new(),
+        deref_is_raw: Vec::new(),
+        ret_ref_source,
+        method_resolutions: Vec::new(),
+    });
+    *next_idx += 1;
+    Ok(())
+}
+
+// Lifetime elision for ref return types. Rule 3: when a method has `&self` /
+// `&mut self`, the output borrow's lifetime is `self`'s, regardless of other
+// ref params. Rule 2: otherwise, exactly one input ref param → its lifetime.
+// `&mut T -> &U` is allowed (downgrade); `&T -> &mut U` is rejected.
 fn check_ret_ref_elision(
     return_type: &RType,
     param_types: &Vec<RType>,
+    self_idx: Option<usize>,
     ret_span: &Span,
     file: &str,
 ) -> Result<Option<usize>, Error> {
@@ -599,6 +732,24 @@ fn check_ret_ref_elision(
         RType::Ref { mutable, .. } => *mutable,
         _ => return Ok(None),
     };
+    // Rule 3: a self-receiver that's a ref shorts the search.
+    if let Some(idx) = self_idx {
+        if let RType::Ref {
+            mutable: src_mutable,
+            ..
+        } = &param_types[idx]
+        {
+            if ret_mutable && !*src_mutable {
+                return Err(Error {
+                    file: file.to_string(),
+                    message: "cannot return `&mut` from a `&self` receiver".to_string(),
+                    span: ret_span.copy(),
+                });
+            }
+            return Ok(Some(idx));
+        }
+        // Self is owned (consuming) — fall through to rule 2.
+    }
     let mut source: Option<usize> = None;
     let mut count: usize = 0;
     let mut i = 0;
@@ -913,11 +1064,13 @@ struct CheckCtx<'a> {
     lit_vars: Vec<u32>,
     lit_constraints: Vec<LitConstraint>,
     deref_is_raw: Vec<bool>,
+    method_resolutions: Vec<MethodResolution>,
     subst: Subst,
     current_module: &'a Vec<String>,
     current_file: &'a str,
     structs: &'a StructTable,
     funcs: &'a FuncTable,
+    self_target: Option<&'a RType>,
 }
 
 fn check_module(
@@ -932,13 +1085,31 @@ fn check_module(
     let mut i = 0;
     while i < module.items.len() {
         match &module.items[i] {
-            Item::Function(f) => check_function(f, path, current_file, structs, funcs)?,
+            Item::Function(f) => check_function(f, path, path, None, current_file, structs, funcs)?,
             Item::Module(m) => {
                 path.push(m.name.clone());
                 check_module(m, path, current_file, structs, funcs)?;
                 path.pop();
             }
             Item::Struct(_) => {}
+            Item::Impl(ib) => {
+                let target_rt = resolve_impl_target(ib, path, structs, current_file)?;
+                let mut method_prefix = clone_path(path);
+                method_prefix.push(ib.target.segments[0].name.clone());
+                let mut k = 0;
+                while k < ib.methods.len() {
+                    check_function(
+                        &ib.methods[k],
+                        path,
+                        &method_prefix,
+                        Some(&target_rt),
+                        current_file,
+                        structs,
+                        funcs,
+                    )?;
+                    k += 1;
+                }
+            }
         }
         i += 1;
     }
@@ -949,6 +1120,8 @@ fn check_module(
 fn check_function(
     func: &Function,
     current_module: &Vec<String>,
+    path_prefix: &Vec<String>,
+    self_target: Option<&RType>,
     current_file: &str,
     structs: &StructTable,
     funcs: &mut FuncTable,
@@ -957,7 +1130,13 @@ fn check_function(
     let mut locals: Vec<LocalEntry> = Vec::new();
     let mut k = 0;
     while k < func.params.len() {
-        let rt = resolve_type(&func.params[k].ty, current_module, structs, current_file)?;
+        let rt = resolve_type(
+            &func.params[k].ty,
+            current_module,
+            structs,
+            self_target,
+            current_file,
+        )?;
         locals.push(LocalEntry {
             name: func.params[k].name.clone(),
             ty: rtype_to_infer(&rt),
@@ -966,17 +1145,24 @@ fn check_function(
         k += 1;
     }
     let return_rt: Option<RType> = match &func.return_type {
-        Some(ty) => Some(resolve_type(ty, current_module, structs, current_file)?),
+        Some(ty) => Some(resolve_type(
+            ty,
+            current_module,
+            structs,
+            self_target,
+            current_file,
+        )?),
         None => None,
     };
 
-    let (let_vars, lit_vars, lit_constraints, deref_is_raw, subst) = {
+    let (let_vars, lit_vars, lit_constraints, deref_is_raw, method_resolutions, subst) = {
         let mut ctx = CheckCtx {
             locals,
             let_vars: Vec::new(),
             lit_vars: Vec::new(),
             lit_constraints: Vec::new(),
             deref_is_raw: Vec::new(),
+            method_resolutions: Vec::new(),
             subst: Subst {
                 bindings: Vec::new(),
                 is_integer: Vec::new(),
@@ -985,6 +1171,7 @@ fn check_function(
             current_file,
             structs,
             funcs: &*funcs,
+            self_target,
         };
         check_block(&mut ctx, &func.body, &return_rt)?;
         (
@@ -992,6 +1179,7 @@ fn check_function(
             ctx.lit_vars,
             ctx.lit_constraints,
             ctx.deref_is_raw,
+            ctx.method_resolutions,
             ctx.subst,
         )
     };
@@ -1042,7 +1230,7 @@ fn check_function(
     }
 
     // Store on the FnSymbol.
-    let mut full = clone_path(current_module);
+    let mut full = clone_path(path_prefix);
     full.push(func.name.clone());
     let mut e = 0;
     while e < funcs.entries.len() {
@@ -1050,6 +1238,7 @@ fn check_function(
             funcs.entries[e].let_types = let_types;
             funcs.entries[e].lit_types = lit_types;
             funcs.entries[e].deref_is_raw = deref_is_raw;
+            funcs.entries[e].method_resolutions = method_resolutions;
             break;
         }
         e += 1;
@@ -1144,6 +1333,7 @@ fn check_let_stmt(ctx: &mut CheckCtx, let_stmt: &LetStmt) -> Result<(), Error> {
                 annotation,
                 ctx.current_module,
                 ctx.structs,
+                ctx.self_target,
                 ctx.current_file,
             )?;
             let annot_infer = rtype_to_infer(&annot_rt);
@@ -1488,7 +1678,236 @@ fn check_expr(ctx: &mut CheckCtx, expr: &Expr) -> Result<InferType, Error> {
         ExprKind::Deref(inner) => check_deref(ctx, inner, expr),
         ExprKind::Unsafe(block) => check_block_expr(ctx, block.as_ref()),
         ExprKind::Block(block) => check_block_expr(ctx, block.as_ref()),
+        ExprKind::MethodCall(mc) => check_method_call(ctx, mc, expr),
     }
+}
+
+// `recv.method(args)` resolution. Type-check the receiver, peel one layer of
+// ref to find the underlying struct, look up `[StructPath, method_name]` in
+// FuncTable, derive a `ReceiverAdjust` from the recv type vs the method's
+// receiver type, type-check remaining args, and record the resolution for
+// borrowck/codegen consumption.
+fn check_method_call(
+    ctx: &mut CheckCtx,
+    mc: &crate::ast::MethodCall,
+    call_expr: &Expr,
+) -> Result<InferType, Error> {
+    let recv_ty = check_expr(ctx, &mc.receiver)?;
+    let resolved_recv = ctx.subst.substitute(&recv_ty);
+    // Determine the receiver's struct path (peel one ref layer).
+    let (recv_kind, struct_path): (RecvShape, Vec<String>) = match resolved_recv {
+        InferType::Struct(p) => (RecvShape::Owned, p),
+        InferType::Ref { inner, mutable } => match *inner {
+            InferType::Struct(p) => (
+                if mutable {
+                    RecvShape::MutRef
+                } else {
+                    RecvShape::SharedRef
+                },
+                p,
+            ),
+            _ => {
+                return Err(Error {
+                    file: ctx.current_file.to_string(),
+                    message: "method calls require a struct receiver".to_string(),
+                    span: mc.receiver.span.copy(),
+                });
+            }
+        },
+        _ => {
+            return Err(Error {
+                file: ctx.current_file.to_string(),
+                message: "method calls require a struct receiver".to_string(),
+                span: mc.receiver.span.copy(),
+            });
+        }
+    };
+    let mut method_path = clone_path(&struct_path);
+    method_path.push(mc.method.clone());
+    let entry = match func_lookup(ctx.funcs, &method_path) {
+        Some(e) => e,
+        None => {
+            return Err(Error {
+                file: ctx.current_file.to_string(),
+                message: format!(
+                    "no method `{}` on `{}`",
+                    mc.method,
+                    place_to_string(&struct_path)
+                ),
+                span: mc.method_span.copy(),
+            });
+        }
+    };
+    if entry.param_types.is_empty() {
+        return Err(Error {
+            file: ctx.current_file.to_string(),
+            message: format!(
+                "function `{}` is not a method (no `self` receiver)",
+                place_to_string(&method_path)
+            ),
+            span: mc.method_span.copy(),
+        });
+    }
+    let recv_param = &entry.param_types[0];
+    let recv_adjust = derive_recv_adjust(&recv_kind, recv_param, ctx, &mc.receiver, &mc.method_span)?;
+    let expected_arg_count = entry.param_types.len() - 1;
+    if mc.args.len() != expected_arg_count {
+        return Err(Error {
+            file: ctx.current_file.to_string(),
+            message: format!(
+                "wrong number of arguments to `{}`: expected {}, got {}",
+                mc.method,
+                expected_arg_count,
+                mc.args.len()
+            ),
+            span: call_expr.span.copy(),
+        });
+    }
+    // Snapshot stuff we need before we mutate ctx (entry borrow ends here).
+    let callee_idx = entry.idx;
+    let callee_ret_source = entry.ret_ref_source;
+    let mut method_param_infer: Vec<InferType> = Vec::new();
+    let mut k = 0;
+    while k < entry.param_types.len() {
+        method_param_infer.push(rtype_to_infer(&entry.param_types[k]));
+        k += 1;
+    }
+    let return_infer: Option<InferType> = match &entry.return_type {
+        Some(rt) => Some(rtype_to_infer(rt)),
+        None => None,
+    };
+    // Reserve the resolution slot in source-DFS order.
+    let resolution_idx = ctx.method_resolutions.len();
+    ctx.method_resolutions.push(MethodResolution {
+        callee_idx,
+        callee_path: clone_path(&method_path),
+        recv_adjust,
+        ret_borrows_receiver: false,
+    });
+    // Type-check remaining args against method's params[1..].
+    let mut i = 0;
+    while i < mc.args.len() {
+        let arg_ty = check_expr(ctx, &mc.args[i])?;
+        ctx.subst.unify(
+            &arg_ty,
+            &method_param_infer[i + 1],
+            &mc.args[i].span,
+            ctx.current_file,
+        )?;
+        i += 1;
+    }
+    // Record whether this call's result borrow should be attributed to the
+    // receiver place (for borrowck propagation through ref-returning methods).
+    let ret_borrows_recv = matches!(callee_ret_source, Some(0))
+        && matches!(
+            ctx.method_resolutions[resolution_idx].recv_adjust,
+            ReceiverAdjust::BorrowImm
+                | ReceiverAdjust::BorrowMut
+                | ReceiverAdjust::ByRef
+        );
+    ctx.method_resolutions[resolution_idx].ret_borrows_receiver = ret_borrows_recv;
+    match return_infer {
+        Some(rt) => Ok(rt),
+        None => Err(Error {
+            file: ctx.current_file.to_string(),
+            message: format!(
+                "method `{}` returns unit and can't be used as a value",
+                mc.method
+            ),
+            span: call_expr.span.copy(),
+        }),
+    }
+}
+
+enum RecvShape {
+    Owned,
+    SharedRef,
+    MutRef,
+}
+
+fn derive_recv_adjust(
+    recv_kind: &RecvShape,
+    recv_param: &RType,
+    ctx: &CheckCtx,
+    recv_expr: &Expr,
+    method_span: &Span,
+) -> Result<ReceiverAdjust, Error> {
+    match recv_param {
+        RType::Struct(_) => {
+            // Method takes `Self` (owned).
+            match recv_kind {
+                RecvShape::Owned => Ok(ReceiverAdjust::Move),
+                _ => Err(Error {
+                    file: ctx.current_file.to_string(),
+                    message: format!(
+                        "cannot move out of borrow to call `{}` (which takes `self` by value)",
+                        token_method_name(recv_expr)
+                    ),
+                    span: method_span.copy(),
+                }),
+            }
+        }
+        RType::Ref {
+            mutable: param_mut,
+            ..
+        } => {
+            // Method takes `&Self` or `&mut Self`.
+            match (recv_kind, param_mut) {
+                (RecvShape::Owned, false) => Ok(ReceiverAdjust::BorrowImm),
+                (RecvShape::Owned, true) => {
+                    if !is_mutable_place(ctx, recv_expr) {
+                        return Err(Error {
+                            file: ctx.current_file.to_string(),
+                            message:
+                                "cannot call `&mut self` method on an immutable receiver"
+                                    .to_string(),
+                            span: method_span.copy(),
+                        });
+                    }
+                    Ok(ReceiverAdjust::BorrowMut)
+                }
+                (RecvShape::SharedRef, false) => Ok(ReceiverAdjust::ByRef),
+                (RecvShape::SharedRef, true) => Err(Error {
+                    file: ctx.current_file.to_string(),
+                    message:
+                        "cannot call `&mut self` method through a shared reference"
+                            .to_string(),
+                    span: method_span.copy(),
+                }),
+                (RecvShape::MutRef, false) => Ok(ReceiverAdjust::ByRef),
+                (RecvShape::MutRef, true) => Ok(ReceiverAdjust::ByRef),
+            }
+        }
+        _ => unreachable!("method receiver must be Self or &Self/&mut Self"),
+    }
+}
+
+fn token_method_name(_recv: &Expr) -> &'static str {
+    // Placeholder: we only use this in an error message that's about the
+    // receiver, not the method itself.
+    "this method"
+}
+
+// A receiver is a "mutable place" if it's a Var bound to a `mut` local, or a
+// FieldAccess chain rooted at one — same rule as for `&mut place` borrows.
+fn is_mutable_place(ctx: &CheckCtx, expr: &Expr) -> bool {
+    let chain = match extract_place_for_assign(expr) {
+        Some(c) => c,
+        None => return false,
+    };
+    let mut i = ctx.locals.len();
+    while i > 0 {
+        i -= 1;
+        if ctx.locals[i].name == chain[0] {
+            // Owned `mut` binding, or a `&mut T` binding.
+            if ctx.locals[i].mutable {
+                return true;
+            }
+            let resolved = ctx.subst.substitute(&ctx.locals[i].ty);
+            return matches!(resolved, InferType::Ref { mutable: true, .. });
+        }
+    }
+    false
 }
 
 // `*p` reads the pointed-to value. Result type = inner of the ref/raw-ptr.
@@ -1528,7 +1947,13 @@ fn check_cast(
     ty: &Type,
     cast_expr: &Expr,
 ) -> Result<InferType, Error> {
-    let target = resolve_type(ty, ctx.current_module, ctx.structs, ctx.current_file)?;
+    let target = resolve_type(
+        ty,
+        ctx.current_module,
+        ctx.structs,
+        ctx.self_target,
+        ctx.current_file,
+    )?;
     if !is_raw_ptr(&target) {
         return Err(Error {
             file: ctx.current_file.to_string(),
@@ -1571,12 +1996,7 @@ fn check_cast(
 }
 
 fn check_call(ctx: &mut CheckCtx, call: &Call, call_expr: &Expr) -> Result<InferType, Error> {
-    let mut full = clone_path(ctx.current_module);
-    let mut i = 0;
-    while i < call.callee.segments.len() {
-        full.push(call.callee.segments[i].name.clone());
-        i += 1;
-    }
+    let full = resolve_full_path(ctx.current_module, ctx.self_target, &call.callee.segments);
     let entry = match func_lookup(ctx.funcs, &full) {
         Some(e) => e,
         None => {
@@ -1643,12 +2063,7 @@ fn check_struct_lit(
     lit: &StructLit,
     lit_expr: &Expr,
 ) -> Result<InferType, Error> {
-    let mut full = clone_path(ctx.current_module);
-    let mut i = 0;
-    while i < lit.path.segments.len() {
-        full.push(lit.path.segments[i].name.clone());
-        i += 1;
-    }
+    let full = resolve_full_path(ctx.current_module, ctx.self_target, &lit.path.segments);
 
     let entry = match struct_lookup(ctx.structs, &full) {
         Some(e) => e,

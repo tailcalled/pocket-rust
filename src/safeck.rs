@@ -9,7 +9,7 @@
 // (`FnSymbol.deref_is_raw`). Safeck walks the AST in lockstep with that
 // vector, tracking an `in_unsafe` boolean across `unsafe { ... }` boundaries.
 
-use crate::ast::{Block, Call, Expr, ExprKind, Function, Item, Module, Stmt, StructLit};
+use crate::ast::{Block, Call, Expr, ExprKind, Function, Item, MethodCall, Module, Stmt, StructLit};
 use crate::span::Error;
 use crate::typeck::{FuncTable, clone_path, func_lookup};
 
@@ -45,6 +45,19 @@ fn check_module(
                 path.pop();
             }
             Item::Struct(_) => {}
+            Item::Impl(ib) => {
+                if ib.target.segments.len() != 1 {
+                    continue;
+                }
+                let target_name = ib.target.segments[0].name.clone();
+                path.push(target_name);
+                let mut k = 0;
+                while k < ib.methods.len() {
+                    check_function(&ib.methods[k], path, current_file, funcs)?;
+                    k += 1;
+                }
+                path.pop();
+            }
         }
         i += 1;
     }
@@ -118,6 +131,7 @@ fn walk_expr(state: &mut SafeState, expr: &Expr) -> Result<(), Error> {
             Ok(())
         }
         ExprKind::Call(call) => walk_call(state, call),
+        ExprKind::MethodCall(mc) => walk_method_call(state, mc),
         ExprKind::StructLit(lit) => walk_struct_lit(state, lit),
         ExprKind::FieldAccess(fa) => walk_expr(state, &fa.base),
         ExprKind::Block(block) => walk_block(state, block.as_ref()),
@@ -135,6 +149,16 @@ fn walk_call(state: &mut SafeState, call: &Call) -> Result<(), Error> {
     let mut i = 0;
     while i < call.args.len() {
         walk_expr(state, &call.args[i])?;
+        i += 1;
+    }
+    Ok(())
+}
+
+fn walk_method_call(state: &mut SafeState, mc: &MethodCall) -> Result<(), Error> {
+    walk_expr(state, &mc.receiver)?;
+    let mut i = 0;
+    while i < mc.args.len() {
+        walk_expr(state, &mc.args[i])?;
         i += 1;
     }
     Ok(())

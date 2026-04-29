@@ -1,11 +1,12 @@
 use crate::ast::{
-    AssignStmt, Block, Call, Expr, ExprKind, FieldAccess, Function, Item, LetStmt, Module, Stmt,
-    StructLit,
+    AssignStmt, Block, Call, Expr, ExprKind, FieldAccess, Function, Item, LetStmt, MethodCall,
+    Module, Stmt, StructLit,
 };
 use crate::span::Error;
 use crate::typeck::{
-    FuncTable, IntKind, RType, StructTable, byte_size_of, clone_path, flatten_rtype, func_lookup,
-    is_ref_mutable, resolve_type, rtype_clone, struct_lookup,
+    FuncTable, IntKind, MethodResolution, RType, ReceiverAdjust, StructTable, byte_size_of,
+    clone_path, flatten_rtype, func_lookup, is_ref_mutable, resolve_type, rtype_clone,
+    struct_lookup,
 };
 use crate::wasm;
 
@@ -61,6 +62,9 @@ struct FnCtx<'a> {
     let_offsets: &'a Vec<Option<u32>>,
     let_idx: usize,
     lit_idx: usize,
+    method_resolutions: &'a Vec<MethodResolution>,
+    method_idx: usize,
+    self_target: Option<RType>,
 }
 
 // ============================================================================
@@ -290,6 +294,33 @@ fn walk_expr_addr(
         ExprKind::Deref(inner) => walk_expr_addr(inner, stack, let_idx, info),
         ExprKind::Unsafe(b) => walk_block_addr(b.as_ref(), stack, let_idx, info),
         ExprKind::Block(b) => walk_block_addr(b.as_ref(), stack, let_idx, info),
+        ExprKind::MethodCall(mc) => {
+            // The receiver may be autoref'd (BorrowImm/BorrowMut) at codegen
+            // time; that takes its address. Without consulting typeck's
+            // recv_adjust here, conservatively mark the receiver's root binding
+            // as addressed whenever the receiver is a place chain. (Same
+            // over-approximation as walk_expr_addr for `Borrow`.)
+            if let Some(chain) = extract_place(&mc.receiver) {
+                let root = &chain[0];
+                let mut i = stack.len();
+                while i > 0 {
+                    i -= 1;
+                    if binding_ref_name(&stack[i]) == root {
+                        match &stack[i] {
+                            BindingRef::Param(idx, _) => info.param_addressed[*idx] = true,
+                            BindingRef::Let(idx, _) => info.let_addressed[*idx] = true,
+                        }
+                        break;
+                    }
+                }
+            }
+            walk_expr_addr(&mc.receiver, stack, let_idx, info);
+            let mut i = 0;
+            while i < mc.args.len() {
+                walk_expr_addr(&mc.args[i], stack, let_idx, info);
+                i += 1;
+            }
+        }
     }
 }
 
@@ -307,13 +338,37 @@ fn emit_module(
     let mut i = 0;
     while i < module.items.len() {
         match &module.items[i] {
-            Item::Function(f) => emit_function(wasm_mod, f, path, structs, funcs)?,
+            Item::Function(f) => emit_function(wasm_mod, f, path, path, None, structs, funcs)?,
             Item::Module(m) => {
                 path.push(m.name.clone());
                 emit_module(wasm_mod, m, path, structs, funcs)?;
                 path.pop();
             }
             Item::Struct(_) => {}
+            Item::Impl(ib) => {
+                if ib.target.segments.len() != 1 {
+                    continue;
+                }
+                let target_name = ib.target.segments[0].name.clone();
+                let mut method_prefix = clone_path(path);
+                method_prefix.push(target_name);
+                let mut target_path = clone_path(path);
+                target_path.push(ib.target.segments[0].name.clone());
+                let target_rt = RType::Struct(target_path);
+                let mut k = 0;
+                while k < ib.methods.len() {
+                    emit_function(
+                        wasm_mod,
+                        &ib.methods[k],
+                        path,
+                        &method_prefix,
+                        Some(&target_rt),
+                        structs,
+                        funcs,
+                    )?;
+                    k += 1;
+                }
+            }
         }
         i += 1;
     }
@@ -324,10 +379,12 @@ fn emit_function(
     wasm_mod: &mut wasm::Module,
     func: &Function,
     current_module: &Vec<String>,
+    path_prefix: &Vec<String>,
+    self_target: Option<&RType>,
     structs: &StructTable,
     funcs: &FuncTable,
 ) -> Result<(), Error> {
-    let mut full = clone_path(current_module);
+    let mut full = clone_path(path_prefix);
     full.push(func.name.clone());
     let entry = func_lookup(funcs, &full).expect("typeck registered this function");
 
@@ -434,6 +491,9 @@ fn emit_function(
         let_offsets: &let_offsets,
         let_idx: 0,
         lit_idx: 0,
+        method_resolutions: &entry.method_resolutions,
+        method_idx: 0,
+        self_target: self_target.map(|rt| rtype_clone(rt)),
     };
 
     // Prologue: SP -= frame_size; copy spilled params from their incoming
@@ -498,7 +558,10 @@ fn emit_function(
     };
     wasm_mod.code.push(body);
 
-    if current_module.is_empty() {
+    // Export only crate-root free functions. Methods (path_prefix !=
+    // current_module) and items in submodules stay internal.
+    let is_method = path_prefix.len() != current_module.len();
+    if current_module.is_empty() && !is_method {
         wasm_mod.exports.push(wasm::Export {
             name: func.name.clone(),
             kind: wasm::ExportKind::Func,
@@ -876,13 +939,85 @@ fn codegen_expr(ctx: &mut FnCtx, expr: &Expr) -> Result<RType, Error> {
             // integer literals were pinned to usize by typeck → i32). The cast
             // is a type-only reinterpretation at WASM level.
             codegen_expr(ctx, inner)?;
-            resolve_type(ty, &ctx.current_module, ctx.structs, "")
-                .map_err(|e| e)
+            resolve_type(
+                ty,
+                &ctx.current_module,
+                ctx.structs,
+                ctx.self_target.as_ref(),
+                "",
+            )
+            .map_err(|e| e)
         }
         ExprKind::Deref(inner) => codegen_deref(ctx, inner),
         ExprKind::Unsafe(block) => codegen_block_expr(ctx, block.as_ref()),
         ExprKind::Block(block) => codegen_block_expr(ctx, block.as_ref()),
+        ExprKind::MethodCall(mc) => codegen_method_call(ctx, mc),
     }
+}
+
+fn codegen_method_call(ctx: &mut FnCtx, mc: &MethodCall) -> Result<RType, Error> {
+    let res_idx = ctx.method_idx;
+    ctx.method_idx += 1;
+    let callee_idx = ctx.method_resolutions[res_idx].callee_idx;
+    // Match on a copy of the resolution shape to avoid borrowing ctx through
+    // the resolutions vec across our subsequent codegen mutations.
+    let recv_adjust_local = match &ctx.method_resolutions[res_idx].recv_adjust {
+        ReceiverAdjust::Move => RecvAdjustLocal::Move,
+        ReceiverAdjust::BorrowImm => RecvAdjustLocal::BorrowImm,
+        ReceiverAdjust::BorrowMut => RecvAdjustLocal::BorrowMut,
+        ReceiverAdjust::ByRef => RecvAdjustLocal::ByRef,
+    };
+    // Look up the callee's return type without holding a borrow into ctx.
+    let return_rt = {
+        let entry = &ctx.funcs.entries[callee_idx_to_table_idx(ctx, callee_idx)];
+        match &entry.return_type {
+            Some(rt) => rtype_clone(rt),
+            None => unreachable!("typeck rejects unit methods used as values"),
+        }
+    };
+    // Codegen receiver.
+    match recv_adjust_local {
+        RecvAdjustLocal::Move => {
+            codegen_expr(ctx, &mc.receiver)?;
+        }
+        RecvAdjustLocal::BorrowImm => {
+            codegen_borrow(ctx, &mc.receiver, false)?;
+        }
+        RecvAdjustLocal::BorrowMut => {
+            codegen_borrow(ctx, &mc.receiver, true)?;
+        }
+        RecvAdjustLocal::ByRef => {
+            codegen_expr(ctx, &mc.receiver)?;
+        }
+    }
+    // Codegen remaining args.
+    let mut i = 0;
+    while i < mc.args.len() {
+        codegen_expr(ctx, &mc.args[i])?;
+        i += 1;
+    }
+    ctx.instructions.push(wasm::Instruction::Call(callee_idx));
+    Ok(return_rt)
+}
+
+enum RecvAdjustLocal {
+    Move,
+    BorrowImm,
+    BorrowMut,
+    ByRef,
+}
+
+// Map a WASM function index back to its FuncTable entry index. They're
+// allocated in lockstep, so equal numerically.
+fn callee_idx_to_table_idx(ctx: &FnCtx, callee_idx: u32) -> usize {
+    let mut i = 0;
+    while i < ctx.funcs.entries.len() {
+        if ctx.funcs.entries[i].idx == callee_idx {
+            return i;
+        }
+        i += 1;
+    }
+    unreachable!("callee_idx must correspond to a registered function");
 }
 
 fn emit_int_lit(ctx: &mut FnCtx, ty: &RType, value: u64) {
@@ -955,12 +1090,11 @@ fn codegen_var(ctx: &mut FnCtx, name: &str) -> Result<RType, Error> {
 
 fn codegen_call(ctx: &mut FnCtx, call: &Call) -> Result<RType, Error> {
     let (func_idx, return_rt) = {
-        let mut full = clone_path(&ctx.current_module);
-        let mut i = 0;
-        while i < call.callee.segments.len() {
-            full.push(call.callee.segments[i].name.clone());
-            i += 1;
-        }
+        let full = crate::typeck::resolve_full_path(
+            &ctx.current_module,
+            ctx.self_target.as_ref(),
+            &call.callee.segments,
+        );
         let entry = func_lookup(ctx.funcs, &full).expect("typeck resolved this call");
         let rt = match &entry.return_type {
             Some(rt) => rtype_clone(rt),
@@ -978,12 +1112,11 @@ fn codegen_call(ctx: &mut FnCtx, call: &Call) -> Result<RType, Error> {
 }
 
 fn codegen_struct_lit(ctx: &mut FnCtx, lit: &StructLit) -> Result<RType, Error> {
-    let mut full = clone_path(&ctx.current_module);
-    let mut i = 0;
-    while i < lit.path.segments.len() {
-        full.push(lit.path.segments[i].name.clone());
-        i += 1;
-    }
+    let full = crate::typeck::resolve_full_path(
+        &ctx.current_module,
+        ctx.self_target.as_ref(),
+        &lit.path.segments,
+    );
 
     // Field layouts: declaration-order (name, flat_offset, valtypes).
     struct FieldLayout {

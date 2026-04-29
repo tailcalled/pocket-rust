@@ -1,9 +1,12 @@
 use crate::ast::{
-    AssignStmt, Block, Call, Expr, ExprKind, FieldAccess, Function, Item, LetStmt, Module, Stmt,
-    StructLit,
+    AssignStmt, Block, Call, Expr, ExprKind, FieldAccess, Function, Item, LetStmt, MethodCall,
+    Module, Stmt, StructLit,
 };
 use crate::span::{Error, Span};
-use crate::typeck::{FuncTable, RType, StructTable, clone_path, func_lookup, rtype_clone};
+use crate::typeck::{
+    FuncTable, MethodResolution, RType, ReceiverAdjust, StructTable, clone_path, func_lookup,
+    resolve_full_path, rtype_clone,
+};
 
 pub fn check(
     root: &Module,
@@ -35,15 +38,45 @@ fn check_module(
     let mut i = 0;
     while i < module.items.len() {
         match &module.items[i] {
-            Item::Function(f) => {
-                check_function(f, current_module, current_file, structs, funcs)?
-            }
+            Item::Function(f) => check_function(
+                f,
+                current_module,
+                current_module,
+                None,
+                current_file,
+                structs,
+                funcs,
+            )?,
             Item::Module(m) => {
                 current_module.push(m.name.clone());
                 check_module(m, current_module, current_file, structs, funcs)?;
                 current_module.pop();
             }
             Item::Struct(_) => {}
+            Item::Impl(ib) => {
+                if ib.target.segments.len() != 1 {
+                    continue;
+                }
+                let target_name = ib.target.segments[0].name.clone();
+                let mut method_prefix = clone_path(current_module);
+                method_prefix.push(target_name.clone());
+                let mut target_full = clone_path(current_module);
+                target_full.push(target_name);
+                let target_rt = RType::Struct(target_full);
+                let mut k = 0;
+                while k < ib.methods.len() {
+                    check_function(
+                        &ib.methods[k],
+                        current_module,
+                        &method_prefix,
+                        Some(rtype_clone(&target_rt)),
+                        current_file,
+                        structs,
+                        funcs,
+                    )?;
+                    k += 1;
+                }
+            }
         }
         i += 1;
     }
@@ -54,11 +87,13 @@ fn check_module(
 fn check_function(
     func: &Function,
     current_module: &Vec<String>,
+    path_prefix: &Vec<String>,
+    self_target: Option<RType>,
     current_file: &str,
     _structs: &StructTable,
     funcs: &FuncTable,
 ) -> Result<(), Error> {
-    let mut full = clone_path(current_module);
+    let mut full = clone_path(path_prefix);
     full.push(func.name.clone());
     let entry = func_lookup(funcs, &full).expect("typeck registered this function");
 
@@ -74,9 +109,12 @@ fn check_function(
         moved: Vec::new(),
         let_types,
         let_idx: 0,
+        method_resolutions: &entry.method_resolutions,
+        method_idx: 0,
         file: current_file.to_string(),
         funcs,
         current_module,
+        self_target,
     };
 
     let mut k = 0;
@@ -105,9 +143,13 @@ struct BorrowState<'a> {
     // Types of let-introduced bindings, in source-DFS order. Populated by typeck.
     let_types: Vec<RType>,
     let_idx: usize,
+    // Per `MethodCall` expression in source-DFS order, populated by typeck.
+    method_resolutions: &'a Vec<MethodResolution>,
+    method_idx: usize,
     file: String,
     funcs: &'a FuncTable,
     current_module: &'a Vec<String>,
+    self_target: Option<RType>,
 }
 
 struct Holder {
@@ -295,7 +337,142 @@ fn walk_expr(state: &mut BorrowState, expr: &Expr) -> Result<ValueDesc, Error> {
         }
         ExprKind::Unsafe(block) => walk_block_expr(state, block.as_ref()),
         ExprKind::Block(block) => walk_block_expr(state, block.as_ref()),
+        ExprKind::MethodCall(mc) => walk_method_call(state, mc),
     }
+}
+
+fn walk_method_call(state: &mut BorrowState, mc: &MethodCall) -> Result<ValueDesc, Error> {
+    let res_idx = state.method_idx;
+    state.method_idx += 1;
+    let recv_adjust = match &state.method_resolutions[res_idx].recv_adjust {
+        ReceiverAdjust::Move => RecvAdjustLocal::Move,
+        ReceiverAdjust::BorrowImm => RecvAdjustLocal::BorrowImm,
+        ReceiverAdjust::BorrowMut => RecvAdjustLocal::BorrowMut,
+        ReceiverAdjust::ByRef => RecvAdjustLocal::ByRef,
+    };
+    let ret_borrows_recv = state.method_resolutions[res_idx].ret_borrows_receiver;
+    // Push synthetic call slot.
+    state.holders.push(Holder {
+        name: None,
+        rtype: None,
+        holds: Vec::new(),
+    });
+    let call_idx = state.holders.len() - 1;
+    // Process the receiver per recv_adjust.
+    let recv_borrows: Vec<HeldBorrow> = match recv_adjust {
+        RecvAdjustLocal::Move => {
+            // Treat recv as an arg — walk it for moves, absorb borrows.
+            let desc = walk_expr(state, &mc.receiver)?;
+            let snapshot = clone_held_borrows(&desc.borrows);
+            let mut k = 0;
+            while k < desc.borrows.len() {
+                let new = HeldBorrow {
+                    place: clone_path(&desc.borrows[k].place),
+                    mutable: desc.borrows[k].mutable,
+                };
+                check_borrow_conflict(state, &new, &mc.receiver.span)?;
+                state.holders[call_idx].holds.push(new);
+                k += 1;
+            }
+            snapshot
+        }
+        RecvAdjustLocal::BorrowImm | RecvAdjustLocal::BorrowMut => {
+            // Synthesize a borrow on recv (recv must be a place expr; typeck verified).
+            let mutable = matches!(recv_adjust, RecvAdjustLocal::BorrowMut);
+            walk_synth_borrow(state, &mc.receiver, mutable, call_idx)?
+        }
+        RecvAdjustLocal::ByRef => {
+            // Recv is already a ref — walk as a regular var read; its borrows
+            // get absorbed into the call slot (and snapshotted for propagation).
+            let desc = walk_expr(state, &mc.receiver)?;
+            let snapshot = clone_held_borrows(&desc.borrows);
+            let mut k = 0;
+            while k < desc.borrows.len() {
+                let new = HeldBorrow {
+                    place: clone_path(&desc.borrows[k].place),
+                    mutable: desc.borrows[k].mutable,
+                };
+                check_borrow_conflict(state, &new, &mc.receiver.span)?;
+                state.holders[call_idx].holds.push(new);
+                k += 1;
+            }
+            snapshot
+        }
+    };
+    // Process remaining args.
+    let mut i = 0;
+    while i < mc.args.len() {
+        let desc = walk_expr(state, &mc.args[i])?;
+        let mut k = 0;
+        while k < desc.borrows.len() {
+            let new = HeldBorrow {
+                place: clone_path(&desc.borrows[k].place),
+                mutable: desc.borrows[k].mutable,
+            };
+            check_borrow_conflict(state, &new, &mc.args[i].span)?;
+            state.holders[call_idx].holds.push(new);
+            k += 1;
+        }
+        i += 1;
+    }
+    state.holders.truncate(call_idx);
+    if ret_borrows_recv {
+        Ok(ValueDesc {
+            borrows: recv_borrows,
+        })
+    } else {
+        Ok(empty_desc())
+    }
+}
+
+enum RecvAdjustLocal {
+    Move,
+    BorrowImm,
+    BorrowMut,
+    ByRef,
+}
+
+// Synthesize a `&recv` (or `&mut recv`) borrow, with the same conflict checks
+// `walk_borrow` would apply, and absorb the result into the call slot.
+fn walk_synth_borrow(
+    state: &mut BorrowState,
+    inner: &Expr,
+    mutable: bool,
+    call_idx: usize,
+) -> Result<Vec<HeldBorrow>, Error> {
+    let place = match extract_place(inner) {
+        Some(p) => p,
+        None => {
+            // Non-place receiver — autoref of a temporary. Walk for side
+            // effects; produces no borrow.
+            walk_expr(state, inner)?;
+            return Ok(Vec::new());
+        }
+    };
+    // Check it hasn't been moved.
+    let mut i = 0;
+    while i < state.moved.len() {
+        if paths_share_prefix(&state.moved[i], &place) {
+            return Err(Error {
+                file: state.file.clone(),
+                message: format!(
+                    "cannot borrow `{}`: it has been moved",
+                    place_to_string(&place)
+                ),
+                span: inner.span.copy(),
+            });
+        }
+        i += 1;
+    }
+    let new = HeldBorrow {
+        place: clone_path(&place),
+        mutable,
+    };
+    check_borrow_conflict(state, &new, &inner.span)?;
+    state.holders[call_idx].holds.push(new);
+    let mut snapshot: Vec<HeldBorrow> = Vec::new();
+    snapshot.push(HeldBorrow { place, mutable });
+    Ok(snapshot)
 }
 
 fn walk_var(state: &mut BorrowState, name: &str, expr: &Expr) -> Result<ValueDesc, Error> {
@@ -346,12 +523,11 @@ fn walk_call(state: &mut BorrowState, call: &Call) -> Result<ValueDesc, Error> {
     // Look up the callee's elision info: if it returns a ref, ret_ref_source
     // is the index of the source ref arg whose borrows the result inherits.
     let ret_ref_source = {
-        let mut full = clone_path(state.current_module);
-        let mut i = 0;
-        while i < call.callee.segments.len() {
-            full.push(call.callee.segments[i].name.clone());
-            i += 1;
-        }
+        let full = resolve_full_path(
+            state.current_module,
+            state.self_target.as_ref(),
+            &call.callee.segments,
+        );
         let entry = func_lookup(state.funcs, &full).expect("typeck resolved this call");
         entry.ret_ref_source
     };

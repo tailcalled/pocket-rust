@@ -14,6 +14,9 @@ pub enum TokenKind {
     Const,
     As,
     Unsafe,
+    Impl,
+    SelfLower,
+    SelfUpper,
     Ident(String),
     LParen,
     RParen,
@@ -41,6 +44,9 @@ pub fn token_kind_name(t: &TokenKind) -> &'static str {
         TokenKind::Const => "`const`",
         TokenKind::As => "`as`",
         TokenKind::Unsafe => "`unsafe`",
+        TokenKind::Impl => "`impl`",
+        TokenKind::SelfLower => "`self`",
+        TokenKind::SelfUpper => "`Self`",
         TokenKind::Ident(_) => "identifier",
         TokenKind::LParen => "`(`",
         TokenKind::RParen => "`)`",
@@ -124,6 +130,21 @@ pub fn tokenize(file: &str, source: &str) -> Result<Vec<Token>, Error> {
             } else if text == "unsafe" {
                 tokens.push(Token {
                     kind: TokenKind::Unsafe,
+                    span,
+                });
+            } else if text == "impl" {
+                tokens.push(Token {
+                    kind: TokenKind::Impl,
+                    span,
+                });
+            } else if text == "self" {
+                tokens.push(Token {
+                    kind: TokenKind::SelfLower,
+                    span,
+                });
+            } else if text == "Self" {
+                tokens.push(Token {
+                    kind: TokenKind::SelfUpper,
                     span,
                 });
             } else {

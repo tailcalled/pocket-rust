@@ -1,6 +1,6 @@
 use crate::ast::{
-    AssignStmt, Block, Call, Expr, ExprKind, FieldAccess, FieldInit, Function, LetStmt, Param,
-    Path, PathSegment, Stmt, StructDef, StructField, StructLit, Type, TypeKind,
+    AssignStmt, Block, Call, Expr, ExprKind, FieldAccess, FieldInit, Function, ImplBlock, LetStmt,
+    MethodCall, Param, Path, PathSegment, Stmt, StructDef, StructField, StructLit, Type, TypeKind,
 };
 use crate::lexer::{Token, TokenKind, token_kind_name};
 use crate::span::{Error, Pos, Span};
@@ -9,6 +9,7 @@ pub enum RawItem {
     Function(Function),
     Struct(StructDef),
     ModDecl { name: String, name_span: Span },
+    Impl(ImplBlock),
 }
 
 pub fn parse(file: &str, tokens: Vec<Token>) -> Result<Vec<RawItem>, Error> {
@@ -42,9 +43,30 @@ impl Parser {
             Ok(RawItem::Function(self.parse_function()?))
         } else if self.peek_kind(&TokenKind::Struct) {
             Ok(RawItem::Struct(self.parse_struct_def()?))
+        } else if self.peek_kind(&TokenKind::Impl) {
+            Ok(RawItem::Impl(self.parse_impl_block()?))
         } else {
-            Err(self.error_at_current("expected `fn`, `mod`, or `struct`"))
+            Err(self.error_at_current("expected `fn`, `mod`, `struct`, or `impl`"))
         }
+    }
+
+    fn parse_impl_block(&mut self) -> Result<ImplBlock, Error> {
+        let impl_span = self.expect(&TokenKind::Impl, "`impl`")?;
+        let target = self.parse_path()?;
+        self.expect(&TokenKind::LBrace, "`{`")?;
+        let mut methods: Vec<Function> = Vec::new();
+        while !self.peek_kind(&TokenKind::RBrace) {
+            if !self.peek_kind(&TokenKind::Fn) {
+                return Err(self.error_at_current("expected `fn` inside `impl` block"));
+            }
+            methods.push(self.parse_function()?);
+        }
+        let rb = self.expect(&TokenKind::RBrace, "`}`")?;
+        Ok(ImplBlock {
+            target,
+            methods,
+            span: Span::new(impl_span.start, rb.end),
+        })
     }
 
     fn parse_mod_decl(&mut self) -> Result<RawItem, Error> {
@@ -116,7 +138,11 @@ impl Parser {
 
     fn parse_params(&mut self) -> Result<Vec<Param>, Error> {
         let mut params = Vec::new();
-        params.push(self.parse_param()?);
+        if let Some(recv) = self.try_parse_receiver()? {
+            params.push(recv);
+        } else {
+            params.push(self.parse_param()?);
+        }
         while self.peek_kind(&TokenKind::Comma) {
             self.pos += 1;
             if self.peek_kind(&TokenKind::RParen) {
@@ -125,6 +151,58 @@ impl Parser {
             params.push(self.parse_param()?);
         }
         Ok(params)
+    }
+
+    // Receiver shorthand: `self` / `&self` / `&mut self`. Desugared to a
+    // regular `self: Self` / `self: &Self` / `self: &mut Self` param. Only
+    // valid as the first param (caller restricts).
+    fn try_parse_receiver(&mut self) -> Result<Option<Param>, Error> {
+        if self.peek_kind(&TokenKind::SelfLower) {
+            let span = self.tokens[self.pos].span.copy();
+            self.pos += 1;
+            return Ok(Some(Param {
+                name: "self".to_string(),
+                name_span: span.copy(),
+                ty: Type {
+                    kind: TypeKind::SelfType,
+                    span,
+                },
+            }));
+        }
+        if self.peek_kind(&TokenKind::Amp) {
+            let save_pos = self.pos;
+            let amp_span = self.tokens[self.pos].span.copy();
+            self.pos += 1;
+            let mutable = if self.peek_kind(&TokenKind::Mut) {
+                self.pos += 1;
+                true
+            } else {
+                false
+            };
+            if self.peek_kind(&TokenKind::SelfLower) {
+                let self_span = self.tokens[self.pos].span.copy();
+                let outer = Span::new(amp_span.start.copy(), self_span.end.copy());
+                self.pos += 1;
+                let inner = Type {
+                    kind: TypeKind::SelfType,
+                    span: self_span.copy(),
+                };
+                return Ok(Some(Param {
+                    name: "self".to_string(),
+                    name_span: self_span,
+                    ty: Type {
+                        kind: TypeKind::Ref {
+                            inner: Box::new(inner),
+                            mutable,
+                        },
+                        span: outer,
+                    },
+                }));
+            }
+            // Not a receiver — backtrack so parse_param sees the original `&`.
+            self.pos = save_pos;
+        }
+        Ok(None)
     }
 
     fn parse_param(&mut self) -> Result<Param, Error> {
@@ -139,6 +217,14 @@ impl Parser {
     }
 
     fn parse_type(&mut self) -> Result<Type, Error> {
+        if self.peek_kind(&TokenKind::SelfUpper) {
+            let span = self.tokens[self.pos].span.copy();
+            self.pos += 1;
+            return Ok(Type {
+                kind: TypeKind::SelfType,
+                span,
+            });
+        }
         if self.peek_kind(&TokenKind::Amp) {
             let amp_span = self.expect(&TokenKind::Amp, "`&`")?;
             let mutable = if self.peek_kind(&TokenKind::Mut) {
@@ -318,15 +404,30 @@ impl Parser {
         while self.peek_kind(&TokenKind::Dot) {
             self.pos += 1;
             let (field, field_span) = self.expect_ident()?;
-            let span = Span::new(expr.span.start.copy(), field_span.end.copy());
-            expr = Expr {
-                kind: ExprKind::FieldAccess(FieldAccess {
-                    base: Box::new(expr),
-                    field,
-                    field_span,
-                }),
-                span,
-            };
+            if self.peek_kind(&TokenKind::LParen) {
+                let args = self.parse_call_args()?;
+                let end = self.tokens[self.pos - 1].span.end.copy();
+                let span = Span::new(expr.span.start.copy(), end);
+                expr = Expr {
+                    kind: ExprKind::MethodCall(MethodCall {
+                        receiver: Box::new(expr),
+                        method: field,
+                        method_span: field_span,
+                        args,
+                    }),
+                    span,
+                };
+            } else {
+                let span = Span::new(expr.span.start.copy(), field_span.end.copy());
+                expr = Expr {
+                    kind: ExprKind::FieldAccess(FieldAccess {
+                        base: Box::new(expr),
+                        field,
+                        field_span,
+                    }),
+                    span,
+                };
+            }
         }
         Ok(expr)
     }
@@ -342,6 +443,15 @@ impl Parser {
         match &self.tokens[self.pos].kind {
             TokenKind::IntLit(_) => self.parse_int_lit(),
             TokenKind::Ident(_) => self.parse_path_atom(),
+            TokenKind::SelfUpper => self.parse_path_atom(),
+            TokenKind::SelfLower => {
+                let span = self.tokens[self.pos].span.copy();
+                self.pos += 1;
+                Ok(Expr {
+                    kind: ExprKind::Var("self".to_string()),
+                    span,
+                })
+            }
             TokenKind::LBrace => self.parse_block_expr(),
             TokenKind::Unsafe => self.parse_unsafe_block(),
             TokenKind::LParen => {
@@ -486,7 +596,7 @@ impl Parser {
     }
 
     fn parse_path(&mut self) -> Result<Path, Error> {
-        let (first_name, first_span) = self.expect_ident()?;
+        let (first_name, first_span) = self.expect_path_segment()?;
         let start = first_span.start.copy();
         let mut end = first_span.end.copy();
         let mut segments = Vec::new();
@@ -496,7 +606,7 @@ impl Parser {
         });
         while self.peek_kind(&TokenKind::PathSep) {
             self.pos += 1;
-            let (name, span) = self.expect_ident()?;
+            let (name, span) = self.expect_path_segment()?;
             end = span.end.copy();
             segments.push(PathSegment { name, span });
         }
@@ -504,6 +614,18 @@ impl Parser {
             segments,
             span: Span::new(start, end),
         })
+    }
+
+    // Like expect_ident, but also accepts `Self` as a path segment named "Self".
+    fn expect_path_segment(&mut self) -> Result<(String, Span), Error> {
+        if self.pos < self.tokens.len() {
+            if let TokenKind::SelfUpper = &self.tokens[self.pos].kind {
+                let span = self.tokens[self.pos].span.copy();
+                self.pos += 1;
+                return Ok(("Self".to_string(), span));
+            }
+        }
+        self.expect_ident()
     }
 
     fn expect(&mut self, kind: &TokenKind, label: &str) -> Result<Span, Error> {
@@ -585,6 +707,9 @@ impl Parser {
             (TokenKind::Const, TokenKind::Const) => true,
             (TokenKind::As, TokenKind::As) => true,
             (TokenKind::Unsafe, TokenKind::Unsafe) => true,
+            (TokenKind::Impl, TokenKind::Impl) => true,
+            (TokenKind::SelfLower, TokenKind::SelfLower) => true,
+            (TokenKind::SelfUpper, TokenKind::SelfUpper) => true,
             (TokenKind::Eq, TokenKind::Eq) => true,
             _ => false,
         }
