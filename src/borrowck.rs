@@ -62,7 +62,16 @@ fn check_module(
                 method_prefix.push(target_name.clone());
                 let mut target_full = clone_path(current_module);
                 target_full.push(target_name);
-                let target_rt = RType::Struct(target_full);
+                let mut impl_param_args: Vec<RType> = Vec::new();
+                let mut k = 0;
+                while k < ib.type_params.len() {
+                    impl_param_args.push(RType::Param(ib.type_params[k].name.clone()));
+                    k += 1;
+                }
+                let target_rt = RType::Struct {
+                    path: target_full,
+                    type_args: impl_param_args,
+                };
                 let mut k = 0;
                 while k < ib.methods.len() {
                     check_function(

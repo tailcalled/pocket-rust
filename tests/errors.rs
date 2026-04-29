@@ -370,6 +370,32 @@ fn method_call_borrow_outlives_source_is_rejected() {
 }
 
 #[test]
+fn wrong_struct_type_arg_count_is_rejected() {
+    let err = compile_source(
+        "struct Pair<T, U> { first: T, second: U }\n\
+         fn answer() -> u32 { let p: Pair<u32> = Pair { first: 1, second: 2 }; p.first }",
+    );
+    assert!(
+        err.contains("type arguments"),
+        "expected wrong-struct-type-arg-count error, got: {}",
+        err
+    );
+}
+
+#[test]
+fn impl_target_args_must_match_impl_params() {
+    let err = compile_source(
+        "struct Pair<T, U> { first: T, second: U }\n\
+         impl<A, B> Pair<u32, B> { fn x(&self) -> u32 { 0 } }",
+    );
+    assert!(
+        err.contains("must match the impl's type parameters"),
+        "expected impl-target-mismatch error, got: {}",
+        err
+    );
+}
+
+#[test]
 fn field_access_on_generic_param_is_rejected() {
     // Polymorphic body check: `t.field` where `t: T` has no shape — reject.
     let err = compile_source(

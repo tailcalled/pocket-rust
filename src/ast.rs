@@ -16,6 +16,7 @@ pub enum Item {
 
 #[derive(Clone)]
 pub struct ImplBlock {
+    pub type_params: Vec<TypeParam>,
     pub target: Path,
     pub methods: Vec<Function>,
     pub span: Span,
@@ -25,6 +26,7 @@ pub struct ImplBlock {
 pub struct StructDef {
     pub name: String,
     pub name_span: Span,
+    pub type_params: Vec<TypeParam>,
     pub fields: Vec<StructField>,
 }
 
@@ -128,13 +130,13 @@ pub struct MethodCall {
     pub receiver: Box<Expr>,
     pub method: String,
     pub method_span: Span,
+    pub turbofish_args: Vec<Type>,
     pub args: Vec<Expr>,
 }
 
 #[derive(Clone)]
 pub struct Call {
     pub callee: Path,
-    pub generic_args: Vec<Type>,
     pub args: Vec<Expr>,
 }
 
@@ -168,4 +170,5 @@ pub struct Path {
 pub struct PathSegment {
     pub name: String,
     pub span: Span,
+    pub args: Vec<Type>,
 }

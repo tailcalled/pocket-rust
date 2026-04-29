@@ -86,6 +86,21 @@ fn rtype_vec_eq(a: &Vec<RType>, b: &Vec<RType>) -> bool {
     true
 }
 
+fn make_struct_env(type_params: &Vec<String>, type_args: &Vec<RType>) -> Vec<(String, RType)> {
+    let mut env: Vec<(String, RType)> = Vec::new();
+    let n = if type_params.len() < type_args.len() {
+        type_params.len()
+    } else {
+        type_args.len()
+    };
+    let mut i = 0;
+    while i < n {
+        env.push((type_params[i].clone(), rtype_clone(&type_args[i])));
+        i += 1;
+    }
+    env
+}
+
 fn rtype_vec_clone(v: &Vec<RType>) -> Vec<RType> {
     let mut out: Vec<RType> = Vec::new();
     let mut i = 0;
@@ -108,7 +123,11 @@ pub fn emit(
     // entries' idxs (which typeck assigned 0..entries.len()).
     let mut mono = MonoState::new(funcs.entries.len() as u32);
     emit_module(wasm_mod, root, &mut module_path, structs, funcs, &mut mono)?;
-    while let Some(work) = mono.queue.pop() {
+    // Drain in FIFO order so wasm_mod.functions index matches the assigned
+    // wasm_idx. (Each emit_monomorphic may enqueue more work — those go to the
+    // end and are processed after the current batch.)
+    while !mono.queue.is_empty() {
+        let work = mono.queue.remove(0);
         emit_monomorphic(wasm_mod, work, structs, funcs, &mut mono)?;
     }
     Ok(())
@@ -148,9 +167,11 @@ struct FnCtx<'a> {
     current_module: Vec<String>,
     let_types: Vec<RType>,
     lit_types: Vec<RType>,
+    struct_lit_types: Vec<RType>,
     let_offsets: Vec<Option<u32>>,
     let_idx: usize,
     lit_idx: usize,
+    struct_lit_idx: usize,
     method_resolutions: Vec<MethodResolution>,
     method_idx: usize,
     call_resolutions: Vec<CallResolution>,
@@ -217,13 +238,15 @@ fn collect_leaves(
             signed: false,
             valtype: wasm::ValType::I32,
         }),
-        RType::Struct(p) => {
-            let entry = struct_lookup(structs, p).expect("resolved struct");
+        RType::Struct { path, type_args } => {
+            let entry = struct_lookup(structs, path).expect("resolved struct");
+            let env = make_struct_env(&entry.type_params, type_args);
             let mut off = base_offset;
             let mut i = 0;
             while i < entry.fields.len() {
-                collect_leaves(&entry.fields[i].ty, structs, off, out);
-                off += byte_size_of(&entry.fields[i].ty, structs);
+                let fty = substitute_rtype(&entry.fields[i].ty, &env);
+                collect_leaves(&fty, structs, off, out);
+                off += byte_size_of(&fty, structs);
                 i += 1;
             }
         }
@@ -463,19 +486,35 @@ fn emit_module(
                 method_prefix.push(target_name);
                 let mut target_path = clone_path(path);
                 target_path.push(ib.target.segments[0].name.clone());
-                let target_rt = RType::Struct(target_path);
+                let mut impl_param_args: Vec<RType> = Vec::new();
+                let mut k = 0;
+                while k < ib.type_params.len() {
+                    impl_param_args.push(RType::Param(ib.type_params[k].name.clone()));
+                    k += 1;
+                }
+                let target_rt = RType::Struct {
+                    path: target_path,
+                    type_args: impl_param_args,
+                };
+                let impl_is_generic = !ib.type_params.is_empty();
                 let mut k = 0;
                 while k < ib.methods.len() {
-                    emit_function(
-                        wasm_mod,
-                        &ib.methods[k],
-                        path,
-                        &method_prefix,
-                        Some(&target_rt),
-                        structs,
-                        funcs,
-                        mono,
-                    )?;
+                    let method_is_generic =
+                        impl_is_generic || !ib.methods[k].type_params.is_empty();
+                    if method_is_generic {
+                        // Templated method — emit lazily via mono queue.
+                    } else {
+                        emit_function(
+                            wasm_mod,
+                            &ib.methods[k],
+                            path,
+                            &method_prefix,
+                            Some(&target_rt),
+                            structs,
+                            funcs,
+                            mono,
+                        )?;
+                    }
                     k += 1;
                 }
             }
@@ -501,14 +540,41 @@ fn emit_monomorphic(
     let return_type = tmpl.return_type.as_ref().map(|t| substitute_rtype(t, &env));
     let let_types = subst_vec(&tmpl.let_types, &env);
     let lit_types = subst_vec(&tmpl.lit_types, &env);
-    let method_resolutions = clone_method_resolutions(&tmpl.method_resolutions);
+    let struct_lit_types = subst_vec(&tmpl.struct_lit_types, &env);
+    let method_resolutions = clone_method_resolutions(&tmpl.method_resolutions, &env);
     let call_resolutions = subst_call_resolutions(&tmpl.call_resolutions, &env);
+    // Determine self_target for the body: if this template is a method (its
+    // path ends with method_name and the parent path is a struct), we may need
+    // to pass a Self target for resolve_type. For free generic fns, None.
+    // Phase 1 templates were always free fns, so this only matters for generic
+    // methods (Phase 3) — handled below by checking the struct lookup.
+    let self_target: Option<RType> = if tmpl.path.len() >= 2 {
+        let parent_path: Vec<String> = tmpl.path[..tmpl.path.len() - 1].to_vec();
+        if let Some(struct_entry) = crate::typeck::struct_lookup(structs, &parent_path) {
+            // Build self target with type_args from the env (impl's type_params come first).
+            let mut self_args: Vec<RType> = Vec::new();
+            let mut i = 0;
+            while i < struct_entry.type_params.len() {
+                // The first impl_type_params slots in env correspond to struct's type params.
+                self_args.push(rtype_clone(&work.type_args[i]));
+                i += 1;
+            }
+            Some(RType::Struct {
+                path: parent_path,
+                type_args: self_args,
+            })
+        } else {
+            None
+        }
+    } else {
+        None
+    };
     emit_function_concrete(
         wasm_mod,
         &tmpl.func,
         &tmpl.enclosing_module,
         &tmpl.enclosing_module,
-        None,
+        self_target.as_ref(),
         structs,
         funcs,
         mono,
@@ -516,6 +582,7 @@ fn emit_monomorphic(
         return_type,
         let_types,
         lit_types,
+        struct_lit_types,
         method_resolutions,
         call_resolutions,
         env,
@@ -545,15 +612,26 @@ fn subst_vec(v: &Vec<RType>, env: &Vec<(String, RType)>) -> Vec<RType> {
     out
 }
 
-fn clone_method_resolutions(v: &Vec<MethodResolution>) -> Vec<MethodResolution> {
+fn clone_method_resolutions(
+    v: &Vec<MethodResolution>,
+    env: &Vec<(String, RType)>,
+) -> Vec<MethodResolution> {
     let mut out: Vec<MethodResolution> = Vec::new();
     let mut i = 0;
     while i < v.len() {
+        let mut subst_args: Vec<RType> = Vec::new();
+        let mut j = 0;
+        while j < v[i].type_args.len() {
+            subst_args.push(substitute_rtype(&v[i].type_args[j], env));
+            j += 1;
+        }
         out.push(MethodResolution {
             callee_idx: v[i].callee_idx,
             callee_path: clone_path(&v[i].callee_path),
             recv_adjust: copy_recv_adjust(&v[i].recv_adjust),
             ret_borrows_receiver: v[i].ret_borrows_receiver,
+            template_idx: v[i].template_idx,
+            type_args: subst_args,
         });
         i += 1;
     }
@@ -608,7 +686,8 @@ fn emit_function(
     let return_type = entry.return_type.as_ref().map(rtype_clone);
     let let_types = rtype_vec_clone(&entry.let_types);
     let lit_types = rtype_vec_clone(&entry.lit_types);
-    let method_resolutions = clone_method_resolutions(&entry.method_resolutions);
+    let struct_lit_types = rtype_vec_clone(&entry.struct_lit_types);
+    let method_resolutions = clone_method_resolutions(&entry.method_resolutions, &Vec::new());
     let call_resolutions = subst_call_resolutions(&entry.call_resolutions, &Vec::new());
     let wasm_idx = entry.idx;
     let is_export = current_module.is_empty() && path_prefix.len() == current_module.len();
@@ -625,6 +704,7 @@ fn emit_function(
         return_type,
         let_types,
         lit_types,
+        struct_lit_types,
         method_resolutions,
         call_resolutions,
         Vec::new(),
@@ -647,6 +727,7 @@ fn emit_function_concrete(
     return_type: Option<RType>,
     let_types: Vec<RType>,
     lit_types: Vec<RType>,
+    struct_lit_types: Vec<RType>,
     method_resolutions: Vec<MethodResolution>,
     call_resolutions: Vec<CallResolution>,
     env: Vec<(String, RType)>,
@@ -752,9 +833,11 @@ fn emit_function_concrete(
         current_module: clone_path(current_module),
         let_types,
         lit_types,
+        struct_lit_types,
         let_offsets,
         let_idx: 0,
         lit_idx: 0,
+        struct_lit_idx: 0,
         method_resolutions,
         method_idx: 0,
         call_resolutions,
@@ -971,16 +1054,17 @@ fn codegen_assign_stmt(ctx: &mut FnCtx, assign: &AssignStmt) -> Result<(), Error
     let mut chain_offset: u32 = 0;
     let mut i = 1;
     while i < chain.len() {
-        let struct_path = match &current_ty {
-            RType::Struct(p) => clone_path(p),
+        let (struct_path, struct_args) = match &current_ty {
+            RType::Struct { path, type_args } => (clone_path(path), rtype_vec_clone(type_args)),
             _ => unreachable!("typeck verified chain navigates structs"),
         };
         let entry = struct_lookup(ctx.structs, &struct_path).expect("resolved struct");
+        let env = make_struct_env(&entry.type_params, &struct_args);
         let mut field_offset: u32 = 0;
         let mut found_field = false;
         let mut j = 0;
         while j < entry.fields.len() {
-            let fty = rtype_clone(&entry.fields[j].ty);
+            let fty = substitute_rtype(&entry.fields[j].ty, &env);
             let s = byte_size_of(&fty, ctx.structs);
             if entry.fields[j].name == chain[i] {
                 chain_offset += field_offset;
@@ -1047,21 +1131,23 @@ fn flat_chain_offset(ctx: &FnCtx, chain: &Vec<String>, binding_idx: usize) -> u3
     let mut flat_off: u32 = 0;
     let mut i = 1;
     while i < chain.len() {
-        let struct_path = match &current_ty {
-            RType::Struct(p) => clone_path(p),
+        let (struct_path, struct_args) = match &current_ty {
+            RType::Struct { path, type_args } => (clone_path(path), rtype_vec_clone(type_args)),
             _ => unreachable!("typeck verified chain navigates structs"),
         };
         let entry = struct_lookup(ctx.structs, &struct_path).expect("resolved struct");
+        let env = make_struct_env(&entry.type_params, &struct_args);
         let mut field_flat_off: u32 = 0;
         let mut found = false;
         let mut j = 0;
         while j < entry.fields.len() {
+            let fty = substitute_rtype(&entry.fields[j].ty, &env);
             let mut vts: Vec<wasm::ValType> = Vec::new();
-            flatten_rtype(&entry.fields[j].ty, ctx.structs, &mut vts);
+            flatten_rtype(&fty, ctx.structs, &mut vts);
             let s = vts.len() as u32;
             if entry.fields[j].name == chain[i] {
                 flat_off += field_flat_off;
-                current_ty = rtype_clone(&entry.fields[j].ty);
+                current_ty = fty;
                 found = true;
                 break;
             }
@@ -1124,16 +1210,17 @@ fn codegen_deref_assign(
     let mut chain_byte_offset: u32 = 0;
     let mut i = 0;
     while i < fields.len() {
-        let struct_path = match &current_ty {
-            RType::Struct(p) => clone_path(p),
+        let (struct_path, struct_args) = match &current_ty {
+            RType::Struct { path, type_args } => (clone_path(path), rtype_vec_clone(type_args)),
             _ => unreachable!("typeck verified chain navigates structs"),
         };
         let entry = struct_lookup(ctx.structs, &struct_path).expect("resolved struct");
+        let env = make_struct_env(&entry.type_params, &struct_args);
         let mut field_off: u32 = 0;
         let mut found = false;
         let mut j = 0;
         while j < entry.fields.len() {
-            let fty = rtype_clone(&entry.fields[j].ty);
+            let fty = substitute_rtype(&entry.fields[j].ty, &env);
             let s = byte_size_of(&fty, ctx.structs);
             if entry.fields[j].name == fields[i] {
                 chain_byte_offset += field_off;
@@ -1225,7 +1312,6 @@ fn codegen_expr(ctx: &mut FnCtx, expr: &Expr) -> Result<RType, Error> {
 fn codegen_method_call(ctx: &mut FnCtx, mc: &MethodCall) -> Result<RType, Error> {
     let res_idx = ctx.method_idx;
     ctx.method_idx += 1;
-    let callee_idx = ctx.method_resolutions[res_idx].callee_idx;
     // Match on a copy of the resolution shape to avoid borrowing ctx through
     // the resolutions vec across our subsequent codegen mutations.
     let recv_adjust_local = match &ctx.method_resolutions[res_idx].recv_adjust {
@@ -1234,13 +1320,34 @@ fn codegen_method_call(ctx: &mut FnCtx, mc: &MethodCall) -> Result<RType, Error>
         ReceiverAdjust::BorrowMut => RecvAdjustLocal::BorrowMut,
         ReceiverAdjust::ByRef => RecvAdjustLocal::ByRef,
     };
-    // Look up the callee's return type without holding a borrow into ctx.
-    let return_rt = {
-        let entry = &ctx.funcs.entries[callee_idx_to_table_idx(ctx, callee_idx)];
-        match &entry.return_type {
-            Some(rt) => rtype_clone(rt),
-            None => unreachable!("typeck rejects unit methods used as values"),
-        }
+    // Determine the wasm idx and return type. For non-template methods, use
+    // the recorded callee_idx directly. For template methods, substitute the
+    // resolution's type_args under our env, intern via MonoState, and compute
+    // the return type from the template's signature.
+    let template_idx_opt = ctx.method_resolutions[res_idx].template_idx;
+    let (callee_idx, return_rt) = if let Some(template_idx) = template_idx_opt {
+        let raw_args = rtype_vec_clone(&ctx.method_resolutions[res_idx].type_args);
+        let concrete = subst_vec(&raw_args, &ctx.env);
+        let return_rt = {
+            let tmpl = &ctx.funcs.templates[template_idx];
+            let tmpl_env = build_env(&tmpl.type_params, &concrete);
+            match &tmpl.return_type {
+                Some(rt) => substitute_rtype(rt, &tmpl_env),
+                None => unreachable!("typeck rejects unit methods used as values"),
+            }
+        };
+        let idx = ctx.mono.intern(template_idx, concrete);
+        (idx, return_rt)
+    } else {
+        let callee_idx = ctx.method_resolutions[res_idx].callee_idx;
+        let return_rt = {
+            let entry = &ctx.funcs.entries[callee_idx_to_table_idx(ctx, callee_idx)];
+            match &entry.return_type {
+                Some(rt) => rtype_clone(rt),
+                None => unreachable!("typeck rejects unit methods used as values"),
+            }
+        };
+        (callee_idx, return_rt)
     };
     // Codegen receiver.
     match recv_adjust_local {
@@ -1398,13 +1505,21 @@ fn codegen_call(ctx: &mut FnCtx, call: &Call) -> Result<RType, Error> {
 }
 
 fn codegen_struct_lit(ctx: &mut FnCtx, lit: &StructLit) -> Result<RType, Error> {
-    let full = crate::typeck::resolve_full_path(
-        &ctx.current_module,
-        ctx.self_target.as_ref(),
-        &lit.path.segments,
-    );
+    // Read the resolved struct type recorded by typeck (in source-DFS order).
+    // For generic structs, this carries the concrete type_args needed for
+    // layout. Substitute under our env in case those args themselves reference
+    // outer Param entries (mono of mono).
+    let recorded_idx = ctx.struct_lit_idx;
+    ctx.struct_lit_idx += 1;
+    let recorded_ty = rtype_clone(&ctx.struct_lit_types[recorded_idx]);
+    let recorded_ty = substitute_rtype(&recorded_ty, &ctx.env);
+    let (full, struct_args) = match &recorded_ty {
+        RType::Struct { path, type_args } => (clone_path(path), rtype_vec_clone(type_args)),
+        _ => unreachable!("struct_lit_types must hold a Struct"),
+    };
 
-    // Field layouts: declaration-order (name, flat_offset, valtypes).
+    // Field layouts: declaration-order (name, flat_offset, valtypes), with
+    // field types substituted via the struct's type-arg env.
     struct FieldLayout {
         name: String,
         flat_offset: u32,
@@ -1412,12 +1527,14 @@ fn codegen_struct_lit(ctx: &mut FnCtx, lit: &StructLit) -> Result<RType, Error> 
     }
     let layouts: Vec<FieldLayout> = {
         let entry = struct_lookup(ctx.structs, &full).expect("typeck resolved this struct");
+        let env = make_struct_env(&entry.type_params, &struct_args);
         let mut out: Vec<FieldLayout> = Vec::new();
         let mut flat_off: u32 = 0;
         let mut i = 0;
         while i < entry.fields.len() {
+            let fty = substitute_rtype(&entry.fields[i].ty, &env);
             let mut vts: Vec<wasm::ValType> = Vec::new();
-            flatten_rtype(&entry.fields[i].ty, ctx.structs, &mut vts);
+            flatten_rtype(&fty, ctx.structs, &mut vts);
             let s = vts.len() as u32;
             out.push(FieldLayout {
                 name: entry.fields[i].name.clone(),
@@ -1483,7 +1600,10 @@ fn codegen_struct_lit(ctx: &mut FnCtx, lit: &StructLit) -> Result<RType, Error> 
         i += 1;
     }
 
-    Ok(RType::Struct(full))
+    Ok(RType::Struct {
+        path: full,
+        type_args: struct_args,
+    })
 }
 
 fn codegen_field_access(ctx: &mut FnCtx, fa: &FieldAccess) -> Result<RType, Error> {
@@ -1561,16 +1681,17 @@ fn codegen_place_chain_load(
     let mut chain_offset: u32 = 0;
     let mut i = 1;
     while i < chain.len() {
-        let struct_path = match &current_ty {
-            RType::Struct(p) => clone_path(p),
+        let (struct_path, struct_args) = match &current_ty {
+            RType::Struct { path, type_args } => (clone_path(path), rtype_vec_clone(type_args)),
             _ => unreachable!("typeck verified chain navigates structs"),
         };
         let entry = struct_lookup(ctx.structs, &struct_path).expect("resolved struct");
+        let env = make_struct_env(&entry.type_params, &struct_args);
         let mut field_offset: u32 = 0;
         let mut found_field = false;
         let mut j = 0;
         while j < entry.fields.len() {
-            let fty = rtype_clone(&entry.fields[j].ty);
+            let fty = substitute_rtype(&entry.fields[j].ty, &env);
             let s = byte_size_of(&fty, ctx.structs);
             if entry.fields[j].name == chain[i] {
                 chain_offset += field_offset;
@@ -1651,10 +1772,10 @@ fn extract_field_from_stack(
     field_name: &str,
 ) -> Result<RType, Error> {
     // Compute total flat size, field flat offset, field flat size, field type.
-    let struct_path = match base_type {
-        RType::Struct(p) => clone_path(p),
+    let (struct_path, struct_args) = match base_type {
+        RType::Struct { path, type_args } => (clone_path(path), rtype_vec_clone(type_args)),
         RType::Ref { inner, .. } => match inner.as_ref() {
-            RType::Struct(p) => clone_path(p),
+            RType::Struct { path, type_args } => (clone_path(path), rtype_vec_clone(type_args)),
             _ => unreachable!("typeck rejects field access on non-struct"),
         },
         _ => unreachable!("typeck rejects field access on non-struct"),
@@ -1665,10 +1786,11 @@ fn extract_field_from_stack(
     let mut field_ty: RType = RType::Int(IntKind::I32);
     {
         let entry = struct_lookup(ctx.structs, &struct_path).expect("resolved struct");
+        let env = make_struct_env(&entry.type_params, &struct_args);
         let mut found = false;
         let mut i = 0;
         while i < entry.fields.len() {
-            let fty = rtype_clone(&entry.fields[i].ty);
+            let fty = substitute_rtype(&entry.fields[i].ty, &env);
             let mut vts: Vec<wasm::ValType> = Vec::new();
             flatten_rtype(&fty, ctx.structs, &mut vts);
             let s = vts.len() as u32;
@@ -1756,16 +1878,17 @@ fn codegen_borrow(ctx: &mut FnCtx, inner: &Expr, mutable: bool) -> Result<RType,
     let mut chain_offset: u32 = 0;
     let mut i = 1;
     while i < chain.len() {
-        let struct_path = match &current_ty {
-            RType::Struct(p) => clone_path(p),
+        let (struct_path, struct_args) = match &current_ty {
+            RType::Struct { path, type_args } => (clone_path(path), rtype_vec_clone(type_args)),
             _ => unreachable!("typeck verified chain navigates structs"),
         };
         let entry = struct_lookup(ctx.structs, &struct_path).expect("resolved struct");
+        let env = make_struct_env(&entry.type_params, &struct_args);
         let mut field_offset: u32 = 0;
         let mut j = 0;
         let mut found_field = false;
         while j < entry.fields.len() {
-            let fty = rtype_clone(&entry.fields[j].ty);
+            let fty = substitute_rtype(&entry.fields[j].ty, &env);
             let s = byte_size_of(&fty, ctx.structs);
             if entry.fields[j].name == chain[i] {
                 chain_offset += field_offset;

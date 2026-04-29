@@ -53,7 +53,12 @@ impl Parser {
 
     fn parse_impl_block(&mut self) -> Result<ImplBlock, Error> {
         let impl_span = self.expect(&TokenKind::Impl, "`impl`")?;
-        let target = self.parse_path()?;
+        let type_params = if self.peek_kind(&TokenKind::LAngle) {
+            self.parse_type_params()?
+        } else {
+            Vec::new()
+        };
+        let target = self.parse_path_with_type_args()?;
         self.expect(&TokenKind::LBrace, "`{`")?;
         let mut methods: Vec<Function> = Vec::new();
         while !self.peek_kind(&TokenKind::RBrace) {
@@ -64,10 +69,46 @@ impl Parser {
         }
         let rb = self.expect(&TokenKind::RBrace, "`}`")?;
         Ok(ImplBlock {
+            type_params,
             target,
             methods,
             span: Span::new(impl_span.start, rb.end),
         })
+    }
+
+    // Parse a path that may carry generic args on its last segment using the
+    // type-position syntax: `Foo<T1, T2>` (no `::`). Used for type references
+    // and for impl targets.
+    fn parse_path_with_type_args(&mut self) -> Result<Path, Error> {
+        let mut path = self.parse_path()?;
+        if self.peek_kind(&TokenKind::LAngle) {
+            let args = self.parse_angle_type_args()?;
+            // Attach to the last segment.
+            let last = path.segments.len() - 1;
+            path.segments[last].args = args;
+            // Extend the path's span to cover the args.
+            if let Some(end_pos) = self.tokens.get(self.pos.saturating_sub(1)) {
+                path.span = Span::new(path.span.start.copy(), end_pos.span.end.copy());
+            }
+        }
+        Ok(path)
+    }
+
+    fn parse_angle_type_args(&mut self) -> Result<Vec<Type>, Error> {
+        self.expect(&TokenKind::LAngle, "`<`")?;
+        let mut args: Vec<Type> = Vec::new();
+        if !self.peek_kind(&TokenKind::RAngle) {
+            args.push(self.parse_type()?);
+            while self.peek_kind(&TokenKind::Comma) {
+                self.pos += 1;
+                if self.peek_kind(&TokenKind::RAngle) {
+                    break;
+                }
+                args.push(self.parse_type()?);
+            }
+        }
+        self.expect(&TokenKind::RAngle, "`>`")?;
+        Ok(args)
     }
 
     fn parse_mod_decl(&mut self) -> Result<RawItem, Error> {
@@ -80,6 +121,11 @@ impl Parser {
     fn parse_struct_def(&mut self) -> Result<StructDef, Error> {
         self.expect(&TokenKind::Struct, "`struct`")?;
         let (name, name_span) = self.expect_ident()?;
+        let type_params = if self.peek_kind(&TokenKind::LAngle) {
+            self.parse_type_params()?
+        } else {
+            Vec::new()
+        };
         self.expect(&TokenKind::LBrace, "`{`")?;
         let mut fields = Vec::new();
         if !self.peek_kind(&TokenKind::RBrace) {
@@ -96,6 +142,7 @@ impl Parser {
         Ok(StructDef {
             name,
             name_span,
+            type_params,
             fields,
         })
     }
@@ -297,7 +344,7 @@ impl Parser {
                 span,
             });
         }
-        let path = self.parse_path()?;
+        let path = self.parse_path_with_type_args()?;
         let span = path.span.copy();
         Ok(Type {
             kind: TypeKind::Path(path),
@@ -433,6 +480,13 @@ impl Parser {
         while self.peek_kind(&TokenKind::Dot) {
             self.pos += 1;
             let (field, field_span) = self.expect_ident()?;
+            // Optional method-call turbofish: `.method::<T1, T2>(args)`.
+            let turbofish_args = if self.peek_two(&TokenKind::PathSep, &TokenKind::LAngle) {
+                self.pos += 1; // skip `::`
+                self.parse_angle_type_args()?
+            } else {
+                Vec::new()
+            };
             if self.peek_kind(&TokenKind::LParen) {
                 let args = self.parse_call_args()?;
                 let end = self.tokens[self.pos - 1].span.end.copy();
@@ -442,10 +496,17 @@ impl Parser {
                         receiver: Box::new(expr),
                         method: field,
                         method_span: field_span,
+                        turbofish_args,
                         args,
                     }),
                     span,
                 };
+            } else if !turbofish_args.is_empty() {
+                return Err(Error {
+                    file: self.file.clone(),
+                    message: "expected `(` after method-call turbofish `::<…>`".to_string(),
+                    span: field_span,
+                });
             } else {
                 let span = Span::new(expr.span.start.copy(), field_span.end.copy());
                 expr = Expr {
@@ -543,33 +604,14 @@ impl Parser {
 
     fn parse_path_atom(&mut self) -> Result<Expr, Error> {
         let path = self.parse_path()?;
-        // Optional turbofish: `path::<T1, T2>(args)`. We've already consumed
-        // `path`; the `::<` here is `PathSep` followed by `LAngle`. If the
-        // user wrote `path::other` we'd have consumed both segments above.
-        let generic_args = if self.peek_two(&TokenKind::PathSep, &TokenKind::LAngle) {
-            self.pos += 1; // skip `::`
-            self.parse_turbofish_args()?
-        } else {
-            Vec::new()
-        };
+        let had_turbofish = path.segments.iter().any(|s| !s.args.is_empty());
         if self.peek_kind(&TokenKind::LParen) {
             let args = self.parse_call_args()?;
             let end = self.tokens[self.pos - 1].span.end.copy();
             let span = Span::new(path.span.start.copy(), end);
             Ok(Expr {
-                kind: ExprKind::Call(Call {
-                    callee: path,
-                    generic_args,
-                    args,
-                }),
+                kind: ExprKind::Call(Call { callee: path, args }),
                 span,
-            })
-        } else if !generic_args.is_empty() {
-            // turbofish without a following call — illegal.
-            Err(Error {
-                file: self.file.clone(),
-                message: "expected `(` after turbofish `::<…>`".to_string(),
-                span: path.span.copy(),
             })
         } else if self.peek_kind(&TokenKind::LBrace) {
             let fields = self.parse_struct_init()?;
@@ -578,6 +620,12 @@ impl Parser {
             Ok(Expr {
                 kind: ExprKind::StructLit(StructLit { path, fields }),
                 span,
+            })
+        } else if had_turbofish {
+            Err(Error {
+                file: self.file.clone(),
+                message: "expected `(` or `{` after turbofish `::<…>`".to_string(),
+                span: path.span.copy(),
             })
         } else if path.segments.len() == 1 {
             let seg = &path.segments[0];
@@ -592,23 +640,6 @@ impl Parser {
                 span: path.span.copy(),
             })
         }
-    }
-
-    fn parse_turbofish_args(&mut self) -> Result<Vec<Type>, Error> {
-        self.expect(&TokenKind::LAngle, "`<`")?;
-        let mut args: Vec<Type> = Vec::new();
-        if !self.peek_kind(&TokenKind::RAngle) {
-            args.push(self.parse_type()?);
-            while self.peek_kind(&TokenKind::Comma) {
-                self.pos += 1;
-                if self.peek_kind(&TokenKind::RAngle) {
-                    break;
-                }
-                args.push(self.parse_type()?);
-            }
-        }
-        self.expect(&TokenKind::RAngle, "`>`")?;
-        Ok(args)
     }
 
     fn peek_two(&self, a: &TokenKind, b: &TokenKind) -> bool {
@@ -672,15 +703,34 @@ impl Parser {
         segments.push(PathSegment {
             name: first_name,
             span: first_span,
+            args: Vec::new(),
         });
-        // Don't consume `::<…>` (turbofish) — that's handled by the caller.
-        while self.peek_kind(&TokenKind::PathSep)
-            && !self.peek_two(&TokenKind::PathSep, &TokenKind::LAngle)
-        {
-            self.pos += 1;
-            let (name, span) = self.expect_path_segment()?;
-            end = span.end.copy();
-            segments.push(PathSegment { name, span });
+        loop {
+            // Intermediate turbofish: `Pair::<T>::method` — args attach to
+            // the immediately preceding segment, then we continue parsing.
+            if self.peek_two(&TokenKind::PathSep, &TokenKind::LAngle) {
+                self.pos += 1; // skip `::`
+                let args = self.parse_angle_type_args()?;
+                let last = segments.len() - 1;
+                segments[last].args = args;
+                if self.pos > 0 {
+                    end = self.tokens[self.pos - 1].span.end.copy();
+                }
+                continue;
+            }
+            // Plain `::name` — next segment.
+            if self.peek_kind(&TokenKind::PathSep) {
+                self.pos += 1;
+                let (name, span) = self.expect_path_segment()?;
+                end = span.end.copy();
+                segments.push(PathSegment {
+                    name,
+                    span,
+                    args: Vec::new(),
+                });
+                continue;
+            }
+            break;
         }
         Ok(Path {
             segments,

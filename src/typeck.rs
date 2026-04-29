@@ -113,7 +113,10 @@ fn int_kind_max(k: &IntKind) -> u128 {
 
 pub enum RType {
     Int(IntKind),
-    Struct(Vec<String>),
+    Struct {
+        path: Vec<String>,
+        type_args: Vec<RType>,
+    },
     Ref { inner: Box<RType>, mutable: bool },
     RawPtr { inner: Box<RType>, mutable: bool },
     // An opaque type parameter inside a generic body. Carries the param's
@@ -125,7 +128,10 @@ pub enum RType {
 pub fn rtype_clone(t: &RType) -> RType {
     match t {
         RType::Int(k) => RType::Int(int_kind_copy(k)),
-        RType::Struct(p) => RType::Struct(clone_path(p)),
+        RType::Struct { path, type_args } => RType::Struct {
+            path: clone_path(path),
+            type_args: rtype_vec_clone(type_args),
+        },
         RType::Ref { inner, mutable } => RType::Ref {
             inner: Box::new(rtype_clone(inner)),
             mutable: *mutable,
@@ -138,10 +144,43 @@ pub fn rtype_clone(t: &RType) -> RType {
     }
 }
 
+fn rtype_vec_clone(v: &Vec<RType>) -> Vec<RType> {
+    let mut out: Vec<RType> = Vec::new();
+    let mut i = 0;
+    while i < v.len() {
+        out.push(rtype_clone(&v[i]));
+        i += 1;
+    }
+    out
+}
+
+fn rtype_vec_eq(a: &Vec<RType>, b: &Vec<RType>) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut i = 0;
+    while i < a.len() {
+        if !rtype_eq(&a[i], &b[i]) {
+            return false;
+        }
+        i += 1;
+    }
+    true
+}
+
 pub fn rtype_eq(a: &RType, b: &RType) -> bool {
     match (a, b) {
         (RType::Int(ka), RType::Int(kb)) => int_kind_eq(ka, kb),
-        (RType::Struct(pa), RType::Struct(pb)) => path_eq(pa, pb),
+        (
+            RType::Struct {
+                path: pa,
+                type_args: aa,
+            },
+            RType::Struct {
+                path: pb,
+                type_args: ab,
+            },
+        ) => path_eq(pa, pb) && rtype_vec_eq(aa, ab),
         (
             RType::Ref {
                 inner: ia,
@@ -170,7 +209,24 @@ pub fn rtype_eq(a: &RType, b: &RType) -> bool {
 pub fn rtype_to_string(t: &RType) -> String {
     match t {
         RType::Int(k) => int_kind_name(k).to_string(),
-        RType::Struct(p) => place_to_string(p),
+        RType::Struct { path, type_args } => {
+            if type_args.is_empty() {
+                place_to_string(path)
+            } else {
+                let mut s = place_to_string(path);
+                s.push('<');
+                let mut i = 0;
+                while i < type_args.len() {
+                    if i > 0 {
+                        s.push_str(", ");
+                    }
+                    s.push_str(&rtype_to_string(&type_args[i]));
+                    i += 1;
+                }
+                s.push('>');
+                s
+            }
+        }
         RType::Ref { inner, mutable } => {
             if *mutable {
                 format!("&mut {}", rtype_to_string(inner))
@@ -195,12 +251,14 @@ pub fn rtype_size(ty: &RType, structs: &StructTable) -> u32 {
             IntKind::U128 | IntKind::I128 => 2,
             _ => 1,
         },
-        RType::Struct(p) => {
-            let entry = struct_lookup(structs, p).expect("resolved struct");
+        RType::Struct { path, type_args } => {
+            let entry = struct_lookup(structs, path).expect("resolved struct");
+            let env = struct_env(&entry.type_params, type_args);
             let mut s: u32 = 0;
             let mut i = 0;
             while i < entry.fields.len() {
-                s += rtype_size(&entry.fields[i].ty, structs);
+                let fty = substitute_rtype(&entry.fields[i].ty, &env);
+                s += rtype_size(&fty, structs);
                 i += 1;
             }
             s
@@ -208,6 +266,21 @@ pub fn rtype_size(ty: &RType, structs: &StructTable) -> u32 {
         RType::Ref { .. } | RType::RawPtr { .. } => 1,
         RType::Param(_) => unreachable!("rtype_size called on unresolved type parameter"),
     }
+}
+
+fn struct_env(type_params: &Vec<String>, type_args: &Vec<RType>) -> Vec<(String, RType)> {
+    let mut env: Vec<(String, RType)> = Vec::new();
+    let n = if type_params.len() < type_args.len() {
+        type_params.len()
+    } else {
+        type_args.len()
+    };
+    let mut i = 0;
+    while i < n {
+        env.push((type_params[i].clone(), rtype_clone(&type_args[i])));
+        i += 1;
+    }
+    env
 }
 
 pub fn flatten_rtype(ty: &RType, structs: &StructTable, out: &mut Vec<crate::wasm::ValType>) {
@@ -220,11 +293,13 @@ pub fn flatten_rtype(ty: &RType, structs: &StructTable, out: &mut Vec<crate::was
             }
             _ => out.push(crate::wasm::ValType::I32),
         },
-        RType::Struct(p) => {
-            let entry = struct_lookup(structs, p).expect("resolved struct");
+        RType::Struct { path, type_args } => {
+            let entry = struct_lookup(structs, path).expect("resolved struct");
+            let env = struct_env(&entry.type_params, type_args);
             let mut i = 0;
             while i < entry.fields.len() {
-                flatten_rtype(&entry.fields[i].ty, structs, out);
+                let fty = substitute_rtype(&entry.fields[i].ty, &env);
+                flatten_rtype(&fty, structs, out);
                 i += 1;
             }
         }
@@ -243,12 +318,14 @@ pub fn byte_size_of(rt: &RType, structs: &StructTable) -> u32 {
             IntKind::U128 | IntKind::I128 => 16,
         },
         RType::Ref { .. } | RType::RawPtr { .. } => 4,
-        RType::Struct(p) => {
-            let entry = struct_lookup(structs, p).expect("resolved struct");
+        RType::Struct { path, type_args } => {
+            let entry = struct_lookup(structs, path).expect("resolved struct");
+            let env = struct_env(&entry.type_params, type_args);
             let mut total: u32 = 0;
             let mut i = 0;
             while i < entry.fields.len() {
-                total += byte_size_of(&entry.fields[i].ty, structs);
+                let fty = substitute_rtype(&entry.fields[i].ty, &env);
+                total += byte_size_of(&fty, structs);
                 i += 1;
             }
             total
@@ -264,7 +341,18 @@ pub fn byte_size_of(rt: &RType, structs: &StructTable) -> u32 {
 pub fn substitute_rtype(rt: &RType, env: &Vec<(String, RType)>) -> RType {
     match rt {
         RType::Int(k) => RType::Int(int_kind_copy(k)),
-        RType::Struct(p) => RType::Struct(clone_path(p)),
+        RType::Struct { path, type_args } => {
+            let mut subst_args: Vec<RType> = Vec::new();
+            let mut i = 0;
+            while i < type_args.len() {
+                subst_args.push(substitute_rtype(&type_args[i], env));
+                i += 1;
+            }
+            RType::Struct {
+                path: clone_path(path),
+                type_args: subst_args,
+            }
+        }
         RType::Ref { inner, mutable } => RType::Ref {
             inner: Box::new(substitute_rtype(inner, env)),
             mutable: *mutable,
@@ -289,7 +377,7 @@ pub fn substitute_rtype(rt: &RType, env: &Vec<(String, RType)>) -> RType {
 pub fn is_copy(t: &RType) -> bool {
     match t {
         RType::Int(_) => true,
-        RType::Struct(_) => false,
+        RType::Struct { .. } => false,
         RType::Ref { .. } => true,
         RType::RawPtr { .. } => true,
         // Without trait bounds, we can't claim T is Copy. Conservatively false.
@@ -315,6 +403,7 @@ pub struct StructEntry {
     pub path: Vec<String>,
     pub name_span: Span,
     pub file: String,
+    pub type_params: Vec<String>,
     pub fields: Vec<RTypedField>,
 }
 
@@ -340,6 +429,10 @@ pub struct FnSymbol {
     pub return_type: Option<RType>,
     pub let_types: Vec<RType>,
     pub lit_types: Vec<RType>,
+    // Per `StructLit` expression in body, in source-DFS order: the final
+    // resolved struct type (with concrete `type_args`). Codegen reads these
+    // to compute layout for generic struct literals.
+    pub struct_lit_types: Vec<RType>,
     // For each `Deref` expression in the body, in source-DFS order: `true`
     // iff the operand resolved to a raw pointer (`*const T` / `*mut T`).
     // Safeck reads this in lockstep to flag derefs outside `unsafe` blocks.
@@ -381,6 +474,7 @@ pub struct GenericTemplate {
     pub return_type: Option<RType>,
     pub let_types: Vec<RType>,
     pub lit_types: Vec<RType>,
+    pub struct_lit_types: Vec<RType>,
     pub deref_is_raw: Vec<bool>,
     pub ret_ref_source: Option<usize>,
     pub method_resolutions: Vec<MethodResolution>,
@@ -388,13 +482,19 @@ pub struct GenericTemplate {
 }
 
 pub struct MethodResolution {
+    // For concrete methods (non-template), this is the WASM idx. For
+    // generic-method calls, ignored — see `template_idx`/`type_args` instead.
     pub callee_idx: u32,
     pub callee_path: Vec<String>,
     pub recv_adjust: ReceiverAdjust,
-    // Whether the callee's `ret_ref_source = Some(0)` (self-receiver lifetime
-    // flows out) AND the receiver is being autoref'd from a place — borrowck
-    // uses this to attribute the returned borrow to the receiver place.
     pub ret_borrows_receiver: bool,
+    // When the method is a generic template (impl-generic and/or method-generic),
+    // these record the resolution for codegen to monomorphize. type_args has
+    // length = template's type_params.len(), in the same order: impl's params
+    // first (bound to receiver type_args), then method's own (fresh vars
+    // resolved by inference).
+    pub template_idx: Option<usize>,
+    pub type_args: Vec<RType>,
 }
 
 pub enum ReceiverAdjust {
@@ -470,7 +570,7 @@ pub fn resolve_full_path(
     let mut full = clone_path(current_module);
     let mut start = 0;
     if !segments.is_empty() && segments[0].name == "Self" {
-        if let Some(RType::Struct(target_path)) = self_target {
+        if let Some(RType::Struct { path: target_path, .. }) = self_target {
             if let Some(last) = target_path.last() {
                 full.push(last.clone());
                 start = 1;
@@ -541,15 +641,42 @@ pub fn resolve_type(
                 full.push(path.segments[i].name.clone());
                 i += 1;
             }
-            if struct_lookup(structs, &full).is_some() {
-                Ok(RType::Struct(full))
-            } else {
-                Err(Error {
+            // Generic args attach to the path's last segment.
+            let last = &path.segments[path.segments.len() - 1];
+            let entry = match struct_lookup(structs, &full) {
+                Some(e) => e,
+                None => {
+                    return Err(Error {
+                        file: file.to_string(),
+                        message: format!("unknown type: {}", segments_to_string(&path.segments)),
+                        span: path.span.copy(),
+                    });
+                }
+            };
+            if entry.type_params.len() != last.args.len() {
+                return Err(Error {
                     file: file.to_string(),
-                    message: format!("unknown type: {}", segments_to_string(&path.segments)),
+                    message: format!(
+                        "wrong number of type arguments for `{}`: expected {}, got {}",
+                        place_to_string(&full),
+                        entry.type_params.len(),
+                        last.args.len()
+                    ),
                     span: path.span.copy(),
-                })
+                });
             }
+            let mut type_args: Vec<RType> = Vec::new();
+            let mut i = 0;
+            while i < last.args.len() {
+                let t =
+                    resolve_type(&last.args[i], current_module, structs, self_target, type_params, file)?;
+                type_args.push(t);
+                i += 1;
+            }
+            Ok(RType::Struct {
+                path: full,
+                type_args,
+            })
         }
         TypeKind::Ref { inner, mutable } => {
             let r = resolve_type(inner, current_module, structs, self_target, type_params, file)?;
@@ -617,10 +744,16 @@ fn collect_struct_names(module: &Module, path: &mut Vec<String>, table: &mut Str
             Item::Struct(sd) => {
                 let mut full = clone_path(path);
                 full.push(sd.name.clone());
+                let type_param_names: Vec<String> = sd
+                    .type_params
+                    .iter()
+                    .map(|p| p.name.clone())
+                    .collect();
                 table.entries.push(StructEntry {
                     path: full,
                     name_span: sd.name_span.copy(),
                     file: module.source_file.clone(),
+                    type_params: type_param_names,
                     fields: Vec::new(),
                 });
             }
@@ -647,10 +780,22 @@ fn resolve_struct_fields(
             Item::Struct(sd) => {
                 let mut full = clone_path(path);
                 full.push(sd.name.clone());
+                let type_param_names: Vec<String> = sd
+                    .type_params
+                    .iter()
+                    .map(|p| p.name.clone())
+                    .collect();
                 let mut resolved: Vec<RTypedField> = Vec::new();
                 let mut k = 0;
                 while k < sd.fields.len() {
-                    let rt = resolve_type(&sd.fields[k].ty, path, table, None, &Vec::new(), &module.source_file)?;
+                    let rt = resolve_type(
+                        &sd.fields[k].ty,
+                        path,
+                        table,
+                        None,
+                        &type_param_names,
+                        &module.source_file,
+                    )?;
                     if let RType::Ref { .. } = &rt {
                         return Err(Error {
                             file: module.source_file.clone(),
@@ -698,7 +843,16 @@ fn collect_funcs(
     while i < module.items.len() {
         match &module.items[i] {
             Item::Function(f) => {
-                register_function(f, path, None, funcs, next_idx, structs, &module.source_file)?;
+                register_function(
+                    f,
+                    path,
+                    None,
+                    &Vec::new(),
+                    funcs,
+                    next_idx,
+                    structs,
+                    &module.source_file,
+                )?;
             }
             Item::Module(m) => {
                 path.push(m.name.clone());
@@ -708,6 +862,8 @@ fn collect_funcs(
             Item::Struct(_) => {}
             Item::Impl(ib) => {
                 let target_rt = resolve_impl_target(ib, path, structs, &module.source_file)?;
+                let impl_type_params: Vec<String> =
+                    ib.type_params.iter().map(|p| p.name.clone()).collect();
                 let target_name = ib.target.segments[0].name.clone();
                 path.push(target_name);
                 let mut k = 0;
@@ -716,6 +872,7 @@ fn collect_funcs(
                         &ib.methods[k],
                         path,
                         Some(&target_rt),
+                        &impl_type_params,
                         funcs,
                         next_idx,
                         structs,
@@ -731,8 +888,10 @@ fn collect_funcs(
     Ok(())
 }
 
-// Resolves an `impl Path { ... }` target to its struct type. We only support
-// single-segment paths naming a struct in the current module.
+// Resolves an `impl Path { ... }` target to its struct type. The impl's type
+// params must match the target struct's type params 1:1 (e.g., `impl<T, U>
+// Pair<T, U>`). Returns the struct type with `Param(...)` type args matching
+// the impl's parameter names.
 fn resolve_impl_target(
     ib: &crate::ast::ImplBlock,
     current_module: &Vec<String>,
@@ -748,42 +907,95 @@ fn resolve_impl_target(
     }
     let mut target_path = clone_path(current_module);
     target_path.push(ib.target.segments[0].name.clone());
-    if struct_lookup(structs, &target_path).is_none() {
+    let entry = match struct_lookup(structs, &target_path) {
+        Some(e) => e,
+        None => {
+            return Err(Error {
+                file: file.to_string(),
+                message: format!("unknown struct: {}", ib.target.segments[0].name),
+                span: ib.target.span.copy(),
+            });
+        }
+    };
+    let target_args = &ib.target.segments[0].args;
+    if target_args.len() != entry.type_params.len() {
         return Err(Error {
             file: file.to_string(),
-            message: format!("unknown struct: {}", ib.target.segments[0].name),
+            message: format!(
+                "impl target has wrong number of type arguments: expected {}, got {}",
+                entry.type_params.len(),
+                target_args.len()
+            ),
             span: ib.target.span.copy(),
         });
     }
-    Ok(RType::Struct(target_path))
+    if entry.type_params.len() != ib.type_params.len() {
+        return Err(Error {
+            file: file.to_string(),
+            message: format!(
+                "impl declares {} type parameter(s) but target struct has {}",
+                ib.type_params.len(),
+                entry.type_params.len()
+            ),
+            span: ib.target.span.copy(),
+        });
+    }
+    // Each target arg must be a single-segment path matching the impl's type
+    // params in order. Concrete instantiations (`impl Foo<u32>`) aren't yet
+    // supported.
+    let impl_param_names: Vec<String> = ib.type_params.iter().map(|p| p.name.clone()).collect();
+    let mut type_args: Vec<RType> = Vec::new();
+    let mut i = 0;
+    while i < target_args.len() {
+        let arg_ty = &target_args[i];
+        let ok = match &arg_ty.kind {
+            crate::ast::TypeKind::Path(p) => {
+                p.segments.len() == 1
+                    && p.segments[0].args.is_empty()
+                    && p.segments[0].name == impl_param_names[i]
+            }
+            _ => false,
+        };
+        if !ok {
+            return Err(Error {
+                file: file.to_string(),
+                message:
+                    "impl target's type arguments must match the impl's type parameters in order"
+                        .to_string(),
+                span: arg_ty.span.copy(),
+            });
+        }
+        type_args.push(RType::Param(impl_param_names[i].clone()));
+        i += 1;
+    }
+    Ok(RType::Struct {
+        path: target_path,
+        type_args,
+    })
 }
 
 fn register_function(
     f: &Function,
     current_module: &Vec<String>,
     self_target: Option<&RType>,
+    impl_type_params: &Vec<String>,
     funcs: &mut FuncTable,
     next_idx: &mut u32,
     structs: &StructTable,
     source_file: &str,
 ) -> Result<(), Error> {
-    let type_param_names: Vec<String> = {
-        let mut v: Vec<String> = Vec::new();
-        let mut i = 0;
-        while i < f.type_params.len() {
-            v.push(f.type_params[i].name.clone());
-            i += 1;
-        }
-        v
-    };
-    let is_generic = !type_param_names.is_empty();
-    if is_generic && self_target.is_some() {
-        return Err(Error {
-            file: source_file.to_string(),
-            message: "generic methods are not yet supported".to_string(),
-            span: f.name_span.copy(),
-        });
+    let mut type_param_names: Vec<String> = Vec::new();
+    let mut i = 0;
+    while i < impl_type_params.len() {
+        type_param_names.push(impl_type_params[i].clone());
+        i += 1;
     }
+    let mut i = 0;
+    while i < f.type_params.len() {
+        type_param_names.push(f.type_params[i].name.clone());
+        i += 1;
+    }
+    let is_generic = !type_param_names.is_empty();
     let mut full = clone_path(current_module);
     full.push(f.name.clone());
     let mut param_types: Vec<RType> = Vec::new();
@@ -833,6 +1045,7 @@ fn register_function(
             return_type,
             let_types: Vec::new(),
             lit_types: Vec::new(),
+            struct_lit_types: Vec::new(),
             deref_is_raw: Vec::new(),
             ret_ref_source,
             method_resolutions: Vec::new(),
@@ -846,6 +1059,7 @@ fn register_function(
             return_type,
             let_types: Vec::new(),
             lit_types: Vec::new(),
+            struct_lit_types: Vec::new(),
             deref_is_raw: Vec::new(),
             ret_ref_source,
             method_resolutions: Vec::new(),
@@ -929,7 +1143,10 @@ fn check_ret_ref_elision(
 enum InferType {
     Var(u32),
     Int(IntKind),
-    Struct(Vec<String>),
+    Struct {
+        path: Vec<String>,
+        type_args: Vec<InferType>,
+    },
     Ref { inner: Box<InferType>, mutable: bool },
     RawPtr { inner: Box<InferType>, mutable: bool },
     Param(String),
@@ -939,7 +1156,10 @@ fn infer_clone(t: &InferType) -> InferType {
     match t {
         InferType::Var(v) => InferType::Var(*v),
         InferType::Int(k) => InferType::Int(int_kind_copy(k)),
-        InferType::Struct(p) => InferType::Struct(clone_path(p)),
+        InferType::Struct { path, type_args } => InferType::Struct {
+            path: clone_path(path),
+            type_args: infer_vec_clone(type_args),
+        },
         InferType::Ref { inner, mutable } => InferType::Ref {
             inner: Box::new(infer_clone(inner)),
             mutable: *mutable,
@@ -952,10 +1172,49 @@ fn infer_clone(t: &InferType) -> InferType {
     }
 }
 
+fn infer_vec_clone(v: &Vec<InferType>) -> Vec<InferType> {
+    let mut out: Vec<InferType> = Vec::new();
+    let mut i = 0;
+    while i < v.len() {
+        out.push(infer_clone(&v[i]));
+        i += 1;
+    }
+    out
+}
+
+// Build a name → InferType env from a generic struct/template's type-param
+// names paired with the call site's type arguments. Used to substitute Param
+// in field types or method signatures.
+fn build_infer_env(type_params: &Vec<String>, type_args: &Vec<InferType>) -> Vec<(String, InferType)> {
+    let mut env: Vec<(String, InferType)> = Vec::new();
+    let n = if type_params.len() < type_args.len() {
+        type_params.len()
+    } else {
+        type_args.len()
+    };
+    let mut i = 0;
+    while i < n {
+        env.push((type_params[i].clone(), infer_clone(&type_args[i])));
+        i += 1;
+    }
+    env
+}
+
 fn rtype_to_infer(rt: &RType) -> InferType {
     match rt {
         RType::Int(k) => InferType::Int(int_kind_copy(k)),
-        RType::Struct(p) => InferType::Struct(clone_path(p)),
+        RType::Struct { path, type_args } => {
+            let mut infer_args: Vec<InferType> = Vec::new();
+            let mut i = 0;
+            while i < type_args.len() {
+                infer_args.push(rtype_to_infer(&type_args[i]));
+                i += 1;
+            }
+            InferType::Struct {
+                path: clone_path(path),
+                type_args: infer_args,
+            }
+        }
         RType::Ref { inner, mutable } => InferType::Ref {
             inner: Box::new(rtype_to_infer(inner)),
             mutable: *mutable,
@@ -975,7 +1234,18 @@ fn infer_substitute(t: &InferType, env: &Vec<(String, InferType)>) -> InferType 
     match t {
         InferType::Var(v) => InferType::Var(*v),
         InferType::Int(k) => InferType::Int(int_kind_copy(k)),
-        InferType::Struct(p) => InferType::Struct(clone_path(p)),
+        InferType::Struct { path, type_args } => {
+            let mut subst_args: Vec<InferType> = Vec::new();
+            let mut i = 0;
+            while i < type_args.len() {
+                subst_args.push(infer_substitute(&type_args[i], env));
+                i += 1;
+            }
+            InferType::Struct {
+                path: clone_path(path),
+                type_args: subst_args,
+            }
+        }
         InferType::Ref { inner, mutable } => InferType::Ref {
             inner: Box::new(infer_substitute(inner, env)),
             mutable: *mutable,
@@ -1001,7 +1271,24 @@ fn infer_to_string(t: &InferType) -> String {
     match t {
         InferType::Var(v) => format!("?{}", v),
         InferType::Int(k) => int_kind_name(k).to_string(),
-        InferType::Struct(p) => place_to_string(p),
+        InferType::Struct { path, type_args } => {
+            if type_args.is_empty() {
+                place_to_string(path)
+            } else {
+                let mut s = place_to_string(path);
+                s.push('<');
+                let mut i = 0;
+                while i < type_args.len() {
+                    if i > 0 {
+                        s.push_str(", ");
+                    }
+                    s.push_str(&infer_to_string(&type_args[i]));
+                    i += 1;
+                }
+                s.push('>');
+                s
+            }
+        }
         InferType::Ref { inner, mutable } => {
             if *mutable {
                 format!("&mut {}", infer_to_string(inner))
@@ -1050,7 +1337,18 @@ impl Subst {
                 None => InferType::Var(*v),
             },
             InferType::Int(k) => InferType::Int(int_kind_copy(k)),
-            InferType::Struct(p) => InferType::Struct(clone_path(p)),
+            InferType::Struct { path, type_args } => {
+                let mut subst_args: Vec<InferType> = Vec::new();
+                let mut i = 0;
+                while i < type_args.len() {
+                    subst_args.push(self.substitute(&type_args[i]));
+                    i += 1;
+                }
+                InferType::Struct {
+                    path: clone_path(path),
+                    type_args: subst_args,
+                }
+            }
             InferType::Ref { inner, mutable } => InferType::Ref {
                 inner: Box::new(self.substitute(inner)),
                 mutable: *mutable,
@@ -1121,11 +1419,18 @@ impl Subst {
                     })
                 }
             }
-            (InferType::Struct(pa), InferType::Struct(pb)) => {
-                if path_eq(&pa, &pb) {
-                    Ok(())
-                } else {
-                    Err(Error {
+            (
+                InferType::Struct {
+                    path: pa,
+                    type_args: aa,
+                },
+                InferType::Struct {
+                    path: pb,
+                    type_args: ab,
+                },
+            ) => {
+                if !path_eq(&pa, &pb) {
+                    return Err(Error {
                         file: file.to_string(),
                         message: format!(
                             "type mismatch: expected `{}`, got `{}`",
@@ -1133,8 +1438,26 @@ impl Subst {
                             place_to_string(&pa)
                         ),
                         span: span.copy(),
-                    })
+                    });
                 }
+                if aa.len() != ab.len() {
+                    return Err(Error {
+                        file: file.to_string(),
+                        message: format!(
+                            "type mismatch: `{}` has {} type arguments, expected {}",
+                            place_to_string(&pa),
+                            aa.len(),
+                            ab.len()
+                        ),
+                        span: span.copy(),
+                    });
+                }
+                let mut i = 0;
+                while i < aa.len() {
+                    self.unify(&aa[i], &ab[i], span, file)?;
+                    i += 1;
+                }
+                Ok(())
             }
             (
                 InferType::Ref {
@@ -1228,7 +1551,18 @@ impl Subst {
         match self.substitute(ty) {
             InferType::Var(_) => RType::Int(IntKind::I32),
             InferType::Int(k) => RType::Int(k),
-            InferType::Struct(p) => RType::Struct(p),
+            InferType::Struct { path, type_args } => {
+                let mut concrete: Vec<RType> = Vec::new();
+                let mut i = 0;
+                while i < type_args.len() {
+                    concrete.push(self.finalize(&type_args[i]));
+                    i += 1;
+                }
+                RType::Struct {
+                    path,
+                    type_args: concrete,
+                }
+            }
             InferType::Param(n) => RType::Param(n),
             InferType::Ref { inner, mutable } => RType::Ref {
                 inner: Box::new(self.finalize(&inner)),
@@ -1259,8 +1593,10 @@ struct CheckCtx<'a> {
     let_vars: Vec<InferType>,
     lit_vars: Vec<u32>,
     lit_constraints: Vec<LitConstraint>,
+    struct_lit_vars: Vec<InferType>,
+    in_borrow: u32,
     deref_is_raw: Vec<bool>,
-    method_resolutions: Vec<MethodResolution>,
+    method_resolutions: Vec<PendingMethodCall>,
     call_resolutions: Vec<PendingCall>,
     subst: Subst,
     current_module: &'a Vec<String>,
@@ -1324,14 +1660,16 @@ fn check_function(
     structs: &StructTable,
     funcs: &mut FuncTable,
 ) -> Result<(), Error> {
-    let type_param_names: Vec<String> = {
-        let mut v: Vec<String> = Vec::new();
-        let mut i = 0;
-        while i < func.type_params.len() {
-            v.push(func.type_params[i].name.clone());
-            i += 1;
-        }
-        v
+    // Look up the registered template to derive the full type-param list
+    // (impl's params + method's own params, for generic impl methods).
+    let lookup_path = {
+        let mut p = clone_path(path_prefix);
+        p.push(func.name.clone());
+        p
+    };
+    let type_param_names: Vec<String> = match template_lookup(funcs, &lookup_path) {
+        Some((_, t)) => t.type_params.clone(),
+        None => Vec::new(),
     };
     // Build initial locals from params (params are immutable bindings in our subset).
     let mut locals: Vec<LocalEntry> = Vec::new();
@@ -1368,6 +1706,7 @@ fn check_function(
         let_vars,
         lit_vars,
         lit_constraints,
+        struct_lit_vars,
         deref_is_raw,
         method_resolutions,
         pending_calls,
@@ -1378,6 +1717,8 @@ fn check_function(
             let_vars: Vec::new(),
             lit_vars: Vec::new(),
             lit_constraints: Vec::new(),
+            struct_lit_vars: Vec::new(),
+            in_borrow: 0,
             deref_is_raw: Vec::new(),
             method_resolutions: Vec::new(),
             call_resolutions: Vec::new(),
@@ -1397,6 +1738,7 @@ fn check_function(
             ctx.let_vars,
             ctx.lit_vars,
             ctx.lit_constraints,
+            ctx.struct_lit_vars,
             ctx.deref_is_raw,
             ctx.method_resolutions,
             ctx.call_resolutions,
@@ -1448,6 +1790,34 @@ fn check_function(
         lit_types.push(subst.finalize(&InferType::Var(lit_vars[i])));
         i += 1;
     }
+    let mut struct_lit_types: Vec<RType> = Vec::new();
+    let mut i = 0;
+    while i < struct_lit_vars.len() {
+        struct_lit_types.push(subst.finalize(&struct_lit_vars[i]));
+        i += 1;
+    }
+    // Finalize pending method calls into MethodResolution.
+    let mut method_resolutions_final: Vec<MethodResolution> = Vec::new();
+    let mut i = 0;
+    while i < method_resolutions.len() {
+        let p = &method_resolutions[i];
+        let mut type_args: Vec<RType> = Vec::new();
+        let mut j = 0;
+        while j < p.type_arg_infers.len() {
+            type_args.push(subst.finalize(&p.type_arg_infers[j]));
+            j += 1;
+        }
+        method_resolutions_final.push(MethodResolution {
+            callee_idx: p.callee_idx,
+            callee_path: clone_path(&p.callee_path),
+            recv_adjust: copy_recv_adjust_local(&p.recv_adjust),
+            ret_borrows_receiver: p.ret_borrows_receiver,
+            template_idx: p.template_idx,
+            type_args,
+        });
+        i += 1;
+    }
+    let method_resolutions = method_resolutions_final;
     // Resolve pending generic call sites by finalizing each fresh type-arg var.
     let mut call_resolutions: Vec<CallResolution> = Vec::new();
     let mut i = 0;
@@ -1485,6 +1855,7 @@ fn check_function(
     if let Some(e) = entry_idx {
         funcs.entries[e].let_types = let_types;
         funcs.entries[e].lit_types = lit_types;
+        funcs.entries[e].struct_lit_types = struct_lit_types;
         funcs.entries[e].deref_is_raw = deref_is_raw;
         funcs.entries[e].method_resolutions = method_resolutions;
         funcs.entries[e].call_resolutions = call_resolutions;
@@ -1494,6 +1865,7 @@ fn check_function(
             if path_eq(&funcs.templates[t].path, &full) {
                 funcs.templates[t].let_types = let_types;
                 funcs.templates[t].lit_types = lit_types;
+                funcs.templates[t].struct_lit_types = struct_lit_types;
                 funcs.templates[t].deref_is_raw = deref_is_raw;
                 funcs.templates[t].method_resolutions = method_resolutions;
                 funcs.templates[t].call_resolutions = call_resolutions;
@@ -1505,10 +1877,33 @@ fn check_function(
     Ok(())
 }
 
+fn copy_recv_adjust_local(r: &ReceiverAdjust) -> ReceiverAdjust {
+    match r {
+        ReceiverAdjust::Move => ReceiverAdjust::Move,
+        ReceiverAdjust::BorrowImm => ReceiverAdjust::BorrowImm,
+        ReceiverAdjust::BorrowMut => ReceiverAdjust::BorrowMut,
+        ReceiverAdjust::ByRef => ReceiverAdjust::ByRef,
+    }
+}
+
 // Per-call recording during body check; resolved at end-of-fn into `CallResolution`.
 enum PendingCall {
     Direct(usize),
     Generic { template_idx: usize, type_var_ids: Vec<u32> },
+}
+
+// Like `MethodResolution`, but records type-arg InferTypes instead of
+// finalized RTypes. End-of-fn finalizes via `subst.finalize`.
+struct PendingMethodCall {
+    callee_idx: u32,
+    callee_path: Vec<String>,
+    recv_adjust: ReceiverAdjust,
+    ret_borrows_receiver: bool,
+    template_idx: Option<usize>,
+    // For template methods: one InferType per template type_param. Order:
+    // impl's params first (bound to receiver type_args), then method's own
+    // params (fresh inference vars, possibly unified by turbofish/inference).
+    type_arg_infers: Vec<InferType>,
 }
 
 fn check_block(
@@ -1783,8 +2178,8 @@ fn check_deref_rooted_assign(
     let mut current = inner_infer;
     let mut i = 0;
     while i < fields.len() {
-        let struct_path = match &current {
-            InferType::Struct(p) => clone_path(p),
+        let (struct_path, type_args) = match &current {
+            InferType::Struct { path, type_args } => (clone_path(path), infer_vec_clone(type_args)),
             _ => {
                 return Err(Error {
                     file: ctx.current_file.to_string(),
@@ -1798,7 +2193,9 @@ fn check_deref_rooted_assign(
         let mut k = 0;
         while k < entry.fields.len() {
             if entry.fields[k].name == fields[i] {
-                current = rtype_to_infer(&entry.fields[k].ty);
+                let field_infer = rtype_to_infer(&entry.fields[k].ty);
+                let env = build_infer_env(&entry.type_params, &type_args);
+                current = infer_substitute(&field_infer, &env);
                 found = true;
                 break;
             }
@@ -1857,10 +2254,12 @@ fn walk_chain_type(
     let mut current = infer_clone(start);
     let mut i = 1;
     while i < chain.len() {
-        let struct_path = match &current {
-            InferType::Struct(p) => clone_path(p),
+        let (struct_path, type_args) = match &current {
+            InferType::Struct { path, type_args } => (clone_path(path), infer_vec_clone(type_args)),
             InferType::Ref { inner, .. } => match inner.as_ref() {
-                InferType::Struct(p) => clone_path(p),
+                InferType::Struct { path, type_args } => {
+                    (clone_path(path), infer_vec_clone(type_args))
+                }
                 _ => {
                     return Err(Error {
                         file: file.to_string(),
@@ -1882,7 +2281,9 @@ fn walk_chain_type(
         let mut k = 0;
         while k < entry.fields.len() {
             if entry.fields[k].name == chain[i] {
-                current = rtype_to_infer(&entry.fields[k].ty);
+                let field_infer = rtype_to_infer(&entry.fields[k].ty);
+                let env = build_infer_env(&entry.type_params, &type_args);
+                current = infer_substitute(&field_infer, &env);
                 found = true;
                 break;
             }
@@ -1934,7 +2335,11 @@ fn check_expr(ctx: &mut CheckCtx, expr: &Expr) -> Result<InferType, Error> {
         ExprKind::StructLit(lit) => check_struct_lit(ctx, lit, expr),
         ExprKind::FieldAccess(fa) => check_field_access(ctx, fa, expr),
         ExprKind::Borrow { inner, mutable } => {
+            // Inside a Borrow's place chain, suppress the "non-Copy through ref"
+            // rejection — borrowing a place doesn't move out of it.
+            ctx.in_borrow += 1;
             let inner_ty = check_expr(ctx, inner)?;
+            ctx.in_borrow -= 1;
             Ok(InferType::Ref {
                 inner: Box::new(inner_ty),
                 mutable: *mutable,
@@ -1960,18 +2365,29 @@ fn check_method_call(
 ) -> Result<InferType, Error> {
     let recv_ty = check_expr(ctx, &mc.receiver)?;
     let resolved_recv = ctx.subst.substitute(&recv_ty);
-    // Determine the receiver's struct path (peel one ref layer).
-    let (recv_kind, struct_path): (RecvShape, Vec<String>) = match resolved_recv {
-        InferType::Struct(p) => (RecvShape::Owned, p),
-        InferType::Ref { inner, mutable } => match *inner {
-            InferType::Struct(p) => (
-                if mutable {
-                    RecvShape::MutRef
-                } else {
-                    RecvShape::SharedRef
-                },
-                p,
-            ),
+    // Determine the receiver's struct path AND its type args (so we can bind
+    // them to the impl's type params when the method is generic).
+    let (recv_kind, struct_path, recv_type_args): (RecvShape, Vec<String>, Vec<InferType>) =
+        match resolved_recv {
+            InferType::Struct { path, type_args } => (RecvShape::Owned, path, type_args),
+            InferType::Ref { inner, mutable } => match *inner {
+                InferType::Struct { path, type_args } => (
+                    if mutable {
+                        RecvShape::MutRef
+                    } else {
+                        RecvShape::SharedRef
+                    },
+                    path,
+                    type_args,
+                ),
+                _ => {
+                    return Err(Error {
+                        file: ctx.current_file.to_string(),
+                        message: "method calls require a struct receiver".to_string(),
+                        span: mc.receiver.span.copy(),
+                    });
+                }
+            },
             _ => {
                 return Err(Error {
                     file: ctx.current_file.to_string(),
@@ -1979,32 +2395,51 @@ fn check_method_call(
                     span: mc.receiver.span.copy(),
                 });
             }
-        },
-        _ => {
-            return Err(Error {
-                file: ctx.current_file.to_string(),
-                message: "method calls require a struct receiver".to_string(),
-                span: mc.receiver.span.copy(),
-            });
-        }
-    };
+        };
     let mut method_path = clone_path(&struct_path);
     method_path.push(mc.method.clone());
-    let entry = match func_lookup(ctx.funcs, &method_path) {
-        Some(e) => e,
-        None => {
-            return Err(Error {
-                file: ctx.current_file.to_string(),
-                message: format!(
-                    "no method `{}` on `{}`",
-                    mc.method,
-                    place_to_string(&struct_path)
-                ),
-                span: mc.method_span.copy(),
-            });
-        }
-    };
-    if entry.param_types.is_empty() {
+    // Try entries (concrete methods) first, then templates (generic methods).
+    let from_entry = func_lookup(ctx.funcs, &method_path).is_some();
+    let from_template = template_lookup(ctx.funcs, &method_path).is_some();
+    if !from_entry && !from_template {
+        return Err(Error {
+            file: ctx.current_file.to_string(),
+            message: format!(
+                "no method `{}` on `{}`",
+                mc.method,
+                place_to_string(&struct_path)
+            ),
+            span: mc.method_span.copy(),
+        });
+    }
+    // Snapshot the method's signature data; for templates, also build a
+    // type-arg env mapping the method's type_params to fresh inference vars
+    // (with the impl's params bound to the receiver's type_args first).
+    let (mp_param_types, mp_return_type, mp_type_params, mp_callee_idx, mp_ret_ref_source, mp_is_template, mp_template_idx) =
+        if from_entry {
+            let entry = func_lookup(ctx.funcs, &method_path).unwrap();
+            (
+                rtype_vec_clone(&entry.param_types),
+                entry.return_type.as_ref().map(rtype_clone),
+                Vec::new(),
+                entry.idx,
+                entry.ret_ref_source,
+                false,
+                0usize,
+            )
+        } else {
+            let (idx, t) = template_lookup(ctx.funcs, &method_path).unwrap();
+            (
+                rtype_vec_clone(&t.param_types),
+                t.return_type.as_ref().map(rtype_clone),
+                t.type_params.clone(),
+                0u32,
+                t.ret_ref_source,
+                true,
+                idx,
+            )
+        };
+    if mp_param_types.is_empty() {
         return Err(Error {
             file: ctx.current_file.to_string(),
             message: format!(
@@ -2014,9 +2449,74 @@ fn check_method_call(
             span: mc.method_span.copy(),
         });
     }
-    let recv_param = &entry.param_types[0];
+    // Build env: for templates, the leading type_params correspond to the
+    // impl's params (from the receiver type_args), and any trailing entries
+    // are the method's own type_params (fresh vars, may be unified by
+    // turbofish).
+    let mut env: Vec<(String, InferType)> = Vec::new();
+    let mut method_type_var_ids: Vec<u32> = Vec::new();
+    if mp_is_template {
+        let mut i = 0;
+        while i < mp_type_params.len() {
+            if i < recv_type_args.len() {
+                // Bind impl's param to the receiver's corresponding type arg.
+                env.push((mp_type_params[i].clone(), infer_clone(&recv_type_args[i])));
+                method_type_var_ids.push(0);
+            } else {
+                let v = ctx.subst.fresh_var();
+                env.push((mp_type_params[i].clone(), InferType::Var(v)));
+                method_type_var_ids.push(v);
+            }
+            i += 1;
+        }
+        // Apply method-call turbofish (`.foo::<T1, T2>(...)`) by unifying each
+        // explicit arg with the corresponding fresh var (in the trailing
+        // slots, after impl-bound ones).
+        if !mc.turbofish_args.is_empty() {
+            let method_own_count = mp_type_params.len() - recv_type_args.len();
+            if mc.turbofish_args.len() != method_own_count {
+                return Err(Error {
+                    file: ctx.current_file.to_string(),
+                    message: format!(
+                        "wrong number of type arguments to method `{}`: expected {}, got {}",
+                        mc.method,
+                        method_own_count,
+                        mc.turbofish_args.len()
+                    ),
+                    span: mc.method_span.copy(),
+                });
+            }
+            let mut k = 0;
+            while k < mc.turbofish_args.len() {
+                let user_rt = resolve_type(
+                    &mc.turbofish_args[k],
+                    ctx.current_module,
+                    ctx.structs,
+                    ctx.self_target,
+                    ctx.type_params,
+                    ctx.current_file,
+                )?;
+                let user_infer = rtype_to_infer(&user_rt);
+                let var_id = method_type_var_ids[recv_type_args.len() + k];
+                ctx.subst.unify(
+                    &InferType::Var(var_id),
+                    &user_infer,
+                    &mc.turbofish_args[k].span,
+                    ctx.current_file,
+                )?;
+                k += 1;
+            }
+        }
+    } else if !mc.turbofish_args.is_empty() {
+        return Err(Error {
+            file: ctx.current_file.to_string(),
+            message: format!("method `{}` is not generic", mc.method),
+            span: mc.method_span.copy(),
+        });
+    }
+    let recv_param = &mp_param_types[0];
     let recv_adjust = derive_recv_adjust(&recv_kind, recv_param, ctx, &mc.receiver, &mc.method_span)?;
-    let expected_arg_count = entry.param_types.len() - 1;
+    let expected_arg_count = mp_param_types.len() - 1;
     if mc.args.len() != expected_arg_count {
         return Err(Error {
             file: ctx.current_file.to_string(),
@@ -2029,26 +2529,53 @@ fn check_method_call(
             span: call_expr.span.copy(),
         });
     }
-    // Snapshot stuff we need before we mutate ctx (entry borrow ends here).
-    let callee_idx = entry.idx;
-    let callee_ret_source = entry.ret_ref_source;
+    let callee_idx = mp_callee_idx;
+    let callee_ret_source = mp_ret_ref_source;
     let mut method_param_infer: Vec<InferType> = Vec::new();
     let mut k = 0;
-    while k < entry.param_types.len() {
-        method_param_infer.push(rtype_to_infer(&entry.param_types[k]));
+    while k < mp_param_types.len() {
+        let raw = rtype_to_infer(&mp_param_types[k]);
+        let subst = if mp_is_template {
+            infer_substitute(&raw, &env)
+        } else {
+            raw
+        };
+        method_param_infer.push(subst);
         k += 1;
     }
-    let return_infer: Option<InferType> = match &entry.return_type {
-        Some(rt) => Some(rtype_to_infer(rt)),
+    let return_infer: Option<InferType> = match &mp_return_type {
+        Some(rt) => {
+            let raw = rtype_to_infer(rt);
+            Some(if mp_is_template {
+                infer_substitute(&raw, &env)
+            } else {
+                raw
+            })
+        }
         None => None,
+    };
+    // Build the type-arg env (only meaningful for templates).
+    let type_arg_infers: Vec<InferType> = if mp_is_template {
+        let mut v: Vec<InferType> = Vec::new();
+        let mut i = 0;
+        while i < mp_type_params.len() {
+            v.push(infer_clone(&env[i].1));
+            i += 1;
+        }
+        v
+    } else {
+        Vec::new()
     };
     // Reserve the resolution slot in source-DFS order.
     let resolution_idx = ctx.method_resolutions.len();
-    ctx.method_resolutions.push(MethodResolution {
+    let template_idx_opt = if mp_is_template { Some(mp_template_idx) } else { None };
+    ctx.method_resolutions.push(PendingMethodCall {
         callee_idx,
         callee_path: clone_path(&method_path),
         recv_adjust,
         ret_borrows_receiver: false,
+        template_idx: template_idx_opt,
+        type_arg_infers,
     });
     // Type-check remaining args against method's params[1..].
     let mut i = 0;
@@ -2099,7 +2626,7 @@ fn derive_recv_adjust(
     method_span: &Span,
 ) -> Result<ReceiverAdjust, Error> {
     match recv_param {
-        RType::Struct(_) => {
+        RType::Struct { .. } => {
             // Method takes `Self` (owned).
             match recv_kind {
                 RecvShape::Owned => Ok(ReceiverAdjust::Move),
@@ -2264,10 +2791,23 @@ fn check_cast(
 
 fn check_call(ctx: &mut CheckCtx, call: &Call, call_expr: &Expr) -> Result<InferType, Error> {
     let full = resolve_full_path(ctx.current_module, ctx.self_target, &call.callee.segments);
+    // Generic args attach to the last segment of the callee path.
+    let last_seg_args = if call.callee.segments.is_empty() {
+        Vec::new()
+    } else {
+        let last = &call.callee.segments[call.callee.segments.len() - 1];
+        let mut v: Vec<crate::ast::Type> = Vec::new();
+        let mut i = 0;
+        while i < last.args.len() {
+            v.push(last.args[i].clone());
+            i += 1;
+        }
+        v
+    };
     // Try non-generic first.
     if let Some(entry_idx) = funcs_entry_index(ctx.funcs, &full) {
         let entry = &ctx.funcs.entries[entry_idx];
-        if !call.generic_args.is_empty() {
+        if !last_seg_args.is_empty() {
             return Err(Error {
                 file: ctx.current_file.to_string(),
                 message: format!(
@@ -2341,16 +2881,14 @@ fn check_call(ctx: &mut CheckCtx, call: &Call, call_expr: &Expr) -> Result<Infer
             .return_type
             .as_ref()
             .map(rtype_clone);
-        if !call.generic_args.is_empty()
-            && call.generic_args.len() != tmpl_type_params.len()
-        {
+        if !last_seg_args.is_empty() && last_seg_args.len() != tmpl_type_params.len() {
             return Err(Error {
                 file: ctx.current_file.to_string(),
                 message: format!(
                     "wrong number of type arguments to `{}`: expected {}, got {}",
                     segments_to_string(&call.callee.segments),
                     tmpl_type_params.len(),
-                    call.generic_args.len()
+                    last_seg_args.len()
                 ),
                 span: call_expr.span.copy(),
             });
@@ -2378,9 +2916,9 @@ fn check_call(ctx: &mut CheckCtx, call: &Call, call_expr: &Expr) -> Result<Infer
         }
         // Apply explicit turbofish args by unifying.
         let mut k = 0;
-        while k < call.generic_args.len() {
+        while k < last_seg_args.len() {
             let user_rt = resolve_type(
-                &call.generic_args[k],
+                &last_seg_args[k],
                 ctx.current_module,
                 ctx.structs,
                 ctx.self_target,
@@ -2391,7 +2929,7 @@ fn check_call(ctx: &mut CheckCtx, call: &Call, call_expr: &Expr) -> Result<Infer
             ctx.subst.unify(
                 &InferType::Var(var_ids[k]),
                 &user_infer,
-                &call.generic_args[k].span,
+                &last_seg_args[k].span,
                 ctx.current_file,
             )?;
             k += 1;
@@ -2473,6 +3011,7 @@ fn check_struct_lit(
             });
         }
     };
+    let struct_type_params: Vec<String> = entry.type_params.clone();
     let mut def_field_names: Vec<String> = Vec::new();
     let mut def_field_types: Vec<RType> = Vec::new();
     let mut k = 0;
@@ -2481,6 +3020,59 @@ fn check_struct_lit(
         def_field_types.push(rtype_clone(&entry.fields[k].ty));
         k += 1;
     }
+    // Allocate fresh type-arg vars for this struct's params. If the path's
+    // last segment carried turbofish args, unify them.
+    let last_seg = &lit.path.segments[lit.path.segments.len() - 1];
+    if !last_seg.args.is_empty() && last_seg.args.len() != struct_type_params.len() {
+        return Err(Error {
+            file: ctx.current_file.to_string(),
+            message: format!(
+                "wrong number of type arguments for `{}`: expected {}, got {}",
+                place_to_string(&full),
+                struct_type_params.len(),
+                last_seg.args.len()
+            ),
+            span: lit.path.span.copy(),
+        });
+    }
+    let mut env: Vec<(String, InferType)> = Vec::new();
+    let mut type_arg_infers: Vec<InferType> = Vec::new();
+    let mut i = 0;
+    while i < struct_type_params.len() {
+        let v = ctx.subst.fresh_var();
+        type_arg_infers.push(InferType::Var(v));
+        env.push((struct_type_params[i].clone(), InferType::Var(v)));
+        i += 1;
+    }
+    let mut k = 0;
+    while k < last_seg.args.len() {
+        let user_rt = resolve_type(
+            &last_seg.args[k],
+            ctx.current_module,
+            ctx.structs,
+            ctx.self_target,
+            ctx.type_params,
+            ctx.current_file,
+        )?;
+        let user_infer = rtype_to_infer(&user_rt);
+        ctx.subst.unify(
+            &type_arg_infers[k],
+            &user_infer,
+            &last_seg.args[k].span,
+            ctx.current_file,
+        )?;
+        k += 1;
+    }
+    // Record this struct lit's type in source-DFS visit-first order: push
+    // BEFORE checking field initializers so nested struct lits get later
+    // indices, matching codegen's outer-first traversal.
+    let result = InferType::Struct {
+        path: clone_path(&full),
+        type_args: infer_vec_clone(&type_arg_infers),
+    };
+    let struct_lit_idx = ctx.struct_lit_vars.len();
+    ctx.struct_lit_vars.push(infer_clone(&result));
+    let _ = struct_lit_idx;
 
     // Validate field shape.
     let mut i = 0;
@@ -2539,7 +3131,9 @@ fn check_struct_lit(
         i += 1;
     }
 
-    // Type-check inits in source order.
+    // Type-check inits in source order. Each declared field type is
+    // substituted via the struct's type-arg env so Param("T") in field types
+    // unifies with whatever the type-arg var resolves to.
     let mut i = 0;
     while i < lit.fields.len() {
         let init = &lit.fields[i];
@@ -2547,7 +3141,8 @@ fn check_struct_lit(
         let mut k = 0;
         while k < def_field_names.len() {
             if def_field_names[k] == init.name {
-                let expected = rtype_to_infer(&def_field_types[k]);
+                let expected_raw = rtype_to_infer(&def_field_types[k]);
+                let expected = infer_substitute(&expected_raw, &env);
                 ctx.subst
                     .unify(&init_ty, &expected, &init.value.span, ctx.current_file)?;
                 break;
@@ -2557,7 +3152,10 @@ fn check_struct_lit(
         i += 1;
     }
 
-    Ok(InferType::Struct(full))
+    Ok(InferType::Struct {
+        path: full,
+        type_args: type_arg_infers,
+    })
 }
 
 fn check_field_access(
@@ -2571,10 +3169,10 @@ fn check_field_access(
     let through_explicit_deref = matches!(&fa.base.kind, ExprKind::Deref(_));
     let base_ty = check_expr(ctx, &fa.base)?;
     let resolved = ctx.subst.substitute(&base_ty);
-    let (struct_path, through_ref) = match resolved {
-        InferType::Struct(p) => (p, through_explicit_deref),
+    let (struct_path, struct_type_args, through_ref) = match resolved {
+        InferType::Struct { path, type_args } => (path, type_args, through_explicit_deref),
         InferType::Ref { inner, .. } => match *inner {
-            InferType::Struct(p) => (p, true),
+            InferType::Struct { path, type_args } => (path, type_args, true),
             _ => {
                 return Err(Error {
                     file: ctx.current_file.to_string(),
@@ -2595,20 +3193,29 @@ fn check_field_access(
     let mut i = 0;
     while i < entry.fields.len() {
         if entry.fields[i].name == fa.field {
-            let field_ty = rtype_clone(&entry.fields[i].ty);
-            if through_ref && !is_copy(&field_ty) {
+            // Substitute the field's declared type with the struct's type args
+            // (e.g., `pair.first` where pair: Pair<u32, u64> and field declared
+            // as T → resolves to u32).
+            let env = build_infer_env(&entry.type_params, &struct_type_args);
+            let field_ty_raw = rtype_clone(&entry.fields[i].ty);
+            let field_infer_raw = rtype_to_infer(&field_ty_raw);
+            let field_infer = infer_substitute(&field_infer_raw, &env);
+            // Copy check: a non-Copy field accessed through a ref is a move
+            // out of borrow. Suppress when we're inside a `&...` (place
+            // borrow doesn't move).
+            if through_ref && ctx.in_borrow == 0 && !is_copy(&field_ty_raw) {
                 return Err(Error {
                     file: ctx.current_file.to_string(),
                     message: format!(
                         "cannot move out of borrow: field `{}` of `{}` has non-Copy type `{}`",
                         fa.field,
                         place_to_string(&struct_path),
-                        rtype_to_string(&field_ty)
+                        rtype_to_string(&field_ty_raw)
                     ),
                     span: fa.field_span.copy(),
                 });
             }
-            return Ok(rtype_to_infer(&field_ty));
+            return Ok(field_infer);
         }
         i += 1;
     }
