@@ -303,6 +303,11 @@ pub struct FnSymbol {
     // iff the operand resolved to a raw pointer (`*const T` / `*mut T`).
     // Safeck reads this in lockstep to flag derefs outside `unsafe` blocks.
     pub deref_is_raw: Vec<bool>,
+    // Lifetime elision rule 2: when the return type is a reference and there
+    // is exactly one reference parameter, the output borrow inherits its
+    // lifetime from that parameter. Borrowck uses this to propagate borrows
+    // through ref-returning calls.
+    pub ret_ref_source: Option<usize>,
 }
 
 pub struct FuncTable {
@@ -546,18 +551,14 @@ fn collect_funcs(
                     k += 1;
                 }
                 let return_type = match &f.return_type {
-                    Some(ty) => {
-                        let rt = resolve_type(ty, path, structs, &module.source_file)?;
-                        if let RType::Ref { .. } = &rt {
-                            return Err(Error {
-                                file: module.source_file.clone(),
-                                message: "functions cannot return reference types".to_string(),
-                                span: ty.span.copy(),
-                            });
-                        }
-                        Some(rt)
-                    }
+                    Some(ty) => Some(resolve_type(ty, path, structs, &module.source_file)?),
                     None => None,
+                };
+                let ret_ref_source = match (&return_type, &f.return_type) {
+                    (Some(rt), Some(ret_ty)) => {
+                        check_ret_ref_elision(rt, &param_types, &ret_ty.span, &module.source_file)?
+                    }
+                    _ => None,
                 };
                 funcs.entries.push(FnSymbol {
                     path: full,
@@ -567,6 +568,7 @@ fn collect_funcs(
                     let_types: Vec::new(),
                     lit_types: Vec::new(),
                     deref_is_raw: Vec::new(),
+                    ret_ref_source,
                 });
                 *next_idx += 1;
             }
@@ -580,6 +582,56 @@ fn collect_funcs(
         i += 1;
     }
     Ok(())
+}
+
+// Validates a ref return type against the parameters and returns the index of
+// the source ref param. Implements lifetime elision rule 2: exactly one input
+// ref param → its lifetime flows to the output ref. `&mut T -> &U` is allowed
+// (downgrade); `&T -> &mut U` is rejected (would forge mutability). When the
+// return is not a ref, returns Ok(None) — nothing to elide.
+fn check_ret_ref_elision(
+    return_type: &RType,
+    param_types: &Vec<RType>,
+    ret_span: &Span,
+    file: &str,
+) -> Result<Option<usize>, Error> {
+    let ret_mutable = match return_type {
+        RType::Ref { mutable, .. } => *mutable,
+        _ => return Ok(None),
+    };
+    let mut source: Option<usize> = None;
+    let mut count: usize = 0;
+    let mut i = 0;
+    while i < param_types.len() {
+        if let RType::Ref { .. } = &param_types[i] {
+            count += 1;
+            source = Some(i);
+        }
+        i += 1;
+    }
+    if count != 1 {
+        return Err(Error {
+            file: file.to_string(),
+            message: format!(
+                "function returning a reference must have exactly one reference parameter (found {})",
+                count
+            ),
+            span: ret_span.copy(),
+        });
+    }
+    let src_idx = source.expect("count == 1");
+    let src_mutable = match &param_types[src_idx] {
+        RType::Ref { mutable, .. } => *mutable,
+        _ => unreachable!(),
+    };
+    if ret_mutable && !src_mutable {
+        return Err(Error {
+            file: file.to_string(),
+            message: "cannot return `&mut` from a `&` parameter".to_string(),
+            span: ret_span.copy(),
+        });
+    }
+    Ok(Some(src_idx))
 }
 
 // ----- InferType -----

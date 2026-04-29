@@ -257,13 +257,63 @@ fn ref_in_struct_field_is_rejected() {
 }
 
 #[test]
-fn ref_return_type_is_rejected() {
+fn ref_return_with_zero_ref_params_is_rejected() {
+    // Lifetime elision rule 2 only kicks in with exactly one ref param;
+    // zero ref params + ref return has no source lifetime to inherit.
     let err = compile_source(
-        "struct Point { x: usize, y: usize }\nfn whoops(p: &Point) -> &Point { p }",
+        "fn whoops() -> &u32 { let x: u32 = 1; &x }",
     );
     assert!(
-        err.contains("cannot return reference"),
-        "expected ref-return error, got: {}",
+        err.contains("exactly one reference parameter"),
+        "expected zero-ref-params error, got: {}",
+        err
+    );
+}
+
+#[test]
+fn ref_return_with_two_ref_params_is_rejected() {
+    let err = compile_source(
+        "struct Point { x: u32, y: u32 }\n\
+         fn whoops(a: &Point, b: &Point) -> &Point { a }",
+    );
+    assert!(
+        err.contains("exactly one reference parameter"),
+        "expected two-ref-params error, got: {}",
+        err
+    );
+}
+
+#[test]
+fn ref_return_mut_from_shared_param_is_rejected() {
+    // `&T -> &mut U` would forge mutability — rejected.
+    let err = compile_source(
+        "struct Point { x: u32, y: u32 }\n\
+         fn whoops(p: &Point) -> &mut u32 { &mut p.x }",
+    );
+    assert!(
+        err.contains("cannot return `&mut` from a `&` parameter"),
+        "expected mut-from-shared error, got: {}",
+        err
+    );
+}
+
+#[test]
+fn returned_borrow_outlives_source_is_rejected() {
+    // Borrowck propagates the input borrow through the call: `r` carries a
+    // borrow on `pt`, so moving `pt` afterward must conflict.
+    let err = compile_source(
+        "struct Point { x: u32, y: u32 }\n\
+         fn borrow_field(pt: &Point) -> &u32 { &pt.x }\n\
+         fn answer() -> u32 { \
+             let pt = Point { x: 1, y: 2 }; \
+             let r: &u32 = borrow_field(&pt); \
+             let q = pt; \
+             *r \
+         }",
+    );
+    assert!(
+        err.contains("cannot move") && err.contains("borrowed"),
+        "expected propagated-borrow error, got: {}",
         err
     );
 }

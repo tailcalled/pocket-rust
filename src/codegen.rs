@@ -673,12 +673,10 @@ fn codegen_assign_stmt(ctx: &mut FnCtx, assign: &AssignStmt) -> Result<(), Error
 
     // Determine the base address for the store.
     if through_mut_ref {
-        // Read the ref's i32 (always a non-spilled local in our subset) and
-        // store relative to it.
-        let ref_local = match &ctx.locals[binding_idx].storage {
-            Storage::Local { wasm_start, .. } => *wasm_start,
-            Storage::Memory { .. } => unreachable!("ref bindings aren't spilled"),
-        };
+        // Read the ref's pointee address and store relative to it. The ref
+        // may itself be spilled (escape analysis is name-based and over-
+        // approximates), so go through the helper.
+        let ref_local = ref_pointee_addr_local(ctx, binding_idx);
         store_flat_to_memory(
             ctx,
             &current_ty,
@@ -1171,10 +1169,7 @@ fn codegen_place_chain_load(
     }
 
     if through_ref {
-        let ref_local = match &ctx.locals[binding_idx].storage {
-            Storage::Local { wasm_start, .. } => *wasm_start,
-            Storage::Memory { .. } => unreachable!("ref bindings aren't spilled"),
-        };
+        let ref_local = ref_pointee_addr_local(ctx, binding_idx);
         load_flat_from_memory(ctx, &current_ty, BaseAddr::WasmLocal(ref_local), chain_offset);
     } else {
         match &ctx.locals[binding_idx].storage {
@@ -1323,9 +1318,22 @@ fn codegen_borrow(ctx: &mut FnCtx, inner: &Expr, mutable: bool) -> Result<RType,
     if !found {
         unreachable!("typeck verified the binding exists");
     }
-    // Walk chain to byte offset + final type.
     let root_ty = rtype_clone(&ctx.locals[binding_idx].rtype);
-    let mut current_ty = rtype_clone(&root_ty);
+    // Borrowing `&r.field…` where r is a ref binding doesn't take r's address —
+    // it takes the *pointee's* field address. The base is r's i32 value, not
+    // SP+frame_offset. (For chain.len() == 1, falls into the SP-relative path
+    // below — `&r` *does* take r's address, producing `&&T`.)
+    let through_ref = matches!(&root_ty, RType::Ref { .. }) && chain.len() >= 2;
+
+    // Walk chain to byte offset + final type.
+    let mut current_ty = if through_ref {
+        match &root_ty {
+            RType::Ref { inner, .. } => rtype_clone(inner),
+            _ => unreachable!(),
+        }
+    } else {
+        rtype_clone(&root_ty)
+    };
     let mut chain_offset: u32 = 0;
     let mut i = 1;
     while i < chain.len() {
@@ -1354,27 +1362,60 @@ fn codegen_borrow(ctx: &mut FnCtx, inner: &Expr, mutable: bool) -> Result<RType,
         }
         i += 1;
     }
-    // The binding must be spilled (escape analysis enforces this for any
-    // binding whose address is taken).
-    let frame_offset = match &ctx.locals[binding_idx].storage {
-        Storage::Memory { frame_offset } => *frame_offset,
-        Storage::Local { .. } => {
-            unreachable!("escape analysis must have spilled this binding");
-        }
-    };
-    // Push (SP + frame_offset + chain_offset) as i32.
-    ctx.instructions
-        .push(wasm::Instruction::GlobalGet(SP_GLOBAL));
-    let total = frame_offset + chain_offset;
-    if total != 0 {
+    if through_ref {
+        // Base address = ref's pointee address (the i32 the ref carries).
+        let base_local = ref_pointee_addr_local(ctx, binding_idx);
         ctx.instructions
-            .push(wasm::Instruction::I32Const(total as i32));
-        ctx.instructions.push(wasm::Instruction::I32Add);
+            .push(wasm::Instruction::LocalGet(base_local));
+        if chain_offset != 0 {
+            ctx.instructions
+                .push(wasm::Instruction::I32Const(chain_offset as i32));
+            ctx.instructions.push(wasm::Instruction::I32Add);
+        }
+    } else {
+        // The binding must be spilled (escape analysis enforces this for any
+        // binding whose address is taken).
+        let frame_offset = match &ctx.locals[binding_idx].storage {
+            Storage::Memory { frame_offset } => *frame_offset,
+            Storage::Local { .. } => {
+                unreachable!("escape analysis must have spilled this binding");
+            }
+        };
+        ctx.instructions
+            .push(wasm::Instruction::GlobalGet(SP_GLOBAL));
+        let total = frame_offset + chain_offset;
+        if total != 0 {
+            ctx.instructions
+                .push(wasm::Instruction::I32Const(total as i32));
+            ctx.instructions.push(wasm::Instruction::I32Add);
+        }
     }
     Ok(RType::Ref {
         inner: Box::new(current_ty),
         mutable,
     })
+}
+
+// Returns a WASM local whose value is the i32 pointee address held by a ref
+// binding. If the ref is non-spilled (just sits in a local), that's the local
+// itself. If the ref is spilled (its i32 is in memory), allocate a temp local,
+// load the i32 from memory once, and return the temp.
+fn ref_pointee_addr_local(ctx: &mut FnCtx, binding_idx: usize) -> u32 {
+    match &ctx.locals[binding_idx].storage {
+        Storage::Local { wasm_start, .. } => *wasm_start,
+        Storage::Memory { frame_offset } => {
+            let off = *frame_offset;
+            let temp = ctx.next_wasm_local;
+            ctx.extra_locals.push(wasm::ValType::I32);
+            ctx.next_wasm_local += 1;
+            ctx.instructions
+                .push(wasm::Instruction::GlobalGet(SP_GLOBAL));
+            ctx.instructions
+                .push(wasm::Instruction::I32Load { align: 0, offset: off });
+            ctx.instructions.push(wasm::Instruction::LocalSet(temp));
+            temp
+        }
+    }
 }
 
 fn codegen_deref(ctx: &mut FnCtx, inner: &Expr) -> Result<RType, Error> {

@@ -75,6 +75,8 @@ fn check_function(
         let_types,
         let_idx: 0,
         file: current_file.to_string(),
+        funcs,
+        current_module,
     };
 
     let mut k = 0;
@@ -93,7 +95,7 @@ fn check_function(
 
 // ---------- State ----------
 
-struct BorrowState {
+struct BorrowState<'a> {
     // Stack of holders. A holder either names a let/param binding (Some name)
     // or is a synthetic call slot (None name). Each holder records the
     // borrows it currently keeps alive (a list of place paths).
@@ -104,6 +106,8 @@ struct BorrowState {
     let_types: Vec<RType>,
     let_idx: usize,
     file: String,
+    funcs: &'a FuncTable,
+    current_module: &'a Vec<String>,
 }
 
 struct Holder {
@@ -339,6 +343,19 @@ fn walk_var(state: &mut BorrowState, name: &str, expr: &Expr) -> Result<ValueDes
 }
 
 fn walk_call(state: &mut BorrowState, call: &Call) -> Result<ValueDesc, Error> {
+    // Look up the callee's elision info: if it returns a ref, ret_ref_source
+    // is the index of the source ref arg whose borrows the result inherits.
+    let ret_ref_source = {
+        let mut full = clone_path(state.current_module);
+        let mut i = 0;
+        while i < call.callee.segments.len() {
+            full.push(call.callee.segments[i].name.clone());
+            i += 1;
+        }
+        let entry = func_lookup(state.funcs, &full).expect("typeck resolved this call");
+        entry.ret_ref_source
+    };
+
     // Push a synthetic call holder. Borrows produced by argument expressions
     // become its holds for the duration of the call, then the holder is popped.
     state.holders.push(Holder {
@@ -347,9 +364,13 @@ fn walk_call(state: &mut BorrowState, call: &Call) -> Result<ValueDesc, Error> {
         holds: Vec::new(),
     });
     let call_idx = state.holders.len() - 1;
+    // Snapshot each arg's borrows before they're absorbed into the call slot,
+    // so we can later attach the source arg's borrows to the result desc.
+    let mut arg_borrow_snapshots: Vec<Vec<HeldBorrow>> = Vec::new();
     let mut i = 0;
     while i < call.args.len() {
         let desc = walk_expr(state, &call.args[i])?;
+        arg_borrow_snapshots.push(clone_held_borrows(&desc.borrows));
         let mut k = 0;
         while k < desc.borrows.len() {
             // Conflict-check the new borrow against every other holder's holds.
@@ -364,8 +385,12 @@ fn walk_call(state: &mut BorrowState, call: &Call) -> Result<ValueDesc, Error> {
         i += 1;
     }
     state.holders.truncate(call_idx);
-    // Functions can't return references (typeck-rejected), so result carries no borrows.
-    Ok(empty_desc())
+    match ret_ref_source {
+        Some(idx) => Ok(ValueDesc {
+            borrows: clone_held_borrows(&arg_borrow_snapshots[idx]),
+        }),
+        None => Ok(empty_desc()),
+    }
 }
 
 fn check_borrow_conflict(

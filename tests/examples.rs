@@ -284,3 +284,14 @@ fn inner_borrow_lifetime_returns_5() {
     let result = answer.call(&mut store, ()).expect("call failed");
     assert_eq!(result, 5);
 }
+
+#[test]
+fn borrow_field_returns_42() {
+    let bytes = compile_example("borrow_field", "lib.rs");
+    let (mut store, instance) = instantiate(&bytes);
+    let answer = instance
+        .get_typed_func::<(), i32>(&store, "answer")
+        .expect("export `answer` not found / wrong signature");
+    let result = answer.call(&mut store, ()).expect("call failed");
+    assert_eq!(result, 42);
+}
