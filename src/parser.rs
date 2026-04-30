@@ -1,8 +1,9 @@
 use crate::ast::{
-    AssignStmt, Block, Call, Expr, ExprKind, FieldAccess, FieldInit, Function, IfExpr, ImplBlock,
-    LetStmt, Lifetime, LifetimeParam, MethodCall, Param, Path, PathSegment, Stmt, StructDef,
-    StructField, StructLit, TraitBound, TraitDef, TraitMethodSig, Type, TypeKind, TypeParam,
-    UseDecl, UseTree,
+    AssignStmt, Block, Call, EnumDef, EnumVariant, Expr, ExprKind, FieldAccess, FieldInit,
+    FieldPattern, Function, IfExpr, IfLetExpr, ImplBlock, LetStmt, Lifetime, LifetimeParam,
+    MatchArm, MatchExpr, MethodCall, Param, Path, PathSegment, Pattern, PatternKind, Stmt,
+    StructDef, StructField, StructLit, TraitBound, TraitDef, TraitMethodSig, Type, TypeKind,
+    TypeParam, UseDecl, UseTree, VariantPayload,
 };
 use crate::lexer::{Token, TokenKind, token_kind_name};
 use crate::span::{Error, Pos, Span};
@@ -10,6 +11,7 @@ use crate::span::{Error, Pos, Span};
 pub enum RawItem {
     Function(Function),
     Struct(StructDef),
+    Enum(EnumDef),
     ModDecl { name: String, name_span: Span },
     Impl(ImplBlock),
     Trait(TraitDef),
@@ -68,6 +70,8 @@ impl Parser {
             Ok(RawItem::Function(self.parse_function_with_vis(is_pub)?))
         } else if self.peek_kind(&TokenKind::Struct) {
             Ok(RawItem::Struct(self.parse_struct_def_with_vis(is_pub)?))
+        } else if self.peek_kind(&TokenKind::Enum) {
+            Ok(RawItem::Enum(self.parse_enum_def_with_vis(is_pub)?))
         } else if self.peek_kind(&TokenKind::Impl) {
             // `pub impl` isn't a real Rust thing; reject if seen.
             if is_pub {
@@ -80,7 +84,7 @@ impl Parser {
             Ok(RawItem::Use(self.parse_use_decl_with_vis(is_pub)?))
         } else {
             Err(self.error_at_current(
-                "expected `fn`, `mod`, `struct`, `impl`, `trait`, or `use`",
+                "expected `fn`, `mod`, `struct`, `enum`, `impl`, `trait`, or `use`",
             ))
         }
     }
@@ -437,6 +441,83 @@ impl Parser {
         })
     }
 
+    fn parse_enum_def_with_vis(&mut self, is_pub: bool) -> Result<EnumDef, Error> {
+        self.expect(&TokenKind::Enum, "`enum`")?;
+        let (name, name_span) = self.expect_ident()?;
+        let (lifetime_params, type_params) = if self.peek_kind(&TokenKind::LAngle) {
+            self.parse_generic_params()?
+        } else {
+            (Vec::new(), Vec::new())
+        };
+        self.expect(&TokenKind::LBrace, "`{`")?;
+        let mut variants: Vec<EnumVariant> = Vec::new();
+        if !self.peek_kind(&TokenKind::RBrace) {
+            variants.push(self.parse_enum_variant()?);
+            while self.peek_kind(&TokenKind::Comma) {
+                self.pos += 1;
+                if self.peek_kind(&TokenKind::RBrace) {
+                    break;
+                }
+                variants.push(self.parse_enum_variant()?);
+            }
+        }
+        self.expect(&TokenKind::RBrace, "`}`")?;
+        Ok(EnumDef {
+            name,
+            name_span,
+            lifetime_params,
+            type_params,
+            variants,
+            is_pub,
+        })
+    }
+
+    fn parse_enum_variant(&mut self) -> Result<EnumVariant, Error> {
+        let (name, name_span) = self.expect_ident()?;
+        let payload = if self.peek_kind(&TokenKind::LParen) {
+            // Tuple variant: `A(T1, T2, …)`. Empty `A()` is allowed
+            // (parses as a 0-element tuple variant — same shape as
+            // unit, but distinguishes the surface form).
+            self.pos += 1;
+            let mut elems: Vec<Type> = Vec::new();
+            if !self.peek_kind(&TokenKind::RParen) {
+                elems.push(self.parse_type()?);
+                while self.peek_kind(&TokenKind::Comma) {
+                    self.pos += 1;
+                    if self.peek_kind(&TokenKind::RParen) {
+                        break;
+                    }
+                    elems.push(self.parse_type()?);
+                }
+            }
+            self.expect(&TokenKind::RParen, "`)`")?;
+            VariantPayload::Tuple(elems)
+        } else if self.peek_kind(&TokenKind::LBrace) {
+            // Struct variant: `A { f: T, g: U }`.
+            self.pos += 1;
+            let mut fields: Vec<StructField> = Vec::new();
+            if !self.peek_kind(&TokenKind::RBrace) {
+                fields.push(self.parse_struct_field()?);
+                while self.peek_kind(&TokenKind::Comma) {
+                    self.pos += 1;
+                    if self.peek_kind(&TokenKind::RBrace) {
+                        break;
+                    }
+                    fields.push(self.parse_struct_field()?);
+                }
+            }
+            self.expect(&TokenKind::RBrace, "`}`")?;
+            VariantPayload::Struct(fields)
+        } else {
+            VariantPayload::Unit
+        };
+        Ok(EnumVariant {
+            name,
+            name_span,
+            payload,
+        })
+    }
+
     fn parse_function(&mut self) -> Result<Function, Error> {
         self.parse_function_with_vis(false)
     }
@@ -485,6 +566,304 @@ impl Parser {
         let id = self.next_node_id;
         self.next_node_id += 1;
         id
+    }
+
+    // Top-level pattern entry. Or-patterns (`p | q | r`) have lowest
+    // precedence — left-associative chain at the top.
+    fn parse_pattern(&mut self) -> Result<Pattern, Error> {
+        let first = self.parse_pattern_no_or()?;
+        if !self.peek_kind(&TokenKind::Pipe) {
+            return Ok(first);
+        }
+        let start = first.span.start.copy();
+        let mut alternatives: Vec<Pattern> = Vec::new();
+        alternatives.push(first);
+        while self.peek_kind(&TokenKind::Pipe) {
+            self.pos += 1;
+            alternatives.push(self.parse_pattern_no_or()?);
+        }
+        let end = alternatives[alternatives.len() - 1].span.end.copy();
+        let span = Span::new(start, end);
+        let id = self.alloc_node_id();
+        Ok(Pattern {
+            kind: PatternKind::Or(alternatives),
+            span,
+            id,
+        })
+    }
+
+    // Single non-or pattern. Handles `_`, literals, `&pat`/`&mut pat`,
+    // tuple patterns, paths (which become Ident, VariantTuple, or
+    // VariantStruct), and at-bindings `name @ subpat`. Range patterns
+    // use the literal start as the left endpoint.
+    fn parse_pattern_no_or(&mut self) -> Result<Pattern, Error> {
+        if self.pos >= self.tokens.len() {
+            return Err(self.error_at_current("expected pattern, got end of input"));
+        }
+        // `_` — wildcard.
+        if self.peek_kind(&TokenKind::Underscore) {
+            let span = self.tokens[self.pos].span.copy();
+            self.pos += 1;
+            let id = self.alloc_node_id();
+            return Ok(Pattern { kind: PatternKind::Wildcard, span, id });
+        }
+        // `&pat` / `&mut pat`.
+        if self.peek_kind(&TokenKind::Amp) {
+            let amp_span = self.tokens[self.pos].span.copy();
+            self.pos += 1;
+            let mutable = if self.peek_kind(&TokenKind::Mut) {
+                self.pos += 1;
+                true
+            } else {
+                false
+            };
+            let inner = self.parse_pattern_no_or()?;
+            let span = Span::new(amp_span.start, inner.span.end.copy());
+            let id = self.alloc_node_id();
+            return Ok(Pattern {
+                kind: PatternKind::Ref { inner: Box::new(inner), mutable },
+                span,
+                id,
+            });
+        }
+        // `(p, q, ...)` — tuple pattern. `()` is the unit pattern;
+        // `(p,)` is 1-element. Single `(p)` falls through as `p`.
+        if self.peek_kind(&TokenKind::LParen) {
+            let lp = self.tokens[self.pos].span.copy();
+            self.pos += 1;
+            if self.peek_kind(&TokenKind::RParen) {
+                let rp = self.expect(&TokenKind::RParen, "`)`")?;
+                let id = self.alloc_node_id();
+                return Ok(Pattern {
+                    kind: PatternKind::Tuple(Vec::new()),
+                    span: Span::new(lp.start, rp.end),
+                    id,
+                });
+            }
+            let first = self.parse_pattern()?;
+            if self.peek_kind(&TokenKind::Comma) {
+                let mut elems: Vec<Pattern> = Vec::new();
+                elems.push(first);
+                while self.peek_kind(&TokenKind::Comma) {
+                    self.pos += 1;
+                    if self.peek_kind(&TokenKind::RParen) {
+                        break;
+                    }
+                    elems.push(self.parse_pattern()?);
+                }
+                let rp = self.expect(&TokenKind::RParen, "`)`")?;
+                let id = self.alloc_node_id();
+                return Ok(Pattern {
+                    kind: PatternKind::Tuple(elems),
+                    span: Span::new(lp.start, rp.end),
+                    id,
+                });
+            }
+            self.expect(&TokenKind::RParen, "`)`")?;
+            return Ok(first);
+        }
+        // Integer literal — possibly the lower end of a range pattern
+        // (`lo..=hi`).
+        if let TokenKind::IntLit(n) = self.tokens[self.pos].kind {
+            let lit_span = self.tokens[self.pos].span.copy();
+            self.pos += 1;
+            if self.peek_kind(&TokenKind::DotDotEq) {
+                self.pos += 1;
+                if let TokenKind::IntLit(hi) = self.tokens[self.pos].kind {
+                    let end_span = self.tokens[self.pos].span.copy();
+                    self.pos += 1;
+                    let span = Span::new(lit_span.start, end_span.end);
+                    let id = self.alloc_node_id();
+                    return Ok(Pattern {
+                        kind: PatternKind::Range { lo: n, hi },
+                        span,
+                        id,
+                    });
+                }
+                return Err(self.error_at_current("expected integer literal after `..=`"));
+            }
+            let id = self.alloc_node_id();
+            return Ok(Pattern {
+                kind: PatternKind::LitInt(n),
+                span: lit_span,
+                id,
+            });
+        }
+        // Boolean literal.
+        if self.peek_kind(&TokenKind::True) {
+            let span = self.tokens[self.pos].span.copy();
+            self.pos += 1;
+            let id = self.alloc_node_id();
+            return Ok(Pattern { kind: PatternKind::LitBool(true), span, id });
+        }
+        if self.peek_kind(&TokenKind::False) {
+            let span = self.tokens[self.pos].span.copy();
+            self.pos += 1;
+            let id = self.alloc_node_id();
+            return Ok(Pattern { kind: PatternKind::LitBool(false), span, id });
+        }
+        // `ref name` / `ref mut name` — binds a reference to the matched
+        // place rather than moving/copying the value. `mut name` (no
+        // ref) binds by-value with the binding marked mutable so the
+        // arm body can assign through it.
+        if self.peek_kind(&TokenKind::Ref) {
+            let ref_span = self.tokens[self.pos].span.copy();
+            self.pos += 1;
+            let mutable = if self.peek_kind(&TokenKind::Mut) {
+                self.pos += 1;
+                true
+            } else {
+                false
+            };
+            let (name, name_span) = self.expect_ident()?;
+            let span = Span::new(ref_span.start, name_span.end.copy());
+            let id = self.alloc_node_id();
+            return Ok(Pattern {
+                kind: PatternKind::Binding { name, name_span, by_ref: true, mutable },
+                span,
+                id,
+            });
+        }
+        if self.peek_kind(&TokenKind::Mut) {
+            let mut_span = self.tokens[self.pos].span.copy();
+            self.pos += 1;
+            let (name, name_span) = self.expect_ident()?;
+            let span = Span::new(mut_span.start, name_span.end.copy());
+            let id = self.alloc_node_id();
+            return Ok(Pattern {
+                kind: PatternKind::Binding { name, name_span, by_ref: false, mutable: true },
+                span,
+                id,
+            });
+        }
+        // Path-prefixed pattern: `Ident` (binding/variant), `Ident @ pat`,
+        // `Ident::…(args)` (variant tuple), `Ident::… { fields }` (variant
+        // struct), or just `Ident::…` (path-only — unit variant).
+        if matches!(&self.tokens[self.pos].kind, TokenKind::Ident(_)) {
+            let first_span = self.tokens[self.pos].span.copy();
+            // Check whether it's a single ident followed by `@` or by
+            // anything that's NOT a path-continuation. Single-ident is
+            // ambiguous: `x` could be a binding *or* a unit-variant
+            // reference (e.g. `Some` in scope). We always parse it as
+            // an `Ident` pattern; typeck distinguishes against the
+            // active enum table.
+            let is_simple_ident = !self.peek_two(&TokenKind::Ident("".to_string()), &TokenKind::PathSep)
+                && !matches!(
+                    self.tokens.get(self.pos + 1).map(|t| &t.kind),
+                    Some(TokenKind::PathSep) | Some(TokenKind::LParen) | Some(TokenKind::LBrace)
+                );
+            if is_simple_ident {
+                let (name, name_span) = self.expect_ident()?;
+                if self.peek_kind(&TokenKind::At) {
+                    self.pos += 1;
+                    let inner = self.parse_pattern_no_or()?;
+                    let span = Span::new(first_span.start, inner.span.end.copy());
+                    let id = self.alloc_node_id();
+                    return Ok(Pattern {
+                        kind: PatternKind::At { name, name_span, inner: Box::new(inner) },
+                        span,
+                        id,
+                    });
+                }
+                let id = self.alloc_node_id();
+                return Ok(Pattern {
+                    kind: PatternKind::Binding {
+                        name,
+                        name_span: name_span.copy(),
+                        by_ref: false,
+                        mutable: false,
+                    },
+                    span: name_span,
+                    id,
+                });
+            }
+            // Multi-segment path or single ident followed by `(`/`{`.
+            let path = self.parse_path_with_type_args()?;
+            let path_span = path.span.copy();
+            if self.peek_kind(&TokenKind::LParen) {
+                self.pos += 1;
+                let mut elems: Vec<Pattern> = Vec::new();
+                if !self.peek_kind(&TokenKind::RParen) {
+                    elems.push(self.parse_pattern()?);
+                    while self.peek_kind(&TokenKind::Comma) {
+                        self.pos += 1;
+                        if self.peek_kind(&TokenKind::RParen) {
+                            break;
+                        }
+                        elems.push(self.parse_pattern()?);
+                    }
+                }
+                let rp = self.expect(&TokenKind::RParen, "`)`")?;
+                let span = Span::new(path_span.start, rp.end);
+                let id = self.alloc_node_id();
+                return Ok(Pattern {
+                    kind: PatternKind::VariantTuple { path, elems },
+                    span,
+                    id,
+                });
+            }
+            if self.peek_kind(&TokenKind::LBrace) {
+                self.pos += 1;
+                let mut fields: Vec<FieldPattern> = Vec::new();
+                let mut rest = false;
+                if !self.peek_kind(&TokenKind::RBrace) {
+                    loop {
+                        if self.peek_kind(&TokenKind::DotDot) {
+                            self.pos += 1;
+                            rest = true;
+                            break;
+                        }
+                        let (name, name_span) = self.expect_ident()?;
+                        let pattern = if self.peek_kind(&TokenKind::Colon) {
+                            self.pos += 1;
+                            self.parse_pattern()?
+                        } else {
+                            // Shorthand: `Foo { a }` ≡ `Foo { a: a }`,
+                            // where the inner pattern is a binding for `a`.
+                            let id = self.alloc_node_id();
+                            Pattern {
+                                kind: PatternKind::Binding {
+                                    name: name.clone(),
+                                    name_span: name_span.copy(),
+                                    by_ref: false,
+                                    mutable: false,
+                                },
+                                span: name_span.copy(),
+                                id,
+                            }
+                        };
+                        fields.push(FieldPattern { name, name_span, pattern });
+                        if self.peek_kind(&TokenKind::Comma) {
+                            self.pos += 1;
+                            if self.peek_kind(&TokenKind::RBrace) {
+                                break;
+                            }
+                        } else {
+                            break;
+                        }
+                    }
+                }
+                let rb = self.expect(&TokenKind::RBrace, "`}`")?;
+                let span = Span::new(path_span.start, rb.end);
+                let id = self.alloc_node_id();
+                return Ok(Pattern {
+                    kind: PatternKind::VariantStruct { path, fields, rest },
+                    span,
+                    id,
+                });
+            }
+            // Bare path — treat as a unit-variant reference. (No
+            // arguments, no struct-style braces.) Routed through
+            // VariantTuple with an empty `elems` list so typeck can
+            // handle "construct a variant" uniformly.
+            let id = self.alloc_node_id();
+            return Ok(Pattern {
+                kind: PatternKind::VariantTuple { path, elems: Vec::new() },
+                span: path_span,
+                id,
+            });
+        }
+        Err(self.error_at_current("expected pattern"))
     }
 
     // Parse a generic-params list `<'a, 'b, T1, T2>`. Lifetime params come
@@ -1124,6 +1503,7 @@ impl Parser {
                 Ok(Expr { kind: ExprKind::BoolLit(false), span, id })
             }
             TokenKind::If => self.parse_if_expr(),
+            TokenKind::Match => self.parse_match_expr(),
             TokenKind::Builtin => self.parse_builtin(),
             TokenKind::Ident(_) => self.parse_path_atom(),
             TokenKind::SelfUpper => self.parse_path_atom(),
@@ -1217,34 +1597,38 @@ impl Parser {
     // to use them.
     fn parse_if_expr(&mut self) -> Result<Expr, Error> {
         let if_span = self.expect(&TokenKind::If, "`if`")?;
+        // `if let Pat = scrut { ... } else { ... }` — first-class form,
+        // not desugared to `match`.
+        if self.peek_kind(&TokenKind::Let) {
+            self.pos += 1;
+            let pattern = self.parse_pattern()?;
+            self.expect(&TokenKind::Eq, "`=`")?;
+            let saved = self.no_struct_lit;
+            self.no_struct_lit = true;
+            let scrutinee = self.parse_expr()?;
+            self.no_struct_lit = saved;
+            let then_block = self.parse_block()?;
+            let else_block = self.parse_else_or_empty(&then_block)?;
+            let end = else_block.span.end.copy();
+            let span = Span::new(if_span.start, end);
+            let id = self.alloc_node_id();
+            return Ok(Expr {
+                kind: ExprKind::IfLet(IfLetExpr {
+                    pattern,
+                    scrutinee: Box::new(scrutinee),
+                    then_block: Box::new(then_block),
+                    else_block: Box::new(else_block),
+                }),
+                span,
+                id,
+            });
+        }
         let saved = self.no_struct_lit;
         self.no_struct_lit = true;
         let cond = self.parse_expr()?;
         self.no_struct_lit = saved;
         let then_block = self.parse_block()?;
-        let else_block = if self.peek_kind(&TokenKind::Else) {
-            self.pos += 1;
-            if self.peek_kind(&TokenKind::If) {
-                let chained = self.parse_if_expr()?;
-                let span = chained.span.copy();
-                Block {
-                    stmts: Vec::new(),
-                    tail: Some(chained),
-                    span,
-                }
-            } else {
-                self.parse_block()?
-            }
-        } else {
-            // No `else` — synthesize an empty block at the end of the
-            // then-block. Its type is `()`.
-            let end = then_block.span.end.copy();
-            Block {
-                stmts: Vec::new(),
-                tail: None,
-                span: Span::new(end.copy(), end),
-            }
-        };
+        let else_block = self.parse_else_or_empty(&then_block)?;
         let end = else_block.span.end.copy();
         let span = Span::new(if_span.start, end);
         let id = self.alloc_node_id();
@@ -1256,6 +1640,95 @@ impl Parser {
             }),
             span,
             id,
+        })
+    }
+
+    // Shared between `if` and `if let`: parse `else { ... }` /
+    // `else if ... { ... }` / `else if let ... { ... }`, or synthesize
+    // an empty block when no `else` is present.
+    fn parse_else_or_empty(&mut self, then_block: &Block) -> Result<Block, Error> {
+        if self.peek_kind(&TokenKind::Else) {
+            self.pos += 1;
+            if self.peek_kind(&TokenKind::If) {
+                let chained = self.parse_if_expr()?;
+                let span = chained.span.copy();
+                Ok(Block {
+                    stmts: Vec::new(),
+                    tail: Some(chained),
+                    span,
+                })
+            } else {
+                self.parse_block()
+            }
+        } else {
+            let end = then_block.span.end.copy();
+            Ok(Block {
+                stmts: Vec::new(),
+                tail: None,
+                span: Span::new(end.copy(), end),
+            })
+        }
+    }
+
+    // `match scrut { pat => arm, pat if guard => arm, _ => arm, ... }`.
+    // Trailing comma after the last arm is optional, and arms whose body
+    // is a brace-block may omit the trailing comma.
+    fn parse_match_expr(&mut self) -> Result<Expr, Error> {
+        let match_span = self.expect(&TokenKind::Match, "`match`")?;
+        let saved = self.no_struct_lit;
+        self.no_struct_lit = true;
+        let scrutinee = self.parse_expr()?;
+        self.no_struct_lit = saved;
+        self.expect(&TokenKind::LBrace, "`{`")?;
+        let mut arms: Vec<MatchArm> = Vec::new();
+        while !self.peek_kind(&TokenKind::RBrace) {
+            arms.push(self.parse_match_arm()?);
+            if self.peek_kind(&TokenKind::Comma) {
+                self.pos += 1;
+            } else if !self.peek_kind(&TokenKind::RBrace) {
+                // No comma and not at end — only allowed when the arm
+                // body is a brace-block (then comma is optional).
+                let last = arms.last().unwrap();
+                if !is_brace_block_expr(&last.body) {
+                    return Err(self.error_at_current("expected `,` after match arm"));
+                }
+            }
+        }
+        let rb = self.expect(&TokenKind::RBrace, "`}`")?;
+        let span = Span::new(match_span.start, rb.end);
+        let id = self.alloc_node_id();
+        Ok(Expr {
+            kind: ExprKind::Match(MatchExpr {
+                scrutinee: Box::new(scrutinee),
+                arms,
+                span: span.copy(),
+            }),
+            span,
+            id,
+        })
+    }
+
+    fn parse_match_arm(&mut self) -> Result<MatchArm, Error> {
+        let pattern = self.parse_pattern()?;
+        let pat_start = pattern.span.start.copy();
+        let guard = if self.peek_kind(&TokenKind::If) {
+            self.pos += 1;
+            let saved = self.no_struct_lit;
+            self.no_struct_lit = true;
+            let g = self.parse_expr()?;
+            self.no_struct_lit = saved;
+            Some(g)
+        } else {
+            None
+        };
+        self.expect(&TokenKind::FatArrow, "`=>`")?;
+        let body = self.parse_expr()?;
+        let span = Span::new(pat_start, body.span.end.copy());
+        Ok(MatchArm {
+            pattern,
+            guard,
+            body,
+            span,
         })
     }
 
@@ -1349,10 +1822,21 @@ impl Parser {
                 id,
             })
         } else {
-            Err(Error {
-                file: self.file.clone(),
-                message: "expected `(` or `{` after multi-segment path".to_string(),
-                span: path.span.copy(),
+            // Bare multi-segment path with no `(` or `{` after — could
+            // be a unit-variant reference (`Option::None`) or a path
+            // to a free function used as a value (no first-class
+            // function values yet, so this latter case currently errors
+            // at typeck). Route through Call with an empty arg list;
+            // typeck disambiguates via the enum table.
+            let span = path.span.copy();
+            let id = self.alloc_node_id();
+            Ok(Expr {
+                kind: ExprKind::Call(Call {
+                    callee: path,
+                    args: Vec::new(),
+                }),
+                span,
+                id,
             })
         }
     }
@@ -1604,6 +2088,15 @@ impl Parser {
             (TokenKind::NotEq, TokenKind::NotEq) => true,
             (TokenKind::LtEq, TokenKind::LtEq) => true,
             (TokenKind::GtEq, TokenKind::GtEq) => true,
+            (TokenKind::Enum, TokenKind::Enum) => true,
+            (TokenKind::Match, TokenKind::Match) => true,
+            (TokenKind::Ref, TokenKind::Ref) => true,
+            (TokenKind::Underscore, TokenKind::Underscore) => true,
+            (TokenKind::Pipe, TokenKind::Pipe) => true,
+            (TokenKind::At, TokenKind::At) => true,
+            (TokenKind::DotDot, TokenKind::DotDot) => true,
+            (TokenKind::DotDotEq, TokenKind::DotDotEq) => true,
+            (TokenKind::FatArrow, TokenKind::FatArrow) => true,
             _ => false,
         }
     }
@@ -1635,13 +2128,22 @@ impl Parser {
 // Expressions whose syntax already delimits them with braces and which
 // can therefore sit in statement position without a trailing `;`. Their
 // value (if any) is discarded by the enclosing block — codegen_expr_stmt
-// emits the matching number of `drop`s. `if`/`else if` chains and any
-// brace block are recognised here.
+// emits the matching number of `drop`s. `if`/`else if` chains, `match`,
+// `if let`, and any brace block are recognised here.
 fn is_unit_block_like(expr: &Expr) -> bool {
     match &expr.kind {
         ExprKind::Block(_) => true,
         ExprKind::Unsafe(_) => true,
         ExprKind::If(_) => true,
+        ExprKind::IfLet(_) => true,
+        ExprKind::Match(_) => true,
         _ => false,
     }
+}
+
+// Match arms ending in a brace-delimited expression body don't need a
+// trailing comma. This is the same set as `is_unit_block_like` plus
+// nothing else — so we just reuse that.
+fn is_brace_block_expr(expr: &Expr) -> bool {
+    is_unit_block_like(expr)
 }

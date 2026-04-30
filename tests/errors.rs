@@ -1201,3 +1201,89 @@ fn tuple_unit_used_as_value_is_rejected() {
         err
     );
 }
+
+
+#[test]
+fn match_non_exhaustive_is_rejected() {
+    // Must cover every value; without a wildcard, this can't match
+    // every u32 — should be rejected.
+    let err = compile_source(
+        "fn f() -> u32 { let x: u32 = 5; match x { 0 => 1, 1 => 2 } }",
+    );
+    assert!(
+        err.contains("non-exhaustive"),
+        "expected non-exhaustive error, got: {}",
+        err
+    );
+}
+
+#[test]
+fn match_pattern_move_then_reuse_is_rejected() {
+    // The pattern binds a non-Copy `Owned` payload by value; the arm
+    // body uses it twice. Borrowck must catch the second use as a
+    // move-after-move.
+    let err = compile_source(
+        "struct Owned { n: u32 }\n\
+         enum Wrap { Some(Owned), None }\n\
+         fn use_twice(o: Owned) -> u32 { o.n }\n\
+         fn f() -> u32 {\n\
+             let w: Wrap = Wrap::Some(Owned { n: 42 });\n\
+             match w {\n\
+                 Wrap::Some(inner) => use_twice(inner) + use_twice(inner),\n\
+                 Wrap::None => 0,\n\
+             }\n\
+         }",
+    );
+    assert!(
+        err.contains("already moved"),
+        "expected move-after-move error, got: {}",
+        err
+    );
+}
+
+#[test]
+fn match_partial_move_invalidates_scrutinee() {
+    // Binding a non-Copy variant payload by value partial-moves the
+    // scrutinee place. Subsequent use of the scrutinee must error.
+    let err = compile_source(
+        "struct Owned { n: u32 }\n\
+         enum Wrap { Some(Owned), None }\n\
+         fn use_owned(o: Owned) -> u32 { o.n }\n\
+         fn use_wrap(w: Wrap) -> u32 { 0 }\n\
+         fn f() -> u32 {\n\
+             let w: Wrap = Wrap::Some(Owned { n: 42 });\n\
+             let n: u32 = match w {\n\
+                 Wrap::Some(inner) => use_owned(inner),\n\
+                 Wrap::None => 0,\n\
+             };\n\
+             use_wrap(w) + n\n\
+         }",
+    );
+    assert!(
+        err.contains("already moved") || err.contains("moved"),
+        "expected partial-move-of-scrutinee error, got: {}",
+        err
+    );
+}
+
+#[test]
+fn match_ref_binding_outstanding_borrow_blocks_mut() {
+    // `ref rx` against a place creates a borrow of that place. While
+    // `rx` is live, taking `&mut p` should conflict.
+    let err = compile_source(
+        "struct Point { x: u32, y: u32 }\n\
+         fn set(p: &mut Point) { }\n\
+         fn f() -> u32 {\n\
+             let mut p: Point = Point { x: 1, y: 2 };\n\
+             let n: u32 = match p {\n\
+                 Point { x: ref rx, y } => { let _m = &mut p; *rx + y }\n\
+             };\n\
+             n\n\
+         }",
+    );
+    assert!(
+        err.contains("borrow") || err.contains("conflict") || err.contains("already moved"),
+        "expected borrow conflict, got: {}",
+        err
+    );
+}

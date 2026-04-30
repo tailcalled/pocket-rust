@@ -128,10 +128,17 @@ pub enum Instruction {
     I64Store { align: u32, offset: u32 },
     // Structured control flow. `If(BlockType)` opens an if-block whose
     // result is described by the BlockType; `Else` separates the two
-    // arms; `End` closes both `If` and standalone `Block`/`Loop`.
+    // arms; `End` closes any structured block (`If`, `Block`, etc.).
+    // `Block(BlockType)` opens a plain block whose result is described
+    // by the BlockType. `Br(label)` jumps out of the labeled enclosing
+    // block (label = depth, 0 = innermost); `BrIf(label)` does the same
+    // when the i32 on top of the stack is non-zero.
     If(BlockType),
     Else,
     End,
+    Block(BlockType),
+    Br(u32),
+    BrIf(u32),
 }
 
 // Wasm structured-control-flow block result. Three encodings, matching
@@ -505,6 +512,18 @@ fn encode_instruction(out: &mut Vec<u8>, inst: &Instruction) {
         }
         Instruction::End => {
             out.push(0x0b);
+        }
+        Instruction::Block(bt) => {
+            out.push(0x02);
+            encode_block_type(out, bt);
+        }
+        Instruction::Br(label) => {
+            out.push(0x0c);
+            write_uleb128(out, *label);
+        }
+        Instruction::BrIf(label) => {
+            out.push(0x0d);
+            write_uleb128(out, *label);
         }
     }
 }

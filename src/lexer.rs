@@ -25,6 +25,9 @@ pub enum TokenKind {
     False,
     Use,
     Pub,
+    Enum,
+    Match,
+    Ref,
     // The currency-sign character `¤` (U+00A4). Prefixes a builtin
     // intrinsic call: `¤name(args)`. The lexer emits this as a
     // standalone token; the following identifier (and parenthesized
@@ -57,7 +60,20 @@ pub enum TokenKind {
     LtEq,
     GtEq,
     Eq,
+    // `_` — wildcard / placeholder. Used by patterns (matches anything,
+    // binds nothing) and `let _ = …;`. Lexed as a standalone token, not
+    // an identifier — pure-`_` ident isn't a binding name.
+    Underscore,
+    // `|` — pipe. Or-patterns (`A | B | C`).
+    Pipe,
+    // `@` — pattern at-binding (`name @ subpattern`).
+    At,
+    // `..` — rest pattern in struct/tuple patterns (`Foo { x, .. }`).
+    DotDot,
+    // `..=` — inclusive range, used in range patterns (`0..=9`).
+    DotDotEq,
     IntLit(u64),
+    FatArrow,
 }
 
 pub fn token_kind_name(t: &TokenKind) -> &'static str {
@@ -81,6 +97,9 @@ pub fn token_kind_name(t: &TokenKind) -> &'static str {
         TokenKind::False => "`false`",
         TokenKind::Use => "`use`",
         TokenKind::Pub => "`pub`",
+        TokenKind::Enum => "`enum`",
+        TokenKind::Match => "`match`",
+        TokenKind::Ref => "`ref`",
         TokenKind::Builtin => "`¤`",
         TokenKind::LAngle => "`<`",
         TokenKind::RAngle => "`>`",
@@ -108,6 +127,12 @@ pub fn token_kind_name(t: &TokenKind) -> &'static str {
         TokenKind::LtEq => "`<=`",
         TokenKind::GtEq => "`>=`",
         TokenKind::Eq => "`=`",
+        TokenKind::Underscore => "`_`",
+        TokenKind::Pipe => "`|`",
+        TokenKind::At => "`@`",
+        TokenKind::DotDot => "`..`",
+        TokenKind::DotDotEq => "`..=`",
+        TokenKind::FatArrow => "`=>`",
         TokenKind::IntLit(_) => "integer literal",
     }
 }
@@ -234,6 +259,26 @@ pub fn tokenize(file: &str, source: &str) -> Result<Vec<Token>, Error> {
                     kind: TokenKind::Pub,
                     span,
                 });
+            } else if text == "enum" {
+                tokens.push(Token {
+                    kind: TokenKind::Enum,
+                    span,
+                });
+            } else if text == "match" {
+                tokens.push(Token {
+                    kind: TokenKind::Match,
+                    span,
+                });
+            } else if text == "ref" {
+                tokens.push(Token {
+                    kind: TokenKind::Ref,
+                    span,
+                });
+            } else if text == "_" {
+                tokens.push(Token {
+                    kind: TokenKind::Underscore,
+                    span,
+                });
             } else {
                 tokens.push(Token {
                     kind: TokenKind::Ident(text),
@@ -278,6 +323,22 @@ pub fn tokenize(file: &str, source: &str) -> Result<Vec<Token>, Error> {
         } else if b == b',' {
             push_single(&mut tokens, TokenKind::Comma, line, &mut col);
             byte_pos += 1;
+        } else if b == b'.'
+            && (byte_pos + 2) < bytes.len()
+            && bytes[byte_pos + 1] == b'.'
+            && bytes[byte_pos + 2] == b'='
+        {
+            let start = Pos::new(line, col);
+            col += 3;
+            let end = Pos::new(line, col);
+            tokens.push(Token { kind: TokenKind::DotDotEq, span: Span::new(start, end) });
+            byte_pos += 3;
+        } else if b == b'.' && (byte_pos + 1) < bytes.len() && bytes[byte_pos + 1] == b'.' {
+            let start = Pos::new(line, col);
+            col += 2;
+            let end = Pos::new(line, col);
+            tokens.push(Token { kind: TokenKind::DotDot, span: Span::new(start, end) });
+            byte_pos += 2;
         } else if b == b'.' {
             push_single(&mut tokens, TokenKind::Dot, line, &mut col);
             byte_pos += 1;
@@ -301,6 +362,12 @@ pub fn tokenize(file: &str, source: &str) -> Result<Vec<Token>, Error> {
             col += 2;
             let end = Pos::new(line, col);
             tokens.push(Token { kind: TokenKind::EqEq, span: Span::new(start, end) });
+            byte_pos += 2;
+        } else if b == b'=' && (byte_pos + 1) < bytes.len() && bytes[byte_pos + 1] == b'>' {
+            let start = Pos::new(line, col);
+            col += 2;
+            let end = Pos::new(line, col);
+            tokens.push(Token { kind: TokenKind::FatArrow, span: Span::new(start, end) });
             byte_pos += 2;
         } else if b == b'=' {
             push_single(&mut tokens, TokenKind::Eq, line, &mut col);
@@ -382,6 +449,12 @@ pub fn tokenize(file: &str, source: &str) -> Result<Vec<Token>, Error> {
             byte_pos += 2;
         } else if b == b':' {
             push_single(&mut tokens, TokenKind::Colon, line, &mut col);
+            byte_pos += 1;
+        } else if b == b'|' {
+            push_single(&mut tokens, TokenKind::Pipe, line, &mut col);
+            byte_pos += 1;
+        } else if b == b'@' {
+            push_single(&mut tokens, TokenKind::At, line, &mut col);
             byte_pos += 1;
         } else if b == 0xc2 && (byte_pos + 1) < bytes.len() && bytes[byte_pos + 1] == 0xa4 {
             // `¤` U+00A4 — UTF-8 encoded as the two bytes 0xC2 0xA4.

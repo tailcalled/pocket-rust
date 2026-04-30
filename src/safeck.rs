@@ -45,6 +45,7 @@ fn check_module(
                 path.pop();
             }
             Item::Struct(_) => {}
+            Item::Enum(_) => {}
             Item::Impl(ib) => {
                 if ib.trait_path.is_some() {
                     i += 1;
@@ -185,6 +186,21 @@ fn walk_expr(state: &mut SafeState, expr: &Expr) -> Result<(), Error> {
             Ok(())
         }
         ExprKind::TupleIndex { base, .. } => walk_expr(state, base),
+        ExprKind::Match(m) => {
+            walk_expr(state, &m.scrutinee)?;
+            let mut i = 0;
+            while i < m.arms.len() {
+                walk_expr(state, &m.arms[i].body)?;
+                i += 1;
+            }
+            Ok(())
+        }
+        ExprKind::IfLet(il) => {
+            walk_expr(state, &il.scrutinee)?;
+            walk_block(state, il.then_block.as_ref())?;
+            walk_block(state, il.else_block.as_ref())?;
+            Ok(())
+        }
     }
 }
 

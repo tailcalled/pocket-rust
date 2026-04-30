@@ -12,13 +12,14 @@ use crate::typeck::{
 pub fn check(
     root: &Module,
     structs: &StructTable,
+    enums: &crate::typeck::EnumTable,
     traits: &TraitTable,
     funcs: &mut FuncTable,
 ) -> Result<(), Error> {
     let mut current_file = root.source_file.clone();
     let mut current_module: Vec<String> = Vec::new();
     push_root_name(&mut current_module, root);
-    check_module(root, &mut current_module, &mut current_file, structs, traits, funcs)?;
+    check_module(root, &mut current_module, &mut current_file, structs, enums, traits, funcs)?;
     Ok(())
 }
 
@@ -33,6 +34,7 @@ fn check_module(
     current_module: &mut Vec<String>,
     current_file: &mut String,
     structs: &StructTable,
+    enums: &crate::typeck::EnumTable,
     traits: &TraitTable,
     funcs: &mut FuncTable,
 ) -> Result<(), Error> {
@@ -48,15 +50,17 @@ fn check_module(
                 None,
                 current_file,
                 structs,
+                enums,
                 traits,
                 funcs,
             )?,
             Item::Module(m) => {
                 current_module.push(m.name.clone());
-                check_module(m, current_module, current_file, structs, traits, funcs)?;
+                check_module(m, current_module, current_file, structs, enums, traits, funcs)?;
                 current_module.pop();
             }
             Item::Struct(_) => {}
+            Item::Enum(_) => {}
             Item::Use(_) => {}
             Item::Impl(ib) => {
                 let target_name = match &ib.target.kind {
@@ -100,6 +104,7 @@ fn check_module(
                         Some(rtype_clone(&target_rt)),
                         current_file,
                         structs,
+                        enums,
                         traits,
                         funcs,
                     )?;
@@ -120,7 +125,8 @@ fn check_function(
     path_prefix: &Vec<String>,
     self_target: Option<RType>,
     current_file: &str,
-    _structs: &StructTable,
+    structs: &StructTable,
+    enums: &crate::typeck::EnumTable,
     traits: &TraitTable,
     funcs: &mut FuncTable,
 ) -> Result<(), Error> {
@@ -181,6 +187,8 @@ fn check_function(
             file: current_file.to_string(),
             funcs: funcs_ro,
             traits,
+            structs,
+            enums,
             current_module,
             self_target,
             type_params,
@@ -256,6 +264,8 @@ struct BorrowState<'a> {
     file: String,
     funcs: &'a FuncTable,
     traits: &'a TraitTable,
+    structs: &'a StructTable,
+    enums: &'a crate::typeck::EnumTable,
     type_params: Vec<String>,
     type_param_bounds: Vec<Vec<Vec<String>>>,
     #[allow(dead_code)]
@@ -530,6 +540,33 @@ fn walk_expr_for_liveness(expr: &Expr, step: &mut u32, info: &mut Liveness) {
         ExprKind::TupleIndex { base, .. } => {
             walk_expr_for_liveness(base, step, info);
         }
+        ExprKind::Match(m) => {
+            walk_expr_for_liveness(&m.scrutinee, step, info);
+            let mut i = 0;
+            while i < m.arms.len() {
+                if let Some(g) = &m.arms[i].guard {
+                    walk_expr_for_liveness(g, step, info);
+                }
+                // Pattern bindings are seeded so unused arm-body lookups
+                // don't think the binding's last-use is "before its
+                // declaration" (which would be a degenerate case anyway,
+                // but seeding is harmless and matches the let-stmt path).
+                let mut names: Vec<String> = Vec::new();
+                collect_pattern_bindings(&m.arms[i].pattern, &mut names);
+                let mut k = 0;
+                while k < names.len() {
+                    liveness_record(info, &names[k], *step);
+                    k += 1;
+                }
+                walk_expr_for_liveness(&m.arms[i].body, step, info);
+                i += 1;
+            }
+        }
+        ExprKind::IfLet(il) => {
+            walk_expr_for_liveness(&il.scrutinee, step, info);
+            walk_block_for_liveness(il.then_block.as_ref(), step, info);
+            walk_block_for_liveness(il.else_block.as_ref(), step, info);
+        }
     }
 }
 
@@ -689,6 +726,761 @@ fn walk_expr(state: &mut BorrowState, expr: &Expr) -> Result<ValueDesc, Error> {
         ExprKind::TupleIndex { base, index, .. } => {
             walk_tuple_index(state, base, *index, expr)
         }
+        ExprKind::Match(m) => walk_match_expr(state, m),
+        ExprKind::IfLet(il) => walk_if_let_expr(state, il),
+    }
+}
+
+fn walk_match_expr(
+    state: &mut BorrowState,
+    m: &crate::ast::MatchExpr,
+) -> Result<ValueDesc, Error> {
+    // Resolve the scrutinee type (substituted under any outer
+    // monomorphization env). Pattern processing uses this as the
+    // "type at the top of the pattern" and descends as it peels
+    // layers.
+    let scrut_ty: RType = state.expr_types[m.scrutinee.id as usize]
+        .as_ref()
+        .map(rtype_clone)
+        .unwrap_or(RType::Tuple(Vec::new()));
+    // Try to identify the scrutinee as a place expression. If yes,
+    // pattern bindings can record borrows / partial moves rooted at
+    // that place. If the scrutinee is an rvalue (call, struct lit,
+    // etc.), we walk it for side effects and pass `None` to the
+    // pattern walker so no place-rooted tracking happens.
+    let scrut_place: Option<Vec<String>> = extract_place(&m.scrutinee);
+    if let Some(p) = &scrut_place {
+        // Don't pre-emptively move/borrow — defer to pattern walking.
+        // But check the place hasn't already been moved (matching
+        // a moved value is a hard error).
+        check_not_moved(state, p, &m.scrutinee.span)?;
+    } else {
+        // Rvalue scrutinee: surface side effects and let any borrows
+        // it produces die at a synthetic call slot.
+        let scrut_slot = state.holders.len();
+        state.holders.push(Holder {
+            name: None,
+            rtype: None,
+            holds: Vec::new(),
+            field_holds: Vec::new(),
+        });
+        let scrut_desc = walk_expr(state, &m.scrutinee)?;
+        let scrut_holds = HeldBorrow_vec_from_desc(&scrut_desc);
+        state.holders[scrut_slot].holds = scrut_holds;
+        state.holders.truncate(scrut_slot);
+    }
+    if m.arms.is_empty() {
+        return Ok(empty_desc());
+    }
+    let pre_moved: Vec<MovedPlace> = clone_moved_vec(&state.moved);
+    let pre_holders_len = state.holders.len();
+    let pre_holders_state = snapshot_holders_state(state);
+    let mut merged_moved: Option<Vec<MovedPlace>> = None;
+    let mut tail_borrows: Vec<HeldBorrow> = Vec::new();
+    let mut tail_field_borrows: Vec<FieldHold> = Vec::new();
+    let mut i = 0;
+    while i < m.arms.len() {
+        // Reset to the pre-arm state for each arm.
+        state.moved = clone_moved_vec(&pre_moved);
+        state.holders.truncate(pre_holders_len);
+        restore_holders_state(state, snapshot_clone(&pre_holders_state));
+        let mark = state.holders.len();
+        // Walk the pattern: pushes bindings as Holders with proper
+        // rtype and (for `ref` bindings) outstanding borrows; records
+        // partial moves for value-bindings of non-Copy values rooted
+        // at the scrutinee place.
+        walk_pattern_for_borrowck(
+            state,
+            &m.arms[i].pattern,
+            &scrut_ty,
+            scrut_place.as_ref(),
+            &m.arms[i].pattern.span,
+        )?;
+        if let Some(g) = &m.arms[i].guard {
+            walk_expr(state, g)?;
+        }
+        let arm_desc = walk_expr(state, &m.arms[i].body)?;
+        state.holders.truncate(mark);
+        let arm_moved = clone_moved_vec(&state.moved);
+        merged_moved = Some(match merged_moved {
+            Some(prev) => merge_moved_sets(&prev, &arm_moved),
+            None => arm_moved,
+        });
+        let mut k = 0;
+        while k < arm_desc.borrows.len() {
+            tail_borrows.push(HeldBorrow {
+                place: clone_path(&arm_desc.borrows[k].place),
+                mutable: arm_desc.borrows[k].mutable,
+            });
+            k += 1;
+        }
+        let mut k = 0;
+        while k < arm_desc.field_borrows.len() {
+            tail_field_borrows.push(FieldHold {
+                field: clone_path(&arm_desc.field_borrows[k].field),
+                borrows: clone_held_borrows(&arm_desc.field_borrows[k].borrows),
+            });
+            k += 1;
+        }
+        i += 1;
+    }
+    state.moved = merged_moved.unwrap_or(pre_moved);
+    Ok(ValueDesc {
+        borrows: tail_borrows,
+        field_borrows: tail_field_borrows,
+    })
+}
+
+// `if let Pat = scrut { then } else { else }`. Like a single-arm
+// match plus an else fallback. Walks the scrutinee, then both arms
+// against a snapshot, and merges the moved-place sets across the
+// two paths. Pattern bindings (with their borrows / partial moves)
+// scope to the then-arm only.
+fn walk_if_let_expr(
+    state: &mut BorrowState,
+    il: &crate::ast::IfLetExpr,
+) -> Result<ValueDesc, Error> {
+    let scrut_ty: RType = state.expr_types[il.scrutinee.id as usize]
+        .as_ref()
+        .map(rtype_clone)
+        .unwrap_or(RType::Tuple(Vec::new()));
+    let scrut_place: Option<Vec<String>> = extract_place(&il.scrutinee);
+    if let Some(p) = &scrut_place {
+        check_not_moved(state, p, &il.scrutinee.span)?;
+    } else {
+        let scrut_slot = state.holders.len();
+        state.holders.push(Holder {
+            name: None,
+            rtype: None,
+            holds: Vec::new(),
+            field_holds: Vec::new(),
+        });
+        let scrut_desc = walk_expr(state, &il.scrutinee)?;
+        let scrut_holds = HeldBorrow_vec_from_desc(&scrut_desc);
+        state.holders[scrut_slot].holds = scrut_holds;
+        state.holders.truncate(scrut_slot);
+    }
+    let pre_moved: Vec<MovedPlace> = clone_moved_vec(&state.moved);
+    let pre_holders_len = state.holders.len();
+    let pre_holders_state = snapshot_holders_state(state);
+    // Then-arm: pattern bindings + body.
+    let mark = state.holders.len();
+    walk_pattern_for_borrowck(
+        state,
+        &il.pattern,
+        &scrut_ty,
+        scrut_place.as_ref(),
+        &il.pattern.span,
+    )?;
+    let then_desc = walk_block_expr(state, il.then_block.as_ref())?;
+    state.holders.truncate(mark);
+    let then_moved = clone_moved_vec(&state.moved);
+    // Else-arm: no bindings, fresh state.
+    state.moved = clone_moved_vec(&pre_moved);
+    state.holders.truncate(pre_holders_len);
+    restore_holders_state(state, snapshot_clone(&pre_holders_state));
+    let else_desc = walk_block_expr(state, il.else_block.as_ref())?;
+    let else_moved = clone_moved_vec(&state.moved);
+    state.moved = merge_moved_sets(&then_moved, &else_moved);
+    // Combine borrows from both arms (caller decides what to do with them).
+    let mut borrows = then_desc.borrows;
+    let mut k = 0;
+    while k < else_desc.borrows.len() {
+        borrows.push(HeldBorrow {
+            place: clone_path(&else_desc.borrows[k].place),
+            mutable: else_desc.borrows[k].mutable,
+        });
+        k += 1;
+    }
+    let mut field_borrows = then_desc.field_borrows;
+    let mut k = 0;
+    while k < else_desc.field_borrows.len() {
+        field_borrows.push(FieldHold {
+            field: clone_path(&else_desc.field_borrows[k].field),
+            borrows: clone_held_borrows(&else_desc.field_borrows[k].borrows),
+        });
+        k += 1;
+    }
+    Ok(ValueDesc { borrows, field_borrows })
+}
+
+fn snapshot_clone(
+    snap: &Vec<(Vec<HeldBorrow>, Vec<FieldHold>)>,
+) -> Vec<(Vec<HeldBorrow>, Vec<FieldHold>)> {
+    let mut out: Vec<(Vec<HeldBorrow>, Vec<FieldHold>)> = Vec::new();
+    let mut i = 0;
+    while i < snap.len() {
+        out.push((
+            clone_held_borrows(&snap[i].0),
+            clone_field_holds(&snap[i].1),
+        ));
+        i += 1;
+    }
+    out
+}
+
+// Walk a pattern at borrowck time: pushes a Holder for each binding
+// (with the binding's resolved RType), records partial moves on
+// `state.moved` for non-Copy value bindings rooted at the scrutinee
+// place, and seeds `ref` bindings' holders with the borrow they
+// represent.
+//
+// `scrut_path` is `Some(place)` when the scrutinee is a place
+// expression (so borrows / partial moves can be rooted at it) or
+// `None` for rvalue scrutinees (no place to track). Path extension:
+// tuple element `i` becomes path + ["i"]; struct field `f` becomes
+// path + ["f"]; variant `V::W(payload)` extends with `["V", "0"]`
+// to keep the variant tag distinct from same-named struct fields.
+//
+// Ref pattern (`&p`) descends into the pointee; pocket-rust doesn't
+// give pointees a place identity, so the inner pattern walks with
+// `None` — bindings inside still get the right RType, but place-
+// rooted move/borrow tracking stops at the deref boundary.
+fn walk_pattern_for_borrowck(
+    state: &mut BorrowState,
+    pattern: &crate::ast::Pattern,
+    scrut_ty: &RType,
+    scrut_path: Option<&Vec<String>>,
+    span: &Span,
+) -> Result<(), Error> {
+    use crate::ast::PatternKind;
+    use crate::typeck::{
+        EnumEntry, VariantPayloadResolved, enum_lookup, struct_lookup,
+    };
+    match &pattern.kind {
+        PatternKind::Wildcard
+        | PatternKind::LitInt(_)
+        | PatternKind::LitBool(_)
+        | PatternKind::Range { .. } => Ok(()),
+        PatternKind::Binding { name, by_ref, mutable, .. } => {
+            if *by_ref {
+                // `ref name` / `ref mut name`: holder type is `&T` /
+                // `&mut T`; if the scrutinee is a place, the borrow
+                // is recorded on the holder so downstream
+                // conflict-with-`&mut` checks see it.
+                let ref_ty = RType::Ref {
+                    inner: Box::new(rtype_clone(scrut_ty)),
+                    mutable: *mutable,
+                    lifetime: crate::typeck::LifetimeRepr::Inferred(0),
+                };
+                let holds: Vec<HeldBorrow> = match scrut_path {
+                    Some(p) => {
+                        let new = HeldBorrow {
+                            place: clone_path(p),
+                            mutable: *mutable,
+                        };
+                        check_borrow_conflict(state, &new, span)?;
+                        vec![HeldBorrow {
+                            place: clone_path(p),
+                            mutable: *mutable,
+                        }]
+                    }
+                    None => Vec::new(),
+                };
+                state.holders.push(Holder {
+                    name: Some(name.clone()),
+                    rtype: Some(ref_ty),
+                    holds,
+                    field_holds: Vec::new(),
+                });
+            } else {
+                // Value binding: if the scrutinee is a place and the
+                // value is non-Copy, record a partial move at the
+                // current sub-path — subsequent uses of the
+                // scrutinee will detect the conflict via prefix-
+                // overlap.
+                if let Some(p) = scrut_path {
+                    let copy = is_copy_with_bounds(
+                        scrut_ty,
+                        state.traits,
+                        &state.type_params,
+                        &state.type_param_bounds,
+                    );
+                    if !copy {
+                        try_move(state, clone_path(p), span.copy())?;
+                    }
+                }
+                state.holders.push(Holder {
+                    name: Some(name.clone()),
+                    rtype: Some(rtype_clone(scrut_ty)),
+                    holds: Vec::new(),
+                    field_holds: Vec::new(),
+                });
+            }
+            Ok(())
+        }
+        PatternKind::At { name, inner, .. } => {
+            // `name @ inner`: bind name (value-binding semantics)
+            // and recurse into inner. If the value is non-Copy and
+            // we're rooted at a place, the at-binding moves it.
+            if let Some(p) = scrut_path {
+                let copy = is_copy_with_bounds(
+                    scrut_ty,
+                    state.traits,
+                    &state.type_params,
+                    &state.type_param_bounds,
+                );
+                if !copy {
+                    try_move(state, clone_path(p), span.copy())?;
+                }
+            }
+            state.holders.push(Holder {
+                name: Some(name.clone()),
+                rtype: Some(rtype_clone(scrut_ty)),
+                holds: Vec::new(),
+                field_holds: Vec::new(),
+            });
+            walk_pattern_for_borrowck(state, inner, scrut_ty, scrut_path, span)
+        }
+        PatternKind::Tuple(elems) => {
+            if let RType::Tuple(elem_tys) = scrut_ty {
+                let mut i = 0;
+                while i < elems.len() && i < elem_tys.len() {
+                    let sub_path = scrut_path.map(|p| {
+                        let mut np = clone_path(p);
+                        np.push(format!("{}", i));
+                        np
+                    });
+                    walk_pattern_for_borrowck(
+                        state,
+                        &elems[i],
+                        &elem_tys[i],
+                        sub_path.as_ref(),
+                        span,
+                    )?;
+                    i += 1;
+                }
+            }
+            Ok(())
+        }
+        PatternKind::Ref { inner, .. } => {
+            // Match descends through the reference into its pointee.
+            // Pocket-rust doesn't give pointees a place identity for
+            // borrow tracking, so the inner walks without a path.
+            // Bindings inside still get the right RType.
+            if let RType::Ref { inner: pointee, .. } = scrut_ty {
+                walk_pattern_for_borrowck(state, inner, pointee.as_ref(), None, span)
+            } else {
+                Ok(())
+            }
+        }
+        PatternKind::VariantTuple { path, elems } => {
+            if let RType::Enum { path: enum_path, type_args, .. } = scrut_ty {
+                let entry: &EnumEntry = match enum_lookup(state.enums, enum_path) {
+                    Some(e) => e,
+                    None => return Ok(()),
+                };
+                let variant_name = match path.segments.last() {
+                    Some(s) => s.name.clone(),
+                    None => return Ok(()),
+                };
+                let mut v_idx: Option<usize> = None;
+                let mut k = 0;
+                while k < entry.variants.len() {
+                    if entry.variants[k].name == variant_name {
+                        v_idx = Some(k);
+                        break;
+                    }
+                    k += 1;
+                }
+                let v_idx = match v_idx {
+                    Some(i) => i,
+                    None => return Ok(()),
+                };
+                let env = enum_type_env(&entry.type_params, type_args);
+                if let VariantPayloadResolved::Tuple(payload_tys) =
+                    &entry.variants[v_idx].payload
+                {
+                    let mut i = 0;
+                    while i < elems.len() && i < payload_tys.len() {
+                        let sub_ty =
+                            crate::typeck::substitute_rtype(&payload_tys[i], &env);
+                        let sub_path = scrut_path.map(|p| {
+                            let mut np = clone_path(p);
+                            np.push(variant_name.clone());
+                            np.push(format!("{}", i));
+                            np
+                        });
+                        walk_pattern_for_borrowck(
+                            state,
+                            &elems[i],
+                            &sub_ty,
+                            sub_path.as_ref(),
+                            span,
+                        )?;
+                        i += 1;
+                    }
+                }
+            }
+            Ok(())
+        }
+        PatternKind::VariantStruct { path, fields, .. } => {
+            match scrut_ty {
+                RType::Enum { path: enum_path, type_args, .. } => {
+                    let entry = match enum_lookup(state.enums, enum_path) {
+                        Some(e) => e,
+                        None => return Ok(()),
+                    };
+                    let variant_name = match path.segments.last() {
+                        Some(s) => s.name.clone(),
+                        None => return Ok(()),
+                    };
+                    let mut v_idx: Option<usize> = None;
+                    let mut k = 0;
+                    while k < entry.variants.len() {
+                        if entry.variants[k].name == variant_name {
+                            v_idx = Some(k);
+                            break;
+                        }
+                        k += 1;
+                    }
+                    let v_idx = match v_idx {
+                        Some(i) => i,
+                        None => return Ok(()),
+                    };
+                    let env = enum_type_env(&entry.type_params, type_args);
+                    if let VariantPayloadResolved::Struct(field_defs) =
+                        &entry.variants[v_idx].payload
+                    {
+                        let mut k = 0;
+                        while k < fields.len() {
+                            let mut idx: Option<usize> = None;
+                            let mut j = 0;
+                            while j < field_defs.len() {
+                                if field_defs[j].name == fields[k].name {
+                                    idx = Some(j);
+                                    break;
+                                }
+                                j += 1;
+                            }
+                            if let Some(j) = idx {
+                                let sub_ty = crate::typeck::substitute_rtype(
+                                    &field_defs[j].ty,
+                                    &env,
+                                );
+                                let sub_path = scrut_path.map(|p| {
+                                    let mut np = clone_path(p);
+                                    np.push(variant_name.clone());
+                                    np.push(fields[k].name.clone());
+                                    np
+                                });
+                                walk_pattern_for_borrowck(
+                                    state,
+                                    &fields[k].pattern,
+                                    &sub_ty,
+                                    sub_path.as_ref(),
+                                    span,
+                                )?;
+                            }
+                            k += 1;
+                        }
+                    }
+                }
+                RType::Struct { path: struct_path, type_args, .. } => {
+                    let entry = match struct_lookup(state.structs, struct_path) {
+                        Some(e) => e,
+                        None => return Ok(()),
+                    };
+                    let env = enum_type_env(&entry.type_params, type_args);
+                    let mut k = 0;
+                    while k < fields.len() {
+                        let mut idx: Option<usize> = None;
+                        let mut j = 0;
+                        while j < entry.fields.len() {
+                            if entry.fields[j].name == fields[k].name {
+                                idx = Some(j);
+                                break;
+                            }
+                            j += 1;
+                        }
+                        if let Some(j) = idx {
+                            let sub_ty =
+                                crate::typeck::substitute_rtype(&entry.fields[j].ty, &env);
+                            let sub_path = scrut_path.map(|p| {
+                                let mut np = clone_path(p);
+                                np.push(fields[k].name.clone());
+                                np
+                            });
+                            walk_pattern_for_borrowck(
+                                state,
+                                &fields[k].pattern,
+                                &sub_ty,
+                                sub_path.as_ref(),
+                                span,
+                            )?;
+                        }
+                        k += 1;
+                    }
+                }
+                _ => {}
+            }
+            Ok(())
+        }
+        PatternKind::Or(alts) => {
+            // Or-patterns: typeck enforces that all alternatives bind
+            // the same names with unifiable types. For move/borrow
+            // tracking we conservatively use the *union* — if any
+            // alternative would move a non-Copy value or hold a
+            // borrow, treat the binding as if it always does. The
+            // simplest implementation is to walk just the first alt
+            // and emit those bindings; alternatives that differ
+            // structurally (e.g. `Some(ref x) | None` — illegal in
+            // typeck since None doesn't bind x) wouldn't get past
+            // typeck anyway. For E3 we keep the first-alt approach.
+            if !alts.is_empty() {
+                walk_pattern_for_borrowck(state, &alts[0], scrut_ty, scrut_path, span)?;
+            }
+            Ok(())
+        }
+    }
+}
+
+// Old typed-walk variant (no place-rooted tracking) — kept for
+// reference; not used now that walk_pattern_for_borrowck does the
+// full job.
+#[allow(dead_code)]
+fn collect_pattern_bindings_typed(
+    pattern: &crate::ast::Pattern,
+    scrut_ty: &RType,
+    structs: &StructTable,
+    enums: &crate::typeck::EnumTable,
+    out: &mut Vec<(String, RType)>,
+) {
+    use crate::ast::PatternKind;
+    use crate::typeck::{
+        EnumEntry, VariantPayloadResolved, enum_lookup, struct_lookup,
+    };
+    match &pattern.kind {
+        PatternKind::Wildcard
+        | PatternKind::LitInt(_)
+        | PatternKind::LitBool(_)
+        | PatternKind::Range { .. } => {}
+        PatternKind::Binding { name, by_ref, mutable, .. } => {
+            let ty = if *by_ref {
+                RType::Ref {
+                    inner: Box::new(rtype_clone(scrut_ty)),
+                    mutable: *mutable,
+                    lifetime: crate::typeck::LifetimeRepr::Inferred(0),
+                }
+            } else {
+                rtype_clone(scrut_ty)
+            };
+            out.push((name.clone(), ty));
+        }
+        PatternKind::At { name, inner, .. } => {
+            out.push((name.clone(), rtype_clone(scrut_ty)));
+            collect_pattern_bindings_typed(inner, scrut_ty, structs, enums, out);
+        }
+        PatternKind::Tuple(elems) => {
+            if let RType::Tuple(elem_tys) = scrut_ty {
+                let mut i = 0;
+                while i < elems.len() && i < elem_tys.len() {
+                    collect_pattern_bindings_typed(&elems[i], &elem_tys[i], structs, enums, out);
+                    i += 1;
+                }
+            }
+        }
+        PatternKind::Ref { inner, .. } => {
+            if let RType::Ref { inner: pointee, .. } = scrut_ty {
+                collect_pattern_bindings_typed(inner, pointee.as_ref(), structs, enums, out);
+            }
+        }
+        PatternKind::VariantTuple { path, elems } => {
+            // Look up the variant in the enum corresponding to the
+            // scrutinee type, find its tuple-payload types
+            // substituted under the scrutinee's type-args.
+            if let RType::Enum { path: enum_path, type_args, .. } = scrut_ty {
+                let entry: &EnumEntry = match enum_lookup(enums, enum_path) {
+                    Some(e) => e,
+                    None => return,
+                };
+                let variant_name = match path.segments.last() {
+                    Some(s) => s.name.clone(),
+                    None => return,
+                };
+                let mut variant_idx: Option<usize> = None;
+                let mut k = 0;
+                while k < entry.variants.len() {
+                    if entry.variants[k].name == variant_name {
+                        variant_idx = Some(k);
+                        break;
+                    }
+                    k += 1;
+                }
+                let v_idx = match variant_idx {
+                    Some(i) => i,
+                    None => return,
+                };
+                let env = enum_type_env(&entry.type_params, type_args);
+                if let VariantPayloadResolved::Tuple(payload_tys) = &entry.variants[v_idx].payload {
+                    let mut i = 0;
+                    while i < elems.len() && i < payload_tys.len() {
+                        let sub_ty =
+                            crate::typeck::substitute_rtype(&payload_tys[i], &env);
+                        collect_pattern_bindings_typed(&elems[i], &sub_ty, structs, enums, out);
+                        i += 1;
+                    }
+                }
+            }
+        }
+        PatternKind::VariantStruct { path, fields, .. } => {
+            // Two cases: the path resolves to an enum variant (struct-
+            // shaped payload) OR to a bare struct type. Distinguish
+            // by the scrutinee's resolved type.
+            match scrut_ty {
+                RType::Enum { path: enum_path, type_args, .. } => {
+                    let entry = match enum_lookup(enums, enum_path) {
+                        Some(e) => e,
+                        None => return,
+                    };
+                    let variant_name = match path.segments.last() {
+                        Some(s) => s.name.clone(),
+                        None => return,
+                    };
+                    let mut v_idx: Option<usize> = None;
+                    let mut k = 0;
+                    while k < entry.variants.len() {
+                        if entry.variants[k].name == variant_name {
+                            v_idx = Some(k);
+                            break;
+                        }
+                        k += 1;
+                    }
+                    let v_idx = match v_idx {
+                        Some(i) => i,
+                        None => return,
+                    };
+                    let env = enum_type_env(&entry.type_params, type_args);
+                    if let VariantPayloadResolved::Struct(field_defs) =
+                        &entry.variants[v_idx].payload
+                    {
+                        let mut k = 0;
+                        while k < fields.len() {
+                            let mut idx: Option<usize> = None;
+                            let mut j = 0;
+                            while j < field_defs.len() {
+                                if field_defs[j].name == fields[k].name {
+                                    idx = Some(j);
+                                    break;
+                                }
+                                j += 1;
+                            }
+                            if let Some(j) = idx {
+                                let sub_ty = crate::typeck::substitute_rtype(
+                                    &field_defs[j].ty,
+                                    &env,
+                                );
+                                collect_pattern_bindings_typed(
+                                    &fields[k].pattern,
+                                    &sub_ty,
+                                    structs,
+                                    enums,
+                                    out,
+                                );
+                            }
+                            k += 1;
+                        }
+                    }
+                }
+                RType::Struct { path: struct_path, type_args, .. } => {
+                    let entry = match struct_lookup(structs, struct_path) {
+                        Some(e) => e,
+                        None => return,
+                    };
+                    let env = enum_type_env(&entry.type_params, type_args);
+                    let mut k = 0;
+                    while k < fields.len() {
+                        let mut idx: Option<usize> = None;
+                        let mut j = 0;
+                        while j < entry.fields.len() {
+                            if entry.fields[j].name == fields[k].name {
+                                idx = Some(j);
+                                break;
+                            }
+                            j += 1;
+                        }
+                        if let Some(j) = idx {
+                            let sub_ty =
+                                crate::typeck::substitute_rtype(&entry.fields[j].ty, &env);
+                            collect_pattern_bindings_typed(
+                                &fields[k].pattern,
+                                &sub_ty,
+                                structs,
+                                enums,
+                                out,
+                            );
+                        }
+                        k += 1;
+                    }
+                }
+                _ => {}
+            }
+        }
+        PatternKind::Or(alts) => {
+            // All alts bind the same set with unifiable types
+            // (typeck-enforced); use the first alt to seed.
+            if !alts.is_empty() {
+                collect_pattern_bindings_typed(&alts[0], scrut_ty, structs, enums, out);
+            }
+        }
+    }
+}
+
+// Build a (param_name, concrete_type) env from a type's declared
+// type-params and concrete type-args. Used to substitute Param slots
+// in payload/field types during pattern-type recursion.
+fn enum_type_env(params: &Vec<String>, args: &Vec<RType>) -> Vec<(String, RType)> {
+    let mut env: Vec<(String, RType)> = Vec::new();
+    let n = if params.len() < args.len() { params.len() } else { args.len() };
+    let mut i = 0;
+    while i < n {
+        env.push((params[i].clone(), rtype_clone(&args[i])));
+        i += 1;
+    }
+    env
+}
+
+// Walk a pattern recursively and append every binding name it
+// introduces (Ident, At, VariantTuple/Struct elements/fields, Tuple
+// elements, Ref inner, Or alternatives).
+fn collect_pattern_bindings(pattern: &crate::ast::Pattern, out: &mut Vec<String>) {
+    use crate::ast::PatternKind;
+    match &pattern.kind {
+        PatternKind::Wildcard | PatternKind::LitInt(_) | PatternKind::LitBool(_) => {}
+        PatternKind::Binding { name, .. } => out.push(name.clone()),
+        PatternKind::At { name, inner, .. } => {
+            out.push(name.clone());
+            collect_pattern_bindings(inner, out);
+        }
+        PatternKind::VariantTuple { elems, .. } => {
+            let mut k = 0;
+            while k < elems.len() {
+                collect_pattern_bindings(&elems[k], out);
+                k += 1;
+            }
+        }
+        PatternKind::VariantStruct { fields, .. } => {
+            let mut k = 0;
+            while k < fields.len() {
+                collect_pattern_bindings(&fields[k].pattern, out);
+                k += 1;
+            }
+        }
+        PatternKind::Tuple(elems) => {
+            let mut k = 0;
+            while k < elems.len() {
+                collect_pattern_bindings(&elems[k], out);
+                k += 1;
+            }
+        }
+        PatternKind::Ref { inner, .. } => collect_pattern_bindings(inner, out),
+        PatternKind::Or(alts) => {
+            // All alts bind the same set; pick the first.
+            if !alts.is_empty() {
+                collect_pattern_bindings(&alts[0], out);
+            }
+        }
+        PatternKind::Range { .. } => {}
     }
 }
 
@@ -1093,6 +1885,9 @@ fn walk_call(
                 None => Vec::new(),
             }
         }
+        // Variant construction yields a fresh enum value at a new
+        // address — no input refs flow through into the result.
+        CallResolution::Variant { .. } => Vec::new(),
     };
 
     // Push a synthetic call holder. Borrows produced by argument expressions

@@ -1,6 +1,6 @@
 use crate::ast::{
     AssignStmt, Block, Call, Expr, ExprKind, FieldAccess, Function, Item, LetStmt, MethodCall,
-    Module, Stmt, StructLit,
+    Module, Path, Pattern, Stmt, StructLit,
 };
 use crate::span::Error;
 use crate::typeck::{
@@ -115,6 +115,7 @@ pub fn emit(
     wasm_mod: &mut wasm::Module,
     root: &Module,
     structs: &StructTable,
+    enums: &crate::typeck::EnumTable,
     traits: &crate::typeck::TraitTable,
     funcs: &FuncTable,
 ) -> Result<(), Error> {
@@ -123,13 +124,10 @@ pub fn emit(
     // Monomorphic instantiations get wasm idxs starting after the non-generic
     // entries' idxs (which typeck assigned 0..entries.len()).
     let mut mono = MonoState::new(funcs.entries.len() as u32);
-    emit_module(wasm_mod, root, &mut module_path, structs, traits, funcs, &mut mono)?;
-    // Drain in FIFO order so wasm_mod.functions index matches the assigned
-    // wasm_idx. (Each emit_monomorphic may enqueue more work — those go to the
-    // end and are processed after the current batch.)
+    emit_module(wasm_mod, root, &mut module_path, structs, enums, traits, funcs, &mut mono)?;
     while !mono.queue.is_empty() {
         let work = mono.queue.remove(0);
-        emit_monomorphic(wasm_mod, work, structs, traits, funcs, &mut mono)?;
+        emit_monomorphic(wasm_mod, work, structs, enums, traits, funcs, &mut mono)?;
     }
     Ok(())
 }
@@ -150,6 +148,14 @@ fn push_root_name(path: &mut Vec<String>, root: &Module) {
 enum Storage {
     Local { wasm_start: u32, flat_size: u32 },
     Memory { frame_offset: u32 },
+    // Value's bytes live at `[addr_local + 0]` — used for pattern
+    // bindings that escape analysis flagged as addressed. The slot is
+    // dynamically allocated at bind time (`__sp -= byte_size`); the
+    // function epilogue's saved-SP restore reclaims it. Reads/writes
+    // / address-takes go through `addr_local`. Mirrors `Memory`'s
+    // role for let-bindings but with an i32-local-held base address
+    // instead of a fixed `__sp + frame_offset`.
+    MemoryAt { addr_local: u32 },
 }
 
 struct LocalBinding {
@@ -164,6 +170,7 @@ struct FnCtx<'a> {
     extra_locals: Vec<wasm::ValType>,
     instructions: Vec<wasm::Instruction>,
     structs: &'a StructTable,
+    enums: &'a crate::typeck::EnumTable,
     traits: &'a crate::typeck::TraitTable,
     funcs: &'a FuncTable,
     current_module: Vec<String>,
@@ -175,6 +182,11 @@ struct FnCtx<'a> {
     // stack, `None` otherwise. Indexed by `let_stmt.value.id`. Sized to
     // `func.node_count`.
     let_offsets: Vec<Option<u32>>,
+    // Per-pattern-binding (Binding/At Pattern.id) flag — `true` means the
+    // binding is borrowed somewhere in the arm, so `bind_pattern_value`
+    // allocates a shadow-stack slot at bind time (Storage::MemoryAt).
+    // Indexed by Pattern.id. Sized to `func.node_count`.
+    pattern_addressed: Vec<bool>,
     method_resolutions: Vec<Option<MethodResolution>>,
     call_resolutions: Vec<Option<CallResolution>>,
     self_target: Option<RType>,
@@ -228,6 +240,7 @@ struct MemLeaf {
 fn collect_leaves(
     rt: &RType,
     structs: &StructTable,
+    enums: &crate::typeck::EnumTable,
     base_offset: u32,
     out: &mut Vec<MemLeaf>,
 ) {
@@ -269,8 +282,8 @@ fn collect_leaves(
             let mut i = 0;
             while i < entry.fields.len() {
                 let fty = substitute_rtype(&entry.fields[i].ty, &env);
-                collect_leaves(&fty, structs, off, out);
-                off += byte_size_of(&fty, structs);
+                collect_leaves(&fty, structs, enums, off, out);
+                off += byte_size_of(&fty, structs, enums);
                 i += 1;
             }
         }
@@ -290,11 +303,22 @@ fn collect_leaves(
             let mut off = base_offset;
             let mut i = 0;
             while i < elems.len() {
-                collect_leaves(&elems[i], structs, off, out);
-                off += byte_size_of(&elems[i], structs);
+                collect_leaves(&elems[i], structs, enums, off, out);
+                off += byte_size_of(&elems[i], structs, enums);
                 i += 1;
             }
         }
+        // Enums lay out as i32 disc + max-payload bytes. From the
+        // outside the value is referenced by an i32 address; we don't
+        // expose the inner leaves to the load/store-to-flat machinery
+        // (which is for register-passable types). Codegen of enum
+        // construction/match handles disc/payload bytes directly.
+        RType::Enum { .. } => out.push(MemLeaf {
+            byte_offset: base_offset,
+            byte_size: 4,
+            signed: false,
+            valtype: wasm::ValType::I32,
+        }),
     }
 }
 
@@ -346,6 +370,14 @@ struct AddressInfo {
     // some `&binding…` chain rooted at that let-binding takes its address;
     // the binding then needs a shadow-stack slot.
     let_addressed: Vec<bool>,
+    // Indexed by Pattern.id of the binding pattern node (a `Binding` or
+    // `At` pattern). Same semantics as `let_addressed` but for match-arm
+    // and (later) if-let pattern bindings: when a binding is borrowed
+    // (`&n` of the binding, autoref of a method receiver, `&n.field`,
+    // etc.), `bind_pattern_value` allocates a shadow-stack slot for it
+    // so the address is stable; otherwise the binding sits in wasm
+    // locals.
+    pattern_addressed: Vec<bool>,
 }
 
 // T4: walk the function body, marking each `let` whose binding type
@@ -466,6 +498,19 @@ fn walk_expr_drop_marks(
         ExprKind::TupleIndex { base, .. } => {
             walk_expr_drop_marks(base, expr_types, traits, info);
         }
+        ExprKind::Match(m) => {
+            walk_expr_drop_marks(&m.scrutinee, expr_types, traits, info);
+            let mut i = 0;
+            while i < m.arms.len() {
+                walk_expr_drop_marks(&m.arms[i].body, expr_types, traits, info);
+                i += 1;
+            }
+        }
+        ExprKind::IfLet(il) => {
+            walk_expr_drop_marks(&il.scrutinee, expr_types, traits, info);
+            walk_block_drop_marks(il.then_block.as_ref(), expr_types, traits, info);
+            walk_block_drop_marks(il.else_block.as_ref(), expr_types, traits, info);
+        }
     }
 }
 
@@ -473,6 +518,7 @@ fn analyze_addresses(func: &Function) -> AddressInfo {
     let mut info = AddressInfo {
         param_addressed: vec_of_false(func.params.len()),
         let_addressed: vec_of_false(func.node_count as usize),
+        pattern_addressed: vec_of_false(func.node_count as usize),
     };
     let mut stack: Vec<BindingRef> = Vec::new();
     let mut k = 0;
@@ -500,11 +546,20 @@ enum BindingRef {
     // Carries the let's value expr NodeId (used to key let_addressed /
     // let_offsets).
     Let(u32, String),
+    // Match / if-let pattern binding. NodeId is the Binding/At
+    // Pattern's id (used to key `pattern_addressed`). Mirrors `Let`
+    // for the address-analysis pass — we want `&binding.field…`
+    // chains rooted at a pattern binding to mark the pattern slot
+    // addressed so codegen spills it to the shadow stack from the
+    // start.
+    Pattern(u32, String),
 }
 
 fn binding_ref_name<'a>(b: &'a BindingRef) -> &'a str {
     match b {
-        BindingRef::Param(_, n) | BindingRef::Let(_, n) => n,
+        BindingRef::Param(_, n)
+        | BindingRef::Let(_, n)
+        | BindingRef::Pattern(_, n) => n,
     }
 }
 
@@ -567,6 +622,9 @@ fn walk_expr_addr(
                         match &stack[i] {
                             BindingRef::Param(idx, _) => info.param_addressed[*idx] = true,
                             BindingRef::Let(id, _) => info.let_addressed[*id as usize] = true,
+                            BindingRef::Pattern(id, _) => {
+                                info.pattern_addressed[*id as usize] = true
+                            }
                         }
                         break;
                     }
@@ -610,6 +668,9 @@ fn walk_expr_addr(
                         match &stack[i] {
                             BindingRef::Param(idx, _) => info.param_addressed[*idx] = true,
                             BindingRef::Let(id, _) => info.let_addressed[*id as usize] = true,
+                            BindingRef::Pattern(id, _) => {
+                                info.pattern_addressed[*id as usize] = true
+                            }
                         }
                         break;
                     }
@@ -630,6 +691,80 @@ fn walk_expr_addr(
             }
         }
         ExprKind::TupleIndex { base, .. } => walk_expr_addr(base, stack, info),
+        ExprKind::Match(m) => {
+            walk_expr_addr(&m.scrutinee, stack, info);
+            let mut i = 0;
+            while i < m.arms.len() {
+                let mark = stack.len();
+                push_pattern_bindings_addr(&m.arms[i].pattern, stack);
+                if let Some(g) = &m.arms[i].guard {
+                    walk_expr_addr(g, stack, info);
+                }
+                walk_expr_addr(&m.arms[i].body, stack, info);
+                while stack.len() > mark {
+                    stack.pop();
+                }
+                i += 1;
+            }
+        }
+        ExprKind::IfLet(il) => {
+            walk_expr_addr(&il.scrutinee, stack, info);
+            let mark = stack.len();
+            push_pattern_bindings_addr(&il.pattern, stack);
+            walk_block_addr(il.then_block.as_ref(), stack, info);
+            while stack.len() > mark {
+                stack.pop();
+            }
+            walk_block_addr(il.else_block.as_ref(), stack, info);
+        }
+    }
+}
+
+// Push BindingRef::Pattern entries for every binding that `pattern`
+// introduces, so address analysis on the arm body can resolve `&name`
+// chains rooted at a pattern binding.
+fn push_pattern_bindings_addr(pattern: &Pattern, stack: &mut Vec<BindingRef>) {
+    use crate::ast::PatternKind;
+    match &pattern.kind {
+        PatternKind::Binding { name, .. } => {
+            stack.push(BindingRef::Pattern(pattern.id, name.clone()));
+        }
+        PatternKind::At { name, inner, .. } => {
+            stack.push(BindingRef::Pattern(pattern.id, name.clone()));
+            push_pattern_bindings_addr(inner, stack);
+        }
+        PatternKind::Tuple(elems) => {
+            let mut k = 0;
+            while k < elems.len() {
+                push_pattern_bindings_addr(&elems[k], stack);
+                k += 1;
+            }
+        }
+        PatternKind::Ref { inner, .. } => push_pattern_bindings_addr(inner, stack),
+        PatternKind::VariantTuple { elems, .. } => {
+            let mut k = 0;
+            while k < elems.len() {
+                push_pattern_bindings_addr(&elems[k], stack);
+                k += 1;
+            }
+        }
+        PatternKind::VariantStruct { fields, .. } => {
+            let mut k = 0;
+            while k < fields.len() {
+                push_pattern_bindings_addr(&fields[k].pattern, stack);
+                k += 1;
+            }
+        }
+        PatternKind::Or(alts) => {
+            // All alts bind the same set; walk first.
+            if !alts.is_empty() {
+                push_pattern_bindings_addr(&alts[0], stack);
+            }
+        }
+        PatternKind::Wildcard
+        | PatternKind::LitInt(_)
+        | PatternKind::LitBool(_)
+        | PatternKind::Range { .. } => {}
     }
 }
 
@@ -642,6 +777,7 @@ fn emit_module(
     module: &Module,
     path: &mut Vec<String>,
     structs: &StructTable,
+    enums: &crate::typeck::EnumTable,
     traits: &crate::typeck::TraitTable,
     funcs: &FuncTable,
     mono: &mut MonoState,
@@ -653,15 +789,16 @@ fn emit_module(
                 if !f.type_params.is_empty() {
                     // Generic template — skip; emitted lazily via mono queue.
                 } else {
-                    emit_function(wasm_mod, f, path, path, None, structs, traits, funcs, mono)?;
+                    emit_function(wasm_mod, f, path, path, None, structs, enums, traits, funcs, mono)?;
                 }
             }
             Item::Module(m) => {
                 path.push(m.name.clone());
-                emit_module(wasm_mod, m, path, structs, traits, funcs, mono)?;
+                emit_module(wasm_mod, m, path, structs, enums, traits, funcs, mono)?;
                 path.pop();
             }
             Item::Struct(_) => {}
+            Item::Enum(_) => {}
             Item::Impl(ib) => {
                 // Determine the method-path prefix (must mirror what
                 // typeck stored in the registered method's path).
@@ -718,6 +855,7 @@ fn emit_module(
                             &method_prefix,
                             Some(&target_rt),
                             structs,
+                            enums,
                             traits,
                             funcs,
                             mono,
@@ -741,6 +879,7 @@ fn emit_monomorphic(
     wasm_mod: &mut wasm::Module,
     work: MonoWork,
     structs: &StructTable,
+    enums: &crate::typeck::EnumTable,
     traits: &crate::typeck::TraitTable,
     funcs: &FuncTable,
     mono: &mut MonoState,
@@ -771,6 +910,7 @@ fn emit_monomorphic(
         &tmpl.enclosing_module,
         self_target.as_ref(),
         structs,
+        enums,
         traits,
         funcs,
         mono,
@@ -866,6 +1006,13 @@ fn opt_call_resolutions_clone(
             Some(CallResolution::Generic { template_idx, type_args }) => {
                 out.push(Some(CallResolution::Generic {
                     template_idx: *template_idx,
+                    type_args: subst_vec(type_args, env),
+                }));
+            }
+            Some(CallResolution::Variant { enum_path, disc, type_args }) => {
+                out.push(Some(CallResolution::Variant {
+                    enum_path: clone_path(enum_path),
+                    disc: *disc,
                     type_args: subst_vec(type_args, env),
                 }));
             }
@@ -971,6 +1118,19 @@ fn collect_lets_in_expr(expr: &Expr, out: &mut Vec<u32>) {
             }
         }
         ExprKind::TupleIndex { base, .. } => collect_lets_in_expr(base, out),
+        ExprKind::Match(m) => {
+            collect_lets_in_expr(&m.scrutinee, out);
+            let mut i = 0;
+            while i < m.arms.len() {
+                collect_lets_in_expr(&m.arms[i].body, out);
+                i += 1;
+            }
+        }
+        ExprKind::IfLet(il) => {
+            collect_lets_in_expr(&il.scrutinee, out);
+            collect_let_value_ids(il.then_block.as_ref(), out);
+            collect_let_value_ids(il.else_block.as_ref(), out);
+        }
     }
 }
 
@@ -990,6 +1150,7 @@ fn emit_function(
     path_prefix: &Vec<String>,
     self_target: Option<&RType>,
     structs: &StructTable,
+    enums: &crate::typeck::EnumTable,
     traits: &crate::typeck::TraitTable,
     funcs: &FuncTable,
     mono: &mut MonoState,
@@ -1016,6 +1177,7 @@ fn emit_function(
         path_prefix,
         self_target,
         structs,
+        enums,
         traits,
         funcs,
         mono,
@@ -1062,6 +1224,7 @@ fn emit_function_concrete(
     path_prefix: &Vec<String>,
     self_target: Option<&RType>,
     structs: &StructTable,
+    enums: &crate::typeck::EnumTable,
     traits: &crate::typeck::TraitTable,
     funcs: &FuncTable,
     mono: &mut MonoState,
@@ -1093,7 +1256,7 @@ fn emit_function_concrete(
     while k < param_types.len() {
         if address_info.param_addressed[k] {
             param_offsets.push(Some(frame_size));
-            frame_size += byte_size_of(&param_types[k], structs);
+            frame_size += byte_size_of(&param_types[k], structs, enums);
         } else {
             param_offsets.push(None);
         }
@@ -1117,16 +1280,26 @@ fn emit_function_concrete(
                 let ty = expr_types[id]
                     .as_ref()
                     .expect("typeck recorded the let's type");
-                frame_size += byte_size_of(ty, structs);
+                frame_size += byte_size_of(ty, structs, enums);
             }
             k += 1;
         }
     }
 
     // Build the WASM signature: refs collapse to a single i32; everything else
-    // flattens to flat scalars as before.
+    // flattens to flat scalars as before. Functions returning enums use sret:
+    // a leading i32 param is prepended (the destination address into the
+    // caller's frame), and at function-body end we memcpy the constructed
+    // enum's bytes to that address before returning.
+    let returns_enum = matches!(&return_type, Some(RType::Enum { .. }));
     let mut wasm_params: Vec<wasm::ValType> = Vec::new();
     let mut next_wasm_local: u32 = 0;
+    let mut sret_ptr_local: Option<u32> = None;
+    if returns_enum {
+        wasm_params.push(wasm::ValType::I32);
+        sret_ptr_local = Some(next_wasm_local);
+        next_wasm_local += 1;
+    }
     let mut locals: Vec<LocalBinding> = Vec::new();
     let mut k = 0;
     while k < func.params.len() {
@@ -1188,11 +1361,13 @@ fn emit_function_concrete(
         extra_locals: Vec::new(),
         instructions: Vec::new(),
         structs,
+        enums,
         traits,
         funcs,
         current_module: clone_path(current_module),
         expr_types,
         let_offsets,
+        pattern_addressed: address_info.pattern_addressed.clone(),
         method_resolutions,
         call_resolutions,
         self_target: self_target.map(|rt| rtype_clone(rt)),
@@ -1205,6 +1380,20 @@ fn emit_function_concrete(
         type_params,
         mono,
     };
+
+    // Allocate a wasm local to remember __sp on function entry. Variant
+    // construction sites allocate fresh slots dynamically via `__sp -=
+    // size`; the epilogue restores from this saved value rather than
+    // doing a fixed `__sp += frame_size`. This way the function ends
+    // with __sp restored regardless of how many enum temporaries got
+    // allocated during the body.
+    let fn_entry_sp_local = ctx.next_wasm_local;
+    ctx.extra_locals.push(wasm::ValType::I32);
+    ctx.next_wasm_local += 1;
+    ctx.instructions
+        .push(wasm::Instruction::GlobalGet(SP_GLOBAL));
+    ctx.instructions
+        .push(wasm::Instruction::LocalSet(fn_entry_sp_local));
 
     // Prologue: SP -= frame_size; copy spilled params from their incoming
     // WASM-local slots into shadow-stack memory.
@@ -1229,7 +1418,7 @@ fn emit_function_concrete(
             match &param_offsets[p] {
                 Some(off) => {
                     let mut leaves: Vec<MemLeaf> = Vec::new();
-                    collect_leaves(&pty, structs, 0, &mut leaves);
+                    collect_leaves(&pty, structs, enums, 0, &mut leaves);
                     let mut k = 0;
                     while k < leaves.len() {
                         ctx.instructions
@@ -1295,29 +1484,47 @@ fn emit_function_concrete(
         }
         let n = ctx.locals.len();
         emit_drops_for_locals_range(&mut ctx, 0, n)?;
-        let mut k = 0;
-        while k < return_flat.len() {
-            ctx.instructions
-                .push(wasm::Instruction::LocalGet(save_start + k as u32));
-            k += 1;
+        if returns_enum {
+            // sret: copy bytes from the constructed enum's address
+            // (saved at save_start, an i32) into the caller-supplied
+            // sret_ptr (wasm local 0). After SP restore, the temp
+            // address is invalid; sret_ptr is in the caller's frame
+            // and stays valid. We then push sret_ptr as the i32
+            // return value so the caller keeps a stable address.
+            let enum_ty = return_type.as_ref().unwrap();
+            let bytes = byte_size_of(enum_ty, structs, enums);
+            emit_memcpy(
+                &mut ctx,
+                sret_ptr_local.expect("sret_ptr allocated when returns_enum"),
+                save_start,
+                bytes,
+            );
+            ctx.instructions.push(wasm::Instruction::LocalGet(
+                sret_ptr_local.expect("sret_ptr allocated when returns_enum"),
+            ));
+        } else {
+            let mut k = 0;
+            while k < return_flat.len() {
+                ctx.instructions
+                    .push(wasm::Instruction::LocalGet(save_start + k as u32));
+                k += 1;
+            }
         }
     } else {
         let n = ctx.locals.len();
         emit_drops_for_locals_range(&mut ctx, 0, n)?;
     }
 
-    // Epilogue: SP += frame_size. The return value (if any) is already on the
-    // WASM stack from the body's tail expression; SP arithmetic doesn't touch
-    // the operand stack.
-    if frame_size > 0 {
-        ctx.instructions
-            .push(wasm::Instruction::GlobalGet(SP_GLOBAL));
-        ctx.instructions
-            .push(wasm::Instruction::I32Const(frame_size as i32));
-        ctx.instructions.push(wasm::Instruction::I32Add);
-        ctx.instructions
-            .push(wasm::Instruction::GlobalSet(SP_GLOBAL));
-    }
+    // Epilogue: restore __sp to its function-entry value. This covers
+    // both the static `frame_size` allocation from the prologue and any
+    // dynamic slots allocated during the body (e.g. enum-construction
+    // temporaries). The return value (if any) is already on the WASM
+    // stack from the body's tail expression; SP arithmetic doesn't
+    // touch the operand stack.
+    ctx.instructions
+        .push(wasm::Instruction::LocalGet(fn_entry_sp_local));
+    ctx.instructions
+        .push(wasm::Instruction::GlobalSet(SP_GLOBAL));
 
     // Drain any FuncTypes that codegen registered for multi-value if-blocks.
     // They were assigned typeidx = pending_types_base + position, so appending
@@ -1657,7 +1864,7 @@ fn codegen_assign_stmt(ctx: &mut FnCtx, assign: &AssignStmt) -> Result<(), Error
                 let mut j = 0;
                 while j < entry.fields.len() {
                     let fty = substitute_rtype(&entry.fields[j].ty, &env);
-                    let s = byte_size_of(&fty, ctx.structs);
+                    let s = byte_size_of(&fty, ctx.structs, ctx.enums);
                     if entry.fields[j].name == chain[i] {
                         chain_offset += field_offset;
                         current_ty = fty;
@@ -1679,7 +1886,7 @@ fn codegen_assign_stmt(ctx: &mut FnCtx, assign: &AssignStmt) -> Result<(), Error
                 let mut elem_offset: u32 = 0;
                 let mut j = 0;
                 while j < idx {
-                    elem_offset += byte_size_of(&elems[j], ctx.structs);
+                    elem_offset += byte_size_of(&elems[j], ctx.structs, ctx.enums);
                     j += 1;
                 }
                 chain_offset += elem_offset;
@@ -1710,6 +1917,14 @@ fn codegen_assign_stmt(ctx: &mut FnCtx, assign: &AssignStmt) -> Result<(), Error
             Storage::Memory { frame_offset } => {
                 let base_off = *frame_offset + chain_offset;
                 store_flat_to_memory(ctx, &current_ty, BaseAddr::StackPointer, base_off);
+            }
+            Storage::MemoryAt { addr_local } => {
+                store_flat_to_memory(
+                    ctx,
+                    &current_ty,
+                    BaseAddr::WasmLocal(*addr_local),
+                    chain_offset,
+                );
             }
             Storage::Local { wasm_start, .. } => {
                 // Non-spilled binding: walk the chain in *flat-scalar* units
@@ -1851,7 +2066,7 @@ fn codegen_deref_assign(
         let mut j = 0;
         while j < entry.fields.len() {
             let fty = substitute_rtype(&entry.fields[j].ty, &env);
-            let s = byte_size_of(&fty, ctx.structs);
+            let s = byte_size_of(&fty, ctx.structs, ctx.enums);
             if entry.fields[j].name == fields[i] {
                 chain_byte_offset += field_off;
                 current_ty = fty;
@@ -1959,6 +2174,8 @@ fn codegen_expr(ctx: &mut FnCtx, expr: &Expr) -> Result<RType, Error> {
         ExprKind::Builtin { name, args, .. } => codegen_builtin(ctx, name, args, expr.id),
         ExprKind::Tuple(elems) => codegen_tuple_lit(ctx, elems),
         ExprKind::TupleIndex { base, index, .. } => codegen_tuple_index(ctx, base, *index),
+        ExprKind::Match(m) => codegen_match_expr(ctx, m, expr.id),
+        ExprKind::IfLet(il) => codegen_if_let_expr(ctx, il, expr.id),
     }
 }
 
@@ -2425,6 +2642,1057 @@ fn codegen_if_expr(
     let _ = codegen_block_expr(ctx, if_expr.else_block.as_ref())?;
     ctx.instructions.push(wasm::Instruction::End);
     Ok(result_ty)
+}
+
+// `match scrut { pat => body, … }`. Lowering:
+//
+//   block (result T)              ; outer
+//     block                       ; arm0_no_match
+//       <pattern check 0>          ; if mismatch, br 0
+//       <bind pattern names>
+//       <body 0>                   ; pushes T
+//       br 1                       ; deliver result to outer
+//     end
+//     block                       ; arm1_no_match
+//       …
+//     end
+//     unreachable                 ; exhaustiveness ensures this is dead
+//   end
+//
+// The scrutinee is evaluated once and stashed: a non-enum scrutinee
+// goes into wasm locals (one per flat scalar); an enum scrutinee's
+// wasm-stack value is an i32 address, which is saved to a single local
+// and used as the base for `[addr + offset]` byte-addressed reads.
+fn codegen_match_expr(
+    ctx: &mut FnCtx,
+    m: &crate::ast::MatchExpr,
+    match_node_id: crate::ast::NodeId,
+) -> Result<RType, Error> {
+    let result_ty = rtype_clone(
+        ctx.expr_types[match_node_id as usize]
+            .as_ref()
+            .expect("typeck recorded the match's type"),
+    );
+    let result_ty = substitute_rtype(&result_ty, &ctx.env);
+    let scrut_ty = rtype_clone(
+        ctx.expr_types[m.scrutinee.id as usize]
+            .as_ref()
+            .expect("typeck recorded the scrutinee's type"),
+    );
+    let scrut_ty = substitute_rtype(&scrut_ty, &ctx.env);
+    // Codegen the scrutinee (pushes its flat scalars or, for enums, its
+    // address). Stash into wasm locals for stable read/re-read.
+    let _ = codegen_expr(ctx, &m.scrutinee)?;
+    // `ref` bindings need an addressable place. For enum scrutinees the
+    // stash is already address-based (Memory). For non-enum scrutinees
+    // we'd normally stash into wasm locals (Locals storage), but those
+    // locals aren't addressable — so if any arm pattern uses `ref`, we
+    // spill the scrutinee to a fresh shadow-stack slot first so every
+    // sub-pattern's storage is Memory and `ref` bindings have a real
+    // address. The function epilogue's saved-SP restore reclaims the
+    // slot at function exit.
+    let is_enum_scrut = matches!(&scrut_ty, RType::Enum { .. });
+    let needs_ref_spill = !is_enum_scrut
+        && m.arms.iter().any(|a| pattern_uses_ref_binding(&a.pattern));
+    let storage = if needs_ref_spill {
+        spill_match_scrutinee(ctx, &scrut_ty)
+    } else {
+        stash_match_scrutinee(ctx, &scrut_ty)
+    };
+    // Compute outer block-type for the unified arm result.
+    let bt = block_type_for(ctx, &result_ty);
+    ctx.instructions.push(wasm::Instruction::Block(bt));
+    let mut i = 0;
+    while i < m.arms.len() {
+        let arm = &m.arms[i];
+        ctx.instructions
+            .push(wasm::Instruction::Block(wasm::BlockType::Empty));
+        // Save locals/scope mark so pattern-introduced bindings clean
+        // up after the arm body.
+        let mark = ctx.locals.len();
+        codegen_pattern(ctx, &arm.pattern, &scrut_ty, &storage, 0)?;
+        // Guard: after pattern match succeeds, evaluate the bool
+        // expression. If false, br to the arm's no-match label so
+        // the next arm gets a chance.
+        if let Some(g) = &arm.guard {
+            let _ = codegen_expr(ctx, g)?;
+            ctx.instructions.push(wasm::Instruction::I32Eqz);
+            ctx.instructions.push(wasm::Instruction::BrIf(0));
+        }
+        // Body produces the result type's flat scalars on the stack.
+        let _ = codegen_expr(ctx, &arm.body)?;
+        ctx.instructions.push(wasm::Instruction::Br(1));
+        ctx.instructions.push(wasm::Instruction::End);
+        ctx.locals.truncate(mark);
+        i += 1;
+    }
+    // After the last arm, exhaustiveness guarantees control would have
+    // already exited — emit `unreachable` so the wasm validator sees
+    // the outer block's expected result type without a fall-through.
+    ctx.instructions.push(wasm::Instruction::Unreachable);
+    ctx.instructions.push(wasm::Instruction::End);
+    Ok(result_ty)
+}
+
+// Where the scrutinee value is parked between arms.
+#[derive(Clone)]
+enum PatScrut {
+    /// Value's flat scalars live in consecutive wasm locals starting at
+    /// `start`. The number of slots is `flatten_rtype(ty).len()` for the
+    /// type at that storage. Sub-storage for tuple/struct fields is a
+    /// sub-range: `Locals { start: start + flat_offset_to_child }`.
+    Locals { start: u32 },
+    /// Value's bytes live at `[addr_local + byte_offset]`. Used for
+    /// enum-typed scrutinees: the base address is saved once on entry,
+    /// and recursive descent into payload fields just bumps `byte_offset`.
+    Memory { addr_local: u32, byte_offset: u32 },
+}
+
+// Walk a pattern recursively and return true if it (or any sub-pattern)
+// is a `ref` binding. Used by codegen_match_expr to decide whether the
+// non-enum scrutinee needs to be spilled to the shadow stack so that
+// `ref` bindings have a real address.
+// `if let Pat = scrut { then } else { else }`. Lowering mirrors a
+// single-arm match plus the else fallback: outer wasm `block` carries
+// the unified result type; an inner empty-result block holds the
+// pattern check (br 0 on no-match → fall through to the else-block);
+// on match the then-block runs and `br 1`s past the else with its
+// result. The else-block runs only when the inner block fell through.
+fn codegen_if_let_expr(
+    ctx: &mut FnCtx,
+    il: &crate::ast::IfLetExpr,
+    if_let_node_id: crate::ast::NodeId,
+) -> Result<RType, Error> {
+    let result_ty = rtype_clone(
+        ctx.expr_types[if_let_node_id as usize]
+            .as_ref()
+            .expect("typeck recorded the if-let's type"),
+    );
+    let result_ty = substitute_rtype(&result_ty, &ctx.env);
+    let scrut_ty = rtype_clone(
+        ctx.expr_types[il.scrutinee.id as usize]
+            .as_ref()
+            .expect("typeck recorded the scrutinee's type"),
+    );
+    let scrut_ty = substitute_rtype(&scrut_ty, &ctx.env);
+    let _ = codegen_expr(ctx, &il.scrutinee)?;
+    let is_enum_scrut = matches!(&scrut_ty, RType::Enum { .. });
+    let needs_ref_spill = !is_enum_scrut && pattern_uses_ref_binding(&il.pattern);
+    let storage = if needs_ref_spill {
+        spill_match_scrutinee(ctx, &scrut_ty)
+    } else {
+        stash_match_scrutinee(ctx, &scrut_ty)
+    };
+    let outer_bt = block_type_for(ctx, &result_ty);
+    ctx.instructions.push(wasm::Instruction::Block(outer_bt));
+    ctx.instructions
+        .push(wasm::Instruction::Block(wasm::BlockType::Empty));
+    let mark = ctx.locals.len();
+    codegen_pattern(ctx, &il.pattern, &scrut_ty, &storage, 0)?;
+    let _ = codegen_block_expr(ctx, il.then_block.as_ref())?;
+    ctx.instructions.push(wasm::Instruction::Br(1));
+    ctx.locals.truncate(mark);
+    ctx.instructions.push(wasm::Instruction::End);
+    let _ = codegen_block_expr(ctx, il.else_block.as_ref())?;
+    ctx.instructions.push(wasm::Instruction::End);
+    Ok(result_ty)
+}
+
+fn pattern_uses_ref_binding(p: &Pattern) -> bool {
+    use crate::ast::PatternKind;
+    match &p.kind {
+        PatternKind::Binding { by_ref, .. } => *by_ref,
+        PatternKind::Wildcard
+        | PatternKind::LitInt(_)
+        | PatternKind::LitBool(_)
+        | PatternKind::Range { .. } => false,
+        PatternKind::At { inner, .. } => pattern_uses_ref_binding(inner),
+        PatternKind::Or(alts) => alts.iter().any(|a| pattern_uses_ref_binding(a)),
+        PatternKind::Ref { inner, .. } => pattern_uses_ref_binding(inner),
+        PatternKind::Tuple(elems) => elems.iter().any(|e| pattern_uses_ref_binding(e)),
+        PatternKind::VariantTuple { elems, .. } => {
+            elems.iter().any(|e| pattern_uses_ref_binding(e))
+        }
+        PatternKind::VariantStruct { fields, .. } => {
+            fields.iter().any(|f| pattern_uses_ref_binding(&f.pattern))
+        }
+    }
+}
+
+// Allocate a shadow-stack slot of `byte_size_of(ty)` bytes, copy the
+// scrutinee's flat scalars from the wasm stack into the slot, and
+// return Memory storage rooted at the slot. The slot is reclaimed by
+// the function epilogue's saved-SP restore.
+fn spill_match_scrutinee(ctx: &mut FnCtx, ty: &RType) -> PatScrut {
+    let bytes = byte_size_of(ty, ctx.structs, ctx.enums);
+    ctx.instructions
+        .push(wasm::Instruction::GlobalGet(SP_GLOBAL));
+    ctx.instructions
+        .push(wasm::Instruction::I32Const(bytes as i32));
+    ctx.instructions.push(wasm::Instruction::I32Sub);
+    ctx.instructions
+        .push(wasm::Instruction::GlobalSet(SP_GLOBAL));
+    let addr_local = ctx.next_wasm_local;
+    ctx.extra_locals.push(wasm::ValType::I32);
+    ctx.next_wasm_local += 1;
+    ctx.instructions
+        .push(wasm::Instruction::GlobalGet(SP_GLOBAL));
+    ctx.instructions.push(wasm::Instruction::LocalSet(addr_local));
+    // Pop scrutinee's flat scalars and store them at addr_local. For
+    // non-enum types this writes the flat representation. (Enum
+    // scrutinees never reach here — they're already Memory-backed.)
+    store_flat_to_memory(ctx, ty, BaseAddr::WasmLocal(addr_local), 0);
+    PatScrut::Memory { addr_local, byte_offset: 0 }
+}
+
+fn stash_match_scrutinee(ctx: &mut FnCtx, ty: &RType) -> PatScrut {
+    if matches!(ty, RType::Enum { .. }) {
+        // Wasm-stack value is the i32 address. Stash into a local.
+        let addr_local = ctx.next_wasm_local;
+        ctx.extra_locals.push(wasm::ValType::I32);
+        ctx.next_wasm_local += 1;
+        ctx.instructions
+            .push(wasm::Instruction::LocalSet(addr_local));
+        PatScrut::Memory { addr_local, byte_offset: 0 }
+    } else {
+        let mut vts: Vec<wasm::ValType> = Vec::new();
+        crate::typeck::flatten_rtype(ty, ctx.structs, &mut vts);
+        let start = ctx.next_wasm_local;
+        let mut k = 0;
+        while k < vts.len() {
+            ctx.extra_locals.push(val_type_copy(&vts[k]));
+            ctx.next_wasm_local += 1;
+            k += 1;
+        }
+        // Pop in reverse order (top of stack is the LAST flat scalar).
+        let mut k = vts.len();
+        while k > 0 {
+            k -= 1;
+            ctx.instructions
+                .push(wasm::Instruction::LocalSet(start + k as u32));
+        }
+        PatScrut::Locals { start }
+    }
+}
+
+fn block_type_for(ctx: &mut FnCtx, ty: &RType) -> wasm::BlockType {
+    let mut flat: Vec<wasm::ValType> = Vec::new();
+    crate::typeck::flatten_rtype(ty, ctx.structs, &mut flat);
+    match flat.len() {
+        0 => wasm::BlockType::Empty,
+        1 => wasm::BlockType::Single(val_type_copy(&flat[0])),
+        _ => {
+            let ft = wasm::FuncType {
+                params: Vec::new(),
+                results: copy_val_type_vec(&flat),
+            };
+            let mut found: Option<u32> = None;
+            let mut k = 0;
+            while k < ctx.pending_types.len() {
+                if func_type_eq(&ctx.pending_types[k], &ft) {
+                    found = Some(ctx.pending_types_base + k as u32);
+                    break;
+                }
+                k += 1;
+            }
+            let idx = match found {
+                Some(i) => i,
+                None => {
+                    let i = ctx.pending_types_base + ctx.pending_types.len() as u32;
+                    ctx.pending_types.push(ft);
+                    i
+                }
+            };
+            wasm::BlockType::TypeIdx(idx)
+        }
+    }
+}
+
+// Emit code that, given the scrutinee value at `storage`, either
+// matches `pattern` (extracting any bindings into wasm locals registered
+// in `ctx.locals`) or does `br no_match_target` to skip this arm.
+//
+// Bindings introduced by Ident/At/etc. become entries in `ctx.locals`
+// so the body's codegen of `Var(name)` finds them. The caller's scope
+// management (locals.truncate(mark)) drops them at arm end.
+fn codegen_pattern(
+    ctx: &mut FnCtx,
+    pattern: &Pattern,
+    scrut_ty: &RType,
+    storage: &PatScrut,
+    no_match_target: u32,
+) -> Result<(), Error> {
+    use crate::ast::PatternKind;
+    let resolved_scrut = substitute_rtype(scrut_ty, &ctx.env);
+    match &pattern.kind {
+        PatternKind::Wildcard => Ok(()),
+        PatternKind::Binding { name, by_ref, mutable, .. } => {
+            if *by_ref {
+                bind_pattern_ref(ctx, name, &resolved_scrut, storage, *mutable);
+            } else {
+                bind_pattern_value(ctx, name, &resolved_scrut, storage, pattern.id);
+            }
+            Ok(())
+        }
+        PatternKind::At { name, inner, .. } => {
+            bind_pattern_value(ctx, name, &resolved_scrut, storage, pattern.id);
+            codegen_pattern(ctx, inner, scrut_ty, storage, no_match_target)
+        }
+        PatternKind::LitInt(n) => {
+            // Compare scrutinee value to literal. scrut_ty is some Int kind.
+            push_scrut_value(ctx, &resolved_scrut, storage);
+            push_int_lit(ctx, &resolved_scrut, *n);
+            push_int_eq(ctx, &resolved_scrut);
+            // Now the stack has an i32: 1 if equal, 0 otherwise.
+            // i32.eqz → 1 if not equal; if so, br no_match.
+            ctx.instructions.push(wasm::Instruction::I32Eqz);
+            ctx.instructions
+                .push(wasm::Instruction::BrIf(no_match_target));
+            Ok(())
+        }
+        PatternKind::LitBool(b) => {
+            push_scrut_value(ctx, &resolved_scrut, storage);
+            ctx.instructions
+                .push(wasm::Instruction::I32Const(if *b { 1 } else { 0 }));
+            ctx.instructions.push(wasm::Instruction::I32Eq);
+            ctx.instructions.push(wasm::Instruction::I32Eqz);
+            ctx.instructions
+                .push(wasm::Instruction::BrIf(no_match_target));
+            Ok(())
+        }
+        PatternKind::Range { lo, hi } => {
+            // (lo <= scrut) && (scrut <= hi). On false, br no_match.
+            // For simplicity, decompose: br_if-on-not-greater-than.
+            // First check scrut >= lo.
+            push_scrut_value(ctx, &resolved_scrut, storage);
+            push_int_lit(ctx, &resolved_scrut, *lo);
+            push_int_ge(ctx, &resolved_scrut);
+            ctx.instructions.push(wasm::Instruction::I32Eqz);
+            ctx.instructions
+                .push(wasm::Instruction::BrIf(no_match_target));
+            // Then scrut <= hi.
+            push_scrut_value(ctx, &resolved_scrut, storage);
+            push_int_lit(ctx, &resolved_scrut, *hi);
+            push_int_le(ctx, &resolved_scrut);
+            ctx.instructions.push(wasm::Instruction::I32Eqz);
+            ctx.instructions
+                .push(wasm::Instruction::BrIf(no_match_target));
+            Ok(())
+        }
+        PatternKind::Tuple(elems) => {
+            // Recurse into each element's sub-storage.
+            let elem_tys = match &resolved_scrut {
+                RType::Tuple(es) => rtype_vec_clone(es),
+                _ => unreachable!("typeck verified tuple pattern matches tuple type"),
+            };
+            // Sub-storage for each element.
+            match storage {
+                PatScrut::Locals { start } => {
+                    let mut flat_off: u32 = 0;
+                    let mut i = 0;
+                    while i < elems.len() {
+                        let sub_storage = PatScrut::Locals { start: start + flat_off };
+                        codegen_pattern(ctx, &elems[i], &elem_tys[i], &sub_storage, no_match_target)?;
+                        let mut sub_vts: Vec<wasm::ValType> = Vec::new();
+                        crate::typeck::flatten_rtype(&elem_tys[i], ctx.structs, &mut sub_vts);
+                        flat_off += sub_vts.len() as u32;
+                        i += 1;
+                    }
+                }
+                PatScrut::Memory { addr_local, byte_offset } => {
+                    let mut byte_off = *byte_offset;
+                    let mut i = 0;
+                    while i < elems.len() {
+                        let sub_storage = PatScrut::Memory {
+                            addr_local: *addr_local,
+                            byte_offset: byte_off,
+                        };
+                        codegen_pattern(ctx, &elems[i], &elem_tys[i], &sub_storage, no_match_target)?;
+                        byte_off += byte_size_of(&elem_tys[i], ctx.structs, ctx.enums);
+                        i += 1;
+                    }
+                }
+            }
+            Ok(())
+        }
+        PatternKind::Ref { inner, .. } => {
+            // Scrutinee is `&T` whose flat is [I32]. The address it
+            // holds points at the pointee. To match the inner pattern
+            // against the pointee, switch to Memory storage rooted at
+            // that address.
+            let inner_ty = match &resolved_scrut {
+                RType::Ref { inner, .. } => rtype_clone(inner),
+                _ => unreachable!("typeck verified ref pattern matches ref type"),
+            };
+            // Push the address scalar from storage and stash to a fresh local.
+            push_scrut_value(ctx, &resolved_scrut, storage);
+            let addr_local = ctx.next_wasm_local;
+            ctx.extra_locals.push(wasm::ValType::I32);
+            ctx.next_wasm_local += 1;
+            ctx.instructions
+                .push(wasm::Instruction::LocalSet(addr_local));
+            let inner_storage = PatScrut::Memory { addr_local, byte_offset: 0 };
+            codegen_pattern(ctx, inner, &inner_ty, &inner_storage, no_match_target)
+        }
+        PatternKind::VariantTuple { path, elems } => {
+            codegen_variant_pattern(
+                ctx,
+                path,
+                Some(elems),
+                None,
+                false,
+                &resolved_scrut,
+                storage,
+                no_match_target,
+            )
+        }
+        PatternKind::VariantStruct { path, fields, rest } => {
+            // Same syntactic shape covers both enum struct-variants
+            // (`E::V { f: e }`) and bare struct destructure
+            // (`Point { x, y }`). Dispatch on the resolved scrutinee
+            // type — variant patterns must hit Memory storage and
+            // need a disc check; struct patterns just walk fields.
+            if matches!(&resolved_scrut, RType::Struct { .. }) {
+                codegen_struct_pattern(
+                    ctx,
+                    fields,
+                    *rest,
+                    &resolved_scrut,
+                    storage,
+                    no_match_target,
+                )
+            } else {
+                codegen_variant_pattern(
+                    ctx,
+                    path,
+                    None,
+                    Some(fields),
+                    *rest,
+                    &resolved_scrut,
+                    storage,
+                    no_match_target,
+                )
+            }
+        }
+        PatternKind::Or(alts) => {
+            // Or-patterns: try each alternative in turn. We wrap each
+            // alt in its own block; on match, we br PAST the entire
+            // or-construct (jumping to the success path of the parent
+            // pattern). On no-match for an alt, we fall through to the
+            // next alt. If the last alt fails, we br to the parent's
+            // no_match.
+            //
+            // Implementation: outer block "or_match"; for each alt
+            // except last, an inner block "alt_no_match"; on alt match,
+            // br to or_match. On alt no-match, fall through. Last alt
+            // uses the parent's no_match_target directly.
+            //
+            // After the or-construct: control proceeds normally
+            // (matched). Nested wasm `block`s account for the increased
+            // br-depth so that the parent's no_match_target is
+            // referenced as `no_match_target + nesting_depth`.
+            if alts.is_empty() {
+                return Ok(());
+            }
+            ctx.instructions
+                .push(wasm::Instruction::Block(wasm::BlockType::Empty));
+            // Inside or_match block, parent's no_match is at depth
+            // no_match_target + 1.
+            let parent_no_match = no_match_target + 1;
+            let mut k = 0;
+            while k + 1 < alts.len() {
+                ctx.instructions
+                    .push(wasm::Instruction::Block(wasm::BlockType::Empty));
+                // Within this inner block, no-match within the alt
+                // means br 0 (this block's end → fall through to next alt).
+                codegen_pattern(ctx, &alts[k], scrut_ty, storage, 0)?;
+                // Match: br 1 to escape both this inner and continue
+                // past the or_match block.
+                ctx.instructions.push(wasm::Instruction::Br(1));
+                ctx.instructions.push(wasm::Instruction::End);
+                k += 1;
+            }
+            // Last alt: no fallback; failure goes straight to parent.
+            codegen_pattern(ctx, &alts[k], scrut_ty, storage, parent_no_match)?;
+            ctx.instructions.push(wasm::Instruction::End);
+            Ok(())
+        }
+    }
+}
+
+// Compute the address `addr_local + byte_offset` and load the
+// scrutinee's flat scalars onto the wasm stack. For Locals storage,
+// just `local.get` each slot. For Memory storage, `iN.load` each leaf
+// from the computed address.
+fn push_scrut_value(ctx: &mut FnCtx, ty: &RType, storage: &PatScrut) {
+    match storage {
+        PatScrut::Locals { start } => {
+            let mut vts: Vec<wasm::ValType> = Vec::new();
+            crate::typeck::flatten_rtype(ty, ctx.structs, &mut vts);
+            let mut k = 0;
+            while k < vts.len() {
+                ctx.instructions
+                    .push(wasm::Instruction::LocalGet(start + k as u32));
+                k += 1;
+            }
+        }
+        PatScrut::Memory { addr_local, byte_offset } => {
+            let mut leaves: Vec<MemLeaf> = Vec::new();
+            collect_leaves(ty, ctx.structs, ctx.enums, *byte_offset, &mut leaves);
+            let mut k = 0;
+            while k < leaves.len() {
+                ctx.instructions
+                    .push(wasm::Instruction::LocalGet(*addr_local));
+                ctx.instructions.push(load_instr(&leaves[k], 0));
+                k += 1;
+            }
+        }
+    }
+}
+
+// Push an integer literal onto the stack with the right wasm value type
+// for the target int kind. For 128-bit kinds the literal must be ≤
+// i64::MAX (typeck range-checks pattern literals against the kind).
+fn push_int_lit(ctx: &mut FnCtx, ty: &RType, n: u64) {
+    match ty {
+        RType::Int(k) => {
+            let mut vts: Vec<wasm::ValType> = Vec::new();
+            crate::typeck::flatten_rtype(ty, ctx.structs, &mut vts);
+            match (vts.len(), &vts[0]) {
+                (1, wasm::ValType::I32) => {
+                    ctx.instructions
+                        .push(wasm::Instruction::I32Const(n as i32));
+                }
+                (1, wasm::ValType::I64) => {
+                    ctx.instructions
+                        .push(wasm::Instruction::I64Const(n as i64));
+                }
+                (2, _) => {
+                    // 128-bit: pattern matching not yet supported
+                    // because an Eq comparison needs 128-bit cmp. Reject.
+                    let _ = k;
+                    ctx.instructions
+                        .push(wasm::Instruction::I64Const(n as i64));
+                    ctx.instructions
+                        .push(wasm::Instruction::I64Const(0));
+                }
+                _ => unreachable!(),
+            }
+        }
+        _ => unreachable!("push_int_lit on non-Int"),
+    }
+}
+
+// Push the equality test result (i32: 1 if equal, 0 otherwise) for two
+// values of `ty` on the wasm stack. For Int types: iN.eq on the single
+// scalar (or a 128-bit decomposition for u128/i128). For bool: i32.eq.
+fn push_int_eq(ctx: &mut FnCtx, ty: &RType) {
+    match ty {
+        RType::Int(k) => {
+            let mut vts: Vec<wasm::ValType> = Vec::new();
+            crate::typeck::flatten_rtype(ty, ctx.structs, &mut vts);
+            match (vts.len(), &vts[0]) {
+                (1, wasm::ValType::I32) => {
+                    ctx.instructions.push(wasm::Instruction::I32Eq);
+                }
+                (1, wasm::ValType::I64) => {
+                    ctx.instructions.push(wasm::Instruction::I64Eq);
+                }
+                _ => {
+                    // 128-bit equality: stack has (a_lo, a_hi, b_lo, b_hi).
+                    // For simplicity, do a placeholder: replace with proper
+                    // 128-bit eq when needed. For now a low-only check.
+                    let _ = k;
+                    // Pop b_hi and a_hi (drop), then compare lows.
+                    ctx.instructions.push(wasm::Instruction::Drop);
+                    let tmp = ctx.next_wasm_local;
+                    ctx.extra_locals.push(wasm::ValType::I64);
+                    ctx.next_wasm_local += 1;
+                    ctx.instructions.push(wasm::Instruction::LocalSet(tmp));
+                    ctx.instructions.push(wasm::Instruction::Drop);
+                    ctx.instructions.push(wasm::Instruction::LocalGet(tmp));
+                    ctx.instructions.push(wasm::Instruction::I64Eq);
+                }
+            }
+        }
+        RType::Bool => {
+            ctx.instructions.push(wasm::Instruction::I32Eq);
+        }
+        _ => unreachable!("push_int_eq on non-Int/Bool"),
+    }
+}
+
+// Push 1 if the second operand is `>=` the first, 0 otherwise. Picks
+// signed/unsigned variant from the int's signedness.
+fn push_int_ge(ctx: &mut FnCtx, ty: &RType) {
+    match ty {
+        RType::Int(k) => {
+            let signed = int_kind_is_signed(k);
+            let mut vts: Vec<wasm::ValType> = Vec::new();
+            crate::typeck::flatten_rtype(ty, ctx.structs, &mut vts);
+            match (vts.len(), &vts[0]) {
+                (1, wasm::ValType::I32) => {
+                    if signed {
+                        ctx.instructions.push(wasm::Instruction::I32GeS);
+                    } else {
+                        ctx.instructions.push(wasm::Instruction::I32GeU);
+                    }
+                }
+                (1, wasm::ValType::I64) => {
+                    if signed {
+                        ctx.instructions.push(wasm::Instruction::I64GeS);
+                    } else {
+                        ctx.instructions.push(wasm::Instruction::I64GeU);
+                    }
+                }
+                _ => {
+                    // 128-bit: not yet
+                    ctx.instructions.push(wasm::Instruction::I32Const(1));
+                }
+            }
+        }
+        _ => unreachable!("push_int_ge on non-Int"),
+    }
+}
+
+fn push_int_le(ctx: &mut FnCtx, ty: &RType) {
+    match ty {
+        RType::Int(k) => {
+            let signed = int_kind_is_signed(k);
+            let mut vts: Vec<wasm::ValType> = Vec::new();
+            crate::typeck::flatten_rtype(ty, ctx.structs, &mut vts);
+            match (vts.len(), &vts[0]) {
+                (1, wasm::ValType::I32) => {
+                    if signed {
+                        ctx.instructions.push(wasm::Instruction::I32LeS);
+                    } else {
+                        ctx.instructions.push(wasm::Instruction::I32LeU);
+                    }
+                }
+                (1, wasm::ValType::I64) => {
+                    if signed {
+                        ctx.instructions.push(wasm::Instruction::I64LeS);
+                    } else {
+                        ctx.instructions.push(wasm::Instruction::I64LeU);
+                    }
+                }
+                _ => {
+                    ctx.instructions.push(wasm::Instruction::I32Const(1));
+                }
+            }
+        }
+        _ => unreachable!("push_int_le on non-Int"),
+    }
+}
+
+fn int_kind_is_signed(k: &crate::typeck::IntKind) -> bool {
+    use crate::typeck::IntKind;
+    matches!(
+        k,
+        IntKind::I8 | IntKind::I16 | IntKind::I32 | IntKind::I64 | IntKind::I128 | IntKind::Isize
+    )
+}
+
+// Bind a pattern's name to the matched value at `storage`. The binding
+// is added to `ctx.locals` so that `Var(name)` inside the arm body
+// finds it.
+//
+// For non-enum types: the binding owns its own fresh wasm-local range
+// holding the value's flat scalars. We copy from the scrutinee
+// storage (locals or memory) into those slots.
+//
+// For enum types: the binding's storage is an address (the binding's
+// flat representation is [I32]). When the scrutinee is at Memory, the
+// address `addr + byte_offset` IS the binding's address; we cache it
+// in a fresh i32 local.
+// Bind by reference: `ref name` (or `ref mut name`). The binding's
+// type is `&T` (or `&mut T`), and its storage is a single i32 wasm
+// local holding the address of the matched place — `addr_local +
+// byte_offset` for Memory storage. The Locals case never reaches
+// here: codegen_match_expr pre-walks the patterns and, if any arm
+// uses `ref`, spills the scrutinee to the shadow stack so storage
+// is always Memory by the time we get here.
+fn bind_pattern_ref(
+    ctx: &mut FnCtx,
+    name: &str,
+    ty: &RType,
+    storage: &PatScrut,
+    mutable: bool,
+) {
+    let ref_ty = RType::Ref {
+        inner: Box::new(rtype_clone(ty)),
+        mutable,
+        lifetime: crate::typeck::LifetimeRepr::Inferred(0),
+    };
+    let dest = ctx.next_wasm_local;
+    ctx.extra_locals.push(wasm::ValType::I32);
+    ctx.next_wasm_local += 1;
+    match storage {
+        PatScrut::Memory { addr_local, byte_offset } => {
+            ctx.instructions
+                .push(wasm::Instruction::LocalGet(*addr_local));
+            if *byte_offset != 0 {
+                ctx.instructions
+                    .push(wasm::Instruction::I32Const(*byte_offset as i32));
+                ctx.instructions.push(wasm::Instruction::I32Add);
+            }
+            ctx.instructions.push(wasm::Instruction::LocalSet(dest));
+        }
+        PatScrut::Locals { .. } => {
+            unreachable!(
+                "ref binding against locals storage — codegen_match_expr should have spilled"
+            )
+        }
+    }
+    ctx.locals.push(LocalBinding {
+        name: name.to_string(),
+        rtype: ref_ty,
+        storage: Storage::Local {
+            wasm_start: dest,
+            flat_size: 1,
+        },
+    });
+}
+
+fn bind_pattern_value(
+    ctx: &mut FnCtx,
+    name: &str,
+    ty: &RType,
+    storage: &PatScrut,
+    pattern_id: crate::ast::NodeId,
+) {
+    let is_enum = matches!(ty, RType::Enum { .. });
+    if is_enum {
+        // Bind = the address of this enum value.
+        let dest = ctx.next_wasm_local;
+        ctx.extra_locals.push(wasm::ValType::I32);
+        ctx.next_wasm_local += 1;
+        match storage {
+            PatScrut::Locals { start } => {
+                ctx.instructions
+                    .push(wasm::Instruction::LocalGet(*start));
+                ctx.instructions.push(wasm::Instruction::LocalSet(dest));
+            }
+            PatScrut::Memory { addr_local, byte_offset } => {
+                ctx.instructions
+                    .push(wasm::Instruction::LocalGet(*addr_local));
+                if *byte_offset != 0 {
+                    ctx.instructions
+                        .push(wasm::Instruction::I32Const(*byte_offset as i32));
+                    ctx.instructions.push(wasm::Instruction::I32Add);
+                }
+                ctx.instructions.push(wasm::Instruction::LocalSet(dest));
+            }
+        }
+        ctx.locals.push(LocalBinding {
+            name: name.to_string(),
+            rtype: rtype_clone(ty),
+            storage: Storage::Local {
+                wasm_start: dest,
+                flat_size: 1,
+            },
+        });
+        return;
+    }
+    // Non-enum value: if escape analysis flagged this binding as
+    // addressed, allocate a shadow-stack slot up front so reads /
+    // writes / borrows all share one stable location. Otherwise stash
+    // into wasm locals (the fast path).
+    let addressed = (pattern_id as usize) < ctx.pattern_addressed.len()
+        && ctx.pattern_addressed[pattern_id as usize];
+    if addressed {
+        let bytes = byte_size_of(ty, ctx.structs, ctx.enums);
+        ctx.instructions
+            .push(wasm::Instruction::GlobalGet(SP_GLOBAL));
+        ctx.instructions
+            .push(wasm::Instruction::I32Const(bytes as i32));
+        ctx.instructions.push(wasm::Instruction::I32Sub);
+        ctx.instructions
+            .push(wasm::Instruction::GlobalSet(SP_GLOBAL));
+        let addr_local = ctx.next_wasm_local;
+        ctx.extra_locals.push(wasm::ValType::I32);
+        ctx.next_wasm_local += 1;
+        ctx.instructions
+            .push(wasm::Instruction::GlobalGet(SP_GLOBAL));
+        ctx.instructions.push(wasm::Instruction::LocalSet(addr_local));
+        // Copy from scrutinee storage to addr_local.
+        match storage {
+            PatScrut::Locals { start } => {
+                let mut vts: Vec<wasm::ValType> = Vec::new();
+                crate::typeck::flatten_rtype(ty, ctx.structs, &mut vts);
+                let mut k = 0;
+                while k < vts.len() {
+                    ctx.instructions
+                        .push(wasm::Instruction::LocalGet(start + k as u32));
+                    k += 1;
+                }
+                store_flat_to_memory(ctx, ty, BaseAddr::WasmLocal(addr_local), 0);
+            }
+            PatScrut::Memory { addr_local: src_addr, byte_offset } => {
+                let src = *src_addr;
+                let off = *byte_offset;
+                if off != 0 {
+                    let src2 = ctx.next_wasm_local;
+                    ctx.extra_locals.push(wasm::ValType::I32);
+                    ctx.next_wasm_local += 1;
+                    ctx.instructions.push(wasm::Instruction::LocalGet(src));
+                    ctx.instructions.push(wasm::Instruction::I32Const(off as i32));
+                    ctx.instructions.push(wasm::Instruction::I32Add);
+                    ctx.instructions.push(wasm::Instruction::LocalSet(src2));
+                    emit_memcpy(ctx, addr_local, src2, bytes);
+                } else {
+                    emit_memcpy(ctx, addr_local, src, bytes);
+                }
+            }
+        }
+        ctx.locals.push(LocalBinding {
+            name: name.to_string(),
+            rtype: rtype_clone(ty),
+            storage: Storage::MemoryAt { addr_local },
+        });
+        return;
+    }
+    let mut vts: Vec<wasm::ValType> = Vec::new();
+    crate::typeck::flatten_rtype(ty, ctx.structs, &mut vts);
+    let dest_start = ctx.next_wasm_local;
+    let mut k = 0;
+    while k < vts.len() {
+        ctx.extra_locals.push(val_type_copy(&vts[k]));
+        ctx.next_wasm_local += 1;
+        k += 1;
+    }
+    match storage {
+        PatScrut::Locals { start } => {
+            let mut k = 0;
+            while k < vts.len() {
+                ctx.instructions
+                    .push(wasm::Instruction::LocalGet(start + k as u32));
+                ctx.instructions
+                    .push(wasm::Instruction::LocalSet(dest_start + k as u32));
+                k += 1;
+            }
+        }
+        PatScrut::Memory { addr_local, byte_offset } => {
+            // Load each leaf from memory into the binding's locals.
+            let mut leaves: Vec<MemLeaf> = Vec::new();
+            collect_leaves(ty, ctx.structs, ctx.enums, *byte_offset, &mut leaves);
+            // Push all leaves onto the wasm stack first (in declaration
+            // order), then pop into locals in reverse so each leaf
+            // lands in its corresponding local slot.
+            let mut k = 0;
+            while k < leaves.len() {
+                ctx.instructions
+                    .push(wasm::Instruction::LocalGet(*addr_local));
+                ctx.instructions.push(load_instr(&leaves[k], 0));
+                k += 1;
+            }
+            let mut k = leaves.len();
+            while k > 0 {
+                k -= 1;
+                ctx.instructions
+                    .push(wasm::Instruction::LocalSet(dest_start + k as u32));
+            }
+        }
+    }
+    ctx.locals.push(LocalBinding {
+        name: name.to_string(),
+        rtype: rtype_clone(ty),
+        storage: Storage::Local {
+            wasm_start: dest_start,
+            flat_size: vts.len() as u32,
+        },
+    });
+}
+
+// Variant pattern check + binding. Branches to `no_match_target` if the
+// scrutinee's discriminant doesn't match the variant's, or if any
+// payload sub-pattern fails.
+// `Point { x, y }` against a struct scrutinee. No disc check (it's a
+// product, not a sum); just recurse into each named field's
+// sub-storage. The scrutinee storage may be Locals or Memory; we
+// recurse with the corresponding sub-range / sub-offset per field
+// in declaration order.
+fn codegen_struct_pattern(
+    ctx: &mut FnCtx,
+    fields: &Vec<crate::ast::FieldPattern>,
+    _rest: bool,
+    scrut_ty: &RType,
+    storage: &PatScrut,
+    no_match_target: u32,
+) -> Result<(), Error> {
+    let (struct_path, struct_args) = match scrut_ty {
+        RType::Struct { path, type_args, .. } => (clone_path(path), rtype_vec_clone(type_args)),
+        _ => unreachable!("struct pattern requires struct scrutinee"),
+    };
+    let entry =
+        struct_lookup(ctx.structs, &struct_path).expect("typeck verified struct exists");
+    let env = make_struct_env(&entry.type_params, &struct_args);
+    // Build (name, byte_offset, flat_offset, ty) for each declared field.
+    struct FieldInfo {
+        name: String,
+        byte_offset: u32,
+        flat_offset: u32,
+        ty: RType,
+    }
+    let mut infos: Vec<FieldInfo> = Vec::with_capacity(entry.fields.len());
+    let mut byte_off: u32 = 0;
+    let mut flat_off: u32 = 0;
+    let mut k = 0;
+    while k < entry.fields.len() {
+        let fty = substitute_rtype(&entry.fields[k].ty, &env);
+        let mut vts: Vec<wasm::ValType> = Vec::new();
+        crate::typeck::flatten_rtype(&fty, ctx.structs, &mut vts);
+        let fb = byte_size_of(&fty, ctx.structs, ctx.enums);
+        infos.push(FieldInfo {
+            name: entry.fields[k].name.clone(),
+            byte_offset: byte_off,
+            flat_offset: flat_off,
+            ty: fty,
+        });
+        byte_off += fb;
+        flat_off += vts.len() as u32;
+        k += 1;
+    }
+    let mut k = 0;
+    while k < fields.len() {
+        let fp = &fields[k];
+        let mut idx: Option<usize> = None;
+        let mut j = 0;
+        while j < infos.len() {
+            if infos[j].name == fp.name {
+                idx = Some(j);
+                break;
+            }
+            j += 1;
+        }
+        let i = idx.expect("typeck verified field name");
+        let sub_storage = match storage {
+            PatScrut::Memory { addr_local, byte_offset } => PatScrut::Memory {
+                addr_local: *addr_local,
+                byte_offset: *byte_offset + infos[i].byte_offset,
+            },
+            PatScrut::Locals { start } => PatScrut::Locals {
+                start: *start + infos[i].flat_offset,
+            },
+        };
+        codegen_pattern(ctx, &fp.pattern, &infos[i].ty, &sub_storage, no_match_target)?;
+        k += 1;
+    }
+    Ok(())
+}
+
+fn codegen_variant_pattern(
+    ctx: &mut FnCtx,
+    path: &Path,
+    tuple_elems: Option<&Vec<Pattern>>,
+    struct_fields: Option<&Vec<crate::ast::FieldPattern>>,
+    _rest: bool,
+    scrut_ty: &RType,
+    storage: &PatScrut,
+    no_match_target: u32,
+) -> Result<(), Error> {
+    // Resolve the variant by name (last segment) against the scrutinee's
+    // enum type. We can rely on the scrutinee being the right enum type
+    // because typeck already unified the pattern path to the scrutinee's
+    // enum. This means a name lookup against the scrutinee's variants
+    // is sufficient.
+    let (enum_path, enum_type_args) = match scrut_ty {
+        RType::Enum { path, type_args, .. } => (clone_path(path), rtype_vec_clone(type_args)),
+        _ => unreachable!("typeck verified variant pattern against enum"),
+    };
+    let entry =
+        crate::typeck::enum_lookup(ctx.enums, &enum_path).expect("typeck verified enum exists");
+    let variant_name = path
+        .segments
+        .last()
+        .map(|s| s.name.clone())
+        .expect("path has at least one segment");
+    let mut variant_idx: Option<usize> = None;
+    let mut k = 0;
+    while k < entry.variants.len() {
+        if entry.variants[k].name == variant_name {
+            variant_idx = Some(k);
+            break;
+        }
+        k += 1;
+    }
+    let variant_idx = variant_idx.expect("typeck verified variant name");
+    let disc = entry.variants[variant_idx].disc;
+    // Read disc from scrutinee's address. Variant patterns always
+    // require Memory storage (enums are address-passed). Compare to
+    // the variant's disc; on mismatch, br no_match.
+    let (addr_local, byte_offset) = match storage {
+        PatScrut::Memory { addr_local, byte_offset } => (*addr_local, *byte_offset),
+        _ => unreachable!("variant pattern scrutinee must be Memory storage"),
+    };
+    ctx.instructions
+        .push(wasm::Instruction::LocalGet(addr_local));
+    ctx.instructions.push(wasm::Instruction::I32Load {
+        align: 2,
+        offset: byte_offset,
+    });
+    ctx.instructions
+        .push(wasm::Instruction::I32Const(disc as i32));
+    ctx.instructions.push(wasm::Instruction::I32Ne);
+    ctx.instructions
+        .push(wasm::Instruction::BrIf(no_match_target));
+    // Recurse into payload sub-patterns.
+    let env = build_env(&entry.type_params, &enum_type_args);
+    let payload_byte_base = byte_offset + 4;
+    match (&entry.variants[variant_idx].payload, tuple_elems, struct_fields) {
+        (crate::typeck::VariantPayloadResolved::Unit, _, _) => Ok(()),
+        (crate::typeck::VariantPayloadResolved::Tuple(types), Some(elems), _) => {
+            let mut byte_off = payload_byte_base;
+            let mut i = 0;
+            while i < elems.len() {
+                let elem_ty = substitute_rtype(&types[i], &env);
+                let sub_storage = PatScrut::Memory {
+                    addr_local,
+                    byte_offset: byte_off,
+                };
+                codegen_pattern(ctx, &elems[i], &elem_ty, &sub_storage, no_match_target)?;
+                byte_off += byte_size_of(&elem_ty, ctx.structs, ctx.enums);
+                i += 1;
+            }
+            Ok(())
+        }
+        (crate::typeck::VariantPayloadResolved::Struct(field_defs), _, Some(field_pats)) => {
+            // Build (name → byte_offset, sub_ty) for declared fields.
+            let mut decl_offsets: Vec<u32> = Vec::with_capacity(field_defs.len());
+            let mut decl_subst_tys: Vec<RType> = Vec::with_capacity(field_defs.len());
+            let mut byte_off = payload_byte_base;
+            let mut k = 0;
+            while k < field_defs.len() {
+                let fty = substitute_rtype(&field_defs[k].ty, &env);
+                decl_offsets.push(byte_off);
+                byte_off += byte_size_of(&fty, ctx.structs, ctx.enums);
+                decl_subst_tys.push(fty);
+                k += 1;
+            }
+            let mut k = 0;
+            while k < field_pats.len() {
+                let fp = &field_pats[k];
+                let mut decl_idx: Option<usize> = None;
+                let mut j = 0;
+                while j < field_defs.len() {
+                    if field_defs[j].name == fp.name {
+                        decl_idx = Some(j);
+                        break;
+                    }
+                    j += 1;
+                }
+                let idx = decl_idx.expect("typeck verified field name");
+                let sub_storage = PatScrut::Memory {
+                    addr_local,
+                    byte_offset: decl_offsets[idx],
+                };
+                codegen_pattern(ctx, &fp.pattern, &decl_subst_tys[idx], &sub_storage, no_match_target)?;
+                k += 1;
+            }
+            Ok(())
+        }
+        _ => unreachable!("typeck rejected mismatched variant pattern shape"),
+    }
 }
 
 fn val_type_copy(vt: &wasm::ValType) -> wasm::ValType {
@@ -2919,6 +4187,9 @@ fn codegen_var(ctx: &mut FnCtx, name: &str, node_id: crate::ast::NodeId) -> Resu
                 Storage::Memory { frame_offset } => {
                     load_flat_from_memory(ctx, &rt, BaseAddr::StackPointer, *frame_offset);
                 }
+                Storage::MemoryAt { addr_local } => {
+                    load_flat_from_memory(ctx, &rt, BaseAddr::WasmLocal(*addr_local), 0);
+                }
             }
             // If this read is recorded as a whole-binding move site for
             // a flagged binding, clear the flag so the scope-end drop is
@@ -2967,13 +4238,35 @@ fn codegen_call(
     node_id: crate::ast::NodeId,
 ) -> Result<RType, Error> {
     let res_idx = node_id as usize;
-    let (func_idx, return_rt) = match ctx.call_resolutions[res_idx]
+    // Snapshot the resolution upfront so we don't keep a borrow of ctx.call_resolutions.
+    let resolution = ctx.call_resolutions[res_idx]
         .as_ref()
-        .expect("typeck registered this call")
-    {
+        .expect("typeck registered this call");
+    let snapshot = match resolution {
+        CallResolution::Direct(idx) => CallResolution::Direct(*idx),
+        CallResolution::Generic { template_idx, type_args } => CallResolution::Generic {
+            template_idx: *template_idx,
+            type_args: rtype_vec_clone(type_args),
+        },
+        CallResolution::Variant { enum_path, disc, type_args } => CallResolution::Variant {
+            enum_path: clone_path(enum_path),
+            disc: *disc,
+            type_args: rtype_vec_clone(type_args),
+        },
+    };
+    if let CallResolution::Variant { enum_path, disc, type_args } = &snapshot {
+        return codegen_variant_construction(
+            ctx,
+            &call.args,
+            enum_path,
+            *disc,
+            type_args,
+            None,
+        );
+    }
+    let (func_idx, return_rt) = match &snapshot {
         CallResolution::Direct(idx) => {
             let entry = &ctx.funcs.entries[*idx];
-            // No declared return type ⇒ function returns `()`.
             let rt = match &entry.return_type {
                 Some(rt) => rtype_clone(rt),
                 None => RType::Tuple(Vec::new()),
@@ -2981,14 +4274,8 @@ fn codegen_call(
             (entry.idx, rt)
         }
         CallResolution::Generic { template_idx, type_args } => {
-            // Substitute the type_args under the current monomorphization env
-            // (in case the calling function is itself a monomorphic instance
-            // of a generic that called another generic with `T` flowing
-            // through). The substituted args are concrete.
             let concrete = subst_vec(type_args, &ctx.env);
             let template_idx_copy = *template_idx;
-            // Determine the callee's return type by substituting under the
-            // template's own type-param env.
             let return_rt = {
                 let tmpl: &GenericTemplate = &ctx.funcs.templates[template_idx_copy];
                 let tmpl_env = build_env(&tmpl.type_params, &concrete);
@@ -3000,7 +4287,20 @@ fn codegen_call(
             let idx = ctx.mono.intern(template_idx_copy, concrete);
             (idx, return_rt)
         }
+        CallResolution::Variant { .. } => unreachable!("variant case handled above"),
     };
+    // Functions returning an enum use sret: the caller allocates a slot
+    // in its own frame for the return value and passes its address as
+    // a leading i32 param. The function writes there before returning.
+    let returns_enum = matches!(&return_rt, RType::Enum { .. });
+    if returns_enum {
+        let bytes = byte_size_of(&return_rt, ctx.structs, ctx.enums);
+        ctx.instructions.push(wasm::Instruction::GlobalGet(SP_GLOBAL));
+        ctx.instructions.push(wasm::Instruction::I32Const(bytes as i32));
+        ctx.instructions.push(wasm::Instruction::I32Sub);
+        ctx.instructions.push(wasm::Instruction::GlobalSet(SP_GLOBAL));
+        ctx.instructions.push(wasm::Instruction::GlobalGet(SP_GLOBAL));
+    }
     let mut i = 0;
     while i < call.args.len() {
         codegen_expr(ctx, &call.args[i])?;
@@ -3010,11 +4310,185 @@ fn codegen_call(
     Ok(return_rt)
 }
 
+// Lower variant construction (`E::Variant(args)` for tuple variants or
+// `E::Variant { f: e }` for struct variants — same shape from codegen's
+// view: a list of payload expressions, each with a known offset within
+// the variant's payload). `field_names` is `Some(names)` for struct
+// variants (used to map FieldInits to declared field positions) or
+// `None` for tuple variants (positional).
+//
+// Layout: i32 disc at offset 0 (always), then payload bytes starting
+// at offset 4 in declaration order. Smaller variants leave the trailing
+// bytes of the enum's max-payload buffer unused.
+//
+// Returns RType::Enum (with concrete type_args). The wasm stack ends
+// with the address (i32) of the freshly allocated slot.
+fn codegen_variant_construction(
+    ctx: &mut FnCtx,
+    payload_exprs: &Vec<Expr>,
+    enum_path: &Vec<String>,
+    disc: u32,
+    type_args: &Vec<RType>,
+    field_names: Option<&Vec<String>>,
+) -> Result<RType, Error> {
+    let concrete_type_args = subst_vec(type_args, &ctx.env);
+    let enum_ty = RType::Enum {
+        path: clone_path(enum_path),
+        type_args: rtype_vec_clone(&concrete_type_args),
+        lifetime_args: Vec::new(),
+    };
+    let total_size = byte_size_of(&enum_ty, ctx.structs, ctx.enums);
+    // Payload type list, substituted under the enum's type-args env.
+    let entry = crate::typeck::enum_lookup(ctx.enums, enum_path)
+        .expect("typeck verified the enum exists");
+    let env = build_env(&entry.type_params, &concrete_type_args);
+    let variant = &entry.variants[disc as usize];
+    // Build (declared_offset, payload_type) pairs in payload-declaration
+    // order. For struct variants, also build a name → declared-position
+    // mapping so we can route FieldInit by name.
+    let (payload_offsets, payload_types, struct_field_names): (Vec<u32>, Vec<RType>, Vec<String>) = {
+        let mut offsets: Vec<u32> = Vec::new();
+        let mut types: Vec<RType> = Vec::new();
+        let mut names: Vec<String> = Vec::new();
+        let mut off: u32 = 4; // disc takes the first 4 bytes
+        match &variant.payload {
+            crate::typeck::VariantPayloadResolved::Unit => {}
+            crate::typeck::VariantPayloadResolved::Tuple(types_decl) => {
+                let mut i = 0;
+                while i < types_decl.len() {
+                    let ty = substitute_rtype(&types_decl[i], &env);
+                    offsets.push(off);
+                    off += byte_size_of(&ty, ctx.structs, ctx.enums);
+                    types.push(ty);
+                    i += 1;
+                }
+            }
+            crate::typeck::VariantPayloadResolved::Struct(fields) => {
+                let mut i = 0;
+                while i < fields.len() {
+                    let ty = substitute_rtype(&fields[i].ty, &env);
+                    offsets.push(off);
+                    off += byte_size_of(&ty, ctx.structs, ctx.enums);
+                    types.push(ty);
+                    names.push(fields[i].name.clone());
+                    i += 1;
+                }
+            }
+        }
+        (offsets, types, names)
+    };
+    // Allocate the slot: __sp -= total_size; the new __sp is the address.
+    ctx.instructions
+        .push(wasm::Instruction::GlobalGet(SP_GLOBAL));
+    ctx.instructions
+        .push(wasm::Instruction::I32Const(total_size as i32));
+    ctx.instructions.push(wasm::Instruction::I32Sub);
+    ctx.instructions
+        .push(wasm::Instruction::GlobalSet(SP_GLOBAL));
+    // Cache the address in a wasm local so we can reuse it across
+    // the disc + per-field stores.
+    let addr_local = ctx.next_wasm_local;
+    ctx.extra_locals.push(wasm::ValType::I32);
+    ctx.next_wasm_local += 1;
+    ctx.instructions
+        .push(wasm::Instruction::GlobalGet(SP_GLOBAL));
+    ctx.instructions
+        .push(wasm::Instruction::LocalSet(addr_local));
+    // Store the discriminant at offset 0.
+    ctx.instructions
+        .push(wasm::Instruction::LocalGet(addr_local));
+    ctx.instructions
+        .push(wasm::Instruction::I32Const(disc as i32));
+    ctx.instructions.push(wasm::Instruction::I32Store {
+        align: 2,
+        offset: 0,
+    });
+    // Map each payload_expr to its declared position. For tuple variants
+    // payload_exprs is in declaration order. For struct variants we use
+    // field_names to find each FieldInit's position.
+    if payload_exprs.len() != payload_offsets.len() {
+        unreachable!("typeck verified payload arity");
+    }
+    let mut decl_pos_for_arg: Vec<usize> = Vec::with_capacity(payload_exprs.len());
+    if let Some(names) = field_names {
+        // Struct variant: each payload_exprs[i] corresponds to names[i]
+        // (the order the user wrote them). Map to declared position.
+        let mut i = 0;
+        while i < names.len() {
+            let mut found: Option<usize> = None;
+            let mut k = 0;
+            while k < struct_field_names.len() {
+                if struct_field_names[k] == names[i] {
+                    found = Some(k);
+                    break;
+                }
+                k += 1;
+            }
+            decl_pos_for_arg.push(found.expect("typeck verified field name"));
+            i += 1;
+        }
+    } else {
+        // Tuple variant: positional.
+        let mut i = 0;
+        while i < payload_exprs.len() {
+            decl_pos_for_arg.push(i);
+            i += 1;
+        }
+    }
+    // For each argument: load address, codegen value (pushes flat scalars),
+    // then store-flat-to-memory at the field's offset. We use the existing
+    // `store_flat_to_memory` machinery so multi-scalar fields (u128, structs)
+    // get all their bytes written at the right offsets.
+    let mut i = 0;
+    while i < payload_exprs.len() {
+        let decl_pos = decl_pos_for_arg[i];
+        let off = payload_offsets[decl_pos];
+        let ty = rtype_clone(&payload_types[decl_pos]);
+        // codegen the value — pushes its flat scalars onto the wasm stack.
+        codegen_expr(ctx, &payload_exprs[i])?;
+        // store_flat_to_memory pops the flat scalars and stores them at
+        // base + base_offset. Use the cached addr_local as the base.
+        store_flat_to_memory(ctx, &ty, BaseAddr::WasmLocal(addr_local), off);
+        i += 1;
+    }
+    // Push the address as the result of the construction expression.
+    ctx.instructions
+        .push(wasm::Instruction::LocalGet(addr_local));
+    Ok(enum_ty)
+}
+
 fn codegen_struct_lit(
     ctx: &mut FnCtx,
     lit: &StructLit,
     node_id: crate::ast::NodeId,
 ) -> Result<RType, Error> {
+    // Struct-variant construction routes through codegen_struct_lit but
+    // the resolution recorded by typeck distinguishes it. Lower via the
+    // shared variant-construction path; FieldInits map to declared
+    // payload fields by name.
+    if let Some(CallResolution::Variant { enum_path, disc, type_args }) =
+        ctx.call_resolutions[node_id as usize].as_ref()
+    {
+        let enum_path = clone_path(enum_path);
+        let disc = *disc;
+        let type_args = rtype_vec_clone(type_args);
+        let mut payload_exprs: Vec<Expr> = Vec::new();
+        let mut field_names: Vec<String> = Vec::new();
+        let mut i = 0;
+        while i < lit.fields.len() {
+            field_names.push(lit.fields[i].name.clone());
+            payload_exprs.push(lit.fields[i].value.clone());
+            i += 1;
+        }
+        return codegen_variant_construction(
+            ctx,
+            &payload_exprs,
+            &enum_path,
+            disc,
+            &type_args,
+            Some(&field_names),
+        );
+    }
     // Read the resolved struct type recorded by typeck at this NodeId.
     // For generic structs, this carries the concrete type_args needed for
     // layout. Substitute under our env in case those args themselves reference
@@ -3209,7 +4683,7 @@ fn codegen_place_chain_load(
                 let mut j = 0;
                 while j < entry.fields.len() {
                     let fty = substitute_rtype(&entry.fields[j].ty, &env);
-                    let s = byte_size_of(&fty, ctx.structs);
+                    let s = byte_size_of(&fty, ctx.structs, ctx.enums);
                     if entry.fields[j].name == chain[i] {
                         chain_offset += field_offset;
                         current_ty = fty;
@@ -3231,7 +4705,7 @@ fn codegen_place_chain_load(
                 let mut elem_offset: u32 = 0;
                 let mut j = 0;
                 while j < idx {
-                    elem_offset += byte_size_of(&elems[j], ctx.structs);
+                    elem_offset += byte_size_of(&elems[j], ctx.structs, ctx.enums);
                     j += 1;
                 }
                 chain_offset += elem_offset;
@@ -3253,6 +4727,14 @@ fn codegen_place_chain_load(
                     &current_ty,
                     BaseAddr::StackPointer,
                     *frame_offset + chain_offset,
+                );
+            }
+            Storage::MemoryAt { addr_local } => {
+                load_flat_from_memory(
+                    ctx,
+                    &current_ty,
+                    BaseAddr::WasmLocal(*addr_local),
+                    chain_offset,
                 );
             }
             Storage::Local { .. } => {
@@ -3377,8 +4859,41 @@ fn extract_field_from_stack(
 }
 
 fn codegen_borrow(ctx: &mut FnCtx, inner: &Expr, mutable: bool) -> Result<RType, Error> {
-    let chain =
-        extract_place(inner).expect("typeck verified the borrow operand is a place expression");
+    // Non-place inner (e.g. `&42`, `&foo()`): codegen the inner
+    // expression's value, spill to a fresh shadow-stack slot, push
+    // the slot's address. The slot lives until the function exits
+    // (saved-SP epilogue reclaims). This is what a Rust temporary
+    // borrow lowers to.
+    let chain = match extract_place(inner) {
+        Some(c) => c,
+        None => {
+            let inner_ty = codegen_expr(ctx, inner)?;
+            let bytes = byte_size_of(&inner_ty, ctx.structs, ctx.enums);
+            ctx.instructions
+                .push(wasm::Instruction::GlobalGet(SP_GLOBAL));
+            ctx.instructions
+                .push(wasm::Instruction::I32Const(bytes as i32));
+            ctx.instructions.push(wasm::Instruction::I32Sub);
+            ctx.instructions
+                .push(wasm::Instruction::GlobalSet(SP_GLOBAL));
+            let addr_local = ctx.next_wasm_local;
+            ctx.extra_locals.push(wasm::ValType::I32);
+            ctx.next_wasm_local += 1;
+            ctx.instructions
+                .push(wasm::Instruction::GlobalGet(SP_GLOBAL));
+            ctx.instructions.push(wasm::Instruction::LocalSet(addr_local));
+            // The inner's flat scalars are on the wasm stack; store
+            // them at addr_local.
+            store_flat_to_memory(ctx, &inner_ty, BaseAddr::WasmLocal(addr_local), 0);
+            ctx.instructions
+                .push(wasm::Instruction::LocalGet(addr_local));
+            return Ok(RType::Ref {
+                inner: Box::new(inner_ty),
+                mutable,
+                lifetime: crate::typeck::LifetimeRepr::Inferred(0),
+            });
+        }
+    };
     let mut binding_idx: usize = 0;
     let mut found = false;
     let mut k = ctx.locals.len();
@@ -3423,7 +4938,7 @@ fn codegen_borrow(ctx: &mut FnCtx, inner: &Expr, mutable: bool) -> Result<RType,
         let mut found_field = false;
         while j < entry.fields.len() {
             let fty = substitute_rtype(&entry.fields[j].ty, &env);
-            let s = byte_size_of(&fty, ctx.structs);
+            let s = byte_size_of(&fty, ctx.structs, ctx.enums);
             if entry.fields[j].name == chain[i] {
                 chain_offset += field_offset;
                 current_ty = fty;
@@ -3449,21 +4964,34 @@ fn codegen_borrow(ctx: &mut FnCtx, inner: &Expr, mutable: bool) -> Result<RType,
             ctx.instructions.push(wasm::Instruction::I32Add);
         }
     } else {
-        // The binding must be spilled (escape analysis enforces this for any
-        // binding whose address is taken).
-        let frame_offset = match &ctx.locals[binding_idx].storage {
-            Storage::Memory { frame_offset } => *frame_offset,
+        // Let-binding spilled to a fixed frame offset, or a pattern
+        // binding allocated to a shadow-stack slot via MemoryAt.
+        // (Local-storage bindings shouldn't reach here: escape
+        // analysis would have flagged them addressed and forced
+        // spilling at bind time.)
+        match &ctx.locals[binding_idx].storage {
+            Storage::Memory { frame_offset } => {
+                let total = *frame_offset + chain_offset;
+                ctx.instructions
+                    .push(wasm::Instruction::GlobalGet(SP_GLOBAL));
+                if total != 0 {
+                    ctx.instructions
+                        .push(wasm::Instruction::I32Const(total as i32));
+                    ctx.instructions.push(wasm::Instruction::I32Add);
+                }
+            }
+            Storage::MemoryAt { addr_local } => {
+                ctx.instructions
+                    .push(wasm::Instruction::LocalGet(*addr_local));
+                if chain_offset != 0 {
+                    ctx.instructions
+                        .push(wasm::Instruction::I32Const(chain_offset as i32));
+                    ctx.instructions.push(wasm::Instruction::I32Add);
+                }
+            }
             Storage::Local { .. } => {
                 unreachable!("escape analysis must have spilled this binding");
             }
-        };
-        ctx.instructions
-            .push(wasm::Instruction::GlobalGet(SP_GLOBAL));
-        let total = frame_offset + chain_offset;
-        if total != 0 {
-            ctx.instructions
-                .push(wasm::Instruction::I32Const(total as i32));
-            ctx.instructions.push(wasm::Instruction::I32Add);
         }
     }
     Ok(RType::Ref {
@@ -3490,6 +5018,17 @@ fn ref_pointee_addr_local(ctx: &mut FnCtx, binding_idx: usize) -> u32 {
                 .push(wasm::Instruction::GlobalGet(SP_GLOBAL));
             ctx.instructions
                 .push(wasm::Instruction::I32Load { align: 0, offset: off });
+            ctx.instructions.push(wasm::Instruction::LocalSet(temp));
+            temp
+        }
+        Storage::MemoryAt { addr_local } => {
+            let src = *addr_local;
+            let temp = ctx.next_wasm_local;
+            ctx.extra_locals.push(wasm::ValType::I32);
+            ctx.next_wasm_local += 1;
+            ctx.instructions.push(wasm::Instruction::LocalGet(src));
+            ctx.instructions
+                .push(wasm::Instruction::I32Load { align: 0, offset: 0 });
             ctx.instructions.push(wasm::Instruction::LocalSet(temp));
             temp
         }
@@ -3533,11 +5072,73 @@ fn emit_base(ctx: &mut FnCtx, base: BaseAddr) {
     }
 }
 
+// Copy `bytes` bytes from address in `src_local` to address in
+// `dst_local`. Emits a sequence of i64.load + i64.store for the bulk,
+// then i32.load/store for any 4-byte tail. Used by sret returns to
+// move the constructed enum from a callee-frame temp to the caller-
+// supplied destination before SP restore.
+fn emit_memcpy(ctx: &mut FnCtx, dst_local: u32, src_local: u32, bytes: u32) {
+    let mut off: u32 = 0;
+    while off + 8 <= bytes {
+        ctx.instructions.push(wasm::Instruction::LocalGet(dst_local));
+        ctx.instructions.push(wasm::Instruction::LocalGet(src_local));
+        ctx.instructions.push(wasm::Instruction::I64Load { align: 3, offset: off });
+        ctx.instructions.push(wasm::Instruction::I64Store { align: 3, offset: off });
+        off += 8;
+    }
+    while off + 4 <= bytes {
+        ctx.instructions.push(wasm::Instruction::LocalGet(dst_local));
+        ctx.instructions.push(wasm::Instruction::LocalGet(src_local));
+        ctx.instructions.push(wasm::Instruction::I32Load { align: 2, offset: off });
+        ctx.instructions.push(wasm::Instruction::I32Store { align: 2, offset: off });
+        off += 4;
+    }
+    while off + 2 <= bytes {
+        ctx.instructions.push(wasm::Instruction::LocalGet(dst_local));
+        ctx.instructions.push(wasm::Instruction::LocalGet(src_local));
+        ctx.instructions.push(wasm::Instruction::I32Load16U { align: 1, offset: off });
+        ctx.instructions.push(wasm::Instruction::I32Store16 { align: 1, offset: off });
+        off += 2;
+    }
+    while off < bytes {
+        ctx.instructions.push(wasm::Instruction::LocalGet(dst_local));
+        ctx.instructions.push(wasm::Instruction::LocalGet(src_local));
+        ctx.instructions.push(wasm::Instruction::I32Load8U { align: 0, offset: off });
+        ctx.instructions.push(wasm::Instruction::I32Store8 { align: 0, offset: off });
+        off += 1;
+    }
+}
+
 // Pop flat scalars off the WASM stack and store them at base+offset+leaf_offset
-// in memory.
+// in memory. For enum-typed values, the wasm-stack value is an i32
+// address, but the destination expects the enum's bytes inlined — so
+// we memcpy `byte_size_of(enum)` bytes from the source address to
+// dest+base_offset rather than just storing the address as a single
+// i32 leaf.
 fn store_flat_to_memory(ctx: &mut FnCtx, ty: &RType, base: BaseAddr, base_offset: u32) {
+    if matches!(ty, RType::Enum { .. }) {
+        // Stash source address from the wasm stack.
+        let src_local = ctx.next_wasm_local;
+        ctx.extra_locals.push(wasm::ValType::I32);
+        ctx.next_wasm_local += 1;
+        ctx.instructions.push(wasm::Instruction::LocalSet(src_local));
+        // Stash dest address (= base + base_offset) into a fresh local.
+        let dst_local = ctx.next_wasm_local;
+        ctx.extra_locals.push(wasm::ValType::I32);
+        ctx.next_wasm_local += 1;
+        emit_base(ctx, base);
+        if base_offset != 0 {
+            ctx.instructions
+                .push(wasm::Instruction::I32Const(base_offset as i32));
+            ctx.instructions.push(wasm::Instruction::I32Add);
+        }
+        ctx.instructions.push(wasm::Instruction::LocalSet(dst_local));
+        let bytes = byte_size_of(ty, ctx.structs, ctx.enums);
+        emit_memcpy(ctx, dst_local, src_local, bytes);
+        return;
+    }
     let mut leaves: Vec<MemLeaf> = Vec::new();
-    collect_leaves(ty, ctx.structs, 0, &mut leaves);
+    collect_leaves(ty, ctx.structs, ctx.enums, 0, &mut leaves);
     if leaves.is_empty() {
         return;
     }
@@ -3570,7 +5171,7 @@ fn store_flat_to_memory(ctx: &mut FnCtx, ty: &RType, base: BaseAddr, base_offset
 // Push flat scalars onto the WASM stack, loading them from base+offset+leaf_offset.
 fn load_flat_from_memory(ctx: &mut FnCtx, ty: &RType, base: BaseAddr, base_offset: u32) {
     let mut leaves: Vec<MemLeaf> = Vec::new();
-    collect_leaves(ty, ctx.structs, 0, &mut leaves);
+    collect_leaves(ty, ctx.structs, ctx.enums, 0, &mut leaves);
     let mut k = 0;
     while k < leaves.len() {
         emit_base(ctx, base);

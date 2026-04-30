@@ -10,7 +10,7 @@ pub mod wasm;
 
 use ast::{Item, Module};
 use span::{Error, Pos, Span};
-use typeck::{FuncTable, StructTable, TraitTable};
+use typeck::{EnumTable, FuncTable, StructTable, TraitTable};
 
 pub struct File {
     pub path: String,
@@ -78,6 +78,9 @@ pub fn compile(
     let mut structs = StructTable {
         entries: Vec::new(),
     };
+    let mut enums = EnumTable {
+        entries: Vec::new(),
+    };
     let mut traits = TraitTable {
         entries: Vec::new(),
         impls: Vec::new(),
@@ -125,16 +128,16 @@ pub fn compile(
         // Today there's only one prelude library (`std`), so this is
         // a no-op for std itself and applies to any future libraries.
         inject_preludes(&mut lib_root, libraries, Some(&lib.name));
-        if let Err(e) = typeck::check(&lib_root, &mut structs, &mut traits, &mut funcs, &mut reexports, &mut next_idx) {
+        if let Err(e) = typeck::check(&lib_root, &mut structs, &mut enums, &mut traits, &mut funcs, &mut reexports, &mut next_idx) {
             return Err(span::format_error(&e));
         }
-        if let Err(e) = borrowck::check(&lib_root, &structs, &traits, &mut funcs) {
+        if let Err(e) = borrowck::check(&lib_root, &structs, &enums, &traits, &mut funcs) {
             return Err(span::format_error(&e));
         }
         if let Err(e) = safeck::check(&lib_root, &funcs) {
             return Err(span::format_error(&e));
         }
-        if let Err(e) = codegen::emit(&mut wasm_mod, &lib_root, &structs, &traits, &funcs) {
+        if let Err(e) = codegen::emit(&mut wasm_mod, &lib_root, &structs, &enums, &traits, &funcs) {
             return Err(span::format_error(&e));
         }
         i += 1;
@@ -148,16 +151,16 @@ pub fn compile(
     // User crate gets every prelude library — there's no "self" to
     // exclude.
     inject_preludes(&mut user_root, libraries, None);
-    if let Err(e) = typeck::check(&user_root, &mut structs, &mut traits, &mut funcs, &mut reexports, &mut next_idx) {
+    if let Err(e) = typeck::check(&user_root, &mut structs, &mut enums, &mut traits, &mut funcs, &mut reexports, &mut next_idx) {
         return Err(span::format_error(&e));
     }
-    if let Err(e) = borrowck::check(&user_root, &structs, &traits, &mut funcs) {
+    if let Err(e) = borrowck::check(&user_root, &structs, &enums, &traits, &mut funcs) {
         return Err(span::format_error(&e));
     }
     if let Err(e) = safeck::check(&user_root, &funcs) {
         return Err(span::format_error(&e));
     }
-    if let Err(e) = codegen::emit(&mut wasm_mod, &user_root, &structs, &traits, &funcs) {
+    if let Err(e) = codegen::emit(&mut wasm_mod, &user_root, &structs, &enums, &traits, &funcs) {
         return Err(span::format_error(&e));
     }
     Ok(wasm_mod)
@@ -210,6 +213,7 @@ fn resolve_module(
         match raw {
             parser::RawItem::Function(f) => items.push(Item::Function(f)),
             parser::RawItem::Struct(sd) => items.push(Item::Struct(sd)),
+            parser::RawItem::Enum(ed) => items.push(Item::Enum(ed)),
             parser::RawItem::Impl(ib) => items.push(Item::Impl(ib)),
             parser::RawItem::Trait(td) => items.push(Item::Trait(td)),
             parser::RawItem::Use(u) => items.push(Item::Use(u)),

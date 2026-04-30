@@ -747,3 +747,181 @@ fn tuple_borrow_returns_42() {
 fn if_without_else_returns_42() {
     expect_answer("if_without_else", 42u32);
 }
+
+// E0 — enum declarations parse and compile cleanly even without
+// typeck/codegen support (since unused decls are skipped). Using
+// the variants would error at this stage; this test just covers
+// the syntactic path.
+#[test]
+fn enum_decl_parses_returns_42() {
+    expect_answer("enum_decl_parses", 42u32);
+}
+
+#[test]
+fn enum_unit_variant_returns_42() {
+    expect_answer("enum_unit_variant", 42u32);
+}
+
+#[test]
+fn enum_tuple_variant_returns_42() {
+    expect_answer("enum_tuple_variant", 42u32);
+}
+
+#[test]
+fn enum_struct_variant_returns_42() {
+    expect_answer("enum_struct_variant", 42u32);
+}
+
+#[test]
+fn enum_generic_returns_42() {
+    expect_answer("enum_generic", 42u32);
+}
+
+#[test]
+fn enum_pass_to_fn_returns_42() {
+    expect_answer("enum_pass_to_fn", 42u32);
+}
+
+#[test]
+fn enum_return_returns_42() {
+    expect_answer("enum_return", 42u32);
+}
+
+#[test]
+fn match_int_returns_42() {
+    expect_answer("match_int", 42u32);
+}
+
+#[test]
+fn match_enum_unit_returns_42() {
+    expect_answer("match_enum_unit", 42u32);
+}
+
+#[test]
+fn match_enum_tuple_returns_42() {
+    expect_answer("match_enum_tuple", 42u32);
+}
+
+#[test]
+fn match_enum_struct_returns_42() {
+    expect_answer("match_enum_struct", 42u32);
+}
+
+#[test]
+fn match_or_returns_42() {
+    expect_answer("match_or", 42u32);
+}
+
+#[test]
+fn match_range_returns_42() {
+    expect_answer("match_range", 42u32);
+}
+
+#[test]
+fn match_recursive_returns_42() {
+    expect_answer("match_recursive", 42u32);
+}
+
+#[test]
+fn match_at_binding_returns_42() {
+    expect_answer("match_at_binding", 42u32);
+}
+
+#[test]
+fn match_tuple_scrut_returns_42() {
+    expect_answer("match_tuple_scrut", 42u32);
+}
+
+#[test]
+fn match_returns_enum_returns_42() {
+    expect_answer("match_returns_enum", 42u32);
+}
+
+#[test]
+fn match_ref_pat_returns_42() {
+    expect_answer("match_ref_pat", 42u32);
+}
+
+#[test]
+fn match_ref_variant_returns_42() {
+    expect_answer("match_ref_variant", 42u32);
+}
+
+#[test]
+fn match_ref_bind_returns_42() {
+    expect_answer("match_ref_bind", 42u32);
+}
+
+#[test]
+fn match_struct_scrut_returns_42() {
+    expect_answer("match_struct_scrut", 42u32);
+}
+
+#[test]
+fn match_struct_field_pat_returns_42() {
+    expect_answer("match_struct_field_pat", 42u32);
+}
+
+#[test]
+fn match_tuple_lit_pat_returns_42() {
+    expect_answer("match_tuple_lit_pat", 42u32);
+}
+
+#[test]
+fn match_ref_locals_returns_42() {
+    expect_answer("match_ref_locals", 42u32);
+}
+
+#[test]
+fn match_double_use_returns_82() {
+    // Each pattern binding `a` and `b` is `u32` (Copy). Borrowck must
+    // treat reads of these as non-moving — without proper type
+    // propagation through patterns, the second read of `a` would
+    // error "already moved".
+    expect_answer("match_double_use", 82u32);
+}
+
+#[test]
+fn match_move_payload_returns_42() {
+    // Pattern binding moves a non-Copy value out of an enum
+    // payload: `Wrap::Some(inner)` captures `inner: Owned` by
+    // value, then the arm body returns it.
+    expect_answer("match_move_payload", 42u32);
+}
+
+#[test]
+fn match_guard_returns_42() {
+    // First guard `n < 10` fails on 42; second guard `n < 50`
+    // succeeds; arm body returns `n` (= 42).
+    expect_answer("match_guard", 42u32);
+}
+
+#[test]
+fn match_mut_pat_borrow_returns_42() {
+    // `mut n` pattern binding + `&mut n` later: escape analysis
+    // marks the binding as addressed, so bind_pattern_value spills
+    // it to a shadow-stack slot from the start. `*r = 42` writes
+    // through the slot's address; reading `n` afterwards reads the
+    // same slot and sees 42.
+    expect_answer("match_mut_pat_borrow", 42u32);
+}
+
+#[test]
+fn if_let_basic_returns_42() {
+    expect_answer("if_let_basic", 42u32);
+}
+
+#[test]
+fn if_let_no_else_returns_42() {
+    expect_answer("if_let_no_else", 42u32);
+}
+
+#[test]
+fn if_let_else_returns_42() {
+    expect_answer("if_let_else", 42u32);
+}
+
+#[test]
+fn if_let_chain_returns_42() {
+    expect_answer("if_let_chain", 42u32);
+}
