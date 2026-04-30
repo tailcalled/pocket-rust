@@ -136,6 +136,7 @@ pub enum RType {
     // name. Codegen substitutes these to concrete types during monomorphization;
     // operations needing layout (byte_size_of, flatten_rtype) reject `Param`.
     Param(String),
+    Bool,
 }
 
 #[derive(Clone)]
@@ -219,7 +220,7 @@ fn satisfies_num(
             let rt = infer_to_rtype_for_check(t);
             crate::typeck::solve_impl(&num_path, &rt, traits, 0).is_some()
         }
-        InferType::Ref { .. } | InferType::RawPtr { .. } => false,
+        InferType::Ref { .. } | InferType::RawPtr { .. } | InferType::Bool => false,
     }
 }
 
@@ -255,6 +256,7 @@ fn infer_to_rtype_for_check(t: &InferType) -> RType {
             mutable: *mutable,
         },
         InferType::Param(n) => RType::Param(n.clone()),
+        InferType::Bool => RType::Bool,
     }
 }
 
@@ -549,6 +551,7 @@ fn try_match_against_infer(
             InferType::Int(kb) => int_kind_eq(ka, kb),
             _ => false,
         },
+        RType::Bool => matches!(resolved, InferType::Bool),
         RType::Struct {
             path: pa,
             type_args: aa,
@@ -653,7 +656,7 @@ fn freshen_inferred_lifetimes(rt: &mut RType, next_id: &mut u32) {
                 i += 1;
             }
         }
-        RType::Int(_) | RType::Param(_) => {}
+        RType::Int(_) | RType::Param(_) | RType::Bool => {}
     }
 }
 
@@ -698,7 +701,7 @@ fn require_no_inferred_lifetimes(
             }
             Ok(())
         }
-        RType::Int(_) | RType::Param(_) => Ok(()),
+        RType::Int(_) | RType::Param(_) | RType::Bool => Ok(()),
     }
 }
 
@@ -732,7 +735,7 @@ fn validate_named_lifetimes(
             }
             Ok(())
         }
-        RType::Int(_) | RType::Param(_) => Ok(()),
+        RType::Int(_) | RType::Param(_) | RType::Bool => Ok(()),
     }
 }
 
@@ -781,6 +784,7 @@ pub fn rtype_clone(t: &RType) -> RType {
             mutable: *mutable,
         },
         RType::Param(n) => RType::Param(n.clone()),
+        RType::Bool => RType::Bool,
     }
 }
 
@@ -810,6 +814,7 @@ fn rtype_vec_eq(a: &Vec<RType>, b: &Vec<RType>) -> bool {
 
 pub fn rtype_eq(a: &RType, b: &RType) -> bool {
     match (a, b) {
+        (RType::Bool, RType::Bool) => true,
         (RType::Int(ka), RType::Int(kb)) => int_kind_eq(ka, kb),
         (
             RType::Struct {
@@ -852,6 +857,7 @@ pub fn rtype_eq(a: &RType, b: &RType) -> bool {
 
 pub fn rtype_to_string(t: &RType) -> String {
     match t {
+        RType::Bool => "bool".to_string(),
         RType::Int(k) => int_kind_name(k).to_string(),
         RType::Struct { path, type_args, .. } => {
             if type_args.is_empty() {
@@ -891,6 +897,7 @@ pub fn rtype_to_string(t: &RType) -> String {
 
 pub fn rtype_size(ty: &RType, structs: &StructTable) -> u32 {
     match ty {
+        RType::Bool => 1,
         RType::Int(k) => match k {
             IntKind::U128 | IntKind::I128 => 2,
             _ => 1,
@@ -929,6 +936,7 @@ fn struct_env(type_params: &Vec<String>, type_args: &Vec<RType>) -> Vec<(String,
 
 pub fn flatten_rtype(ty: &RType, structs: &StructTable, out: &mut Vec<crate::wasm::ValType>) {
     match ty {
+        RType::Bool => out.push(crate::wasm::ValType::I32),
         RType::Int(k) => match k {
             IntKind::U64 | IntKind::I64 => out.push(crate::wasm::ValType::I64),
             IntKind::U128 | IntKind::I128 => {
@@ -954,6 +962,7 @@ pub fn flatten_rtype(ty: &RType, structs: &StructTable, out: &mut Vec<crate::was
 
 pub fn byte_size_of(rt: &RType, structs: &StructTable) -> u32 {
     match rt {
+        RType::Bool => 1,
         RType::Int(k) => match k {
             IntKind::U8 | IntKind::I8 => 1,
             IntKind::U16 | IntKind::I16 => 2,
@@ -984,6 +993,7 @@ pub fn byte_size_of(rt: &RType, structs: &StructTable) -> u32 {
 // scenarios where the env is partial).
 pub fn substitute_rtype(rt: &RType, env: &Vec<(String, RType)>) -> RType {
     match rt {
+        RType::Bool => RType::Bool,
         RType::Int(k) => RType::Int(int_kind_copy(k)),
         RType::Struct { path, type_args, lifetime_args } => {
             let mut subst_args: Vec<RType> = Vec::new();
@@ -1117,6 +1127,23 @@ pub fn struct_lookup<'a>(table: &'a StructTable, path: &Vec<String>) -> Option<&
     None
 }
 
+// Per-place move state recorded by borrowck. `Moved` means moved on
+// every reachable path; `MaybeMoved` means moved on some paths but not
+// others (the binding's storage is potentially-init at the place's
+// scope-end, requiring a runtime drop flag in codegen). The implicit
+// third state — `Init` — is "the place isn't in the list at all."
+#[derive(Clone, PartialEq, Eq)]
+pub enum MoveStatus {
+    Moved,
+    MaybeMoved,
+}
+
+#[derive(Clone)]
+pub struct MovedPlace {
+    pub place: Vec<String>,
+    pub status: MoveStatus,
+}
+
 // Trait declarations registered during the first typeck pass. Trait
 // methods' signatures are stored with `Self` as `RType::Param("Self")` so
 // impl validation can substitute against the impl target.
@@ -1223,13 +1250,22 @@ pub struct FnSymbol {
     pub method_resolutions: Vec<Option<MethodResolution>>,
     // Per `Call` expression, indexed by Expr.id.
     pub call_resolutions: Vec<Option<CallResolution>>,
-    // T4.6: places that ended up moved during borrowck's walk, snapshotted
-    // after the body completes. Codegen consults this to skip the implicit
-    // scope-end drop for any Drop-typed binding that was moved out — only
-    // the new owner drops. For straight-line code (no control flow yet)
-    // this is exact; with control flow this needs replacement with per-path
-    // drop flags.
-    pub moved_places: Vec<Vec<String>>,
+    // T4.6: places whose move-state at the binding's scope-end was non-Init,
+    // snapshotted from borrowck's walk. Codegen consults this to decide what
+    // to do at each Drop binding's drop point: `Init` means the binding
+    // wasn't moved at all (unconditional drop); `Moved` means it was moved on
+    // every path (skip drop); `MaybeMoved` means it was moved on some paths
+    // (emit a runtime drop flag — set 1 at decl, 0 at every move site, drop
+    // gated on flag).
+    pub moved_places: Vec<MovedPlace>,
+    // Per whole-binding move site: every (NodeId, binding-name) pair where
+    // borrowck observed a non-Copy whole-binding read that consumed the
+    // binding's storage. Codegen consults this to clear drop flags: at the
+    // codegen for the matching NodeId, emit `flag = 0` for the named
+    // binding (only when that binding's status at scope-end is MaybeMoved
+    // — Init bindings don't have flags, and Moved bindings drop is just
+    // skipped). Empty for fns with no whole-binding moves.
+    pub move_sites: Vec<(crate::ast::NodeId, String)>,
 }
 
 // How a `Call` expression resolves to a callee. For non-generic functions
@@ -1280,7 +1316,9 @@ pub struct GenericTemplate {
     // T4.6: see FnSymbol.moved_places. For templates the snapshot is taken
     // from the polymorphic body walk and reused across monomorphizations
     // (move semantics don't depend on concrete type args).
-    pub moved_places: Vec<Vec<String>>,
+    pub moved_places: Vec<MovedPlace>,
+    // See FnSymbol.move_sites.
+    pub move_sites: Vec<(crate::ast::NodeId, String)>,
 }
 
 pub struct MethodResolution {
@@ -1434,6 +1472,9 @@ pub fn resolve_type(
     match &ty.kind {
         TypeKind::Path(path) => {
             if path.segments.len() == 1 {
+                if path.segments[0].name == "bool" {
+                    return Ok(RType::Bool);
+                }
                 if let Some(k) = int_kind_from_name(&path.segments[0].name) {
                     return Ok(RType::Int(k));
                 }
@@ -2745,6 +2786,7 @@ fn register_function(
             method_resolutions: Vec::new(),
             call_resolutions: Vec::new(),
             moved_places: Vec::new(),
+            move_sites: Vec::new(),
         });
     } else {
         funcs.entries.push(FnSymbol {
@@ -2760,6 +2802,7 @@ fn register_function(
             method_resolutions: Vec::new(),
             call_resolutions: Vec::new(),
             moved_places: Vec::new(),
+            move_sites: Vec::new(),
         });
         *next_idx += 1;
     }
@@ -2853,6 +2896,7 @@ enum InferType {
     },
     RawPtr { inner: Box<InferType>, mutable: bool },
     Param(String),
+    Bool,
 }
 
 fn infer_clone(t: &InferType) -> InferType {
@@ -2874,6 +2918,7 @@ fn infer_clone(t: &InferType) -> InferType {
             mutable: *mutable,
         },
         InferType::Param(n) => InferType::Param(n.clone()),
+        InferType::Bool => InferType::Bool,
     }
 }
 
@@ -2931,6 +2976,7 @@ fn rtype_to_infer(rt: &RType) -> InferType {
             mutable: *mutable,
         },
         RType::Param(n) => InferType::Param(n.clone()),
+        RType::Bool => InferType::Bool,
     }
 }
 
@@ -2973,6 +3019,7 @@ fn infer_substitute(t: &InferType, env: &Vec<(String, InferType)>) -> InferType 
             }
             InferType::Param(name.clone())
         }
+        InferType::Bool => InferType::Bool,
     }
 }
 
@@ -3013,6 +3060,7 @@ fn infer_to_string(t: &InferType) -> String {
             }
         }
         InferType::Param(n) => n.clone(),
+        InferType::Bool => "bool".to_string(),
     }
 }
 
@@ -3073,6 +3121,7 @@ impl Subst {
                 mutable: *mutable,
             },
             InferType::Param(n) => InferType::Param(n.clone()),
+            InferType::Bool => InferType::Bool,
         }
     }
 
@@ -3288,6 +3337,7 @@ impl Subst {
                     })
                 }
             }
+            (InferType::Bool, InferType::Bool) => Ok(()),
             (a, b) => Err(Error {
                 file: file.to_string(),
                 message: format!(
@@ -3327,6 +3377,7 @@ impl Subst {
                 inner: Box::new(self.finalize(&inner)),
                 mutable,
             },
+            InferType::Bool => RType::Bool,
         }
     }
 }
@@ -4196,7 +4247,41 @@ fn check_expr_inner(ctx: &mut CheckCtx, expr: &Expr) -> Result<InferType, Error>
         ExprKind::Unsafe(block) => check_block_expr(ctx, block.as_ref()),
         ExprKind::Block(block) => check_block_expr(ctx, block.as_ref()),
         ExprKind::MethodCall(mc) => check_method_call(ctx, mc, expr),
+        ExprKind::BoolLit(_) => Ok(InferType::Bool),
+        ExprKind::If(if_expr) => check_if_expr(ctx, if_expr, expr),
     }
+}
+
+// `if cond { … } else { … }` — cond must be `bool`, the two arms'
+// tail types unify, and the if-expression takes that type. Both arms
+// are required (no unit type yet, so neither arm can be tail-less).
+fn check_if_expr(
+    ctx: &mut CheckCtx,
+    if_expr: &crate::ast::IfExpr,
+    outer: &Expr,
+) -> Result<InferType, Error> {
+    let cond_ty = check_expr_inner(ctx, &if_expr.cond)?;
+    ctx.subst.unify(
+        &cond_ty,
+        &InferType::Bool,
+        ctx.traits,
+        &ctx.type_params,
+        &ctx.type_param_bounds,
+        &if_expr.cond.span,
+        ctx.current_file,
+    )?;
+    let then_ty = check_block_expr(ctx, if_expr.then_block.as_ref())?;
+    let else_ty = check_block_expr(ctx, if_expr.else_block.as_ref())?;
+    ctx.subst.unify(
+        &then_ty,
+        &else_ty,
+        ctx.traits,
+        &ctx.type_params,
+        &ctx.type_param_bounds,
+        &outer.span,
+        ctx.current_file,
+    )?;
+    Ok(then_ty)
 }
 
 // `recv.method(args)` resolution. Type-check the receiver, peel one layer of

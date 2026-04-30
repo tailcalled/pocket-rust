@@ -179,6 +179,7 @@ pub struct Expr {
 #[derive(Clone)]
 pub enum ExprKind {
     IntLit(u64),
+    BoolLit(bool),
     Call(Call),
     Var(String),
     StructLit(StructLit),
@@ -189,6 +190,14 @@ pub enum ExprKind {
     Unsafe(Box<Block>),
     Block(Box<Block>),
     MethodCall(MethodCall),
+    If(IfExpr),
+}
+
+#[derive(Clone)]
+pub struct IfExpr {
+    pub cond: Box<Expr>,
+    pub then_block: Box<Block>,
+    pub else_block: Box<Block>,
 }
 
 #[derive(Clone)]

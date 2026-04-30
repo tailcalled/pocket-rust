@@ -1034,3 +1034,48 @@ fn move_through_struct_field_borrow_is_rejected() {
     );
 }
 
+#[test]
+fn if_condition_must_be_bool() {
+    let err = compile_source("fn answer() -> u32 { if 1 { 1 } else { 2 } }");
+    assert!(
+        err.contains("bool") || err.contains("type mismatch"),
+        "expected non-bool condition error, got: {}",
+        err
+    );
+}
+
+#[test]
+fn if_arms_must_unify() {
+    let err = compile_source(
+        "fn answer() -> u32 { if true { 1u32 as u32 } else { 0u64 as u64 } }",
+    );
+    assert!(
+        err.contains("type mismatch") || err.contains("expected"),
+        "expected arm-mismatch error, got: {}",
+        err
+    );
+}
+
+#[test]
+fn read_after_maybe_moved_in_if_is_rejected() {
+    // Drop binding moved in then-arm only; reading after the if is a
+    // read of a MaybeMoved place, which borrowck rejects.
+    let err = compile_source(
+        "struct L { p: *mut u32 }\n\
+         impl Drop for L { fn drop(&mut self) { unsafe { *self.p = 1; } } }\n\
+         fn take(_l: L) -> u32 { 0 }\n\
+         fn answer() -> u32 {\n\
+             let mut c: u32 = 5;\n\
+             let l: L = L { p: &mut c as *mut u32 };\n\
+             let _v: u32 = if true { take(l) } else { 0 };\n\
+             let _x: L = l;\n\
+             0\n\
+         }",
+    );
+    assert!(
+        err.contains("moved") || err.contains("already"),
+        "expected read-after-MaybeMoved error, got: {}",
+        err
+    );
+}
+

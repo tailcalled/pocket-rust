@@ -127,7 +127,7 @@ fn walk_block(state: &mut SafeState, block: &Block) -> Result<(), Error> {
 
 fn walk_expr(state: &mut SafeState, expr: &Expr) -> Result<(), Error> {
     match &expr.kind {
-        ExprKind::IntLit(_) | ExprKind::Var(_) => Ok(()),
+        ExprKind::IntLit(_) | ExprKind::BoolLit(_) | ExprKind::Var(_) => Ok(()),
         ExprKind::Borrow { inner, .. } => walk_expr(state, inner),
         ExprKind::Cast { inner, .. } => walk_expr(state, inner),
         ExprKind::Deref(inner) => {
@@ -158,6 +158,12 @@ fn walk_expr(state: &mut SafeState, expr: &Expr) -> Result<(), Error> {
             state.in_unsafe = true;
             walk_block(state, block.as_ref())?;
             state.in_unsafe = saved;
+            Ok(())
+        }
+        ExprKind::If(if_expr) => {
+            walk_expr(state, &if_expr.cond)?;
+            walk_block(state, if_expr.then_block.as_ref())?;
+            walk_block(state, if_expr.else_block.as_ref())?;
             Ok(())
         }
     }

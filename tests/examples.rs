@@ -520,3 +520,86 @@ fn trait_decl_and_impl_compiles() {
 fn lifetime_combined_returns_42() {
     expect_answer("lifetime_combined", 42i32);
 }
+
+// Booleans + if-expression: `if b { 1 } else { 2 }` with `b: bool`.
+// Verifies bool literal codegen, the wasm if/else block, and bool
+// flow through a function parameter.
+#[test]
+fn bool_if_returns_1() {
+    expect_answer("bool_if", 1i32);
+}
+
+// Multi-value `if` result: a u128 flattens to two i64s, so the
+// wasm if/else block must reference a registered FuncType (no
+// params, two i64 results) by typeidx. Codegen registers it on
+// the fly via `pending_types`, drained into wasm_mod.types at
+// function-emit-end. Returns 42u128 = (low=42, high=0).
+#[test]
+fn if_returns_u128() {
+    expect_answer("if_returns_u128", (42i64, 0i64));
+}
+
+// Multi-value `if` returning a struct that flattens to (i32, i64).
+// Same typeidx-registration path as u128, with mixed valtypes.
+// Picks the then-arm (`b=true`); reads `p.b` = 9000000000.
+#[test]
+fn if_returns_struct() {
+    expect_answer("if_returns_struct", 9_000_000_000i64);
+}
+
+// Conditional Drop: `l: Logger` is moved into `consume(l)` in the
+// then-arm but not the else-arm. Borrowck records its post-merge
+// status as MaybeMoved; codegen allocates a runtime drop flag,
+// initialized to 1 at l's let-stmt, cleared to 0 at the move site.
+// The fn-end drop checks the flag — when b=true (the move arm)
+// the outer drop is skipped, so total drops = 1 (the one inside
+// `consume`). After 1 drop: sink := original counter = 5, counter
+// := 1. Without flags this would be 2 drops; second drop sets
+// sink := 1 (current counter), so the answer would be 1.
+#[test]
+fn if_conditional_drop_returns_5() {
+    expect_answer("if_conditional_drop", 5u32);
+}
+
+// Drop binding moved in BOTH arms — borrowck's intersection rule
+// gives final status `Moved` (not MaybeMoved). Codegen skips the
+// outer drop entirely (no flag needed). Drops total = 1 (inside
+// consume). sink ends up = 5 (original counter).
+#[test]
+fn if_drop_moved_in_both_returns_5() {
+    expect_answer("if_drop_moved_in_both", 5u32);
+}
+
+// Drop binding moved in NEITHER arm — status is `Init` post-merge.
+// Codegen drops unconditionally at the binding's scope-end (no
+// flag). Drops total = 1 (the outer one). sink ends up = 5.
+#[test]
+fn if_drop_moved_in_neither_returns_5() {
+    expect_answer("if_drop_moved_in_neither", 5u32);
+}
+
+// Borrows flow through if-tail. Both arms produce `&'a u32`; the
+// if-expression's value carries the union of arm borrows so the
+// caller's let-binding correctly tracks borrows on both possible
+// sources.
+#[test]
+fn if_returns_borrow_returns_42() {
+    expect_answer("if_returns_borrow", 42i32);
+}
+
+// Generic `T` flowing through an if. `pick<T>(b, x, y) -> T` walks
+// polymorphically; codegen monomorphizes per call site. The if's
+// result type is `Param("T")`, which substitutes to `u32` here —
+// single-scalar at mono time, so the BlockType is `Single(I32)`.
+#[test]
+fn if_generic_t_returns_42() {
+    expect_answer("if_generic_t", 42i32);
+}
+
+// Same generic if-pick, but monomorphized to `u128` — which
+// flattens to (i64, i64). Verifies the multi-value typeidx path
+// fires correctly when generic substitution lands on a wide type.
+#[test]
+fn if_generic_t_u128_returns_42() {
+    expect_answer("if_generic_t_u128", (42i64, 0i64));
+}

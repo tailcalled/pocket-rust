@@ -4,9 +4,9 @@ use crate::ast::{
 };
 use crate::span::{Error, Span};
 use crate::typeck::{
-    CallResolution, FuncTable, MethodResolution, RType, ReceiverAdjust, StructTable, TraitTable,
-    clone_path, find_lifetime_source, func_lookup, is_copy_with_bounds, path_eq, rtype_clone,
-    template_lookup,
+    CallResolution, FuncTable, MethodResolution, MoveStatus, MovedPlace, RType, ReceiverAdjust,
+    StructTable, TraitTable, clone_path, find_lifetime_source, func_lookup, is_copy_with_bounds,
+    path_eq, rtype_clone, template_lookup,
 };
 
 pub fn check(
@@ -129,7 +129,8 @@ fn check_function(
     // Walk the body using an immutable view of `funcs`; capture state.moved
     // from the resulting BorrowState, then drop the view so we can mutate
     // `funcs` to write back the moved snapshot (T4.6).
-    let moved: Vec<Vec<String>>;
+    let moved: Vec<MovedPlace>;
+    let move_sites: Vec<(crate::ast::NodeId, String)>;
     {
         let funcs_ro: &FuncTable = &*funcs;
         // The function may be a regular entry or a generic template — peel both.
@@ -172,6 +173,7 @@ fn check_function(
         let mut state = BorrowState {
             holders: Vec::new(),
             moved: Vec::new(),
+            move_sites: Vec::new(),
             expr_types,
             method_resolutions,
             call_resolutions,
@@ -199,14 +201,17 @@ fn check_function(
 
         walk_stmts_and_tail(&mut state, &func.body)?;
         moved = state.moved;
+        move_sites = state.move_sites;
     }
 
-    // Snapshot moved places onto the function's metadata so codegen can skip
-    // the implicit scope-end drop for any binding that ended up moved.
+    // Snapshot moved places + move-sites onto the function's metadata so
+    // codegen knows what status each binding had at scope-end and where
+    // the moves happened (for drop-flag clearing).
     let mut k = 0;
     while k < funcs.entries.len() {
         if path_eq(&funcs.entries[k].path, &full) {
             funcs.entries[k].moved_places = moved;
+            funcs.entries[k].move_sites = move_sites;
             return Ok(());
         }
         k += 1;
@@ -215,6 +220,7 @@ fn check_function(
     while k < funcs.templates.len() {
         if path_eq(&funcs.templates[k].path, &full) {
             funcs.templates[k].moved_places = moved;
+            funcs.templates[k].move_sites = move_sites;
             return Ok(());
         }
         k += 1;
@@ -229,8 +235,18 @@ struct BorrowState<'a> {
     // or is a synthetic call slot (None name). Each holder records the
     // borrows it currently keeps alive (a list of place paths).
     holders: Vec<Holder>,
-    // Permanent set of moved places (function-wide).
-    moved: Vec<Vec<String>>,
+    // Move state per place: each entry says "this place is moved (or
+    // maybe-moved) right now." Reads of any such place are rejected.
+    // Only Moved appears in straight-line code; MaybeMoved comes from
+    // join points (if/else, later match/loops). The implicit Init state
+    // is "no entry."
+    moved: Vec<MovedPlace>,
+    // Whole-binding move-site annotations: `(NodeId of the Var
+    // expression, binding name)`. Codegen consults these to clear drop
+    // flags at the right point. We record every move site (whether or
+    // not the binding ends up MaybeMoved) — codegen filters by which
+    // bindings actually got flags allocated.
+    move_sites: Vec<(crate::ast::NodeId, String)>,
     // Per-NodeId resolved types/resolutions populated by typeck. Borrowck
     // looks up by `expr.id` rather than maintaining a source-DFS counter.
     expr_types: &'a Vec<Option<RType>>,
@@ -481,6 +497,19 @@ fn walk_expr_for_liveness(expr: &Expr, step: &mut u32, info: &mut Liveness) {
             // blocks (via walk_stmts_and_tail), so the two passes stay in sync.
             walk_block_for_liveness(b.as_ref(), step, info);
         }
+        ExprKind::BoolLit(_) => {}
+        ExprKind::If(if_expr) => {
+            // Condition runs first, then exactly one arm. Liveness here is
+            // conservative: we visit both arms in sequence, so a binding's
+            // last-use is `max(arm1, arm2)` — keeps it alive long enough
+            // for either path. This means a borrow created in the cond and
+            // only consumed in one arm stays live across both arms, which
+            // is correct (the borrowck walker uses snapshot/merge to track
+            // moves, but liveness GC stays conservative).
+            walk_expr_for_liveness(&if_expr.cond, step, info);
+            walk_block_for_liveness(if_expr.then_block.as_ref(), step, info);
+            walk_block_for_liveness(if_expr.else_block.as_ref(), step, info);
+        }
     }
 }
 
@@ -553,18 +582,12 @@ fn walk_assign_stmt(state: &mut BorrowState, assign: &AssignStmt) -> Result<(), 
     // which holder owns existing borrows. (This means once-borrowed-always-tied
     // for a ref binding; we can refine later.)
     let _ = desc;
-    // The assigned place is now fresh; clear any moves recorded on it or below.
-    let mut new_moved: Vec<Vec<String>> = Vec::new();
+    // The assigned place is now fresh; clear any move records on it or below.
+    let mut new_moved: Vec<MovedPlace> = Vec::new();
     let mut i = 0;
     while i < state.moved.len() {
-        if !chain_is_prefix_of(&chain, &state.moved[i]) {
-            let mut copy: Vec<String> = Vec::new();
-            let mut k = 0;
-            while k < state.moved[i].len() {
-                copy.push(state.moved[i][k].clone());
-                k += 1;
-            }
-            new_moved.push(copy);
+        if !chain_is_prefix_of(&chain, &state.moved[i].place) {
+            new_moved.push(state.moved[i].clone());
         }
         i += 1;
     }
@@ -629,7 +652,168 @@ fn walk_expr(state: &mut BorrowState, expr: &Expr) -> Result<ValueDesc, Error> {
         ExprKind::Unsafe(block) => walk_block_expr(state, block.as_ref()),
         ExprKind::Block(block) => walk_block_expr(state, block.as_ref()),
         ExprKind::MethodCall(mc) => walk_method_call(state, mc, expr.id),
+        ExprKind::BoolLit(_) => Ok(empty_desc()),
+        ExprKind::If(if_expr) => walk_if_expr(state, if_expr),
     }
+}
+
+// `if cond { … } else { … }` — walk the cond first (its borrows die
+// when the cond expression returns, since exactly one arm runs next).
+// Then walk the two arms with the same pre-state, snapshotting and
+// restoring around each. Merge the post-states: a place moved in
+// both arms stays Moved; a place moved in only one becomes MaybeMoved
+// (codegen turns those into flagged drops). The result desc unions
+// the two arms' tail borrows.
+fn walk_if_expr(
+    state: &mut BorrowState,
+    if_expr: &crate::ast::IfExpr,
+) -> Result<ValueDesc, Error> {
+    // Walk the cond as a regular sub-expression (its borrows go into a
+    // synthetic call slot that pops at the end of cond evaluation —
+    // matching how a function call evaluates its arg list).
+    let cond_call_slot = state.holders.len();
+    state.holders.push(Holder {
+        name: None,
+        rtype: None,
+        holds: Vec::new(),
+        field_holds: Vec::new(),
+    });
+    let cond_desc = walk_expr(state, &if_expr.cond)?;
+    let new = HeldBorrow_vec_from_desc(&cond_desc);
+    state.holders[cond_call_slot].holds = new;
+    state.holders.truncate(cond_call_slot);
+
+    // Snapshot the pre-arm state so we can replay the second arm cleanly.
+    let pre_moved: Vec<MovedPlace> = clone_moved_vec(&state.moved);
+    let pre_holders_len = state.holders.len();
+    let pre_holders_state: Vec<(Vec<HeldBorrow>, Vec<FieldHold>)> = snapshot_holders_state(state);
+
+    // Walk arm 1.
+    let arm1_desc = walk_block_expr(state, if_expr.then_block.as_ref())?;
+    let arm1_moved = clone_moved_vec(&state.moved);
+
+    // Restore pre-state and walk arm 2.
+    state.moved = pre_moved;
+    state.holders.truncate(pre_holders_len);
+    restore_holders_state(state, pre_holders_state);
+    let arm2_desc = walk_block_expr(state, if_expr.else_block.as_ref())?;
+    let arm2_moved = clone_moved_vec(&state.moved);
+
+    // Merge arm1 and arm2 post-states. Any place moved in both arms
+    // stays Moved (the post-state is `Moved` regardless of branch). A
+    // place in only one arm becomes MaybeMoved.
+    state.moved = merge_moved_sets(&arm1_moved, &arm2_moved);
+
+    // Holders that escaped both arms via their tail descs survived; the
+    // arm-internal holders are already gone from `state.holders` since
+    // walk_block_expr pops back to its mark. Now the if's value is the
+    // union of both arms' tail borrows. Caller (let / call slot / etc.)
+    // decides where they land.
+    let mut borrows = arm1_desc.borrows;
+    let mut k = 0;
+    while k < arm2_desc.borrows.len() {
+        borrows.push(HeldBorrow {
+            place: clone_path(&arm2_desc.borrows[k].place),
+            mutable: arm2_desc.borrows[k].mutable,
+        });
+        k += 1;
+    }
+    let mut field_borrows = arm1_desc.field_borrows;
+    let mut k = 0;
+    while k < arm2_desc.field_borrows.len() {
+        field_borrows.push(FieldHold {
+            field: clone_path(&arm2_desc.field_borrows[k].field),
+            borrows: clone_held_borrows(&arm2_desc.field_borrows[k].borrows),
+        });
+        k += 1;
+    }
+    Ok(ValueDesc { borrows, field_borrows })
+}
+
+fn HeldBorrow_vec_from_desc(desc: &ValueDesc) -> Vec<HeldBorrow> {
+    clone_held_borrows(&desc.borrows)
+}
+
+fn clone_moved_vec(v: &Vec<MovedPlace>) -> Vec<MovedPlace> {
+    let mut out: Vec<MovedPlace> = Vec::new();
+    let mut i = 0;
+    while i < v.len() {
+        out.push(v[i].clone());
+        i += 1;
+    }
+    out
+}
+
+fn snapshot_holders_state(state: &BorrowState) -> Vec<(Vec<HeldBorrow>, Vec<FieldHold>)> {
+    let mut out: Vec<(Vec<HeldBorrow>, Vec<FieldHold>)> = Vec::new();
+    let mut i = 0;
+    while i < state.holders.len() {
+        out.push((
+            clone_held_borrows(&state.holders[i].holds),
+            clone_field_holds(&state.holders[i].field_holds),
+        ));
+        i += 1;
+    }
+    out
+}
+
+fn restore_holders_state(
+    state: &mut BorrowState,
+    saved: Vec<(Vec<HeldBorrow>, Vec<FieldHold>)>,
+) {
+    let mut i = 0;
+    while i < saved.len() && i < state.holders.len() {
+        state.holders[i].holds = saved[i].0.iter().map(|b| HeldBorrow {
+            place: clone_path(&b.place),
+            mutable: b.mutable,
+        }).collect();
+        state.holders[i].field_holds = clone_field_holds(&saved[i].1);
+        i += 1;
+    }
+}
+
+// Merge two post-arm move sets. A place is `Moved` in the merge iff it
+// was Moved in both arms; `MaybeMoved` if it's in exactly one (or is
+// MaybeMoved in either and present in the other in some form). This is
+// the join point for control-flow.
+fn merge_moved_sets(a: &Vec<MovedPlace>, b: &Vec<MovedPlace>) -> Vec<MovedPlace> {
+    let mut out: Vec<MovedPlace> = Vec::new();
+    let mut i = 0;
+    while i < a.len() {
+        let in_b = find_place(b, &a[i].place);
+        let merged_status = match (&a[i].status, in_b) {
+            (MoveStatus::Moved, Some(MoveStatus::Moved)) => MoveStatus::Moved,
+            _ => MoveStatus::MaybeMoved,
+        };
+        out.push(MovedPlace {
+            place: clone_path(&a[i].place),
+            status: merged_status,
+        });
+        i += 1;
+    }
+    let mut j = 0;
+    while j < b.len() {
+        if find_place(a, &b[j].place).is_none() {
+            // Only in b → MaybeMoved (a's path is implicitly Init).
+            out.push(MovedPlace {
+                place: clone_path(&b[j].place),
+                status: MoveStatus::MaybeMoved,
+            });
+        }
+        j += 1;
+    }
+    out
+}
+
+fn find_place(set: &Vec<MovedPlace>, place: &Vec<String>) -> Option<MoveStatus> {
+    let mut i = 0;
+    while i < set.len() {
+        if path_eq(&set[i].place, place) {
+            return Some(set[i].status.clone());
+        }
+        i += 1;
+    }
+    None
 }
 
 fn walk_method_call(
@@ -762,10 +946,10 @@ fn walk_synth_borrow(
             return Ok(Vec::new());
         }
     };
-    // Check it hasn't been moved.
+    // Check it hasn't been moved (or maybe-moved on some path).
     let mut i = 0;
     while i < state.moved.len() {
-        if paths_share_prefix(&state.moved[i], &place) {
+        if paths_share_prefix(&state.moved[i].place, &place) {
             return Err(Error {
                 file: state.file.clone(),
                 message: format!(
@@ -808,7 +992,7 @@ fn walk_var(state: &mut BorrowState, name: &str, expr: &Expr) -> Result<ValueDes
             // evaluation.
             let mut taken: Vec<HeldBorrow> = Vec::new();
             std::mem::swap(&mut taken, &mut state.holders[idx].holds);
-            state.moved.push(place);
+            state.moved.push(MovedPlace { place, status: MoveStatus::Moved });
             Ok(ValueDesc { borrows: taken, field_borrows: Vec::new() })
         } else {
             // `&T` is Copy: cloning the borrow handle is fine.
@@ -835,6 +1019,8 @@ fn walk_var(state: &mut BorrowState, name: &str, expr: &Expr) -> Result<ValueDes
         let mut place: Vec<String> = Vec::new();
         place.push(name.to_string());
         try_move(state, place, expr.span.copy())?;
+        // Record the move site so codegen can clear the drop flag.
+        state.move_sites.push((expr.id, name.to_string()));
         let mut taken: Vec<FieldHold> = Vec::new();
         std::mem::swap(&mut taken, &mut state.holders[idx].field_holds);
         Ok(ValueDesc {
@@ -1168,7 +1354,7 @@ fn walk_borrow(state: &mut BorrowState, expr: &Expr) -> Result<ValueDesc, Error>
             // Refuse to borrow a place whose root has already been moved.
             let mut i = 0;
             while i < state.moved.len() {
-                if paths_share_prefix(&state.moved[i], &place) {
+                if paths_share_prefix(&state.moved[i].place, &place) {
                     return Err(Error {
                         file: state.file.clone(),
                         message: format!(
@@ -1315,7 +1501,7 @@ fn check_not_moved(
 ) -> Result<(), Error> {
     let mut i = 0;
     while i < state.moved.len() {
-        if paths_share_prefix(&state.moved[i], place) {
+        if paths_share_prefix(&state.moved[i].place, place) {
             return Err(Error {
                 file: state.file.clone(),
                 message: format!("`{}` was already moved", place_to_string(place)),
@@ -1352,7 +1538,7 @@ fn try_move(state: &mut BorrowState, place: Vec<String>, span: Span) -> Result<(
     }
     let mut i = 0;
     while i < state.moved.len() {
-        if paths_share_prefix(&state.moved[i], &place) {
+        if paths_share_prefix(&state.moved[i].place, &place) {
             return Err(Error {
                 file: state.file.clone(),
                 message: format!("`{}` was already moved", place_to_string(&place)),
@@ -1401,7 +1587,7 @@ fn try_move(state: &mut BorrowState, place: Vec<String>, span: Span) -> Result<(
         }
         h += 1;
     }
-    state.moved.push(place);
+    state.moved.push(MovedPlace { place, status: MoveStatus::Moved });
     Ok(())
 }
 

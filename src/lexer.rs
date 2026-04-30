@@ -19,6 +19,10 @@ pub enum TokenKind {
     For,
     SelfLower,
     SelfUpper,
+    If,
+    Else,
+    True,
+    False,
     LAngle,
     RAngle,
     Ident(String),
@@ -56,6 +60,10 @@ pub fn token_kind_name(t: &TokenKind) -> &'static str {
         TokenKind::For => "`for`",
         TokenKind::SelfLower => "`self`",
         TokenKind::SelfUpper => "`Self`",
+        TokenKind::If => "`if`",
+        TokenKind::Else => "`else`",
+        TokenKind::True => "`true`",
+        TokenKind::False => "`false`",
         TokenKind::LAngle => "`<`",
         TokenKind::RAngle => "`>`",
         TokenKind::Ident(_) => "identifier",
@@ -168,6 +176,26 @@ pub fn tokenize(file: &str, source: &str) -> Result<Vec<Token>, Error> {
             } else if text == "Self" {
                 tokens.push(Token {
                     kind: TokenKind::SelfUpper,
+                    span,
+                });
+            } else if text == "if" {
+                tokens.push(Token {
+                    kind: TokenKind::If,
+                    span,
+                });
+            } else if text == "else" {
+                tokens.push(Token {
+                    kind: TokenKind::Else,
+                    span,
+                });
+            } else if text == "true" {
+                tokens.push(Token {
+                    kind: TokenKind::True,
+                    span,
+                });
+            } else if text == "false" {
+                tokens.push(Token {
+                    kind: TokenKind::False,
                     span,
                 });
             } else {

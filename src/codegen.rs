@@ -178,11 +178,29 @@ struct FnCtx<'a> {
     method_resolutions: Vec<Option<MethodResolution>>,
     call_resolutions: Vec<Option<CallResolution>>,
     self_target: Option<RType>,
-    // T4.6: place paths that borrowck observed as moved during this
-    // function's body walk. emit_drops_for_locals_range consults this to
-    // skip the implicit scope-end drop for any binding whose root path
-    // shows up here as a single-segment entry — only the new owner drops.
-    moved_places: Vec<Vec<String>>,
+    // T4.6: borrowck's snapshot of every place whose move-state at scope
+    // end was non-Init (Moved or MaybeMoved). emit_drops_for_locals_range
+    // looks up each Drop binding's name as a single-segment entry — Moved
+    // means skip the drop entirely; MaybeMoved (later) means a flagged
+    // drop. A binding not present at all is `Init` and drops unconditionally.
+    moved_places: Vec<crate::typeck::MovedPlace>,
+    // Move-site annotations from borrowck: at each (NodeId, binding-name)
+    // pair, the named binding's whole-binding storage is consumed. Used
+    // to clear drop flags for MaybeMoved bindings.
+    move_sites: Vec<(crate::ast::NodeId, String)>,
+    // For each binding name that ended up MaybeMoved at scope-end and
+    // is Drop-typed, the wasm local idx of its drop flag (an i32 holding
+    // 1=needs-drop, 0=already-moved). Init = 1 at decl, cleared to 0 at
+    // each move site, gates the scope-end drop call.
+    drop_flags: Vec<(String, u32)>,
+    // Multi-value `if` results need a registered FuncType. We don't hold
+    // `&mut wasm::Module` directly (would conflict with the post-body
+    // `wasm_mod.code.push`); instead we accumulate pending FuncTypes
+    // here and append them to `wasm_mod.types` at function-emit-end.
+    // `pending_types_base` is `wasm_mod.types.len()` at FnCtx
+    // construction, so a pending entry's typeidx is `base + idx_in_pending`.
+    pending_types: Vec<wasm::FuncType>,
+    pending_types_base: u32,
     // Substitution map for the current monomorphization (empty for non-generic
     // functions). Walks of `Cast` and inner `Generic` callee resolutions apply
     // this env to lower `Param("T")` to concrete RTypes.
@@ -259,6 +277,12 @@ fn collect_leaves(
         RType::Param(_) => {
             unreachable!("collect_leaves on unresolved type parameter — codegen should substitute first");
         }
+        RType::Bool => out.push(MemLeaf {
+            byte_offset: base_offset,
+            byte_size: 1,
+            signed: false,
+            valtype: wasm::ValType::I32,
+        }),
     }
 }
 
@@ -406,7 +430,12 @@ fn walk_expr_drop_marks(
         ExprKind::Cast { inner, .. } => {
             walk_expr_drop_marks(inner, expr_types, traits, info);
         }
-        ExprKind::IntLit(_) | ExprKind::Var(_) => {}
+        ExprKind::IntLit(_) | ExprKind::BoolLit(_) | ExprKind::Var(_) => {}
+        ExprKind::If(if_expr) => {
+            walk_expr_drop_marks(&if_expr.cond, expr_types, traits, info);
+            walk_block_drop_marks(if_expr.then_block.as_ref(), expr_types, traits, info);
+            walk_block_drop_marks(if_expr.else_block.as_ref(), expr_types, traits, info);
+        }
     }
 }
 
@@ -484,7 +513,12 @@ fn walk_expr_addr(
     info: &mut AddressInfo,
 ) {
     match &expr.kind {
-        ExprKind::IntLit(_) | ExprKind::Var(_) => {}
+        ExprKind::IntLit(_) | ExprKind::BoolLit(_) | ExprKind::Var(_) => {}
+        ExprKind::If(if_expr) => {
+            walk_expr_addr(&if_expr.cond, stack, info);
+            walk_block_addr(if_expr.then_block.as_ref(), stack, info);
+            walk_block_addr(if_expr.else_block.as_ref(), stack, info);
+        }
         ExprKind::Borrow { inner, .. } => {
             if let Some(chain) = extract_place(inner) {
                 let root = &chain[0];
@@ -673,7 +707,8 @@ fn emit_monomorphic(
     let call_resolutions = opt_call_resolutions_clone(&tmpl.call_resolutions, &env);
     // Move tracking is independent of concrete type args — the template's
     // snapshot from borrowck applies to every monomorphization.
-    let moved_places = clone_paths(&tmpl.moved_places);
+    let moved_places = clone_moved_places(&tmpl.moved_places);
+    let move_sites = clone_move_sites(&tmpl.move_sites);
     // Self target for the body: substitute the impl's stored target pattern
     // through the monomorphization env. This generalizes from the old
     // 1:1-recv-args=impl-args assumption — `impl<T> Pair<usize, T>` produces
@@ -698,6 +733,7 @@ fn emit_monomorphic(
         method_resolutions,
         call_resolutions,
         moved_places,
+        move_sites,
         env,
         tmpl.type_params.clone(),
         work.wasm_idx,
@@ -839,7 +875,12 @@ fn collect_let_value_ids(block: &Block, out: &mut Vec<u32>) {
 
 fn collect_lets_in_expr(expr: &Expr, out: &mut Vec<u32>) {
     match &expr.kind {
-        ExprKind::IntLit(_) | ExprKind::Var(_) => {}
+        ExprKind::IntLit(_) | ExprKind::BoolLit(_) | ExprKind::Var(_) => {}
+        ExprKind::If(if_expr) => {
+            collect_lets_in_expr(&if_expr.cond, out);
+            collect_let_value_ids(if_expr.then_block.as_ref(), out);
+            collect_let_value_ids(if_expr.else_block.as_ref(), out);
+        }
         ExprKind::Borrow { inner, .. } => collect_lets_in_expr(inner, out),
         ExprKind::Cast { inner, .. } => collect_lets_in_expr(inner, out),
         ExprKind::Deref(inner) => collect_lets_in_expr(inner, out),
@@ -901,7 +942,8 @@ fn emit_function(
     let expr_types = opt_vec_clone(&entry.expr_types);
     let method_resolutions = opt_method_resolutions_clone(&entry.method_resolutions, &Vec::new());
     let call_resolutions = opt_call_resolutions_clone(&entry.call_resolutions, &Vec::new());
-    let moved_places = clone_paths(&entry.moved_places);
+    let moved_places = clone_moved_places(&entry.moved_places);
+    let move_sites = clone_move_sites(&entry.move_sites);
     let wasm_idx = entry.idx;
     let is_export = current_module.is_empty() && path_prefix.len() == current_module.len();
     emit_function_concrete(
@@ -920,6 +962,7 @@ fn emit_function(
         method_resolutions,
         call_resolutions,
         moved_places,
+        move_sites,
         Vec::new(),
         Vec::new(),
         wasm_idx,
@@ -927,11 +970,23 @@ fn emit_function(
     )
 }
 
-fn clone_paths(v: &Vec<Vec<String>>) -> Vec<Vec<String>> {
-    let mut out: Vec<Vec<String>> = Vec::new();
+fn clone_moved_places(v: &Vec<crate::typeck::MovedPlace>) -> Vec<crate::typeck::MovedPlace> {
+    let mut out: Vec<crate::typeck::MovedPlace> = Vec::new();
     let mut i = 0;
     while i < v.len() {
-        out.push(clone_path(&v[i]));
+        out.push(v[i].clone());
+        i += 1;
+    }
+    out
+}
+
+fn clone_move_sites(
+    v: &Vec<(crate::ast::NodeId, String)>,
+) -> Vec<(crate::ast::NodeId, String)> {
+    let mut out: Vec<(crate::ast::NodeId, String)> = Vec::new();
+    let mut i = 0;
+    while i < v.len() {
+        out.push((v[i].0, v[i].1.clone()));
         i += 1;
     }
     out
@@ -952,7 +1007,8 @@ fn emit_function_concrete(
     expr_types: Vec<Option<RType>>,
     method_resolutions: Vec<Option<MethodResolution>>,
     call_resolutions: Vec<Option<CallResolution>>,
-    moved_places: Vec<Vec<String>>,
+    moved_places: Vec<crate::typeck::MovedPlace>,
+    move_sites: Vec<(crate::ast::NodeId, String)>,
     env: Vec<(String, RType)>,
     type_params: Vec<String>,
     wasm_idx: u32,
@@ -1078,6 +1134,10 @@ fn emit_function_concrete(
         call_resolutions,
         self_target: self_target.map(|rt| rtype_clone(rt)),
         moved_places,
+        move_sites,
+        drop_flags: Vec::new(),
+        pending_types: Vec::new(),
+        pending_types_base: wasm_mod.types.len() as u32,
         env,
         type_params,
         mono,
@@ -1122,6 +1182,23 @@ fn emit_function_concrete(
             wasm_local_cursor += flat_size;
             p += 1;
         }
+    }
+
+    // Allocate drop flags for any param that's MaybeMoved at scope-end.
+    // Init = 1 (param always initialized at fn entry).
+    let mut p = 0;
+    while p < func.params.len() {
+        let local_name = ctx.locals[p].name.clone();
+        let rt = rtype_clone(&ctx.locals[p].rtype);
+        if needs_drop_flag(&ctx.moved_places, &local_name, &rt, ctx.traits) {
+            let flag_idx = ctx.next_wasm_local;
+            ctx.extra_locals.push(wasm::ValType::I32);
+            ctx.next_wasm_local += 1;
+            ctx.drop_flags.push((local_name, flag_idx));
+            ctx.instructions.push(wasm::Instruction::I32Const(1));
+            ctx.instructions.push(wasm::Instruction::LocalSet(flag_idx));
+        }
+        p += 1;
     }
 
     codegen_block(&mut ctx, &func.body)?;
@@ -1179,6 +1256,12 @@ fn emit_function_concrete(
             .push(wasm::Instruction::GlobalSet(SP_GLOBAL));
     }
 
+    // Drain any FuncTypes that codegen registered for multi-value if-blocks.
+    // They were assigned typeidx = pending_types_base + position, so appending
+    // them now (in order) makes those typeidxs correct in the final module.
+    while !ctx.pending_types.is_empty() {
+        wasm_mod.types.push(ctx.pending_types.remove(0));
+    }
     let body = wasm::FuncBody {
         locals: ctx.extra_locals,
         instructions: ctx.instructions,
@@ -1262,10 +1345,24 @@ fn emit_drops_for_locals_range(ctx: &mut FnCtx, from: usize, to: usize) -> Resul
         if !matches!(&ctx.locals[i].storage, Storage::Memory { .. }) {
             continue;
         }
-        if binding_was_moved(&ctx.moved_places, &ctx.locals[i].name) {
-            continue;
+        match binding_move_status(&ctx.moved_places, &ctx.locals[i].name) {
+            Some(crate::typeck::MoveStatus::Moved) => continue,
+            Some(crate::typeck::MoveStatus::MaybeMoved) => {
+                // Flagged drop: `if flag { drop }; end`. The flag was
+                // initialized to 1 at decl, cleared to 0 at every move
+                // site walked through this path, so it correctly
+                // reflects whether the storage still owns its value.
+                let flag_idx = lookup_drop_flag(&ctx.drop_flags, &ctx.locals[i].name)
+                    .expect("MaybeMoved binding must have an allocated drop flag");
+                ctx.instructions.push(wasm::Instruction::LocalGet(flag_idx));
+                ctx.instructions.push(wasm::Instruction::If(wasm::BlockType::Empty));
+                emit_drop_call_for_local(ctx, i, &rt)?;
+                ctx.instructions.push(wasm::Instruction::End);
+            }
+            None => {
+                emit_drop_call_for_local(ctx, i, &rt)?;
+            }
         }
-        emit_drop_call_for_local(ctx, i, &rt)?;
     }
     Ok(())
 }
@@ -1276,15 +1373,22 @@ fn emit_drops_for_locals_range(ctx: &mut FnCtx, from: usize, to: usize) -> Resul
 // (length > 1) leave the parent partially valid; for non-Drop types
 // codegen still emits no drop, and for Drop types borrowck rejects the
 // partial move outright.
-fn binding_was_moved(moved_places: &Vec<Vec<String>>, name: &str) -> bool {
+// Returns the recorded move-status for `name` if it shows up as a
+// single-segment whole-binding entry, or None if it's `Init`. This is
+// what `emit_drops_for_locals_range` consults to choose between an
+// unconditional drop, a skipped drop, or (later) a flagged drop.
+fn binding_move_status(
+    moved_places: &Vec<crate::typeck::MovedPlace>,
+    name: &str,
+) -> Option<crate::typeck::MoveStatus> {
     let mut i = 0;
     while i < moved_places.len() {
-        if moved_places[i].len() == 1 && moved_places[i][0] == name {
-            return true;
+        if moved_places[i].place.len() == 1 && moved_places[i].place[0] == name {
+            return Some(moved_places[i].status.clone());
         }
         i += 1;
     }
-    false
+    None
 }
 
 fn emit_drop_call_for_local(
@@ -1355,7 +1459,7 @@ fn codegen_let_stmt(ctx: &mut FnCtx, let_stmt: &LetStmt) -> Result<(), Error> {
             store_flat_to_memory(ctx, &value_ty, BaseAddr::StackPointer, frame_offset);
             ctx.locals.push(LocalBinding {
                 name: let_stmt.name.clone(),
-                rtype: value_ty,
+                rtype: rtype_clone(&value_ty),
                 storage: Storage::Memory { frame_offset },
             });
         }
@@ -1379,7 +1483,7 @@ fn codegen_let_stmt(ctx: &mut FnCtx, let_stmt: &LetStmt) -> Result<(), Error> {
             }
             ctx.locals.push(LocalBinding {
                 name: let_stmt.name.clone(),
-                rtype: value_ty,
+                rtype: rtype_clone(&value_ty),
                 storage: Storage::Local {
                     wasm_start: start,
                     flat_size,
@@ -1387,7 +1491,40 @@ fn codegen_let_stmt(ctx: &mut FnCtx, let_stmt: &LetStmt) -> Result<(), Error> {
             });
         }
     }
+    // If this binding ends up MaybeMoved at scope-end, allocate its drop
+    // flag now and init to 1 (the value just landed in storage).
+    if needs_drop_flag(&ctx.moved_places, &let_stmt.name, &value_ty, ctx.traits) {
+        let flag_idx = ctx.next_wasm_local;
+        ctx.extra_locals.push(wasm::ValType::I32);
+        ctx.next_wasm_local += 1;
+        ctx.drop_flags.push((let_stmt.name.clone(), flag_idx));
+        ctx.instructions.push(wasm::Instruction::I32Const(1));
+        ctx.instructions.push(wasm::Instruction::LocalSet(flag_idx));
+    }
     Ok(())
+}
+
+fn needs_drop_flag(
+    moved_places: &Vec<crate::typeck::MovedPlace>,
+    name: &str,
+    rt: &RType,
+    traits: &crate::typeck::TraitTable,
+) -> bool {
+    if !crate::typeck::is_drop(rt, traits) {
+        return false;
+    }
+    let mut i = 0;
+    while i < moved_places.len() {
+        let mp = &moved_places[i];
+        if mp.place.len() == 1
+            && mp.place[0] == name
+            && matches!(mp.status, crate::typeck::MoveStatus::MaybeMoved)
+        {
+            return true;
+        }
+        i += 1;
+    }
+    false
 }
 
 fn codegen_assign_stmt(ctx: &mut FnCtx, assign: &AssignStmt) -> Result<(), Error> {
@@ -1660,7 +1797,7 @@ fn codegen_expr(ctx: &mut FnCtx, expr: &Expr) -> Result<RType, Error> {
             emit_int_lit(ctx, &ty, *n);
             Ok(ty)
         }
-        ExprKind::Var(name) => codegen_var(ctx, name),
+        ExprKind::Var(name) => codegen_var(ctx, name, expr.id),
         ExprKind::Call(call) => codegen_call(ctx, call, expr.id),
         ExprKind::StructLit(lit) => codegen_struct_lit(ctx, lit, expr.id),
         ExprKind::FieldAccess(fa) => codegen_field_access(ctx, fa),
@@ -1689,7 +1826,112 @@ fn codegen_expr(ctx: &mut FnCtx, expr: &Expr) -> Result<RType, Error> {
         ExprKind::Unsafe(block) => codegen_block_expr(ctx, block.as_ref()),
         ExprKind::Block(block) => codegen_block_expr(ctx, block.as_ref()),
         ExprKind::MethodCall(mc) => codegen_method_call(ctx, mc, expr.id),
+        ExprKind::BoolLit(b) => {
+            ctx.instructions.push(wasm::Instruction::I32Const(if *b { 1 } else { 0 }));
+            Ok(RType::Bool)
+        }
+        ExprKind::If(if_expr) => codegen_if_expr(ctx, if_expr, expr.id),
     }
+}
+
+fn codegen_if_expr(
+    ctx: &mut FnCtx,
+    if_expr: &crate::ast::IfExpr,
+    if_node_id: crate::ast::NodeId,
+) -> Result<RType, Error> {
+    // Evaluate the condition (an i32 0/1) onto the stack.
+    let _ = codegen_expr(ctx, &if_expr.cond)?;
+    let result_ty = rtype_clone(
+        ctx.expr_types[if_node_id as usize]
+            .as_ref()
+            .expect("typeck recorded the if's type"),
+    );
+    let mut flat: Vec<wasm::ValType> = Vec::new();
+    crate::typeck::flatten_rtype(&result_ty, ctx.structs, &mut flat);
+    let bt = match flat.len() {
+        0 => wasm::BlockType::Empty,
+        1 => wasm::BlockType::Single(val_type_copy(&flat[0])),
+        _ => {
+            // Multi-value `if` — register a FuncType (no params, these
+            // results) and refer to it by index. We dedupe against
+            // `ctx.pending_types`, then return base + idx so the typeidx
+            // is correct after pending types are appended to
+            // `wasm_mod.types` at function-emit-end.
+            let ft = wasm::FuncType {
+                params: Vec::new(),
+                results: copy_val_type_vec(&flat),
+            };
+            let mut found: Option<u32> = None;
+            let mut k = 0;
+            while k < ctx.pending_types.len() {
+                if func_type_eq(&ctx.pending_types[k], &ft) {
+                    found = Some(ctx.pending_types_base + k as u32);
+                    break;
+                }
+                k += 1;
+            }
+            let idx = match found {
+                Some(i) => i,
+                None => {
+                    let i = ctx.pending_types_base + ctx.pending_types.len() as u32;
+                    ctx.pending_types.push(ft);
+                    i
+                }
+            };
+            wasm::BlockType::TypeIdx(idx)
+        }
+    };
+    ctx.instructions.push(wasm::Instruction::If(bt));
+    let _ = codegen_block_expr(ctx, if_expr.then_block.as_ref())?;
+    ctx.instructions.push(wasm::Instruction::Else);
+    let _ = codegen_block_expr(ctx, if_expr.else_block.as_ref())?;
+    ctx.instructions.push(wasm::Instruction::End);
+    Ok(result_ty)
+}
+
+fn val_type_copy(vt: &wasm::ValType) -> wasm::ValType {
+    match vt {
+        wasm::ValType::I32 => wasm::ValType::I32,
+        wasm::ValType::I64 => wasm::ValType::I64,
+    }
+}
+
+fn copy_val_type_vec(v: &Vec<wasm::ValType>) -> Vec<wasm::ValType> {
+    let mut out: Vec<wasm::ValType> = Vec::new();
+    let mut i = 0;
+    while i < v.len() {
+        out.push(val_type_copy(&v[i]));
+        i += 1;
+    }
+    out
+}
+
+fn func_type_eq(a: &wasm::FuncType, b: &wasm::FuncType) -> bool {
+    if a.params.len() != b.params.len() || a.results.len() != b.results.len() {
+        return false;
+    }
+    let mut i = 0;
+    while i < a.params.len() {
+        if !val_type_struct_eq(&a.params[i], &b.params[i]) {
+            return false;
+        }
+        i += 1;
+    }
+    let mut i = 0;
+    while i < a.results.len() {
+        if !val_type_struct_eq(&a.results[i], &b.results[i]) {
+            return false;
+        }
+        i += 1;
+    }
+    true
+}
+
+fn val_type_struct_eq(a: &wasm::ValType, b: &wasm::ValType) -> bool {
+    matches!(
+        (a, b),
+        (wasm::ValType::I32, wasm::ValType::I32) | (wasm::ValType::I64, wasm::ValType::I64)
+    )
 }
 
 fn codegen_method_call(
@@ -2115,7 +2357,7 @@ fn codegen_block_expr(ctx: &mut FnCtx, block: &Block) -> Result<RType, Error> {
     Ok(result_ty)
 }
 
-fn codegen_var(ctx: &mut FnCtx, name: &str) -> Result<RType, Error> {
+fn codegen_var(ctx: &mut FnCtx, name: &str, node_id: crate::ast::NodeId) -> Result<RType, Error> {
     let mut i = ctx.locals.len();
     while i > 0 {
         i -= 1;
@@ -2136,10 +2378,45 @@ fn codegen_var(ctx: &mut FnCtx, name: &str) -> Result<RType, Error> {
                     load_flat_from_memory(ctx, &rt, BaseAddr::StackPointer, *frame_offset);
                 }
             }
+            // If this read is recorded as a whole-binding move site for
+            // a flagged binding, clear the flag so the scope-end drop is
+            // skipped on this path.
+            if is_move_site(&ctx.move_sites, node_id, name) {
+                if let Some(flag_idx) = lookup_drop_flag(&ctx.drop_flags, name) {
+                    ctx.instructions.push(wasm::Instruction::I32Const(0));
+                    ctx.instructions.push(wasm::Instruction::LocalSet(flag_idx));
+                }
+            }
             return Ok(rt);
         }
     }
     unreachable!("typeck verified the variable exists");
+}
+
+fn is_move_site(
+    move_sites: &Vec<(crate::ast::NodeId, String)>,
+    node_id: crate::ast::NodeId,
+    name: &str,
+) -> bool {
+    let mut i = 0;
+    while i < move_sites.len() {
+        if move_sites[i].0 == node_id && move_sites[i].1 == name {
+            return true;
+        }
+        i += 1;
+    }
+    false
+}
+
+fn lookup_drop_flag(drop_flags: &Vec<(String, u32)>, name: &str) -> Option<u32> {
+    let mut i = 0;
+    while i < drop_flags.len() {
+        if drop_flags[i].0 == name {
+            return Some(drop_flags[i].1);
+        }
+        i += 1;
+    }
+    None
 }
 
 fn codegen_call(

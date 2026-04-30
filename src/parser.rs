@@ -1,7 +1,7 @@
 use crate::ast::{
-    AssignStmt, Block, Call, Expr, ExprKind, FieldAccess, FieldInit, Function, ImplBlock, LetStmt,
-    Lifetime, LifetimeParam, MethodCall, Param, Path, PathSegment, Stmt, StructDef, StructField,
-    StructLit, TraitBound, TraitDef, TraitMethodSig, Type, TypeKind, TypeParam,
+    AssignStmt, Block, Call, Expr, ExprKind, FieldAccess, FieldInit, Function, IfExpr, ImplBlock,
+    LetStmt, Lifetime, LifetimeParam, MethodCall, Param, Path, PathSegment, Stmt, StructDef,
+    StructField, StructLit, TraitBound, TraitDef, TraitMethodSig, Type, TypeKind, TypeParam,
 };
 use crate::lexer::{Token, TokenKind, token_kind_name};
 use crate::span::{Error, Pos, Span};
@@ -20,6 +20,7 @@ pub fn parse(file: &str, tokens: Vec<Token>) -> Result<Vec<RawItem>, Error> {
         tokens,
         pos: 0,
         next_node_id: 0,
+        no_struct_lit: false,
     };
     p.parse_items()
 }
@@ -30,6 +31,11 @@ struct Parser {
     pos: usize,
     // Resets at parse_function entry; captured as Function.node_count at exit.
     next_node_id: u32,
+    // When true, `path { ... }` does not parse as a struct literal — it
+    // stops at the path so the trailing `{` can open a then/else block.
+    // Set while parsing an `if` condition; cleared inside parens. Mirrors
+    // rustc's `restrictions` flag.
+    no_struct_lit: bool,
 }
 
 impl Parser {
@@ -742,6 +748,19 @@ impl Parser {
         }
         match &self.tokens[self.pos].kind {
             TokenKind::IntLit(_) => self.parse_int_lit(),
+            TokenKind::True => {
+                let span = self.tokens[self.pos].span.copy();
+                self.pos += 1;
+                let id = self.alloc_node_id();
+                Ok(Expr { kind: ExprKind::BoolLit(true), span, id })
+            }
+            TokenKind::False => {
+                let span = self.tokens[self.pos].span.copy();
+                self.pos += 1;
+                let id = self.alloc_node_id();
+                Ok(Expr { kind: ExprKind::BoolLit(false), span, id })
+            }
+            TokenKind::If => self.parse_if_expr(),
             TokenKind::Ident(_) => self.parse_path_atom(),
             TokenKind::SelfUpper => self.parse_path_atom(),
             TokenKind::SelfLower => {
@@ -758,7 +777,10 @@ impl Parser {
             TokenKind::Unsafe => self.parse_unsafe_block(),
             TokenKind::LParen => {
                 self.pos += 1;
+                let saved = self.no_struct_lit;
+                self.no_struct_lit = false;
                 let expr = self.parse_expr()?;
+                self.no_struct_lit = saved;
                 self.expect(&TokenKind::RParen, "`)`")?;
                 Ok(expr)
             }
@@ -789,6 +811,45 @@ impl Parser {
     // in a block without a trailing `;`. Right now that's just `unsafe { … }`
     // and `{ … }` — both with `tail.is_none()`.
 
+
+    // `if cond { … } else { … }` — both arms required (no unit type yet).
+    // The `else` may be another `if` (chained `else if … else …`) or a
+    // brace block. Struct literals are disallowed in the condition; wrap
+    // in parens to use them.
+    fn parse_if_expr(&mut self) -> Result<Expr, Error> {
+        let if_span = self.expect(&TokenKind::If, "`if`")?;
+        let saved = self.no_struct_lit;
+        self.no_struct_lit = true;
+        let cond = self.parse_expr()?;
+        self.no_struct_lit = saved;
+        let then_block = self.parse_block()?;
+        self.expect(&TokenKind::Else, "`else`")?;
+        let else_block = if self.peek_kind(&TokenKind::If) {
+            // Desugar `else if … else …` into a block whose tail is the
+            // chained if expression.
+            let chained = self.parse_if_expr()?;
+            let span = chained.span.copy();
+            Block {
+                stmts: Vec::new(),
+                tail: Some(chained),
+                span,
+            }
+        } else {
+            self.parse_block()?
+        };
+        let end = else_block.span.end.copy();
+        let span = Span::new(if_span.start, end);
+        let id = self.alloc_node_id();
+        Ok(Expr {
+            kind: ExprKind::If(IfExpr {
+                cond: Box::new(cond),
+                then_block: Box::new(then_block),
+                else_block: Box::new(else_block),
+            }),
+            span,
+            id,
+        })
+    }
 
     fn parse_unsafe_block(&mut self) -> Result<Expr, Error> {
         let unsafe_span = self.expect(&TokenKind::Unsafe, "`unsafe`")?;
@@ -833,7 +894,7 @@ impl Parser {
                 span,
                 id,
             })
-        } else if self.peek_kind(&TokenKind::LBrace) {
+        } else if self.peek_kind(&TokenKind::LBrace) && !self.no_struct_lit {
             let fields = self.parse_struct_init()?;
             let end = self.tokens[self.pos - 1].span.end.copy();
             let span = Span::new(path.span.start.copy(), end);
@@ -1098,6 +1159,10 @@ impl Parser {
             (TokenKind::LAngle, TokenKind::LAngle) => true,
             (TokenKind::RAngle, TokenKind::RAngle) => true,
             (TokenKind::Eq, TokenKind::Eq) => true,
+            (TokenKind::If, TokenKind::If) => true,
+            (TokenKind::Else, TokenKind::Else) => true,
+            (TokenKind::True, TokenKind::True) => true,
+            (TokenKind::False, TokenKind::False) => true,
             _ => false,
         }
     }

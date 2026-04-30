@@ -85,6 +85,27 @@ pub enum Instruction {
     I32Store8 { align: u32, offset: u32 },
     I32Store16 { align: u32, offset: u32 },
     I64Store { align: u32, offset: u32 },
+    // Structured control flow. `If(BlockType)` opens an if-block whose
+    // result is described by the BlockType; `Else` separates the two
+    // arms; `End` closes both `If` and standalone `Block`/`Loop`.
+    If(BlockType),
+    Else,
+    End,
+}
+
+// Wasm structured-control-flow block result. Three encodings, matching
+// the wasm core spec:
+//   `Empty` — no result on the stack at block end (encoded as 0x40).
+//   `Single(vt)` — exactly one scalar, inline-encoded as that valtype's
+//     byte.
+//   `TypeIdx(i)` — references a pre-registered FuncType (no params, N
+//     results), encoded as the type's signed-LEB128 index. Used for
+//     multi-value blocks (e.g. an `if` whose tail is a struct that
+//     flattens to two or more wasm scalars).
+pub enum BlockType {
+    Empty,
+    Single(ValType),
+    TypeIdx(u32),
 }
 
 impl Module {
@@ -397,6 +418,24 @@ fn encode_instruction(out: &mut Vec<u8>, inst: &Instruction) {
             write_uleb128(out, *align);
             write_uleb128(out, *offset);
         }
+        Instruction::If(bt) => {
+            out.push(0x04);
+            encode_block_type(out, bt);
+        }
+        Instruction::Else => {
+            out.push(0x05);
+        }
+        Instruction::End => {
+            out.push(0x0b);
+        }
+    }
+}
+
+fn encode_block_type(out: &mut Vec<u8>, bt: &BlockType) {
+    match bt {
+        BlockType::Empty => out.push(0x40),
+        BlockType::Single(vt) => out.push(val_type_byte(vt)),
+        BlockType::TypeIdx(i) => write_sleb128_64(out, *i as i64),
     }
 }
 
