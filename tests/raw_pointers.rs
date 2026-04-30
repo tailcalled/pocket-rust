@@ -27,6 +27,7 @@ fn load_stdlib() -> Library {
         name: "std".to_string(),
         vfs,
         entry: "lib.rs".to_string(),
+        prelude: true,
     }
 }
 

@@ -10,6 +10,7 @@ fn load_stdlib() -> Library {
         name: "std".to_string(),
         vfs,
         entry: "lib.rs".to_string(),
+        prelude: true,
     }
 }
 
@@ -38,6 +39,15 @@ fn load_dir(root: &Path, dir: &Path, vfs: &mut Vfs) {
 fn compile_source(source: &str) -> String {
     let mut vfs = Vfs::new();
     vfs.insert("lib.rs".to_string(), source.to_string());
+    let libs = vec![load_stdlib()];
+    compile(&libs, &vfs, "lib.rs").err().expect("expected error")
+}
+
+fn compile_sources(files: &[(&str, &str)]) -> String {
+    let mut vfs = Vfs::new();
+    for (name, src) in files {
+        vfs.insert((*name).to_string(), (*src).to_string());
+    }
     let libs = vec![load_stdlib()];
     compile(&libs, &vfs, "lib.rs").err().expect("expected error")
 }
@@ -1052,6 +1062,54 @@ fn if_arms_must_unify() {
     assert!(
         err.contains("type mismatch") || err.contains("expected"),
         "expected arm-mismatch error, got: {}",
+        err
+    );
+}
+
+#[test]
+fn private_function_call_from_outside_module_is_rejected() {
+    let err = compile_sources(&[
+        ("lib.rs", "mod inner;\nfn answer() -> u32 { inner::secret() }"),
+        ("inner.rs", "fn secret() -> u32 { 7 }"),
+    ]);
+    assert!(
+        err.contains("private"),
+        "expected `private` error, got: {}",
+        err
+    );
+}
+
+#[test]
+fn private_struct_field_read_is_rejected() {
+    let err = compile_sources(&[
+        (
+            "lib.rs",
+            "mod inner;\nfn answer() -> u32 { let f: inner::Foo = inner::make(); f.value }",
+        ),
+        (
+            "inner.rs",
+            "pub struct Foo { value: u32 }\npub fn make() -> Foo { Foo { value: 1 } }",
+        ),
+    ]);
+    assert!(
+        err.contains("private"),
+        "expected private-field error, got: {}",
+        err
+    );
+}
+
+#[test]
+fn private_struct_field_construction_is_rejected() {
+    let err = compile_sources(&[
+        (
+            "lib.rs",
+            "mod inner;\nfn answer() -> u32 { let f: inner::Foo = inner::Foo { value: 1 }; 0 }",
+        ),
+        ("inner.rs", "pub struct Foo { value: u32 }"),
+    ]);
+    assert!(
+        err.contains("private"),
+        "expected private-field-construction error, got: {}",
         err
     );
 }

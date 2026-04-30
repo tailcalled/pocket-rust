@@ -30,6 +30,7 @@ fn main() -> ExitCode {
         name: "std".to_string(),
         vfs: stdlib_vfs,
         entry: "lib.rs".to_string(),
+        prelude: true,
     };
 
     match compile(&[std_lib], &user_vfs, "main.rs") {

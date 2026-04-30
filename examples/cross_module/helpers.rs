@@ -1,3 +1,3 @@
-struct Point { x: usize, y: usize }
+pub struct Point { pub x: usize, pub y: usize }
 
-fn x_of(p: Point) -> usize { p.x }
+pub fn x_of(p: Point) -> usize { p.x }

@@ -192,7 +192,7 @@ fn satisfies_num(
     type_params: &Vec<String>,
     type_param_bounds: &Vec<Vec<Vec<String>>>,
 ) -> bool {
-    let num_path = vec!["std".to_string(), "Num".to_string()];
+    let num_path = vec!["std".to_string(), "ops".to_string(), "Num".to_string()];
     match t {
         InferType::Int(_) | InferType::Var(_) => true,
         InferType::Param(name) => {
@@ -1070,11 +1070,11 @@ pub fn is_copy_with_bounds(
 }
 
 pub fn copy_trait_path() -> Vec<String> {
-    vec!["std".to_string(), "Copy".to_string()]
+    vec!["std".to_string(), "marker".to_string(), "Copy".to_string()]
 }
 
 pub fn drop_trait_path() -> Vec<String> {
-    vec!["std".to_string(), "Drop".to_string()]
+    vec!["std".to_string(), "ops".to_string(), "Drop".to_string()]
 }
 
 // Whether `t` implements `std::Drop`. Used by codegen to decide whether
@@ -1097,6 +1097,7 @@ pub struct RTypedField {
     pub name: String,
     pub name_span: Span,
     pub ty: RType,
+    pub is_pub: bool,
 }
 
 pub struct StructEntry {
@@ -1110,6 +1111,7 @@ pub struct StructEntry {
     // build a substitution env when reading field types.
     pub lifetime_params: Vec<String>,
     pub fields: Vec<RTypedField>,
+    pub is_pub: bool,
 }
 
 pub struct StructTable {
@@ -1125,6 +1127,466 @@ pub fn struct_lookup<'a>(table: &'a StructTable, path: &Vec<String>) -> Option<&
         i += 1;
     }
     None
+}
+
+// Re-export entry: a `pub use foo::Bar;` in module M makes the name
+// `M::Bar` (or `M::<rename>` for `pub use foo::Bar as Q;`) resolve
+// to `foo::Bar`. The table lets cross-module path lookups follow
+// these re-exports — without it, outside callers would have to know
+// the original definition's path even when the re-export is the
+// public API.
+#[derive(Clone)]
+pub struct ReExport {
+    pub module: Vec<String>,
+    pub local_name: String,
+    pub target: Vec<String>,
+}
+
+pub struct ReExportTable {
+    pub entries: Vec<ReExport>,
+}
+
+// Walk every module recursively, collecting every `pub use ...`
+// entry. Each `pub use foo::Bar;` (or renamed) in module M produces a
+// ReExport entry. Globs `pub use foo::*;` register a wildcard re-
+// export that's expanded lazily at lookup time.
+pub fn build_reexport_table(root: &crate::ast::Module) -> ReExportTable {
+    let mut table = ReExportTable { entries: Vec::new() };
+    let mut path: Vec<String> = Vec::new();
+    if !root.name.is_empty() {
+        path.push(root.name.clone());
+    }
+    let crate_root: String = if path.is_empty() {
+        String::new()
+    } else {
+        path[0].clone()
+    };
+    collect_reexports_in_module(root, &mut path, &crate_root, &mut table);
+    table
+}
+
+fn collect_reexports_in_module(
+    module: &crate::ast::Module,
+    path: &mut Vec<String>,
+    crate_root: &str,
+    table: &mut ReExportTable,
+) {
+    let mut i = 0;
+    while i < module.items.len() {
+        match &module.items[i] {
+            crate::ast::Item::Use(u) if u.is_pub => {
+                // Flatten this pub use's tree into UseEntries (with the
+                // crate-root rewrite), then turn each Explicit entry
+                // into a ReExport at the current module.
+                let mut entries: Vec<UseEntry> = Vec::new();
+                flatten_use_tree(&Vec::new(), &u.tree, crate_root, true, &mut entries);
+                let mut k = 0;
+                while k < entries.len() {
+                    if let UseEntry::Explicit { local_name, full_path, .. } = &entries[k] {
+                        table.entries.push(ReExport {
+                            module: clone_path(path),
+                            local_name: local_name.clone(),
+                            target: clone_path(full_path),
+                        });
+                    }
+                    // Globs: a `pub use foo::*;` would need lazy
+                    // expansion at lookup time — skip for now (not in
+                    // the bootstrap path). Documented as a limitation.
+                    k += 1;
+                }
+            }
+            crate::ast::Item::Module(m) => {
+                path.push(m.name.clone());
+                collect_reexports_in_module(m, path, crate_root, table);
+                path.pop();
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+}
+
+// Apply re-exports to a path lookup. If `path` is `[mod..., name]`
+// and `[mod...]` has a `pub use ... as name;`, return the target. May
+// chain through multiple levels (a re-export of a re-export). Caller
+// passes `probe` to validate the final destination resolves in their
+// table; we stop chaining once probe accepts.
+pub fn resolve_via_reexports<F>(
+    path: &Vec<String>,
+    table: &ReExportTable,
+    probe: F,
+) -> Option<Vec<String>>
+where
+    F: Fn(&Vec<String>) -> bool,
+{
+    if path.is_empty() {
+        return None;
+    }
+    let mut current = clone_path(path);
+    let mut depth = 0;
+    while depth < 16 {
+        if probe(&current) {
+            return Some(current);
+        }
+        let module_len = current.len() - 1;
+        let mut found: Option<Vec<String>> = None;
+        let mut i = 0;
+        while i < table.entries.len() {
+            let e = &table.entries[i];
+            if e.module.len() == module_len
+                && e.local_name == current[module_len]
+            {
+                let mut module_eq = true;
+                let mut k = 0;
+                while k < module_len {
+                    if e.module[k] != current[k] {
+                        module_eq = false;
+                        break;
+                    }
+                    k += 1;
+                }
+                if module_eq {
+                    found = Some(clone_path(&e.target));
+                    break;
+                }
+            }
+            i += 1;
+        }
+        match found {
+            Some(t) => {
+                current = t;
+                depth += 1;
+            }
+            None => return None,
+        }
+    }
+    None
+}
+
+// Re-export-aware lookups. When the user writes a path that matches
+// a `pub use` re-export, the actual table holds the entry under the
+// canonical (re-export target) path — these helpers transparently
+// follow the re-export chain so callers don't have to.
+pub fn trait_lookup_resolved<'a>(
+    traits: &'a TraitTable,
+    reexports: &ReExportTable,
+    path: &Vec<String>,
+) -> Option<&'a TraitEntry> {
+    if let Some(e) = trait_lookup(traits, path) {
+        return Some(e);
+    }
+    let target = resolve_via_reexports(path, reexports, |p| {
+        trait_lookup(traits, p).is_some()
+    })?;
+    trait_lookup(traits, &target)
+}
+
+pub fn struct_lookup_resolved<'a>(
+    structs: &'a StructTable,
+    reexports: &ReExportTable,
+    path: &Vec<String>,
+) -> Option<&'a StructEntry> {
+    if let Some(e) = struct_lookup(structs, path) {
+        return Some(e);
+    }
+    let target = resolve_via_reexports(path, reexports, |p| {
+        struct_lookup(structs, p).is_some()
+    })?;
+    struct_lookup(structs, &target)
+}
+
+pub fn func_path_resolved(
+    funcs: &FuncTable,
+    reexports: &ReExportTable,
+    path: &Vec<String>,
+) -> Option<Vec<String>> {
+    if funcs_entry_index(funcs, path).is_some() || template_lookup(funcs, path).is_some() {
+        return Some(clone_path(path));
+    }
+    resolve_via_reexports(path, reexports, |p| {
+        funcs_entry_index(funcs, p).is_some() || template_lookup(funcs, p).is_some()
+    })
+}
+
+// Visibility check: an item with `is_pub` flag, defined inside
+// `defining_module`, is visible from `accessor_module` iff `is_pub`
+// or `accessor_module` is `defining_module` or a descendant. Mirrors
+// Rust's "private items are visible to the defining module and its
+// descendants."
+//
+// Callers pass `defining_module` explicitly so the rule applies
+// uniformly to free functions, structs, traits, and methods —
+// methods nest under their impl target's name in the path, but the
+// defining module is still the enclosing module, not the struct.
+pub fn is_visible_from(
+    defining_module: &Vec<String>,
+    is_pub: bool,
+    accessor_module: &Vec<String>,
+) -> bool {
+    if is_pub {
+        return true;
+    }
+    if accessor_module.len() < defining_module.len() {
+        return false;
+    }
+    let mut i = 0;
+    while i < defining_module.len() {
+        if accessor_module[i] != defining_module[i] {
+            return false;
+        }
+        i += 1;
+    }
+    true
+}
+
+// Defining module for a function-table path: free functions live at
+// `[mod..., name]` (drop one), inherent/trait-impl methods live at
+// `[mod..., StructName, method_name]` (drop two). The
+// `is_method_path` flag is computed from `FnSymbol.impl_target`.
+pub fn fn_defining_module(item_path: &Vec<String>, is_method: bool) -> Vec<String> {
+    let drop = if is_method { 2 } else { 1 };
+    let n = if item_path.len() >= drop {
+        item_path.len() - drop
+    } else {
+        0
+    };
+    let mut out: Vec<String> = Vec::new();
+    let mut i = 0;
+    while i < n {
+        out.push(item_path[i].clone());
+        i += 1;
+    }
+    out
+}
+
+// Defining module for a struct/trait at `[mod..., name]`.
+pub fn type_defining_module(item_path: &Vec<String>) -> Vec<String> {
+    if item_path.is_empty() {
+        return Vec::new();
+    }
+    let mut out: Vec<String> = Vec::new();
+    let mut i = 0;
+    while i + 1 < item_path.len() {
+        out.push(item_path[i].clone());
+        i += 1;
+    }
+    out
+}
+
+// Field-level visibility: a non-pub struct field is only accessible
+// from inside the struct's defining module (or any descendant).
+pub fn field_visible_from(
+    struct_path: &Vec<String>,
+    field_is_pub: bool,
+    accessor_module: &Vec<String>,
+) -> bool {
+    is_visible_from(
+        &type_defining_module(struct_path),
+        field_is_pub,
+        accessor_module,
+    )
+}
+
+// A flattened entry from a `use` declaration. `Explicit` corresponds
+// to `use a::b::c;` (or a renamed `use a::b::c as d;`) — single name
+// → single full path. `Glob` corresponds to `use a::b::*;` — every
+// item directly under `a::b` is brought into scope, resolved lazily
+// at lookup time via probing the relevant table.
+//
+// `is_pub` carries the originating `UseDecl.is_pub` — for `pub use`,
+// the entry contributes to the enclosing module's re-export table
+// (see `ReExportTable`) so outside modules can reach the imported
+// item via `<this_module>::<local_name>`.
+#[derive(Clone)]
+pub enum UseEntry {
+    Explicit {
+        local_name: String,
+        full_path: Vec<String>,
+        is_pub: bool,
+    },
+    Glob {
+        module_path: Vec<String>,
+        is_pub: bool,
+    },
+}
+
+// Recursively flatten a UseTree into a list of UseEntry, with `prefix`
+// prepended to every contained path. Top-level callers pass an empty
+// prefix; the recursion accumulates prefix segments through Nested.
+//
+// A leading `crate` segment in any use path is rewritten to the
+// enclosing crate's root: for the user crate (root_name == "") it's
+// stripped (so `use crate::foo::bar;` becomes `["foo","bar"]`); for a
+// library (e.g. root_name == "std") it's substituted (so `use
+// crate::Drop` inside std's own source becomes `["std","Drop"]`).
+// The prefix is applied first, then the crate-rewrite acts on the
+// resulting absolute path.
+pub fn flatten_use_tree(
+    prefix: &Vec<String>,
+    tree: &crate::ast::UseTree,
+    crate_root: &str,
+    is_pub: bool,
+    out: &mut Vec<UseEntry>,
+) {
+    match tree {
+        crate::ast::UseTree::Leaf { path, rename, .. } => {
+            let mut full = clone_path(prefix);
+            let mut i = 0;
+            while i < path.len() {
+                full.push(path[i].clone());
+                i += 1;
+            }
+            // Local name comes from the *original* last segment (or
+            // explicit rename) — `use crate::foo::Bar;` imports `Bar`,
+            // not `crate`, even after the rewrite below.
+            let local_name = match rename {
+                Some(r) => r.clone(),
+                None => {
+                    if full.is_empty() {
+                        return; // nothing to import
+                    }
+                    full[full.len() - 1].clone()
+                }
+            };
+            full = rewrite_crate_prefix(full, crate_root);
+            out.push(UseEntry::Explicit {
+                local_name,
+                full_path: full,
+                is_pub,
+            });
+        }
+        crate::ast::UseTree::Glob { path, .. } => {
+            let mut full = clone_path(prefix);
+            let mut i = 0;
+            while i < path.len() {
+                full.push(path[i].clone());
+                i += 1;
+            }
+            full = rewrite_crate_prefix(full, crate_root);
+            out.push(UseEntry::Glob {
+                module_path: full,
+                is_pub,
+            });
+        }
+        crate::ast::UseTree::Nested { prefix: p, children, .. } => {
+            let mut combined = clone_path(prefix);
+            let mut i = 0;
+            while i < p.len() {
+                combined.push(p[i].clone());
+                i += 1;
+            }
+            let mut k = 0;
+            while k < children.len() {
+                flatten_use_tree(&combined, &children[k], crate_root, is_pub, out);
+                k += 1;
+            }
+        }
+    }
+}
+
+fn rewrite_crate_prefix(mut path: Vec<String>, crate_root: &str) -> Vec<String> {
+    if !path.is_empty() && path[0] == "crate" {
+        if crate_root.is_empty() {
+            // User crate: drop the `crate` segment entirely. Items
+            // live at the empty-prefix root, so `crate::foo::bar`
+            // becomes just `foo::bar`.
+            let mut rest: Vec<String> = Vec::new();
+            let mut i = 1;
+            while i < path.len() {
+                rest.push(path[i].clone());
+                i += 1;
+            }
+            return rest;
+        } else {
+            // Library: substitute `crate` → library name. So inside
+            // `std`'s source, `use crate::Drop;` becomes `std::Drop`.
+            path[0] = crate_root.to_string();
+            return path;
+        }
+    }
+    path
+}
+
+// Apply use-table resolution to a path. Looks at the path's first
+// segment; if it matches an explicit use, the imported full path
+// replaces just that first segment (the rest of the path is appended).
+// If no explicit match, each glob in scope is tried by prefixing the
+// glob's module path to the original path and probing the resulting
+// candidate against the caller's lookup target. Returns the
+// use-resolved path, or `None` if no use entry applied.
+//
+// `scope` is a single flat list of `UseEntry`s, ordered with
+// outermost-first / innermost-last; iteration is reverse so the
+// innermost scope's entries shadow outer ones.
+//
+// Examples (with `use std::Drop;` and `use std::*;`):
+//   - `Drop` → `std::Drop` (explicit match, single segment).
+//   - `Pair::new` (with `use foo::Pair;`) → `foo::Pair::new` (the
+//     imported `Pair` becomes the path root; the rest follows).
+//   - `Drop` (with only `use std::*;`, no explicit) → `std::Drop`
+//     iff probe(["std","Drop"]) succeeds.
+pub fn resolve_via_use_scopes<F>(
+    path: &[String],
+    scope: &Vec<UseEntry>,
+    probe: F,
+) -> Option<Vec<String>>
+where
+    F: Fn(&Vec<String>) -> bool,
+{
+    if path.is_empty() {
+        return None;
+    }
+    let head = &path[0];
+    // Explicit match on the first segment — innermost (last-pushed) wins.
+    let mut s = scope.len();
+    while s > 0 {
+        s -= 1;
+        if let UseEntry::Explicit { local_name, full_path, .. } = &scope[s] {
+            if local_name == head {
+                let mut out = clone_path(full_path);
+                let mut j = 1;
+                while j < path.len() {
+                    out.push(path[j].clone());
+                    j += 1;
+                }
+                return Some(out);
+            }
+        }
+    }
+    // No explicit; try each glob's `module_path :: path` in reverse.
+    let mut s = scope.len();
+    while s > 0 {
+        s -= 1;
+        if let UseEntry::Glob { module_path, .. } = &scope[s] {
+            let mut candidate = clone_path(module_path);
+            let mut j = 0;
+            while j < path.len() {
+                candidate.push(path[j].clone());
+                j += 1;
+            }
+            if probe(&candidate) {
+                return Some(candidate);
+            }
+        }
+    }
+    None
+}
+
+// Walk a Module's items and flatten every `use` declaration into a
+// single `Vec<UseEntry>`. `crate_root` is the enclosing crate's name
+// (empty for the user crate, or e.g. `"std"` for a library), used by
+// `flatten_use_tree` to rewrite leading `crate` segments. Submodule
+// uses don't propagate up.
+pub fn module_use_entries(module: &crate::ast::Module, crate_root: &str) -> Vec<UseEntry> {
+    let mut out: Vec<UseEntry> = Vec::new();
+    let mut i = 0;
+    while i < module.items.len() {
+        if let crate::ast::Item::Use(u) = &module.items[i] {
+            flatten_use_tree(&Vec::new(), &u.tree, crate_root, u.is_pub, &mut out);
+        }
+        i += 1;
+    }
+    out
 }
 
 // Per-place move state recorded by borrowck. `Moved` means moved on
@@ -1159,6 +1621,7 @@ pub struct TraitEntry {
     pub name_span: Span,
     pub file: String,
     pub methods: Vec<TraitMethodEntry>,
+    pub is_pub: bool,
 }
 
 pub struct TraitMethodEntry {
@@ -1225,6 +1688,7 @@ pub struct FnSymbol {
     // For trait-impl methods, the index into `TraitTable.impls` of the
     // owning impl row. None for free fns and inherent methods.
     pub trait_impl_idx: Option<usize>,
+    pub is_pub: bool,
     // Per `Expr` node, indexed by `Expr.id`. Contains the resolved `RType`
     // for nodes that carry a value type. `None` for nodes without one
     // (currently unused — every Expr produces a value in our subset).
@@ -1300,6 +1764,7 @@ pub struct GenericTemplate {
     // For trait-impl methods, the index into `TraitTable.impls`. None
     // for free fns and inherent methods.
     pub trait_impl_idx: Option<usize>,
+    pub is_pub: bool,
     pub func: crate::ast::Function,
     pub enclosing_module: Vec<String>,
     pub source_file: String,
@@ -1467,6 +1932,8 @@ pub fn resolve_type(
     structs: &StructTable,
     self_target: Option<&RType>,
     type_params: &Vec<String>,
+    use_scope: &Vec<UseEntry>,
+    reexports: &ReExportTable,
     file: &str,
 ) -> Result<RType, Error> {
     match &ty.kind {
@@ -1488,15 +1955,30 @@ pub fn resolve_type(
                     i += 1;
                 }
             }
-            let mut full = clone_path(current_module);
-            let mut i = 0;
-            while i < path.segments.len() {
-                full.push(path.segments[i].name.clone());
-                i += 1;
-            }
-            // Generic args attach to the path's last segment.
+            // Try use-table resolution: if the path's first segment
+            // matches an in-scope use, the resolved path is absolute.
+            // The probe is re-export-aware so a glob like `use std::*;`
+            // can find an item that's only available via a `pub use`
+            // re-export at std's root.
+            let raw_segs: Vec<String> =
+                path.segments.iter().map(|s| s.name.clone()).collect();
+            let mut full = if let Some(p) = resolve_via_use_scopes(
+                &raw_segs,
+                use_scope,
+                |cand| struct_lookup_resolved(structs, reexports, cand).is_some(),
+            ) {
+                p
+            } else {
+                let mut full = clone_path(current_module);
+                let mut i = 0;
+                while i < path.segments.len() {
+                    full.push(path.segments[i].name.clone());
+                    i += 1;
+                }
+                full
+            };
             let last = &path.segments[path.segments.len() - 1];
-            let entry = match struct_lookup(structs, &full) {
+            let entry = match struct_lookup_resolved(structs, reexports, &full) {
                 Some(e) => e,
                 None => {
                     return Err(Error {
@@ -1506,6 +1988,18 @@ pub fn resolve_type(
                     });
                 }
             };
+            // Use the canonical path returned by the resolver — that's
+            // what downstream type representation expects (e.g.
+            // `RType::Struct.path` should be the trait's actual
+            // location, not the re-export alias).
+            full = clone_path(&entry.path);
+            if !is_visible_from(&type_defining_module(&entry.path), entry.is_pub, current_module) {
+                return Err(Error {
+                    file: file.to_string(),
+                    message: format!("struct `{}` is private", place_to_string(&entry.path)),
+                    span: path.span.copy(),
+                });
+            }
             if entry.type_params.len() != last.args.len() {
                 return Err(Error {
                     file: file.to_string(),
@@ -1563,8 +2057,16 @@ pub fn resolve_type(
             let mut type_args: Vec<RType> = Vec::new();
             let mut i = 0;
             while i < last.args.len() {
-                let t =
-                    resolve_type(&last.args[i], current_module, structs, self_target, type_params, file)?;
+                let t = resolve_type(
+                    &last.args[i],
+                    current_module,
+                    structs,
+                    self_target,
+                    type_params,
+                    use_scope,
+                    reexports,
+                    file,
+                )?;
                 type_args.push(t);
                 i += 1;
             }
@@ -1575,7 +2077,16 @@ pub fn resolve_type(
             })
         }
         TypeKind::Ref { inner, mutable, lifetime } => {
-            let r = resolve_type(inner, current_module, structs, self_target, type_params, file)?;
+            let r = resolve_type(
+                inner,
+                current_module,
+                structs,
+                self_target,
+                type_params,
+                use_scope,
+                reexports,
+                file,
+            )?;
             // Phase B: structurally carry the lifetime — `'a` becomes
             // `Named("a")`; elided refs and the `'_` anonymous lifetime
             // both use the `Inferred(0)` placeholder, freshened later.
@@ -1591,7 +2102,16 @@ pub fn resolve_type(
             })
         }
         TypeKind::RawPtr { inner, mutable } => {
-            let r = resolve_type(inner, current_module, structs, self_target, type_params, file)?;
+            let r = resolve_type(
+                inner,
+                current_module,
+                structs,
+                self_target,
+                type_params,
+                use_scope,
+                reexports,
+                file,
+            )?;
             Ok(RType::RawPtr {
                 inner: Box::new(r),
                 mutable: *mutable,
@@ -1615,8 +2135,17 @@ pub fn check(
     structs: &mut StructTable,
     traits: &mut TraitTable,
     funcs: &mut FuncTable,
+    reexports: &mut ReExportTable,
     next_idx: &mut u32,
 ) -> Result<(), Error> {
+    // Build this crate's re-export entries before any pass that does
+    // path resolution, so `pub use` re-exports are visible to lookups.
+    let crate_reexports = build_reexport_table(root);
+    let mut k = 0;
+    while k < crate_reexports.entries.len() {
+        reexports.entries.push(crate_reexports.entries[k].clone());
+        k += 1;
+    }
     let mut path: Vec<String> = Vec::new();
     push_root_name(&mut path, root);
     collect_struct_names(root, &mut path, structs);
@@ -1627,20 +2156,20 @@ pub fn check(
 
     let mut path: Vec<String> = Vec::new();
     push_root_name(&mut path, root);
-    resolve_struct_fields(root, &mut path, structs)?;
+    resolve_struct_fields(root, &mut path, structs, reexports)?;
 
     let mut path: Vec<String> = Vec::new();
     push_root_name(&mut path, root);
-    resolve_trait_methods(root, &mut path, traits, structs)?;
+    resolve_trait_methods(root, &mut path, traits, structs, reexports)?;
 
     let mut path: Vec<String> = Vec::new();
     push_root_name(&mut path, root);
-    collect_funcs(root, &mut path, funcs, next_idx, structs, traits)?;
+    collect_funcs(root, &mut path, funcs, next_idx, structs, traits, reexports)?;
 
     let mut path: Vec<String> = Vec::new();
     push_root_name(&mut path, root);
     let mut current_file = root.source_file.clone();
-    check_module(root, &mut path, &mut current_file, structs, traits, funcs)?;
+    check_module(root, &mut path, &mut current_file, structs, traits, funcs, reexports)?;
 
     Ok(())
 }
@@ -1685,6 +2214,7 @@ fn collect_trait_names(module: &Module, path: &mut Vec<String>, table: &mut Trai
                     name_span: td.name_span.copy(),
                     file: module.source_file.clone(),
                     methods,
+                    is_pub: td.is_pub,
                 });
             }
             Item::Module(m) => {
@@ -1695,6 +2225,7 @@ fn collect_trait_names(module: &Module, path: &mut Vec<String>, table: &mut Trai
             Item::Function(_) => {}
             Item::Struct(_) => {}
             Item::Impl(_) => {}
+            Item::Use(_) => {}
         }
         i += 1;
     }
@@ -1710,7 +2241,10 @@ fn resolve_trait_methods(
     path: &mut Vec<String>,
     traits: &mut TraitTable,
     structs: &StructTable,
+    reexports: &ReExportTable,
 ) -> Result<(), Error> {
+    let crate_root: &str = if path.is_empty() { "" } else { &path[0] };
+    let use_scope = module_use_entries(module, crate_root);
     let mut i = 0;
     while i < module.items.len() {
         match &module.items[i] {
@@ -1745,6 +2279,8 @@ fn resolve_trait_methods(
                             structs,
                             Some(&self_target),
                             &type_params,
+                            &use_scope,
+                            reexports,
                             &module.source_file,
                         )?;
                         param_types.push(rt);
@@ -1757,6 +2293,8 @@ fn resolve_trait_methods(
                             structs,
                             Some(&self_target),
                             &type_params,
+                            &use_scope,
+                            reexports,
                             &module.source_file,
                         )?),
                         None => None,
@@ -1774,12 +2312,13 @@ fn resolve_trait_methods(
             }
             Item::Module(m) => {
                 path.push(m.name.clone());
-                resolve_trait_methods(m, path, traits, structs)?;
+                resolve_trait_methods(m, path, traits, structs, reexports)?;
                 path.pop();
             }
             Item::Function(_) => {}
             Item::Struct(_) => {}
             Item::Impl(_) => {}
+            Item::Use(_) => {}
         }
         i += 1;
     }
@@ -1818,6 +2357,7 @@ fn collect_struct_names(module: &Module, path: &mut Vec<String>, table: &mut Str
                     type_params: type_param_names,
                     lifetime_params: lifetime_param_names,
                     fields: Vec::new(),
+                    is_pub: sd.is_pub,
                 });
             }
             Item::Module(m) => {
@@ -1828,6 +2368,7 @@ fn collect_struct_names(module: &Module, path: &mut Vec<String>, table: &mut Str
             Item::Function(_) => {}
             Item::Impl(_) => {}
             Item::Trait(_) => {}
+            Item::Use(_) => {}
         }
         i += 1;
     }
@@ -1837,6 +2378,7 @@ fn resolve_struct_fields(
     module: &Module,
     path: &mut Vec<String>,
     table: &mut StructTable,
+    reexports: &ReExportTable,
 ) -> Result<(), Error> {
     let mut i = 0;
     while i < module.items.len() {
@@ -1855,6 +2397,8 @@ fn resolve_struct_fields(
                     .map(|p| p.name.clone())
                     .collect();
                 let mut resolved: Vec<RTypedField> = Vec::new();
+                let crate_root: &str = if path.is_empty() { "" } else { &path[0] };
+    let use_scope = module_use_entries(module, crate_root);
                 let mut k = 0;
                 while k < sd.fields.len() {
                     let rt = resolve_type(
@@ -1863,6 +2407,8 @@ fn resolve_struct_fields(
                         table,
                         None,
                         &type_param_names,
+                        &use_scope,
+                        reexports,
                         &module.source_file,
                     )?;
                     // Phase D: refs are allowed in struct fields. Their
@@ -1884,6 +2430,7 @@ fn resolve_struct_fields(
                         name: sd.fields[k].name.clone(),
                         name_span: sd.fields[k].name_span.copy(),
                         ty: rt,
+                        is_pub: sd.fields[k].is_pub,
                     });
                     k += 1;
                 }
@@ -1898,12 +2445,13 @@ fn resolve_struct_fields(
             }
             Item::Module(m) => {
                 path.push(m.name.clone());
-                resolve_struct_fields(m, path, table)?;
+                resolve_struct_fields(m, path, table, reexports)?;
                 path.pop();
             }
             Item::Function(_) => {}
             Item::Impl(_) => {}
             Item::Trait(_) => {}
+            Item::Use(_) => {}
         }
         i += 1;
     }
@@ -1917,7 +2465,10 @@ fn collect_funcs(
     next_idx: &mut u32,
     structs: &StructTable,
     traits: &mut TraitTable,
+    reexports: &ReExportTable,
 ) -> Result<(), Error> {
+    let crate_root: &str = if path.is_empty() { "" } else { &path[0] };
+    let use_scope = module_use_entries(module, crate_root);
     let mut i = 0;
     while i < module.items.len() {
         match &module.items[i] {
@@ -1935,17 +2486,19 @@ fn collect_funcs(
                     next_idx,
                     structs,
                     traits,
+                    &use_scope,
+                    reexports,
                     &module.source_file,
                 )?;
             }
             Item::Module(m) => {
                 path.push(m.name.clone());
-                collect_funcs(m, path, funcs, next_idx, structs, traits)?;
+                collect_funcs(m, path, funcs, next_idx, structs, traits, reexports)?;
                 path.pop();
             }
             Item::Struct(_) => {}
             Item::Impl(ib) => {
-                let target_rt = resolve_impl_target(ib, path, structs, &module.source_file)?;
+                let target_rt = resolve_impl_target(ib, path, structs, &use_scope, reexports, &module.source_file)?;
                 let impl_type_params: Vec<String> =
                     ib.type_params.iter().map(|p| p.name.clone()).collect();
                 let impl_lifetime_params: Vec<String> =
@@ -1962,6 +2515,8 @@ fn collect_funcs(
                             &ib.type_params[bi].bounds[bj].path,
                             path,
                             traits,
+                            &use_scope,
+                            reexports,
                             &module.source_file,
                         )?;
                         row.push(resolved);
@@ -1976,6 +2531,8 @@ fn collect_funcs(
                             trait_path_node,
                             path,
                             traits,
+                            &use_scope,
+                            reexports,
                             &module.source_file,
                         )?;
                         validate_trait_impl(
@@ -2049,6 +2606,8 @@ fn collect_funcs(
                         next_idx,
                         structs,
                         traits,
+                        &use_scope,
+                        reexports,
                         &module.source_file,
                     )?;
                     k += 1;
@@ -2060,6 +2619,8 @@ fn collect_funcs(
                         trait_path_node,
                         path,
                         traits,
+                        &use_scope,
+                        reexports,
                         &module.source_file,
                     )?;
                     validate_trait_impl_signatures(
@@ -2074,6 +2635,7 @@ fn collect_funcs(
                 }
             }
             Item::Trait(_) => {}
+            Item::Use(_) => {}
         }
         i += 1;
     }
@@ -2088,10 +2650,12 @@ fn find_trait_impl_idx(
     target_rt: &RType,
     current_module: &Vec<String>,
     traits: &TraitTable,
+    use_scope: &Vec<UseEntry>,
+    reexports: &ReExportTable,
     file: &str,
 ) -> Option<usize> {
     let trait_path_node = ib.trait_path.as_ref()?;
-    let trait_full = match resolve_trait_path(trait_path_node, current_module, traits, file) {
+    let trait_full = match resolve_trait_path(trait_path_node, current_module, traits, use_scope, reexports, file) {
         Ok(p) => p,
         Err(_) => return None,
     };
@@ -2118,50 +2682,54 @@ fn resolve_trait_path(
     p: &crate::ast::Path,
     current_module: &Vec<String>,
     traits: &TraitTable,
+    use_scope: &Vec<UseEntry>,
+    reexports: &ReExportTable,
     file: &str,
 ) -> Result<Vec<String>, Error> {
-    let mut full = clone_path(current_module);
-    let mut i = 0;
-    while i < p.segments.len() {
-        full.push(p.segments[i].name.clone());
-        i += 1;
-    }
-    if trait_lookup(traits, &full).is_some() {
-        return Ok(full);
-    }
-    let mut alt: Vec<String> = Vec::new();
-    let mut i = 0;
-    while i < p.segments.len() {
-        alt.push(p.segments[i].name.clone());
-        i += 1;
-    }
-    if trait_lookup(traits, &alt).is_some() {
-        return Ok(alt);
-    }
-    if p.segments.len() == 1 {
-        let target = &p.segments[0].name;
-        let mut matches: Vec<Vec<String>> = Vec::new();
+    let raw_segs: Vec<String> = p.segments.iter().map(|s| s.name.clone()).collect();
+    let attempts: Vec<Vec<String>> = {
+        let mut v: Vec<Vec<String>> = Vec::new();
+        // Use-table (re-export-aware probe).
+        if let Some(via_use) = resolve_via_use_scopes(
+            &raw_segs,
+            use_scope,
+            |cand| trait_lookup_resolved(traits, reexports, cand).is_some(),
+        ) {
+            v.push(via_use);
+        }
+        // Module-relative.
+        let mut full = clone_path(current_module);
         let mut i = 0;
-        while i < traits.entries.len() {
-            let path = &traits.entries[i].path;
-            if !path.is_empty() && path[path.len() - 1] == *target {
-                matches.push(clone_path(path));
-            }
+        while i < p.segments.len() {
+            full.push(p.segments[i].name.clone());
             i += 1;
         }
-        if matches.len() == 1 {
-            return Ok(matches.into_iter().next().unwrap());
+        v.push(full);
+        // Absolute (no current-module prefix).
+        let mut alt: Vec<String> = Vec::new();
+        let mut i = 0;
+        while i < p.segments.len() {
+            alt.push(p.segments[i].name.clone());
+            i += 1;
         }
-        if matches.len() > 1 {
-            return Err(Error {
-                file: file.to_string(),
-                message: format!(
-                    "ambiguous trait `{}`: multiple traits with that name",
-                    target
-                ),
-                span: p.span.copy(),
-            });
+        v.push(alt);
+        v
+    };
+    let mut k = 0;
+    while k < attempts.len() {
+        if let Some(entry) = trait_lookup_resolved(traits, reexports, &attempts[k]) {
+            if !is_visible_from(&type_defining_module(&entry.path), entry.is_pub, current_module) {
+                return Err(Error {
+                    file: file.to_string(),
+                    message: format!("trait `{}` is private", place_to_string(&entry.path)),
+                    span: p.span.copy(),
+                });
+            }
+            // Return the canonical path so downstream lookups (impls,
+            // method dispatch) all key off the trait's real location.
+            return Ok(clone_path(&entry.path));
         }
+        k += 1;
     }
     Err(Error {
         file: file.to_string(),
@@ -2567,6 +3135,8 @@ fn resolve_impl_target(
     ib: &crate::ast::ImplBlock,
     current_module: &Vec<String>,
     structs: &StructTable,
+    use_scope: &Vec<UseEntry>,
+    reexports: &ReExportTable,
     file: &str,
 ) -> Result<RType, Error> {
     // Impl target is a full Type pattern with the impl's type-params in
@@ -2580,6 +3150,8 @@ fn resolve_impl_target(
         structs,
         None,
         &impl_param_names,
+        use_scope,
+        reexports,
         file,
     )?;
     if ib.trait_path.is_none() {
@@ -2611,6 +3183,8 @@ fn register_function(
     next_idx: &mut u32,
     structs: &StructTable,
     traits: &TraitTable,
+    use_scope: &Vec<UseEntry>,
+    reexports: &ReExportTable,
     source_file: &str,
 ) -> Result<(), Error> {
     let mut type_param_names: Vec<String> = Vec::new();
@@ -2648,6 +3222,8 @@ fn register_function(
             structs,
             self_target,
             &type_param_names,
+            use_scope,
+            reexports,
             source_file,
         )?;
         param_types.push(rt);
@@ -2660,6 +3236,8 @@ fn register_function(
             structs,
             self_target,
             &type_param_names,
+            use_scope,
+            reexports,
             source_file,
         )?),
         None => None,
@@ -2759,6 +3337,8 @@ fn register_function(
                 &f.type_params[i].bounds[j].path,
                 current_module,
                 traits,
+                use_scope,
+                reexports,
                 source_file,
             )?;
             row.push(resolved);
@@ -2783,6 +3363,7 @@ fn register_function(
             ret_lifetime,
             impl_target: impl_target_for_storage,
             trait_impl_idx,
+            is_pub: f.is_pub,
             method_resolutions: Vec::new(),
             call_resolutions: Vec::new(),
             moved_places: Vec::new(),
@@ -2799,6 +3380,7 @@ fn register_function(
             ret_lifetime,
             impl_target: impl_target_for_storage,
             trait_impl_idx,
+            is_pub: f.is_pub,
             method_resolutions: Vec::new(),
             call_resolutions: Vec::new(),
             moved_places: Vec::new(),
@@ -3411,6 +3993,13 @@ struct CheckCtx<'a> {
     funcs: &'a FuncTable,
     self_target: Option<&'a RType>,
     type_params: &'a Vec<String>,
+    reexports: &'a ReExportTable,
+    // Active use entries, ordered with the outermost (module-level)
+    // entries first and innermost-block entries appended at the end.
+    // Path resolution iterates this in reverse so the innermost scope
+    // shadows outer ones. Block walks save `use_scope.len()` before
+    // entering and truncate back on exit.
+    use_scope: Vec<UseEntry>,
     // Per-type-param trait bounds (resolved trait paths) for the
     // currently-checked function. Same shape as
     // `GenericTemplate.type_param_bounds` — `[i]` lists the bound traits
@@ -3425,23 +4014,26 @@ fn check_module(
     structs: &StructTable,
     traits: &TraitTable,
     funcs: &mut FuncTable,
+    reexports: &ReExportTable,
 ) -> Result<(), Error> {
     let saved = current_file.clone();
     *current_file = module.source_file.clone();
+    let crate_root: &str = if path.is_empty() { "" } else { &path[0] };
+    let use_scope = module_use_entries(module, crate_root);
     let mut i = 0;
     while i < module.items.len() {
         match &module.items[i] {
             Item::Function(f) => {
-                check_function(f, path, path, None, current_file, structs, traits, funcs)?
+                check_function(f, path, path, None, current_file, structs, traits, funcs, reexports, &use_scope)?
             }
             Item::Module(m) => {
                 path.push(m.name.clone());
-                check_module(m, path, current_file, structs, traits, funcs)?;
+                check_module(m, path, current_file, structs, traits, funcs, reexports)?;
                 path.pop();
             }
             Item::Struct(_) => {}
             Item::Impl(ib) => {
-                let target_rt = resolve_impl_target(ib, path, structs, current_file)?;
+                let target_rt = resolve_impl_target(ib, path, structs, &use_scope, reexports, current_file)?;
                 // T2.6: mirror the prefix collect_funcs used. For Path
                 // targets, that's the first AST segment. For non-Path
                 // trait impls, it's a synthetic `__trait_impl_<idx>`
@@ -3452,7 +4044,7 @@ fn check_module(
                         method_prefix.push(p.segments[0].name.clone());
                     }
                     _ => {
-                        match find_trait_impl_idx(ib, &target_rt, path, traits, current_file) {
+                        match find_trait_impl_idx(ib, &target_rt, path, traits, &use_scope, reexports, current_file) {
                             Some(idx) => {
                                 method_prefix.push(format!("__trait_impl_{}", idx));
                             }
@@ -3476,11 +4068,14 @@ fn check_module(
                         structs,
                         traits,
                         funcs,
+                        reexports,
+                        &use_scope,
                     )?;
                     k += 1;
                 }
             }
             Item::Trait(_) => {}
+            Item::Use(_) => {}
         }
         i += 1;
     }
@@ -3497,6 +4092,8 @@ fn check_function(
     structs: &StructTable,
     traits: &TraitTable,
     funcs: &mut FuncTable,
+    reexports: &ReExportTable,
+    module_use_scope: &Vec<UseEntry>,
 ) -> Result<(), Error> {
     // Look up the registered template to derive the full type-param list
     // (impl's params + method's own params, for generic impl methods).
@@ -3534,6 +4131,8 @@ fn check_function(
             structs,
             self_target,
             &type_param_names,
+            module_use_scope,
+            reexports,
             current_file,
         )?;
         locals.push(LocalEntry {
@@ -3550,6 +4149,8 @@ fn check_function(
             structs,
             self_target,
             &type_param_names,
+            module_use_scope,
+            reexports,
             current_file,
         )?),
         None => None,
@@ -3566,6 +4167,15 @@ fn check_function(
             call_res.push(None);
             expr_infer.push(None);
             i += 1;
+        }
+        // Initialize the use scope with the module's flattened entries.
+        // Inner blocks push their own `Stmt::Use` entries on top during
+        // body traversal; the scope is restored on block exit.
+        let mut initial_use_scope: Vec<UseEntry> = Vec::new();
+        let mut k = 0;
+        while k < module_use_scope.len() {
+            initial_use_scope.push(module_use_scope[k].clone());
+            k += 1;
         }
         let mut ctx = CheckCtx {
             locals,
@@ -3585,6 +4195,8 @@ fn check_function(
             self_target,
             type_params: &type_param_names,
             type_param_bounds: &type_param_bounds,
+            reexports,
+            use_scope: initial_use_scope,
         };
         check_block(&mut ctx, &func.body, &return_rt)?;
         (
@@ -3813,6 +4425,19 @@ fn check_block_inner(ctx: &mut CheckCtx, block: &Block) -> Result<Option<InferTy
             Stmt::Let(let_stmt) => check_let_stmt(ctx, let_stmt)?,
             Stmt::Assign(assign) => check_assign_stmt(ctx, assign)?,
             Stmt::Expr(expr) => check_expr_stmt(ctx, expr)?,
+            Stmt::Use(decl) => {
+                // Push this use's flattened entries onto the active
+                // scope. Visible from this stmt forward; the surrounding
+                // `check_block_expr` / `check_expr_stmt` truncates back
+                // on block exit. Crate root for `crate::…` resolution
+                // comes from the enclosing module's path.
+                let crate_root: &str = if ctx.current_module.is_empty() {
+                    ""
+                } else {
+                    &ctx.current_module[0]
+                };
+                flatten_use_tree(&Vec::new(), &decl.tree, crate_root, decl.is_pub, &mut ctx.use_scope);
+            }
         }
         i += 1;
     }
@@ -3831,15 +4456,19 @@ fn check_expr_stmt(ctx: &mut CheckCtx, expr: &Expr) -> Result<(), Error> {
         _ => unreachable!("parser guarantees Stmt::Expr is a block-like"),
     };
     let mark = ctx.locals.len();
+    let use_mark = ctx.use_scope.len();
     let _ = check_block_inner(ctx, block)?;
     ctx.locals.truncate(mark);
+    ctx.use_scope.truncate(use_mark);
     Ok(())
 }
 
 fn check_block_expr(ctx: &mut CheckCtx, block: &Block) -> Result<InferType, Error> {
     let mark = ctx.locals.len();
+    let use_mark = ctx.use_scope.len();
     let result = check_block_inner(ctx, block)?;
     ctx.locals.truncate(mark);
+    ctx.use_scope.truncate(use_mark);
     match result {
         Some(ty) => Ok(ty),
         None => Err(Error {
@@ -3868,6 +4497,8 @@ fn check_let_stmt(ctx: &mut CheckCtx, let_stmt: &LetStmt) -> Result<(), Error> {
                 ctx.structs,
                 ctx.self_target,
                 ctx.type_params,
+                &ctx.use_scope,
+                ctx.reexports,
                 ctx.current_file,
             )?;
             let annot_infer = rtype_to_infer(&annot_rt);
@@ -4442,6 +5073,8 @@ fn check_method_call_symbolic(
                 ctx.structs,
                 ctx.self_target,
                 ctx.type_params,
+                &ctx.use_scope,
+                ctx.reexports,
                 ctx.current_file,
             )?;
             let user_infer = rtype_to_infer(&user_rt);
@@ -4957,6 +5590,8 @@ fn check_method_call(
                     ctx.structs,
                     ctx.self_target,
                     ctx.type_params,
+                    &ctx.use_scope,
+                    ctx.reexports,
                     ctx.current_file,
                 )?;
                 let user_infer = rtype_to_infer(&user_rt);
@@ -5318,6 +5953,8 @@ fn check_cast(
         ctx.structs,
         ctx.self_target,
         ctx.type_params,
+        &ctx.use_scope,
+        ctx.reexports,
         ctx.current_file,
     )?;
     let target_is_ptr = is_raw_ptr(&target);
@@ -5381,7 +6018,22 @@ fn check_cast(
 }
 
 fn check_call(ctx: &mut CheckCtx, call: &Call, call_expr: &Expr) -> Result<InferType, Error> {
-    let full = resolve_full_path(ctx.current_module, ctx.self_target, &call.callee.segments);
+    // Use-table resolution first: an explicit import or matching glob
+    // takes precedence over module-relative path lookup, so
+    // `use std::dummy::id; id(7)` resolves to `["std","dummy","id"]`
+    // rather than `[<current-module>, "id"]`.
+    let raw_segs: Vec<String> =
+        call.callee.segments.iter().map(|s| s.name.clone()).collect();
+    let raw_full =
+        resolve_via_use_scopes(&raw_segs, &ctx.use_scope, |cand| {
+            func_path_resolved(ctx.funcs, ctx.reexports, cand).is_some()
+        })
+        .unwrap_or_else(|| {
+            resolve_full_path(ctx.current_module, ctx.self_target, &call.callee.segments)
+        });
+    // Follow re-exports to the canonical path so the FuncTable lookups
+    // below find the entry/template.
+    let full = func_path_resolved(ctx.funcs, ctx.reexports, &raw_full).unwrap_or(raw_full);
     // Generic args attach to the last segment of the callee path.
     let last_seg_args = if call.callee.segments.is_empty() {
         Vec::new()
@@ -5398,6 +6050,18 @@ fn check_call(ctx: &mut CheckCtx, call: &Call, call_expr: &Expr) -> Result<Infer
     // Try non-generic first.
     if let Some(entry_idx) = funcs_entry_index(ctx.funcs, &full) {
         let entry = &ctx.funcs.entries[entry_idx];
+        let is_method = entry.impl_target.is_some();
+        let def_mod = fn_defining_module(&entry.path, is_method);
+        if !is_visible_from(&def_mod, entry.is_pub, ctx.current_module) {
+            return Err(Error {
+                file: ctx.current_file.to_string(),
+                message: format!(
+                    "function `{}` is private",
+                    place_to_string(&entry.path)
+                ),
+                span: call_expr.span.copy(),
+            });
+        }
         if !last_seg_args.is_empty() {
             return Err(Error {
                 file: ctx.current_file.to_string(),
@@ -5459,6 +6123,20 @@ fn check_call(ctx: &mut CheckCtx, call: &Call, call_expr: &Expr) -> Result<Infer
     }
     // Try a generic template.
     if let Some((template_idx, _)) = template_lookup(ctx.funcs, &full) {
+        let tmpl_is_pub = ctx.funcs.templates[template_idx].is_pub;
+        let tmpl_path = clone_path(&ctx.funcs.templates[template_idx].path);
+        let tmpl_is_method = ctx.funcs.templates[template_idx].impl_target.is_some();
+        let def_mod = fn_defining_module(&tmpl_path, tmpl_is_method);
+        if !is_visible_from(&def_mod, tmpl_is_pub, ctx.current_module) {
+            return Err(Error {
+                file: ctx.current_file.to_string(),
+                message: format!(
+                    "function `{}` is private",
+                    place_to_string(&tmpl_path)
+                ),
+                span: call_expr.span.copy(),
+            });
+        }
         // Snapshot the template's data we need (clone vectors so we don't keep
         // a borrow into ctx.funcs across the upcoming ctx.subst mutations).
         let tmpl_type_params: Vec<String> = ctx.funcs.templates[template_idx].type_params.clone();
@@ -5517,6 +6195,8 @@ fn check_call(ctx: &mut CheckCtx, call: &Call, call_expr: &Expr) -> Result<Infer
                 ctx.structs,
                 ctx.self_target,
                 ctx.type_params,
+                &ctx.use_scope,
+                ctx.reexports,
                 ctx.current_file,
             )?;
             let user_infer = rtype_to_infer(&user_rt);
@@ -5596,7 +6276,18 @@ fn check_struct_lit(
     lit: &StructLit,
     lit_expr: &Expr,
 ) -> Result<InferType, Error> {
-    let full = resolve_full_path(ctx.current_module, ctx.self_target, &lit.path.segments);
+    let raw_segs: Vec<String> = lit.path.segments.iter().map(|s| s.name.clone()).collect();
+    let raw_full =
+        resolve_via_use_scopes(&raw_segs, &ctx.use_scope, |cand| {
+            struct_lookup_resolved(ctx.structs, ctx.reexports, cand).is_some()
+        })
+        .unwrap_or_else(|| {
+            resolve_full_path(ctx.current_module, ctx.self_target, &lit.path.segments)
+        });
+    // Follow re-exports to the struct's canonical path.
+    let full = struct_lookup_resolved(ctx.structs, ctx.reexports, &raw_full)
+        .map(|e| clone_path(&e.path))
+        .unwrap_or(raw_full);
 
     let entry = match struct_lookup(ctx.structs, &full) {
         Some(e) => e,
@@ -5611,15 +6302,30 @@ fn check_struct_lit(
             });
         }
     };
+    if !is_visible_from(&type_defining_module(&entry.path), entry.is_pub, ctx.current_module) {
+        return Err(Error {
+            file: ctx.current_file.to_string(),
+            message: format!("struct `{}` is private", place_to_string(&entry.path)),
+            span: lit.path.span.copy(),
+        });
+    }
     let struct_type_params: Vec<String> = entry.type_params.clone();
     let mut def_field_names: Vec<String> = Vec::new();
     let mut def_field_types: Vec<RType> = Vec::new();
+    let mut def_field_pubs: Vec<bool> = Vec::new();
     let mut k = 0;
     while k < entry.fields.len() {
         def_field_names.push(entry.fields[k].name.clone());
         def_field_types.push(rtype_clone(&entry.fields[k].ty));
+        def_field_pubs.push(entry.fields[k].is_pub);
         k += 1;
     }
+    // Field-level visibility: constructing a struct from outside its
+    // defining module requires every field to be `pub`. Inside the
+    // module, all fields are reachable regardless.
+    let struct_def_module = type_defining_module(&entry.path);
+    let inside_def_module: bool =
+        is_visible_from(&struct_def_module, false, ctx.current_module);
     // Allocate fresh type-arg vars for this struct's params. If the path's
     // last segment carried turbofish args, unify them.
     let last_seg = &lit.path.segments[lit.path.segments.len() - 1];
@@ -5652,6 +6358,8 @@ fn check_struct_lit(
             ctx.structs,
             ctx.self_target,
             ctx.type_params,
+            &ctx.use_scope,
+            ctx.reexports,
             ctx.current_file,
         )?;
         let user_infer = rtype_to_infer(&user_rt);
@@ -5672,22 +6380,36 @@ fn check_struct_lit(
     // Validate field shape.
     let mut i = 0;
     while i < lit.fields.len() {
-        let mut found = false;
+        let mut found_idx: Option<usize> = None;
         let mut j = 0;
         while j < def_field_names.len() {
             if lit.fields[i].name == def_field_names[j] {
-                found = true;
+                found_idx = Some(j);
                 break;
             }
             j += 1;
         }
-        if !found {
+        let found_idx = match found_idx {
+            Some(j) => j,
+            None => {
+                return Err(Error {
+                    file: ctx.current_file.to_string(),
+                    message: format!(
+                        "struct `{}` has no field `{}`",
+                        segments_to_string(&lit.path.segments),
+                        lit.fields[i].name
+                    ),
+                    span: lit.fields[i].name_span.copy(),
+                });
+            }
+        };
+        if !inside_def_module && !def_field_pubs[found_idx] {
             return Err(Error {
                 file: ctx.current_file.to_string(),
                 message: format!(
-                    "struct `{}` has no field `{}`",
-                    segments_to_string(&lit.path.segments),
-                    lit.fields[i].name
+                    "field `{}` of `{}` is private",
+                    lit.fields[i].name,
+                    place_to_string(&full)
                 ),
                 span: lit.fields[i].name_span.copy(),
             });
@@ -5806,6 +6528,19 @@ fn check_field_access(
     let mut i = 0;
     while i < entry.fields.len() {
         if entry.fields[i].name == fa.field {
+            // Field-level visibility: a non-pub field is only readable
+            // from inside the struct's defining module (or descendants).
+            if !field_visible_from(&struct_path, entry.fields[i].is_pub, ctx.current_module) {
+                return Err(Error {
+                    file: ctx.current_file.to_string(),
+                    message: format!(
+                        "field `{}` of `{}` is private",
+                        fa.field,
+                        place_to_string(&struct_path)
+                    ),
+                    span: fa.field_span.copy(),
+                });
+            }
             // Substitute the field's declared type with the struct's type args
             // (e.g., `pair.first` where pair: Pair<u32, u64> and field declared
             // as T → resolves to u32).

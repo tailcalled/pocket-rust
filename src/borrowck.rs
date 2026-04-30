@@ -57,6 +57,7 @@ fn check_module(
                 current_module.pop();
             }
             Item::Struct(_) => {}
+            Item::Use(_) => {}
             Item::Impl(ib) => {
                 let target_name = match &ib.target.kind {
                     crate::ast::TypeKind::Path(p) if p.segments.len() == 1 => {
@@ -356,6 +357,7 @@ fn walk_stmts_and_tail(state: &mut BorrowState, block: &Block) -> Result<ValueDe
             Stmt::Expr(expr) => {
                 walk_expr(state, expr)?;
             }
+            Stmt::Use(_) => {}
         }
         state.current_step += 1;
         gc_dead_holders(state);
@@ -451,6 +453,7 @@ fn walk_block_for_liveness(block: &Block, step: &mut u32, info: &mut Liveness) {
                 walk_expr_for_liveness(&assign.rhs, step, info);
             }
             Stmt::Expr(expr) => walk_expr_for_liveness(expr, step, info),
+            Stmt::Use(_) => {}
         }
         *step += 1;
         i += 1;

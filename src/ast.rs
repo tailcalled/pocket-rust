@@ -20,6 +20,44 @@ pub enum Item {
     Struct(StructDef),
     Impl(ImplBlock),
     Trait(TraitDef),
+    Use(UseDecl),
+}
+
+// `use a::b::c;` / `use a::*;` / `use a::b as c;` / `use a::{b, c::d};`
+// — one declaration produces one `UseDecl` whose `tree` is parsed as a
+// recursive `UseTree`. The flat list of `(local_name, full_path)`
+// imports + `glob_path`s is built lazily during typeck via
+// `flatten_use_tree`.
+#[derive(Clone)]
+pub struct UseDecl {
+    pub tree: UseTree,
+    // `pub use foo::Bar;` — the imported name is itself visible to
+    // outside modules (re-exported). For ordinary `use` (no `pub`),
+    // the import is private to its enclosing module.
+    pub is_pub: bool,
+    pub span: Span,
+}
+
+#[derive(Clone)]
+pub enum UseTree {
+    // `use a::b::c;` or `use a::b::c as d;`. `path` is the full path;
+    // `rename` is `None` for the unrenamed form (local name = last
+    // segment) or `Some("d")` for renamed.
+    Leaf {
+        path: Vec<String>,
+        rename: Option<String>,
+        span: Span,
+    },
+    // `use prefix::{ children };`. Each child gets `prefix` prepended
+    // when flattened.
+    Nested {
+        prefix: Vec<String>,
+        children: Vec<UseTree>,
+        span: Span,
+    },
+    // `use path::*;` — wildcard. Brings every item directly under
+    // `path` into scope, resolved lazily at lookup time.
+    Glob { path: Vec<String>, span: Span },
 }
 
 #[derive(Clone)]
@@ -44,6 +82,7 @@ pub struct TraitDef {
     pub name_span: Span,
     pub methods: Vec<TraitMethodSig>,
     pub span: Span,
+    pub is_pub: bool,
 }
 
 #[derive(Clone)]
@@ -68,6 +107,7 @@ pub struct StructDef {
     pub lifetime_params: Vec<LifetimeParam>,
     pub type_params: Vec<TypeParam>,
     pub fields: Vec<StructField>,
+    pub is_pub: bool,
 }
 
 #[derive(Clone)]
@@ -75,6 +115,7 @@ pub struct StructField {
     pub name: String,
     pub name_span: Span,
     pub ty: Type,
+    pub is_pub: bool,
 }
 
 #[derive(Clone)]
@@ -89,6 +130,7 @@ pub struct Function {
     // Number of NodeIds allocated within this function's body. Side vectors
     // (typeck/borrowck/codegen) sized to this length, indexed by Expr.id.
     pub node_count: u32,
+    pub is_pub: bool,
 }
 
 #[derive(Clone)]
@@ -151,6 +193,10 @@ pub enum Stmt {
     Let(LetStmt),
     Assign(AssignStmt),
     Expr(Expr),
+    // `use a::b::c;` inside a function body or inner block. Scoped to
+    // the enclosing block — visible from the use-stmt's position to the
+    // end of the block.
+    Use(UseDecl),
 }
 
 #[derive(Clone)]

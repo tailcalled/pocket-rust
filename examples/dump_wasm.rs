@@ -8,6 +8,7 @@ fn main() {
         name: "std".to_string(),
         vfs: std_vfs,
         entry: "lib.rs".to_string(),
+        prelude: true,
     };
     let dir_path = "examples/generic_pair";
     let root = Path::new(dir_path);

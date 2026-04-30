@@ -68,6 +68,7 @@ fn check_module(
                 path.pop();
             }
             Item::Trait(_) => {}
+            Item::Use(_) => {}
         }
         i += 1;
     }
@@ -116,6 +117,7 @@ fn walk_block(state: &mut SafeState, block: &Block) -> Result<(), Error> {
                 walk_expr(state, &assign.rhs)?;
             }
             Stmt::Expr(expr) => walk_expr(state, expr)?,
+            Stmt::Use(_) => {}
         }
         i += 1;
     }

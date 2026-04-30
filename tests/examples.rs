@@ -11,6 +11,7 @@ fn load_stdlib() -> Library {
         name: "std".to_string(),
         vfs,
         entry: "lib.rs".to_string(),
+        prelude: true,
     }
 }
 
@@ -519,6 +520,63 @@ fn trait_decl_and_impl_compiles() {
 #[test]
 fn lifetime_combined_returns_42() {
     expect_answer("lifetime_combined", 42i32);
+}
+
+// Basic `use`: bring `std::dummy::id` into scope as `id`. The function
+// call `id(7)` uses the use-table to resolve to `["std","dummy","id"]`
+// rather than the current-module-relative `["id"]`.
+#[test]
+fn use_basic_returns_7() {
+    expect_answer("use_basic", 7i32);
+}
+
+// Glob: `use std::dummy::*;` brings every item directly under
+// `std::dummy` into scope. `id(42)` resolves via the glob.
+#[test]
+fn use_glob_returns_42() {
+    expect_answer("use_glob", 42i32);
+}
+
+// Rename: `use std::dummy::id as identity;`. The local name
+// `identity` resolves to the imported full path.
+#[test]
+fn use_rename_returns_99() {
+    expect_answer("use_rename", 99i32);
+}
+
+// Brace multi-import: `use std::{Drop, dummy};` brings both `Drop`
+// (trait, used in an impl block) and `dummy` (module, used as a
+// path prefix `dummy::id`) into scope.
+#[test]
+fn use_brace_returns_42() {
+    expect_answer("use_brace", 42i32);
+}
+
+// Block-scope use: `use std::dummy::id;` inside a block expression
+// scopes the import to that block. `id(33)` resolves via the local
+// scope. (Adding the same import outside the block would also work,
+// but this verifies the block-scope plumbing.)
+#[test]
+fn use_block_scope_returns_33() {
+    expect_answer("use_block_scope", 33i32);
+}
+
+// `use crate::…` resolves through the enclosing crate's root. For
+// the user crate (name == ""), `crate::helper::compute` rewrites to
+// `helper::compute`. This verifies the crate-prefix substitution in
+// `flatten_use_tree`.
+#[test]
+fn use_crate_returns_77() {
+    expect_answer("use_crate", 77i32);
+}
+
+// `pub use` re-exports. Module `b` has `pub use crate::a::deep;`,
+// which makes `b::deep` resolve (from outside `b`) to `a::deep`.
+// The caller writes `b::deep()` and it dispatches to the original
+// definition. Verifies the ReExportTable lookup at call sites.
+#[test]
+fn pub_use_reexport_returns_77() {
+    expect_answer("pub_use_reexport", 77i32);
 }
 
 // Booleans + if-expression: `if b { 1 } else { 2 }` with `b: bool`.

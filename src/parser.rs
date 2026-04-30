@@ -2,6 +2,7 @@ use crate::ast::{
     AssignStmt, Block, Call, Expr, ExprKind, FieldAccess, FieldInit, Function, IfExpr, ImplBlock,
     LetStmt, Lifetime, LifetimeParam, MethodCall, Param, Path, PathSegment, Stmt, StructDef,
     StructField, StructLit, TraitBound, TraitDef, TraitMethodSig, Type, TypeKind, TypeParam,
+    UseDecl, UseTree,
 };
 use crate::lexer::{Token, TokenKind, token_kind_name};
 use crate::span::{Error, Pos, Span};
@@ -12,6 +13,7 @@ pub enum RawItem {
     ModDecl { name: String, name_span: Span },
     Impl(ImplBlock),
     Trait(TraitDef),
+    Use(UseDecl),
 }
 
 pub fn parse(file: &str, tokens: Vec<Token>) -> Result<Vec<RawItem>, Error> {
@@ -48,19 +50,154 @@ impl Parser {
     }
 
     fn parse_item(&mut self) -> Result<RawItem, Error> {
+        // Optional `pub` prefix on item declarations. Captured here and
+        // threaded into the specific AST node by each parser. `impl` and
+        // `mod` don't carry their own visibility yet (impl methods are
+        // pub'd individually; module visibility isn't enforced).
+        let is_pub = if self.peek_kind(&TokenKind::Pub) {
+            self.pos += 1;
+            true
+        } else {
+            false
+        };
         if self.peek_kind(&TokenKind::Mod) {
+            // `pub mod` is accepted but currently has no extra effect —
+            // module items inside still carry their own `pub`.
             self.parse_mod_decl()
         } else if self.peek_kind(&TokenKind::Fn) {
-            Ok(RawItem::Function(self.parse_function()?))
+            Ok(RawItem::Function(self.parse_function_with_vis(is_pub)?))
         } else if self.peek_kind(&TokenKind::Struct) {
-            Ok(RawItem::Struct(self.parse_struct_def()?))
+            Ok(RawItem::Struct(self.parse_struct_def_with_vis(is_pub)?))
         } else if self.peek_kind(&TokenKind::Impl) {
+            // `pub impl` isn't a real Rust thing; reject if seen.
+            if is_pub {
+                return Err(self.error_at_current("`pub` is not allowed on `impl` blocks"));
+            }
             Ok(RawItem::Impl(self.parse_impl_block()?))
         } else if self.peek_kind(&TokenKind::Trait) {
-            Ok(RawItem::Trait(self.parse_trait_def()?))
+            Ok(RawItem::Trait(self.parse_trait_def_with_vis(is_pub)?))
+        } else if self.peek_kind(&TokenKind::Use) {
+            Ok(RawItem::Use(self.parse_use_decl_with_vis(is_pub)?))
         } else {
-            Err(self.error_at_current("expected `fn`, `mod`, `struct`, `impl`, or `trait`"))
+            Err(self.error_at_current(
+                "expected `fn`, `mod`, `struct`, `impl`, `trait`, or `use`",
+            ))
         }
+    }
+
+    // `use a::b::c;` / `use a::*;` / `use a::b as c;` / `use a::{...};`
+    fn parse_use_decl(&mut self) -> Result<UseDecl, Error> {
+        self.parse_use_decl_with_vis(false)
+    }
+
+    fn parse_use_decl_with_vis(&mut self, is_pub: bool) -> Result<UseDecl, Error> {
+        let use_span = self.expect(&TokenKind::Use, "`use`")?;
+        let tree = self.parse_use_tree()?;
+        let semi = self.expect(&TokenKind::Semi, "`;`")?;
+        let span = Span::new(use_span.start, semi.end);
+        Ok(UseDecl { tree, is_pub, span })
+    }
+
+    // Parse one node of a use tree. Recognizes:
+    //   - `*` → `Glob { path: [] }` (callers prepend a prefix).
+    //   - `{ a, b, c }` → `Nested { prefix: [], children: [a, b, c] }`.
+    //   - `<seg>::<seg>::...` (a path), then optionally:
+    //       - `::*` → Glob with the path as prefix
+    //       - `::{...}` → Nested with the path as prefix
+    //       - ` as <ident>` → Leaf with rename
+    //       - nothing → bare Leaf
+    fn parse_use_tree(&mut self) -> Result<UseTree, Error> {
+        let start_span = if self.pos < self.tokens.len() {
+            self.tokens[self.pos].span.copy()
+        } else {
+            self.eof_span()
+        };
+        // Brace-only form: `{ a, b, c }` with no leading prefix.
+        if self.peek_kind(&TokenKind::LBrace) {
+            return self.parse_use_tree_brace_body(Vec::new(), &start_span);
+        }
+        // Glob with no prefix: `*` (parses but flatten will treat path as
+        // empty — the caller's prefix becomes the glob target).
+        if self.peek_kind(&TokenKind::Star) {
+            let star = self.tokens[self.pos].span.copy();
+            self.pos += 1;
+            let span = Span::new(start_span.start, star.end);
+            return Ok(UseTree::Glob {
+                path: Vec::new(),
+                span,
+            });
+        }
+        // Otherwise we have at least one path segment.
+        let mut segments: Vec<String> = Vec::new();
+        let (first, _) = self.expect_ident()?;
+        segments.push(first);
+        loop {
+            if self.peek_kind(&TokenKind::PathSep) {
+                self.pos += 1;
+                if self.peek_kind(&TokenKind::Star) {
+                    let star = self.tokens[self.pos].span.copy();
+                    self.pos += 1;
+                    let span = Span::new(start_span.start, star.end);
+                    return Ok(UseTree::Glob {
+                        path: segments,
+                        span,
+                    });
+                }
+                if self.peek_kind(&TokenKind::LBrace) {
+                    return self.parse_use_tree_brace_body(segments, &start_span);
+                }
+                let (next, _) = self.expect_ident()?;
+                segments.push(next);
+                continue;
+            }
+            break;
+        }
+        // Optional rename: `as ident`.
+        let rename = if self.pos < self.tokens.len() {
+            // We need to detect `as`. There's a TokenKind::As.
+            if matches!(self.tokens[self.pos].kind, TokenKind::As) {
+                self.pos += 1;
+                let (name, _) = self.expect_ident()?;
+                Some(name)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        let end = self.tokens[self.pos.saturating_sub(1)].span.end.copy();
+        let span = Span::new(start_span.start, end);
+        Ok(UseTree::Leaf {
+            path: segments,
+            rename,
+            span,
+        })
+    }
+
+    fn parse_use_tree_brace_body(
+        &mut self,
+        prefix: Vec<String>,
+        start_span: &Span,
+    ) -> Result<UseTree, Error> {
+        self.expect(&TokenKind::LBrace, "`{`")?;
+        let mut children: Vec<UseTree> = Vec::new();
+        if !self.peek_kind(&TokenKind::RBrace) {
+            children.push(self.parse_use_tree()?);
+            while self.peek_kind(&TokenKind::Comma) {
+                self.pos += 1;
+                if self.peek_kind(&TokenKind::RBrace) {
+                    break;
+                }
+                children.push(self.parse_use_tree()?);
+            }
+        }
+        let rb = self.expect(&TokenKind::RBrace, "`}`")?;
+        let span = Span::new(start_span.start.copy(), rb.end);
+        Ok(UseTree::Nested {
+            prefix,
+            children,
+            span,
+        })
     }
 
     fn parse_impl_block(&mut self) -> Result<ImplBlock, Error> {
@@ -99,10 +236,21 @@ impl Parser {
         self.expect(&TokenKind::LBrace, "`{`")?;
         let mut methods: Vec<Function> = Vec::new();
         while !self.peek_kind(&TokenKind::RBrace) {
+            // Optional `pub` on inherent impl methods. For trait
+            // impls, methods inherit the trait's visibility — `pub`
+            // is silently allowed but doesn't change anything beyond
+            // the method's `is_pub` flag (which won't be checked for
+            // trait-impl methods).
+            let method_is_pub = if self.peek_kind(&TokenKind::Pub) {
+                self.pos += 1;
+                true
+            } else {
+                false
+            };
             if !self.peek_kind(&TokenKind::Fn) {
                 return Err(self.error_at_current("expected `fn` inside `impl` block"));
             }
-            methods.push(self.parse_function()?);
+            methods.push(self.parse_function_with_vis(method_is_pub)?);
         }
         let rb = self.expect(&TokenKind::RBrace, "`}`")?;
         Ok(ImplBlock {
@@ -116,6 +264,10 @@ impl Parser {
     }
 
     fn parse_trait_def(&mut self) -> Result<TraitDef, Error> {
+        self.parse_trait_def_with_vis(false)
+    }
+
+    fn parse_trait_def_with_vis(&mut self, is_pub: bool) -> Result<TraitDef, Error> {
         let trait_kw = self.expect(&TokenKind::Trait, "`trait`")?;
         let (name, name_span) = self.expect_ident()?;
         self.expect(&TokenKind::LBrace, "`{`")?;
@@ -132,6 +284,7 @@ impl Parser {
             name_span,
             methods,
             span: Span::new(trait_kw.start, rb.end),
+            is_pub,
         })
     }
 
@@ -232,6 +385,10 @@ impl Parser {
     }
 
     fn parse_struct_def(&mut self) -> Result<StructDef, Error> {
+        self.parse_struct_def_with_vis(false)
+    }
+
+    fn parse_struct_def_with_vis(&mut self, is_pub: bool) -> Result<StructDef, Error> {
         self.expect(&TokenKind::Struct, "`struct`")?;
         let (name, name_span) = self.expect_ident()?;
         let (lifetime_params, type_params) = if self.peek_kind(&TokenKind::LAngle) {
@@ -258,10 +415,17 @@ impl Parser {
             lifetime_params,
             type_params,
             fields,
+            is_pub,
         })
     }
 
     fn parse_struct_field(&mut self) -> Result<StructField, Error> {
+        let is_pub = if self.peek_kind(&TokenKind::Pub) {
+            self.pos += 1;
+            true
+        } else {
+            false
+        };
         let (name, name_span) = self.expect_ident()?;
         self.expect(&TokenKind::Colon, "`:`")?;
         let ty = self.parse_type()?;
@@ -269,10 +433,15 @@ impl Parser {
             name,
             name_span,
             ty,
+            is_pub,
         })
     }
 
     fn parse_function(&mut self) -> Result<Function, Error> {
+        self.parse_function_with_vis(false)
+    }
+
+    fn parse_function_with_vis(&mut self, is_pub: bool) -> Result<Function, Error> {
         self.expect(&TokenKind::Fn, "`fn`")?;
         let (name, name_span) = self.expect_ident()?;
         let (lifetime_params, type_params) = if self.peek_kind(&TokenKind::LAngle) {
@@ -308,6 +477,7 @@ impl Parser {
             return_type,
             body,
             node_count,
+            is_pub,
         })
     }
 
@@ -555,6 +725,11 @@ impl Parser {
         loop {
             if self.peek_kind(&TokenKind::Let) {
                 stmts.push(self.parse_let_stmt()?);
+                continue;
+            }
+            if self.peek_kind(&TokenKind::Use) {
+                let decl = self.parse_use_decl()?;
+                stmts.push(Stmt::Use(decl));
                 continue;
             }
             if self.peek_kind(&TokenKind::RBrace) {
@@ -1163,6 +1338,8 @@ impl Parser {
             (TokenKind::Else, TokenKind::Else) => true,
             (TokenKind::True, TokenKind::True) => true,
             (TokenKind::False, TokenKind::False) => true,
+            (TokenKind::Use, TokenKind::Use) => true,
+            (TokenKind::Pub, TokenKind::Pub) => true,
             _ => false,
         }
     }

@@ -23,6 +23,8 @@ pub enum TokenKind {
     Else,
     True,
     False,
+    Use,
+    Pub,
     LAngle,
     RAngle,
     Ident(String),
@@ -64,6 +66,8 @@ pub fn token_kind_name(t: &TokenKind) -> &'static str {
         TokenKind::Else => "`else`",
         TokenKind::True => "`true`",
         TokenKind::False => "`false`",
+        TokenKind::Use => "`use`",
+        TokenKind::Pub => "`pub`",
         TokenKind::LAngle => "`<`",
         TokenKind::RAngle => "`>`",
         TokenKind::Ident(_) => "identifier",
@@ -196,6 +200,16 @@ pub fn tokenize(file: &str, source: &str) -> Result<Vec<Token>, Error> {
             } else if text == "false" {
                 tokens.push(Token {
                     kind: TokenKind::False,
+                    span,
+                });
+            } else if text == "use" {
+                tokens.push(Token {
+                    kind: TokenKind::Use,
+                    span,
+                });
+            } else if text == "pub" {
+                tokens.push(Token {
+                    kind: TokenKind::Pub,
                     span,
                 });
             } else {

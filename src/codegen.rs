@@ -381,6 +381,7 @@ fn walk_block_drop_marks(
                 walk_expr_drop_marks(&a.rhs, expr_types, traits, info);
             }
             Stmt::Expr(e) => walk_expr_drop_marks(e, expr_types, traits, info),
+            Stmt::Use(_) => {}
         }
         i += 1;
     }
@@ -496,6 +497,7 @@ fn walk_block_addr(
                 walk_expr_addr(&assign.rhs, stack, info);
             }
             Stmt::Expr(expr) => walk_expr_addr(expr, stack, info),
+            Stmt::Use(_) => {}
         }
         i += 1;
     }
@@ -681,6 +683,7 @@ fn emit_module(
                 }
             }
             Item::Trait(_) => {}
+            Item::Use(_) => {}
         }
         i += 1;
     }
@@ -865,6 +868,7 @@ fn collect_let_value_ids(block: &Block, out: &mut Vec<u32>) {
                 collect_lets_in_expr(&assign.rhs, out);
             }
             Stmt::Expr(expr) => collect_lets_in_expr(expr, out),
+            Stmt::Use(_) => {}
         }
         i += 1;
     }
@@ -1290,6 +1294,7 @@ fn codegen_block(ctx: &mut FnCtx, block: &Block) -> Result<(), Error> {
             Stmt::Let(let_stmt) => codegen_let_stmt(ctx, let_stmt)?,
             Stmt::Assign(assign) => codegen_assign_stmt(ctx, assign)?,
             Stmt::Expr(expr) => codegen_expr_stmt(ctx, expr)?,
+            Stmt::Use(_) => {}
         }
         i += 1;
     }
@@ -1316,6 +1321,7 @@ fn codegen_unit_block_stmt(ctx: &mut FnCtx, block: &Block) -> Result<(), Error> 
             Stmt::Let(let_stmt) => codegen_let_stmt(ctx, let_stmt)?,
             Stmt::Assign(assign) => codegen_assign_stmt(ctx, assign)?,
             Stmt::Expr(inner) => codegen_expr_stmt(ctx, inner)?,
+            Stmt::Use(_) => {}
         }
         i += 1;
     }
@@ -1802,16 +1808,19 @@ fn codegen_expr(ctx: &mut FnCtx, expr: &Expr) -> Result<RType, Error> {
         ExprKind::StructLit(lit) => codegen_struct_lit(ctx, lit, expr.id),
         ExprKind::FieldAccess(fa) => codegen_field_access(ctx, fa),
         ExprKind::Borrow { inner, mutable } => codegen_borrow(ctx, inner, *mutable),
-        ExprKind::Cast { inner, ty } => {
+        ExprKind::Cast { inner, ty: _ } => {
             let src_ty = codegen_expr(ctx, inner)?;
-            let target = resolve_type(
-                ty,
-                &ctx.current_module,
-                ctx.structs,
-                ctx.self_target.as_ref(),
-                &Vec::new(),
-                "",
-            )?;
+            // The cast's resolved target type was recorded by typeck on
+            // this Cast expr's NodeId — using it directly avoids a
+            // re-resolution that would need its own use-scope wiring.
+            let target = rtype_clone(
+                ctx.expr_types[expr.id as usize]
+                    .as_ref()
+                    .expect("typeck recorded the cast's target type"),
+            );
+            // Apply the monomorphization env in case the cast target
+            // contains a `Param` (e.g. inside a generic body).
+            let target = substitute_rtype(&target, &ctx.env);
             // T5: integer-to-integer casts may need wasm conversion ops.
             // i32-flatten ↔ i64 transitions emit wrap_i64 / extend_i32_*.
             // Same-flatten kinds (e.g. u8 ↔ i32) are no-ops since pocket-
@@ -2267,7 +2276,7 @@ fn int_kind_signed(k: &IntKind) -> bool {
 // calls the appropriate impl method, monomorphizing when needed.
 fn emit_int_lit(ctx: &mut FnCtx, ty: &RType, value: u64) {
     // Solve `<ty as Num>::from_i64`.
-    let num_path = vec!["std".to_string(), "Num".to_string()];
+    let num_path = vec!["std".to_string(), "ops".to_string(), "Num".to_string()];
     let resolution = crate::typeck::solve_impl(&num_path, ty, ctx.traits, 0)
         .expect("Num impl exists for every primitive integer kind in stdlib");
     let cand = crate::typeck::find_trait_impl_method(
@@ -2317,6 +2326,7 @@ fn codegen_block_expr(ctx: &mut FnCtx, block: &Block) -> Result<RType, Error> {
             Stmt::Let(let_stmt) => codegen_let_stmt(ctx, let_stmt)?,
             Stmt::Assign(assign) => codegen_assign_stmt(ctx, assign)?,
             Stmt::Expr(expr) => codegen_expr_stmt(ctx, expr)?,
+            Stmt::Use(_) => {}
         }
         i += 1;
     }

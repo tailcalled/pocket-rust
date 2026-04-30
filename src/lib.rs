@@ -54,6 +54,15 @@ pub struct Library {
     pub name: String,
     pub vfs: Vfs,
     pub entry: String,
+    // When true, the host wants this library to act as a prelude for
+    // the user crate — at the user crate's root module we inject a
+    // synthetic `use <name>::*;` so the library's top-level items are
+    // reachable unqualified. The host (e.g. `main.rs`) sets this to
+    // `true` for `std`; tooling that doesn't want any prelude leaves
+    // it `false`. Multiple libraries can opt in; each contributes its
+    // own glob entry, with later-listed libraries shadowing earlier
+    // ones (innermost-last in the use scope).
+    pub prelude: bool,
 }
 
 pub fn compile(
@@ -72,6 +81,9 @@ pub fn compile(
     let mut traits = TraitTable {
         entries: Vec::new(),
         impls: Vec::new(),
+    };
+    let mut reexports = typeck::ReExportTable {
+        entries: Vec::new(),
     };
     let mut funcs = FuncTable {
         entries: Vec::new(),
@@ -101,11 +113,19 @@ pub fn compile(
             ));
         }
         let dummy_span = Span::new(dummy.copy(), dummy.copy());
-        let lib_root = match resolve_module(&lib.vfs, &lib.entry, &lib.name, dummy_span) {
+        let mut lib_root = match resolve_module(&lib.vfs, &lib.entry, &lib.name, dummy_span) {
             Ok(m) => m,
             Err(e) => return Err(span::format_error(&e)),
         };
-        if let Err(e) = typeck::check(&lib_root, &mut structs, &mut traits, &mut funcs, &mut next_idx) {
+        // Each library gets the prelude injected at its root for every
+        // OTHER prelude library — but never for itself, since a
+        // library can't depend on its own prelude (it's defining the
+        // prelude items). E.g. when compiling `core` alongside `std`,
+        // `core` doesn't see `std::*` even if `std.prelude == true`.
+        // Today there's only one prelude library (`std`), so this is
+        // a no-op for std itself and applies to any future libraries.
+        inject_preludes(&mut lib_root, libraries, Some(&lib.name));
+        if let Err(e) = typeck::check(&lib_root, &mut structs, &mut traits, &mut funcs, &mut reexports, &mut next_idx) {
             return Err(span::format_error(&e));
         }
         if let Err(e) = borrowck::check(&lib_root, &structs, &traits, &mut funcs) {
@@ -121,11 +141,14 @@ pub fn compile(
     }
 
     let dummy_span = Span::new(dummy.copy(), dummy);
-    let user_root = match resolve_module(user_vfs, user_entry, "", dummy_span) {
+    let mut user_root = match resolve_module(user_vfs, user_entry, "", dummy_span) {
         Ok(m) => m,
         Err(e) => return Err(span::format_error(&e)),
     };
-    if let Err(e) = typeck::check(&user_root, &mut structs, &mut traits, &mut funcs, &mut next_idx) {
+    // User crate gets every prelude library — there's no "self" to
+    // exclude.
+    inject_preludes(&mut user_root, libraries, None);
+    if let Err(e) = typeck::check(&user_root, &mut structs, &mut traits, &mut funcs, &mut reexports, &mut next_idx) {
         return Err(span::format_error(&e));
     }
     if let Err(e) = borrowck::check(&user_root, &structs, &traits, &mut funcs) {
@@ -138,6 +161,39 @@ pub fn compile(
         return Err(span::format_error(&e));
     }
     Ok(wasm_mod)
+}
+
+// Inject `use <lib>::*;` at `module`'s root for every library in
+// `libraries` whose `prelude` flag is set, except the library named
+// `self_name` (if any) — a library can't be its own prelude since it
+// defines the items the prelude imports. The injected entries are
+// non-pub: the prelude makes names unqualified inside `module` only,
+// not re-exported.
+fn inject_preludes(module: &mut Module, libraries: &[Library], self_name: Option<&str>) {
+    let mut i = 0;
+    while i < libraries.len() {
+        let lib = &libraries[i];
+        if lib.prelude && !lib.name.is_empty() {
+            let is_self = matches!(self_name, Some(n) if n == lib.name);
+            if !is_self {
+                let prelude_span = Span::new(Pos::new(1, 1), Pos::new(1, 1));
+                let mut path: Vec<String> = Vec::new();
+                path.push(lib.name.clone());
+                module.items.insert(
+                    0,
+                    ast::Item::Use(ast::UseDecl {
+                        tree: ast::UseTree::Glob {
+                            path,
+                            span: prelude_span.copy(),
+                        },
+                        is_pub: false,
+                        span: prelude_span,
+                    }),
+                );
+            }
+        }
+        i += 1;
+    }
 }
 
 fn resolve_module(
@@ -156,6 +212,7 @@ fn resolve_module(
             parser::RawItem::Struct(sd) => items.push(Item::Struct(sd)),
             parser::RawItem::Impl(ib) => items.push(Item::Impl(ib)),
             parser::RawItem::Trait(td) => items.push(Item::Trait(td)),
+            parser::RawItem::Use(u) => items.push(Item::Use(u)),
             parser::RawItem::ModDecl {
                 name: child_name,
                 name_span: child_name_span,
