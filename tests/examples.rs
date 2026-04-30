@@ -57,6 +57,30 @@ fn instantiate(bytes: &[u8]) -> (Store<()>, wasmi::Instance) {
     (store, instance)
 }
 
+// Compile `examples/<dir>/lib.rs`, instantiate, invoke `<export>`, and
+// assert the result. Most tests want `<export>` = `"answer"` and `R` =
+// `i32`; the variants (i64 returns, multi-value returns, named exports)
+// flow through the same helper.
+fn expect_export<R>(dir: &str, export: &str, expected: R)
+where
+    R: wasmi::WasmResults + PartialEq + std::fmt::Debug,
+{
+    let bytes = compile_example(dir, "lib.rs");
+    let (mut store, instance) = instantiate(&bytes);
+    let f = instance
+        .get_typed_func::<(), R>(&store, export)
+        .expect("export not found / wrong signature");
+    let actual = f.call(&mut store, ()).expect("call failed");
+    assert_eq!(actual, expected);
+}
+
+fn expect_answer<R>(dir: &str, expected: R)
+where
+    R: wasmi::WasmResults + PartialEq + std::fmt::Debug,
+{
+    expect_export(dir, "answer", expected);
+}
+
 #[test]
 fn empty_lib_compiles_to_loadable_wasm() {
     let bytes = compile_example("empty", "lib.rs");
@@ -66,135 +90,57 @@ fn empty_lib_compiles_to_loadable_wasm() {
 
 #[test]
 fn answer_returns_42() {
-    let bytes = compile_example("answer", "lib.rs");
-    let (mut store, instance) = instantiate(&bytes);
-    let answer = instance
-        .get_typed_func::<(), i32>(&store, "answer")
-        .expect("export `answer` not found / wrong signature");
-    let result = answer.call(&mut store, ()).expect("call failed");
-    assert_eq!(result, 42);
+    expect_answer("answer", 42i32);
 }
 
 #[test]
 fn cross_module_call_returns_42() {
-    let bytes = compile_example("cross_module", "lib.rs");
-    let (mut store, instance) = instantiate(&bytes);
-    let answer = instance
-        .get_typed_func::<(), i32>(&store, "answer")
-        .expect("export `answer` not found / wrong signature");
-    let result = answer.call(&mut store, ()).expect("call failed");
-    assert_eq!(result, 42);
+    expect_answer("cross_module", 42i32);
 }
 
 #[test]
 fn nested_calls_returns_300() {
-    let bytes = compile_example("nested_calls", "lib.rs");
-    let (mut store, instance) = instantiate(&bytes);
-    let answer = instance
-        .get_typed_func::<(), i32>(&store, "answer")
-        .expect("export `answer` not found / wrong signature");
-    let result = answer.call(&mut store, ()).expect("call failed");
-    assert_eq!(result, 300);
+    expect_answer("nested_calls", 300i32);
 }
 
 #[test]
 fn structs_returns_40() {
-    let bytes = compile_example("structs", "lib.rs");
-    let (mut store, instance) = instantiate(&bytes);
-    let answer = instance
-        .get_typed_func::<(), i32>(&store, "answer")
-        .expect("export `answer` not found / wrong signature");
-    let result = answer.call(&mut store, ()).expect("call failed");
-    assert_eq!(result, 40);
+    expect_answer("structs", 40i32);
 }
 
 #[test]
 fn borrows_returns_40() {
-    let bytes = compile_example("borrows", "lib.rs");
-    let (mut store, instance) = instantiate(&bytes);
-    let answer = instance
-        .get_typed_func::<(), i32>(&store, "answer")
-        .expect("export `answer` not found / wrong signature");
-    let result = answer.call(&mut store, ()).expect("call failed");
-    assert_eq!(result, 40);
+    expect_answer("borrows", 40i32);
 }
 
 #[test]
 fn uses_std_dummy_id_returns_7() {
-    let bytes = compile_example("uses_std", "lib.rs");
-    let (mut store, instance) = instantiate(&bytes);
-    let answer = instance
-        .get_typed_func::<(), i32>(&store, "answer")
-        .expect("export `answer` not found / wrong signature");
-    let result = answer.call(&mut store, ()).expect("call failed");
-    assert_eq!(result, 7);
+    expect_answer("uses_std", 7i32);
 }
 
 #[test]
 fn lets_returns_5() {
-    let bytes = compile_example("lets", "lib.rs");
-    let (mut store, instance) = instantiate(&bytes);
-    let answer = instance
-        .get_typed_func::<(), i32>(&store, "answer")
-        .expect("export `answer` not found / wrong signature");
-    let result = answer.call(&mut store, ()).expect("call failed");
-    assert_eq!(result, 5);
+    expect_answer("lets", 5i32);
 }
 
 #[test]
 fn block_expr_returns_11() {
-    let bytes = compile_example("block_expr", "lib.rs");
-    let (mut store, instance) = instantiate(&bytes);
-    let answer = instance
-        .get_typed_func::<(), i32>(&store, "answer")
-        .expect("export `answer` not found / wrong signature");
-    let result = answer.call(&mut store, ()).expect("call failed");
-    assert_eq!(result, 11);
+    expect_answer("block_expr", 11i32);
 }
 
 #[test]
 fn escaping_borrow_returns_42() {
-    let bytes = compile_example("escaping_borrow", "lib.rs");
-    let (mut store, instance) = instantiate(&bytes);
-    let answer = instance
-        .get_typed_func::<(), i32>(&store, "answer")
-        .expect("export `answer` not found / wrong signature");
-    let result = answer.call(&mut store, ()).expect("call failed");
-    assert_eq!(result, 42);
+    expect_answer("escaping_borrow", 42i32);
 }
 
-// KNOWN-FAILING: pocket-rust's borrowck is stricter than Rust here.
-//
-// `examples/inner_borrow_lifetime/lib.rs` is valid Rust — the borrow `&pt1`
-// inside the inner block is bound to `r`, which goes out of scope at the
-// inner `}`. The block's tail is `r.x` (a `usize`, copied through the
-// reference), so nothing borrowing `pt1` escapes, and `let q = pt1;` is
-// accepted. `q.x` is `5`.
-//
-// Pocket-rust currently keeps the `&pt1` borrow alive for the rest of the
-// function (borrows are scoped per-`Call`, not per-binding), so it rejects
-// the `let q = pt1;` move and `compile_example` panics. This test will
-// start passing the day we add per-binding borrow lifetimes.
 #[test]
 fn u8_literal_returns_200() {
-    let bytes = compile_example("u8_literal", "lib.rs");
-    let (mut store, instance) = instantiate(&bytes);
-    let answer = instance
-        .get_typed_func::<(), i32>(&store, "answer")
-        .expect("export `answer` not found / wrong signature");
-    let result = answer.call(&mut store, ()).expect("call failed");
-    assert_eq!(result, 200);
+    expect_answer("u8_literal", 200i32);
 }
 
 #[test]
 fn i64_literal_returns_9_000_000_000() {
-    let bytes = compile_example("i64_literal", "lib.rs");
-    let (mut store, instance) = instantiate(&bytes);
-    let answer = instance
-        .get_typed_func::<(), i64>(&store, "answer")
-        .expect("export `answer` not found / wrong signature");
-    let result = answer.call(&mut store, ()).expect("call failed");
-    assert_eq!(result, 9_000_000_000);
+    expect_answer("i64_literal", 9_000_000_000i64);
 }
 
 // 128-bit literal goes through `<u128 as Num>::from_i64` which casts
@@ -202,13 +148,7 @@ fn i64_literal_returns_9_000_000_000() {
 // (zero-extending the high half for unsigned target).
 #[test]
 fn u128_literal_returns_42() {
-    let bytes = compile_example("u128_literal", "lib.rs");
-    let (mut store, instance) = instantiate(&bytes);
-    let answer = instance
-        .get_typed_func::<(), (i64, i64)>(&store, "answer")
-        .expect("export `answer` not found / wrong signature");
-    let result = answer.call(&mut store, ()).expect("call failed");
-    assert_eq!(result, (42, 0));
+    expect_answer("u128_literal", (42i64, 0i64));
 }
 
 // When `impl Show for u32` and `impl<T> Show for &T` both provide
@@ -218,13 +158,7 @@ fn u128_literal_returns_42() {
 // returns 2.
 #[test]
 fn autoref_disambig_through_ref_returns_2() {
-    let bytes = compile_example("autoref_disambig", "lib.rs");
-    let (mut store, instance) = instantiate(&bytes);
-    let f = instance
-        .get_typed_func::<(), i32>(&store, "through_ref")
-        .expect("export `through_ref` not found / wrong signature");
-    let result = f.call(&mut store, ()).expect("call failed");
-    assert_eq!(result, 2);
+    expect_export("autoref_disambig", "through_ref", 2i32);
 }
 
 // Sanity check the inverse: with `x: u32` (owned), `impl Show for u32`
@@ -232,13 +166,7 @@ fn autoref_disambig_through_ref_returns_2() {
 // pattern-side autoref at tier 1. The direct match wins.
 #[test]
 fn autoref_disambig_through_owned_returns_1() {
-    let bytes = compile_example("autoref_disambig", "lib.rs");
-    let (mut store, instance) = instantiate(&bytes);
-    let f = instance
-        .get_typed_func::<(), i32>(&store, "through_owned")
-        .expect("export `through_owned` not found / wrong signature");
-    let result = f.call(&mut store, ()).expect("call failed");
-    assert_eq!(result, 1);
+    expect_export("autoref_disambig", "through_owned", 1i32);
 }
 
 // Pattern-side autoref reaching a blanket impl: only `impl<T> Tag for
@@ -247,13 +175,7 @@ fn autoref_disambig_through_owned_returns_1() {
 // to the impl method.
 #[test]
 fn autoref_only_returns_7() {
-    let bytes = compile_example("autoref_only", "lib.rs");
-    let (mut store, instance) = instantiate(&bytes);
-    let f = instance
-        .get_typed_func::<(), i32>(&store, "answer")
-        .expect("export `answer` not found / wrong signature");
-    let result = f.call(&mut store, ()).expect("call failed");
-    assert_eq!(result, 7);
+    expect_answer("autoref_only", 7i32);
 }
 
 // Sign-extension test: cast u64 (with bit 63 set) → i64 (reinterprets
@@ -261,222 +183,102 @@ fn autoref_only_returns_7() {
 // the source is signed and negative.
 #[test]
 fn i128_sign_extend_returns_i64_min() {
-    let bytes = compile_example("i128_sign_extend", "lib.rs");
-    let (mut store, instance) = instantiate(&bytes);
-    let answer = instance
-        .get_typed_func::<(), (i64, i64)>(&store, "answer")
-        .expect("export `answer` not found / wrong signature");
-    let result = answer.call(&mut store, ()).expect("call failed");
-    assert_eq!(result, (i64::MIN, -1));
+    expect_answer("i128_sign_extend", (i64::MIN, -1i64));
 }
 
 #[test]
 fn let_mut_scalar_returns_99() {
-    let bytes = compile_example("let_mut_scalar", "lib.rs");
-    let (mut store, instance) = instantiate(&bytes);
-    let answer = instance
-        .get_typed_func::<(), i32>(&store, "answer")
-        .expect("export `answer` not found / wrong signature");
-    let result = answer.call(&mut store, ()).expect("call failed");
-    assert_eq!(result, 99);
+    expect_answer("let_mut_scalar", 99i32);
 }
 
 #[test]
 fn let_mut_record_returns_99() {
-    let bytes = compile_example("let_mut_record", "lib.rs");
-    let (mut store, instance) = instantiate(&bytes);
-    let answer = instance
-        .get_typed_func::<(), i32>(&store, "answer")
-        .expect("export `answer` not found / wrong signature");
-    let result = answer.call(&mut store, ()).expect("call failed");
-    assert_eq!(result, 99);
+    expect_answer("let_mut_record", 99i32);
 }
 
 #[test]
 fn let_mut_nested_returns_99() {
-    let bytes = compile_example("let_mut_nested", "lib.rs");
-    let (mut store, instance) = instantiate(&bytes);
-    let answer = instance
-        .get_typed_func::<(), i32>(&store, "answer")
-        .expect("export `answer` not found / wrong signature");
-    let result = answer.call(&mut store, ()).expect("call failed");
-    assert_eq!(result, 99);
+    expect_answer("let_mut_nested", 99i32);
 }
 
 #[test]
 fn int_inference_returns_7() {
-    let bytes = compile_example("int_inference", "lib.rs");
-    let (mut store, instance) = instantiate(&bytes);
-    let answer = instance
-        .get_typed_func::<(), i32>(&store, "answer")
-        .expect("export `answer` not found / wrong signature");
-    let result = answer.call(&mut store, ()).expect("call failed");
-    assert_eq!(result, 7);
+    expect_answer("int_inference", 7i32);
 }
 
 #[test]
 fn mut_ref_through_binding_returns_99() {
-    let bytes = compile_example("mut_ref_through_binding", "lib.rs");
-    let (mut store, instance) = instantiate(&bytes);
-    let answer = instance
-        .get_typed_func::<(), i32>(&store, "answer")
-        .expect("export `answer` not found / wrong signature");
-    let result = answer.call(&mut store, ()).expect("call failed");
-    assert_eq!(result, 99);
+    expect_answer("mut_ref_through_binding", 99i32);
 }
 
 #[test]
 fn mut_ref_direct_returns_50() {
-    let bytes = compile_example("mut_ref_direct", "lib.rs");
-    let (mut store, instance) = instantiate(&bytes);
-    let answer = instance
-        .get_typed_func::<(), i32>(&store, "answer")
-        .expect("export `answer` not found / wrong signature");
-    let result = answer.call(&mut store, ()).expect("call failed");
-    assert_eq!(result, 50);
+    expect_answer("mut_ref_direct", 50i32);
 }
 
 #[test]
 fn mut_ref_field_returns_77() {
-    let bytes = compile_example("mut_ref_field", "lib.rs");
-    let (mut store, instance) = instantiate(&bytes);
-    let answer = instance
-        .get_typed_func::<(), i32>(&store, "answer")
-        .expect("export `answer` not found / wrong signature");
-    let result = answer.call(&mut store, ()).expect("call failed");
-    assert_eq!(result, 77);
+    expect_answer("mut_ref_field", 77i32);
 }
 
 #[test]
 fn inner_borrow_lifetime_returns_5() {
-    let bytes = compile_example("inner_borrow_lifetime", "lib.rs");
-    let (mut store, instance) = instantiate(&bytes);
-    let answer = instance
-        .get_typed_func::<(), i32>(&store, "answer")
-        .expect("export `answer` not found / wrong signature");
-    let result = answer.call(&mut store, ()).expect("call failed");
-    assert_eq!(result, 5);
+    expect_answer("inner_borrow_lifetime", 5i32);
 }
 
 #[test]
 fn borrow_field_returns_42() {
-    let bytes = compile_example("borrow_field", "lib.rs");
-    let (mut store, instance) = instantiate(&bytes);
-    let answer = instance
-        .get_typed_func::<(), i32>(&store, "answer")
-        .expect("export `answer` not found / wrong signature");
-    let result = answer.call(&mut store, ()).expect("call failed");
-    assert_eq!(result, 42);
+    expect_answer("borrow_field", 42i32);
 }
 
 #[test]
 fn methods_returns_42() {
-    let bytes = compile_example("methods", "lib.rs");
-    let (mut store, instance) = instantiate(&bytes);
-    let answer = instance
-        .get_typed_func::<(), i32>(&store, "answer")
-        .expect("export `answer` not found / wrong signature");
-    let result = answer.call(&mut store, ()).expect("call failed");
-    assert_eq!(result, 42);
+    expect_answer("methods", 42i32);
 }
 
 #[test]
 fn generic_id_returns_100() {
-    let bytes = compile_example("generic_id", "lib.rs");
-    let (mut store, instance) = instantiate(&bytes);
-    let answer = instance
-        .get_typed_func::<(), i32>(&store, "answer")
-        .expect("export `answer` not found / wrong signature");
-    let result = answer.call(&mut store, ()).expect("call failed");
-    assert_eq!(result, 100);
+    expect_answer("generic_id", 100i32);
 }
 
 #[test]
 fn generic_pair_returns_7() {
-    let bytes = compile_example("generic_pair", "lib.rs");
-    let (mut store, instance) = instantiate(&bytes);
-    let answer = instance
-        .get_typed_func::<(), i32>(&store, "answer")
-        .expect("export `answer` not found / wrong signature");
-    let result = answer.call(&mut store, ()).expect("call failed");
-    assert_eq!(result, 7);
+    expect_answer("generic_pair", 7i32);
 }
 
 #[test]
 fn copy_double_use_returns_7() {
-    let bytes = compile_example("copy_double_use", "lib.rs");
-    let (mut store, instance) = instantiate(&bytes);
-    let answer = instance
-        .get_typed_func::<(), i32>(&store, "answer")
-        .expect("export `answer` not found / wrong signature");
-    let result = answer.call(&mut store, ()).expect("call failed");
-    assert_eq!(result, 7);
+    expect_answer("copy_double_use", 7i32);
 }
 
 #[test]
 fn place_borrow_noncopy_field_returns_7() {
-    let bytes = compile_example("place_borrow_noncopy_field", "lib.rs");
-    let (mut store, instance) = instantiate(&bytes);
-    let answer = instance
-        .get_typed_func::<(), i32>(&store, "answer")
-        .expect("export `answer` not found / wrong signature");
-    let result = answer.call(&mut store, ()).expect("call failed");
-    assert_eq!(result, 7);
+    expect_answer("place_borrow_noncopy_field", 7i32);
 }
 
 #[test]
 fn place_borrow_through_ref_returns_42() {
-    let bytes = compile_example("place_borrow_through_ref", "lib.rs");
-    let (mut store, instance) = instantiate(&bytes);
-    let answer = instance
-        .get_typed_func::<(), i32>(&store, "answer")
-        .expect("export `answer` not found / wrong signature");
-    let result = answer.call(&mut store, ()).expect("call failed");
-    assert_eq!(result, 42);
+    expect_answer("place_borrow_through_ref", 42i32);
 }
 
 #[test]
 fn nll_sequential_borrows_returns_7() {
-    let bytes = compile_example("nll_sequential_borrows", "lib.rs");
-    let (mut store, instance) = instantiate(&bytes);
-    let answer = instance
-        .get_typed_func::<(), i32>(&store, "answer")
-        .expect("export `answer` not found / wrong signature");
-    let result = answer.call(&mut store, ()).expect("call failed");
-    assert_eq!(result, 7);
+    expect_answer("nll_sequential_borrows", 7i32);
 }
 
 #[test]
 fn nll_borrow_then_move_returns_7() {
-    let bytes = compile_example("nll_borrow_then_move", "lib.rs");
-    let (mut store, instance) = instantiate(&bytes);
-    let answer = instance
-        .get_typed_func::<(), i32>(&store, "answer")
-        .expect("export `answer` not found / wrong signature");
-    let result = answer.call(&mut store, ()).expect("call failed");
-    assert_eq!(result, 7);
+    expect_answer("nll_borrow_then_move", 7i32);
 }
 
 #[test]
 fn uses_std_generic_struct_returns_42() {
-    let bytes = compile_example("uses_std_generic_struct", "lib.rs");
-    let (mut store, instance) = instantiate(&bytes);
-    let answer = instance
-        .get_typed_func::<(), i32>(&store, "answer")
-        .expect("export `answer` not found / wrong signature");
-    let result = answer.call(&mut store, ()).expect("call failed");
-    assert_eq!(result, 42);
+    expect_answer("uses_std_generic_struct", 42i32);
 }
 
 #[test]
 fn uses_std_generic_returns_42() {
-    let bytes = compile_example("uses_std_generic", "lib.rs");
-    let (mut store, instance) = instantiate(&bytes);
-    let answer = instance
-        .get_typed_func::<(), i32>(&store, "answer")
-        .expect("export `answer` not found / wrong signature");
-    let result = answer.call(&mut store, ()).expect("call failed");
-    assert_eq!(result, 42);
+    expect_answer("uses_std_generic", 42i32);
 }
 
 // Named lifetimes on functions tie param to return type. `pick_first<'a>`
@@ -484,77 +286,41 @@ fn uses_std_generic_returns_42() {
 // doesn't constrain the result.
 #[test]
 fn lifetime_named_returns_42() {
-    let bytes = compile_example("lifetime_named", "lib.rs");
-    let (mut store, instance) = instantiate(&bytes);
-    let answer = instance
-        .get_typed_func::<(), i32>(&store, "answer")
-        .expect("export `answer` not found / wrong signature");
-    let result = answer.call(&mut store, ()).expect("call failed");
-    assert_eq!(result, 42);
+    expect_answer("lifetime_named", 42i32);
 }
 
 // Refs in struct fields: a generic `Wrapper<'a>` holds `&'a Inner` and a
 // field-access produces the held borrow.
 #[test]
 fn lifetime_struct_field_returns_42() {
-    let bytes = compile_example("lifetime_struct_field", "lib.rs");
-    let (mut store, instance) = instantiate(&bytes);
-    let answer = instance
-        .get_typed_func::<(), i32>(&store, "answer")
-        .expect("export `answer` not found / wrong signature");
-    let result = answer.call(&mut store, ()).expect("call failed");
-    assert_eq!(result, 42);
+    expect_answer("lifetime_struct_field", 42i32);
 }
 
 // `&'a self` receiver tied to the impl's lifetime param routes the
 // receiver's borrow into the return ref.
 #[test]
 fn lifetime_self_receiver_returns_42() {
-    let bytes = compile_example("lifetime_self_receiver", "lib.rs");
-    let (mut store, instance) = instantiate(&bytes);
-    let answer = instance
-        .get_typed_func::<(), i32>(&store, "answer")
-        .expect("export `answer` not found / wrong signature");
-    let result = answer.call(&mut store, ()).expect("call failed");
-    assert_eq!(result, 42);
+    expect_answer("lifetime_self_receiver", 42i32);
 }
 
 // Partial-concrete impl: `impl<T> Pair<usize, T>` matches `Pair<u32, T>`
 // for any T's substitution. Method dispatches via try_match on impl_target.
 #[test]
 fn impl_partial_concrete_returns_42() {
-    let bytes = compile_example("impl_partial_concrete", "lib.rs");
-    let (mut store, instance) = instantiate(&bytes);
-    let answer = instance
-        .get_typed_func::<(), i32>(&store, "answer")
-        .expect("export `answer` not found / wrong signature");
-    let result = answer.call(&mut store, ()).expect("call failed");
-    assert_eq!(result, 42);
+    expect_answer("impl_partial_concrete", 42i32);
 }
 
 // Repeat-param impl: `impl<T> Pair<T, T>` only matches when both type
 // args coincide. Matching binds T once and unifies the second occurrence.
 #[test]
 fn impl_repeat_param_returns_42() {
-    let bytes = compile_example("impl_repeat_param", "lib.rs");
-    let (mut store, instance) = instantiate(&bytes);
-    let answer = instance
-        .get_typed_func::<(), i32>(&store, "answer")
-        .expect("export `answer` not found / wrong signature");
-    let result = answer.call(&mut store, ()).expect("call failed");
-    assert_eq!(result, 42);
+    expect_answer("impl_repeat_param", 42i32);
 }
 
 // Fully-concrete impl: zero impl type-params, target is concrete.
 #[test]
 fn impl_fully_concrete_returns_42() {
-    let bytes = compile_example("impl_fully_concrete", "lib.rs");
-    let (mut store, instance) = instantiate(&bytes);
-    let answer = instance
-        .get_typed_func::<(), i32>(&store, "answer")
-        .expect("export `answer` not found / wrong signature");
-    let result = answer.call(&mut store, ()).expect("call failed");
-    assert_eq!(result, 42);
+    expect_answer("impl_fully_concrete", 42i32);
 }
 
 // T4.5: drops at block-expression scope end. The inner block has a
@@ -563,13 +329,7 @@ fn impl_fully_concrete_returns_42() {
 // the outer fn reads `c`.
 #[test]
 fn drop_block_expr_returns_7() {
-    let bytes = compile_example("drop_block_expr", "lib.rs");
-    let (mut store, instance) = instantiate(&bytes);
-    let answer = instance
-        .get_typed_func::<(), i32>(&store, "answer")
-        .expect("export `answer` not found / wrong signature");
-    let result = answer.call(&mut store, ()).expect("call failed");
-    assert_eq!(result, 7);
+    expect_answer("drop_block_expr", 7i32);
 }
 
 // T4.5: Drop function parameters. `take(l: Logger)` drops `l` at fn
@@ -577,13 +337,7 @@ fn drop_block_expr_returns_7() {
 // and observes the drop side effect.
 #[test]
 fn drop_fn_param_returns_1() {
-    let bytes = compile_example("drop_fn_param", "lib.rs");
-    let (mut store, instance) = instantiate(&bytes);
-    let answer = instance
-        .get_typed_func::<(), i32>(&store, "answer")
-        .expect("export `answer` not found / wrong signature");
-    let result = answer.call(&mut store, ()).expect("call failed");
-    assert_eq!(result, 1);
+    expect_answer("drop_fn_param", 1i32);
 }
 
 // T2.5b: trait methods with their own type-params. `Pick::pick<U>`
@@ -594,13 +348,7 @@ fn drop_fn_param_returns_1() {
 // the receiver `First` lands on the concrete impl after `solve_impl`.
 #[test]
 fn trait_method_generic_returns_11() {
-    let bytes = compile_example("trait_method_generic", "lib.rs");
-    let (mut store, instance) = instantiate(&bytes);
-    let answer = instance
-        .get_typed_func::<(), i32>(&store, "answer")
-        .expect("export `answer` not found / wrong signature");
-    let result = answer.call(&mut store, ()).expect("call failed");
-    assert_eq!(result, 11);
+    expect_answer("trait_method_generic", 11i32);
 }
 
 // Lifetime cleanup: nested per-slot field borrow tracking. Reading
@@ -611,13 +359,7 @@ fn trait_method_generic_returns_11() {
 // just verifies the value flows through.
 #[test]
 fn nested_field_borrow_returns_42() {
-    let bytes = compile_example("nested_field_borrow", "lib.rs");
-    let (mut store, instance) = instantiate(&bytes);
-    let answer = instance
-        .get_typed_func::<(), i32>(&store, "answer")
-        .expect("export `answer` not found / wrong signature");
-    let result = answer.call(&mut store, ()).expect("call failed");
-    assert_eq!(result, 42);
+    expect_answer("nested_field_borrow", 42i32);
 }
 
 // Lifetime cleanup: anonymous `'_` lifetime. `'_` parses to a fresh
@@ -628,13 +370,7 @@ fn nested_field_borrow_returns_42() {
 // on it.
 #[test]
 fn anon_lifetime_impl_returns_42() {
-    let bytes = compile_example("anon_lifetime_impl", "lib.rs");
-    let (mut store, instance) = instantiate(&bytes);
-    let answer = instance
-        .get_typed_func::<(), i32>(&store, "answer")
-        .expect("export `answer` not found / wrong signature");
-    let result = answer.call(&mut store, ()).expect("call failed");
-    assert_eq!(result, 42);
+    expect_answer("anon_lifetime_impl", 42i32);
 }
 
 // T4.6: move-aware drops. `let _y: Logger = l;` is a whole-binding
@@ -646,13 +382,7 @@ fn anon_lifetime_impl_returns_42() {
 // expected result is 0.
 #[test]
 fn drop_moved_returns_0() {
-    let bytes = compile_example("drop_moved", "lib.rs");
-    let (mut store, instance) = instantiate(&bytes);
-    let answer = instance
-        .get_typed_func::<(), i32>(&store, "answer")
-        .expect("export `answer` not found / wrong signature");
-    let result = answer.call(&mut store, ()).expect("call failed");
-    assert_eq!(result, 0);
+    expect_answer("drop_moved", 0i32);
 }
 
 // T2.6.5: when type-pattern matching yields multiple candidates, drop
@@ -662,13 +392,7 @@ fn drop_moved_returns_0() {
 // blanket can adjust — the inherent would move out of borrow.
 #[test]
 fn dispatch_adjust_filter_returns_99() {
-    let bytes = compile_example("dispatch_adjust_filter", "lib.rs");
-    let (mut store, instance) = instantiate(&bytes);
-    let answer = instance
-        .get_typed_func::<(), i32>(&store, "answer")
-        .expect("export `answer` not found / wrong signature");
-    let result = answer.call(&mut store, ()).expect("call failed");
-    assert_eq!(result, 99);
+    expect_answer("dispatch_adjust_filter", 99i32);
 }
 
 // T2.6: concrete trait dispatch on a primitive recv. `x.show()` for
@@ -677,13 +401,7 @@ fn dispatch_adjust_filter_returns_99() {
 // missed it).
 #[test]
 fn trait_impl_on_u32_returns_42() {
-    let bytes = compile_example("trait_impl_on_u32", "lib.rs");
-    let (mut store, instance) = instantiate(&bytes);
-    let answer = instance
-        .get_typed_func::<(), i32>(&store, "answer")
-        .expect("export `answer` not found / wrong signature");
-    let result = answer.call(&mut store, ()).expect("call failed");
-    assert_eq!(result, 42);
+    expect_answer("trait_impl_on_u32", 42i32);
 }
 
 // T2.6: blanket impl `impl<T> Show for &T` dispatches when the recv is
@@ -691,13 +409,7 @@ fn trait_impl_on_u32_returns_42() {
 // non-struct target path through method-call dispatch.
 #[test]
 fn trait_blanket_on_ref_returns_42() {
-    let bytes = compile_example("trait_blanket_on_ref", "lib.rs");
-    let (mut store, instance) = instantiate(&bytes);
-    let answer = instance
-        .get_typed_func::<(), i32>(&store, "answer")
-        .expect("export `answer` not found / wrong signature");
-    let result = answer.call(&mut store, ()).expect("call failed");
-    assert_eq!(result, 42);
+    expect_answer("trait_blanket_on_ref", 42i32);
 }
 
 // T5.5: integer literal lands on a user type via `impl Num for Wrap`.
@@ -706,13 +418,7 @@ fn trait_blanket_on_ref_returns_42() {
 // `<Wrap as Num>::from_i64`.
 #[test]
 fn num_user_type_returns_42() {
-    let bytes = compile_example("num_user_type", "lib.rs");
-    let (mut store, instance) = instantiate(&bytes);
-    let answer = instance
-        .get_typed_func::<(), i32>(&store, "answer")
-        .expect("export `answer` not found / wrong signature");
-    let result = answer.call(&mut store, ()).expect("call failed");
-    assert_eq!(result, 42);
+    expect_answer("num_user_type", 42i32);
 }
 
 // T5.5: integer literal in a `<T: Num>` generic body. Inside `make<T:
@@ -721,13 +427,7 @@ fn num_user_type_returns_42() {
 // `<u32 as Num>::from_i64(42)`.
 #[test]
 fn num_generic_body_returns_42() {
-    let bytes = compile_example("num_generic_body", "lib.rs");
-    let (mut store, instance) = instantiate(&bytes);
-    let answer = instance
-        .get_typed_func::<(), i32>(&store, "answer")
-        .expect("export `answer` not found / wrong signature");
-    let result = answer.call(&mut store, ()).expect("call failed");
-    assert_eq!(result, 42);
+    expect_answer("num_generic_body", 42i32);
 }
 
 // T5: every integer literal desugars to `<T as Num>::from_i64(value)`.
@@ -736,13 +436,7 @@ fn num_generic_body_returns_42() {
 // (no inlining), and the values flow through to the answer.
 #[test]
 fn num_literal_dispatch_returns_42() {
-    let bytes = compile_example("num_literal_dispatch", "lib.rs");
-    let (mut store, instance) = instantiate(&bytes);
-    let answer = instance
-        .get_typed_func::<(), i32>(&store, "answer")
-        .expect("export `answer` not found / wrong signature");
-    let result = answer.call(&mut store, ()).expect("call failed");
-    assert_eq!(result, 42);
+    expect_answer("num_literal_dispatch", 42i32);
 }
 
 // T4: dropping a Logger at the inner block's scope end writes 1 to a
@@ -750,13 +444,7 @@ fn num_literal_dispatch_returns_42() {
 // the block, observing the drop side effect.
 #[test]
 fn drop_logger_returns_1() {
-    let bytes = compile_example("drop_logger", "lib.rs");
-    let (mut store, instance) = instantiate(&bytes);
-    let answer = instance
-        .get_typed_func::<(), i32>(&store, "answer")
-        .expect("export `answer` not found / wrong signature");
-    let result = answer.call(&mut store, ()).expect("call failed");
-    assert_eq!(result, 1);
+    expect_answer("drop_logger", 1i32);
 }
 
 // T2.5: trait dispatch through `&self` autoref'ing an owned generic
@@ -764,52 +452,28 @@ fn drop_logger_returns_1() {
 // `&self` must autoref `t` before the trait call.
 #[test]
 fn trait_borrow_self_dispatch_returns_42() {
-    let bytes = compile_example("trait_borrow_self_dispatch", "lib.rs");
-    let (mut store, instance) = instantiate(&bytes);
-    let answer = instance
-        .get_typed_func::<(), i32>(&store, "answer")
-        .expect("export `answer` not found / wrong signature");
-    let result = answer.call(&mut store, ()).expect("call failed");
-    assert_eq!(result, 42);
+    expect_answer("trait_borrow_self_dispatch", 42i32);
 }
 
 // T2.5: `impl<T: Copy> Copy for Wrap<T> {}` validates: the bound makes
 // `Param(T)` Copy so the `inner: T` field passes the field-Copy check.
 #[test]
 fn copy_generic_with_bound_returns_42() {
-    let bytes = compile_example("copy_generic_with_bound", "lib.rs");
-    let (mut store, instance) = instantiate(&bytes);
-    let answer = instance
-        .get_typed_func::<(), i32>(&store, "answer")
-        .expect("export `answer` not found / wrong signature");
-    let result = answer.call(&mut store, ()).expect("call failed");
-    assert_eq!(result, 42);
+    expect_answer("copy_generic_with_bound", 42i32);
 }
 
 // T2.5: in a generic body with `T: Copy`, reading `t` after `let s = t`
 // is a value copy (not a move) because the bound makes `Param(T)` Copy.
 #[test]
 fn copy_param_via_bound_returns_42() {
-    let bytes = compile_example("copy_param_via_bound", "lib.rs");
-    let (mut store, instance) = instantiate(&bytes);
-    let answer = instance
-        .get_typed_func::<(), i32>(&store, "answer")
-        .expect("export `answer` not found / wrong signature");
-    let result = answer.call(&mut store, ()).expect("call failed");
-    assert_eq!(result, 42);
+    expect_answer("copy_param_via_bound", 42i32);
 }
 
 // T3: user-defined `impl Copy for Pt {}`. Reading `p` after `let q = p`
 // should be allowed since Pt is Copy.
 #[test]
 fn copy_user_struct_returns_42() {
-    let bytes = compile_example("copy_user_struct", "lib.rs");
-    let (mut store, instance) = instantiate(&bytes);
-    let answer = instance
-        .get_typed_func::<(), i32>(&store, "answer")
-        .expect("export `answer` not found / wrong signature");
-    let result = answer.call(&mut store, ()).expect("call failed");
-    assert_eq!(result, 42);
+    expect_answer("copy_user_struct", 42i32);
 }
 
 // T3: `&mut T` is NOT Copy — assigning a mut-ref to another binding
@@ -817,25 +481,13 @@ fn copy_user_struct_returns_42() {
 // would be rejected; this test passes the move via the new binding.
 #[test]
 fn copy_mut_ref_not_copy_returns_42() {
-    let bytes = compile_example("copy_mut_ref_not_copy", "lib.rs");
-    let (mut store, instance) = instantiate(&bytes);
-    let answer = instance
-        .get_typed_func::<(), i32>(&store, "answer")
-        .expect("export `answer` not found / wrong signature");
-    let result = answer.call(&mut store, ()).expect("call failed");
-    assert_eq!(result, 42);
+    expect_answer("copy_mut_ref_not_copy", 42i32);
 }
 
 // T2: concrete trait method dispatch via `impl Show for Foo` + `f.show()`.
 #[test]
 fn trait_concrete_dispatch_returns_42() {
-    let bytes = compile_example("trait_concrete_dispatch", "lib.rs");
-    let (mut store, instance) = instantiate(&bytes);
-    let answer = instance
-        .get_typed_func::<(), i32>(&store, "answer")
-        .expect("export `answer` not found / wrong signature");
-    let result = answer.call(&mut store, ()).expect("call failed");
-    assert_eq!(result, 42);
+    expect_answer("trait_concrete_dispatch", 42i32);
 }
 
 // T2: recursive impl resolution. `Wrap<Wrap<u32>>: Show` requires
@@ -844,13 +496,7 @@ fn trait_concrete_dispatch_returns_42() {
 // functions.
 #[test]
 fn trait_recursive_wrap_returns_42() {
-    let bytes = compile_example("trait_recursive_wrap", "lib.rs");
-    let (mut store, instance) = instantiate(&bytes);
-    let answer = instance
-        .get_typed_func::<(), i32>(&store, "answer")
-        .expect("export `answer` not found / wrong signature");
-    let result = answer.call(&mut store, ()).expect("call failed");
-    assert_eq!(result, 42);
+    expect_answer("trait_recursive_wrap", 42i32);
 }
 
 // T2: symbolic dispatch in a generic body via the type-param's bound.
@@ -858,13 +504,7 @@ fn trait_recursive_wrap_returns_42() {
 // Show` and re-dispatches to the concrete impl at mono time.
 #[test]
 fn trait_bound_dispatch_returns_42() {
-    let bytes = compile_example("trait_bound_dispatch", "lib.rs");
-    let (mut store, instance) = instantiate(&bytes);
-    let answer = instance
-        .get_typed_func::<(), i32>(&store, "answer")
-        .expect("export `answer` not found / wrong signature");
-    let result = answer.call(&mut store, ()).expect("call failed");
-    assert_eq!(result, 42);
+    expect_answer("trait_bound_dispatch", 42i32);
 }
 
 // Trait surface: declarations, `impl Trait for Type`, blanket `impl<T>
@@ -872,23 +512,11 @@ fn trait_bound_dispatch_returns_42() {
 // dispatch lands in T2.
 #[test]
 fn trait_decl_and_impl_compiles() {
-    let bytes = compile_example("trait_decl_and_impl", "lib.rs");
-    let (mut store, instance) = instantiate(&bytes);
-    let answer = instance
-        .get_typed_func::<(), i32>(&store, "answer")
-        .expect("export `answer` not found / wrong signature");
-    let result = answer.call(&mut store, ()).expect("call failed");
-    assert_eq!(result, 42);
+    expect_answer("trait_decl_and_impl", 42i32);
 }
 
 // Two ref params share `'a`; the result borrows both.
 #[test]
 fn lifetime_combined_returns_42() {
-    let bytes = compile_example("lifetime_combined", "lib.rs");
-    let (mut store, instance) = instantiate(&bytes);
-    let answer = instance
-        .get_typed_func::<(), i32>(&store, "answer")
-        .expect("export `answer` not found / wrong signature");
-    let result = answer.call(&mut store, ()).expect("call failed");
-    assert_eq!(result, 42);
+    expect_answer("lifetime_combined", 42i32);
 }
