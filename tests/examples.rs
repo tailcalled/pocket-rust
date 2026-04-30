@@ -197,6 +197,34 @@ fn i64_literal_returns_9_000_000_000() {
     assert_eq!(result, 9_000_000_000);
 }
 
+// 128-bit literal goes through `<u128 as Num>::from_i64` which casts
+// the i64 argument to u128 — exercising the Wide64 → Wide128 path
+// (zero-extending the high half for unsigned target).
+#[test]
+fn u128_literal_returns_42() {
+    let bytes = compile_example("u128_literal", "lib.rs");
+    let (mut store, instance) = instantiate(&bytes);
+    let answer = instance
+        .get_typed_func::<(), (i64, i64)>(&store, "answer")
+        .expect("export `answer` not found / wrong signature");
+    let result = answer.call(&mut store, ()).expect("call failed");
+    assert_eq!(result, (42, 0));
+}
+
+// Sign-extension test: cast u64 (with bit 63 set) → i64 (reinterprets
+// as i64::MIN) → i128. The 128-bit high half should be all-ones, since
+// the source is signed and negative.
+#[test]
+fn i128_sign_extend_returns_i64_min() {
+    let bytes = compile_example("i128_sign_extend", "lib.rs");
+    let (mut store, instance) = instantiate(&bytes);
+    let answer = instance
+        .get_typed_func::<(), (i64, i64)>(&store, "answer")
+        .expect("export `answer` not found / wrong signature");
+    let result = answer.call(&mut store, ()).expect("call failed");
+    assert_eq!(result, (i64::MIN, -1));
+}
+
 #[test]
 fn let_mut_scalar_returns_99() {
     let bytes = compile_example("let_mut_scalar", "lib.rs");

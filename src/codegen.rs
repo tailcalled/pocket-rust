@@ -1927,11 +1927,13 @@ fn callee_idx_to_table_idx(ctx: &FnCtx, callee_idx: u32) -> usize {
     unreachable!("callee_idx must correspond to a registered function");
 }
 
-// T5: emits wasm conversion ops for an int-to-int `as` cast. Pocket-
-// rust's storage classes: ≤32-bit integers (and usize/isize on wasm32)
-// flatten to wasm `i32`; 64-bit integers flatten to `i64`; 128-bit
-// integers flatten to two `i64`s (skipped here for now). Same-class
-// transitions are no-ops.
+// Emits wasm conversion ops for an int-to-int `as` cast. Pocket-rust's
+// storage classes: ≤32-bit integers (and usize/isize on wasm32) flatten
+// to wasm `i32`; 64-bit integers flatten to `i64`; 128-bit integers
+// flatten to two `i64`s (low half on top). Same-class transitions are
+// no-ops. For widening, the source's signedness drives whether the
+// high bits come from sign or zero extension — matching Rust's `as`
+// semantics where `-1i32 as u128` is all-bits-set.
 fn emit_int_to_int_cast(ctx: &mut FnCtx, src: &IntKind, tgt: &IntKind) {
     let src_class = int_kind_class(src);
     let tgt_class = int_kind_class(tgt);
@@ -1940,16 +1942,54 @@ fn emit_int_to_int_cast(ctx: &mut FnCtx, src: &IntKind, tgt: &IntKind) {
             ctx.instructions.push(wasm::Instruction::I32WrapI64);
         }
         (IntClass::Narrow32, IntClass::Wide64) => {
-            // Sign vs unsigned extension based on the source signedness.
             if int_kind_signed(src) {
                 ctx.instructions.push(wasm::Instruction::I64ExtendI32S);
             } else {
                 ctx.instructions.push(wasm::Instruction::I64ExtendI32U);
             }
         }
+        (IntClass::Narrow32, IntClass::Wide128) => {
+            // Widen i32 → i64 first, then synthesize the 128-bit high half.
+            if int_kind_signed(src) {
+                ctx.instructions.push(wasm::Instruction::I64ExtendI32S);
+            } else {
+                ctx.instructions.push(wasm::Instruction::I64ExtendI32U);
+            }
+            emit_i64_to_128_high_half(ctx, int_kind_signed(src));
+        }
+        (IntClass::Wide64, IntClass::Wide128) => {
+            emit_i64_to_128_high_half(ctx, int_kind_signed(src));
+        }
+        (IntClass::Wide128, IntClass::Wide64) => {
+            // Drop high half; low half (i64) is left on top.
+            ctx.instructions.push(wasm::Instruction::Drop);
+        }
+        (IntClass::Wide128, IntClass::Narrow32) => {
+            ctx.instructions.push(wasm::Instruction::Drop);
+            ctx.instructions.push(wasm::Instruction::I32WrapI64);
+        }
         // Same class — no wasm op needed.
         _ => {}
     }
+}
+
+// Stack: [low: i64] -> [low: i64, high: i64]. For unsigned source, the
+// high half is just zero. For signed source, we duplicate `low` via a
+// fresh i64 local and emit `low >> 63` (arithmetic) — propagating the
+// sign bit across all 64 bits.
+fn emit_i64_to_128_high_half(ctx: &mut FnCtx, signed: bool) {
+    if !signed {
+        ctx.instructions.push(wasm::Instruction::I64Const(0));
+        return;
+    }
+    let tmp = ctx.next_wasm_local;
+    ctx.extra_locals.push(wasm::ValType::I64);
+    ctx.next_wasm_local += 1;
+    ctx.instructions.push(wasm::Instruction::LocalSet(tmp));
+    ctx.instructions.push(wasm::Instruction::LocalGet(tmp));
+    ctx.instructions.push(wasm::Instruction::LocalGet(tmp));
+    ctx.instructions.push(wasm::Instruction::I64Const(63));
+    ctx.instructions.push(wasm::Instruction::I64ShrS);
 }
 
 #[derive(PartialEq, Eq)]
@@ -1983,21 +2023,7 @@ fn int_kind_signed(k: &IntKind) -> bool {
 // `<T as Num>::from_i64(literal_i64)`. Codegen emits an `i64.const`
 // (the only place a primitive integer constant is emitted now) and
 // calls the appropriate impl method, monomorphizing when needed.
-//
-// 128-bit literals fall back to a direct primitive emit (the literal's
-// value plus a zero high half) — `i128`/`u128` aren't yet in `Num`'s
-// stdlib impls, since `i64 → 128-bit` casts are deferred along with
-// 128-bit storage handling.
 fn emit_int_lit(ctx: &mut FnCtx, ty: &RType, value: u64) {
-    // 128-bit Int targets fall back to the direct primitive emit.
-    if let RType::Int(k) = ty {
-        if matches!(k, IntKind::U128 | IntKind::I128) {
-            ctx.instructions
-                .push(wasm::Instruction::I64Const(value as i64));
-            ctx.instructions.push(wasm::Instruction::I64Const(0));
-            return;
-        }
-    }
     // Solve `<ty as Num>::from_i64`.
     let num_path = vec!["std".to_string(), "Num".to_string()];
     let resolution = crate::typeck::solve_impl(&num_path, ty, ctx.traits, 0)
