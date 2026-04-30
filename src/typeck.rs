@@ -4576,8 +4576,21 @@ fn check_method_call(
             span: mc.method_span.copy(),
         });
     }
-    let mut matched: Vec<(MethodCandidate, Vec<(String, InferType)>, Vec<(InferType, InferType)>)> =
-        Vec::new();
+    // Per matched candidate we record a `match_tier`, lower = more
+    // direct (mirrors Rust's deref-probe sequence; see "Method
+    // dispatch" in CLAUDE.md):
+    //   0 — direct: pattern matches recv_full as-is.
+    //   1 — pattern-side autoref: pattern is `&T` / `&mut T`; the
+    //       pattern's inner matches recv_full. Corresponds to Rust
+    //       autoref'ing the receiver to align with the impl pattern.
+    //   2 — recv-side peel: recv is a Ref and the pattern matches the
+    //       peeled inner. Corresponds to autoderef.
+    let mut matched: Vec<(
+        MethodCandidate,
+        Vec<(String, InferType)>,
+        Vec<(InferType, InferType)>,
+        u8,
+    )> = Vec::new();
     for cand in &candidates {
         let impl_target_opt: Option<RType> = match cand {
             MethodCandidate::Direct(i) => {
@@ -4591,7 +4604,7 @@ fn check_method_call(
             Some(p) => p,
             None => continue,
         };
-        // Try full recv first.
+        // Tier 0: full recv.
         let mut env_so_far: Vec<(String, InferType)> = Vec::new();
         let mut pending: Vec<(InferType, InferType)> = Vec::new();
         let mut ok = try_match_against_infer(
@@ -4601,7 +4614,28 @@ fn check_method_call(
             &mut env_so_far,
             &mut pending,
         );
+        let mut match_tier: u8 = 0;
         if !ok {
+            // Tier 1: pattern-side autoref. Only meaningful when the
+            // pattern is shaped `&T` / `&mut T`; we peel that off and
+            // match its inner against recv_full.
+            if let RType::Ref { inner: pat_inner, .. } = pat {
+                env_so_far = Vec::new();
+                pending = Vec::new();
+                ok = try_match_against_infer(
+                    pat_inner,
+                    &recv_full,
+                    &ctx.subst,
+                    &mut env_so_far,
+                    &mut pending,
+                );
+                if ok {
+                    match_tier = 1;
+                }
+            }
+        }
+        if !ok {
+            // Tier 2: recv-side peel.
             if let Some(peeled) = &recv_peeled {
                 env_so_far = Vec::new();
                 pending = Vec::new();
@@ -4612,10 +4646,13 @@ fn check_method_call(
                     &mut env_so_far,
                     &mut pending,
                 );
+                if ok {
+                    match_tier = 2;
+                }
             }
         }
         if ok {
-            matched.push((*cand, env_so_far, pending));
+            matched.push((*cand, env_so_far, pending, match_tier));
         }
     }
     if matched.is_empty() {
@@ -4655,13 +4692,7 @@ fn check_method_call(
             }
             idx += 1;
         }
-        if adjust_valid.len() == 1 {
-            // Keep just the one survivor.
-            let keep = adjust_valid[0];
-            matched = matched.into_iter().enumerate()
-                .filter_map(|(i, m)| if i == keep { Some(m) } else { None })
-                .collect();
-        } else if adjust_valid.is_empty() {
+        if adjust_valid.is_empty() {
             // None of the candidates can adjust to the receiver shape.
             return Err(Error {
                 file: ctx.current_file.to_string(),
@@ -4672,19 +4703,44 @@ fn check_method_call(
                 ),
                 span: mc.method_span.copy(),
             });
-        } else {
-            return Err(Error {
-                file: ctx.current_file.to_string(),
-                message: format!(
-                    "ambiguous method `{}` on `{}`: multiple impls match",
-                    mc.method,
-                    infer_to_string(&recv_full)
-                ),
-                span: mc.method_span.copy(),
-            });
+        }
+        // Drop adjust-invalid candidates first.
+        let valid_set: Vec<usize> = adjust_valid;
+        matched = matched
+            .into_iter()
+            .enumerate()
+            .filter_map(|(i, m)| if valid_set.contains(&i) { Some(m) } else { None })
+            .collect();
+        // If still ambiguous, prefer the minimum match_tier — Rust's
+        // dispatch probes the receiver type as-is first, then autoref,
+        // then deref. Stops at the first hit. Only a true overlap at
+        // the same tier (e.g. unrelated traits supplying the same
+        // method name on the same recv shape) declares ambiguity.
+        if matched.len() > 1 {
+            let mut min_tier: u8 = u8::MAX;
+            let mut k = 0;
+            while k < matched.len() {
+                if matched[k].3 < min_tier {
+                    min_tier = matched[k].3;
+                }
+                k += 1;
+            }
+            matched = matched.into_iter().filter(|m| m.3 == min_tier).collect();
+            if matched.len() > 1 {
+                return Err(Error {
+                    file: ctx.current_file.to_string(),
+                    message: format!(
+                        "ambiguous method `{}` on `{}`: multiple impls match",
+                        mc.method,
+                        infer_to_string(&recv_full)
+                    ),
+                    span: mc.method_span.copy(),
+                });
+            }
         }
     }
-    let (chosen_cand, mut chosen_env, chosen_pending) = matched.into_iter().next().unwrap();
+    let (chosen_cand, mut chosen_env, chosen_pending, _match_tier) =
+        matched.into_iter().next().unwrap();
     // Commit the pending unifications discovered during pattern matching.
     let mut pi = 0;
     while pi < chosen_pending.len() {

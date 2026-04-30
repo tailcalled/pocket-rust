@@ -211,6 +211,51 @@ fn u128_literal_returns_42() {
     assert_eq!(result, (42, 0));
 }
 
+// When `impl Show for u32` and `impl<T> Show for &T` both provide
+// `show`, dispatch on `r: &u32; r.show()` should pick the `&T` impl —
+// it matches the receiver directly (peel_level 0), while the `u32`
+// impl only matches after peeling (peel_level 1). The `&T` blanket
+// returns 2.
+#[test]
+fn autoref_disambig_through_ref_returns_2() {
+    let bytes = compile_example("autoref_disambig", "lib.rs");
+    let (mut store, instance) = instantiate(&bytes);
+    let f = instance
+        .get_typed_func::<(), i32>(&store, "through_ref")
+        .expect("export `through_ref` not found / wrong signature");
+    let result = f.call(&mut store, ()).expect("call failed");
+    assert_eq!(result, 2);
+}
+
+// Sanity check the inverse: with `x: u32` (owned), `impl Show for u32`
+// matches directly at tier 0 while `impl<T> Show for &T` matches via
+// pattern-side autoref at tier 1. The direct match wins.
+#[test]
+fn autoref_disambig_through_owned_returns_1() {
+    let bytes = compile_example("autoref_disambig", "lib.rs");
+    let (mut store, instance) = instantiate(&bytes);
+    let f = instance
+        .get_typed_func::<(), i32>(&store, "through_owned")
+        .expect("export `through_owned` not found / wrong signature");
+    let result = f.call(&mut store, ()).expect("call failed");
+    assert_eq!(result, 1);
+}
+
+// Pattern-side autoref reaching a blanket impl: only `impl<T> Tag for
+// &T` exists, recv is owned `x: u32`. Pattern `&T` matches via autoref
+// (tier 1, T=u32). derive_recv_adjust says BorrowImm — `&x` is passed
+// to the impl method.
+#[test]
+fn autoref_only_returns_7() {
+    let bytes = compile_example("autoref_only", "lib.rs");
+    let (mut store, instance) = instantiate(&bytes);
+    let f = instance
+        .get_typed_func::<(), i32>(&store, "answer")
+        .expect("export `answer` not found / wrong signature");
+    let result = f.call(&mut store, ()).expect("call failed");
+    assert_eq!(result, 7);
+}
+
 // Sign-extension test: cast u64 (with bit 63 set) → i64 (reinterprets
 // as i64::MIN) → i128. The 128-bit high half should be all-ones, since
 // the source is signed and negative.
