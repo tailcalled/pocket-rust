@@ -179,6 +179,7 @@ pub enum TypeKind {
     },
     RawPtr { inner: Box<Type>, mutable: bool },
     SelfType,
+    Tuple(Vec<Type>),
 }
 
 #[derive(Clone)]
@@ -237,6 +238,20 @@ pub enum ExprKind {
     Block(Box<Block>),
     MethodCall(MethodCall),
     If(IfExpr),
+    // Tuple expression. `()` is the unit value (empty tuple); `(a,)`
+    // is a 1-tuple; `(a, b)` is a 2-tuple; etc. Parenthesized
+    // single-expression `(a)` is parsed as the inner expression
+    // directly (no Tuple node).
+    Tuple(Vec<Expr>),
+    // `t.<index>` — tuple field access by 0-based numeric index.
+    // Distinct from `FieldAccess` (which carries a string name) so
+    // typeck/codegen can treat them separately. Valid only on tuple
+    // values.
+    TupleIndex {
+        base: Box<Expr>,
+        index: u32,
+        index_span: Span,
+    },
     // `¤name(args)` — a compiler-builtin intrinsic call. The name
     // identifies which primitive op (e.g. `u32_add`, `i64_eq`,
     // `bool_and`) and determines the expected arg types and result

@@ -652,6 +652,12 @@ impl Parser {
     }
 
     fn parse_type(&mut self) -> Result<Type, Error> {
+        if self.peek_kind(&TokenKind::LParen) {
+            // Tuple types: `()`, `(T,)`, `(T1, T2, ...)`. The 1-tuple
+            // form requires a trailing comma to disambiguate from
+            // a parenthesized `(T)`.
+            return self.parse_tuple_type();
+        }
         if self.peek_kind(&TokenKind::SelfUpper) {
             let span = self.tokens[self.pos].span.copy();
             self.pos += 1;
@@ -718,6 +724,43 @@ impl Parser {
         })
     }
 
+    // `()` (unit), `(T,)` (1-tuple, comma required), `(T1, T2)` (≥2-tuple,
+    // trailing comma optional). The 1-tuple comma is what disambiguates
+    // from a grouping `(T)`; if we see `(T)` here we still produce a
+    // `TupleType` of length 1 only when the trailing comma is present —
+    // a bare `(T)` falls through to a simple `T`.
+    fn parse_tuple_type(&mut self) -> Result<Type, Error> {
+        let lp = self.expect(&TokenKind::LParen, "`(`")?;
+        if self.peek_kind(&TokenKind::RParen) {
+            let rp = self.expect(&TokenKind::RParen, "`)`")?;
+            return Ok(Type {
+                kind: TypeKind::Tuple(Vec::new()),
+                span: Span::new(lp.start, rp.end),
+            });
+        }
+        let mut elems: Vec<Type> = Vec::new();
+        elems.push(self.parse_type()?);
+        let mut had_trailing_comma = false;
+        while self.peek_kind(&TokenKind::Comma) {
+            self.pos += 1;
+            had_trailing_comma = true;
+            if self.peek_kind(&TokenKind::RParen) {
+                break;
+            }
+            had_trailing_comma = false;
+            elems.push(self.parse_type()?);
+        }
+        let rp = self.expect(&TokenKind::RParen, "`)`")?;
+        if elems.len() == 1 && !had_trailing_comma {
+            // `(T)` is a parenthesized type — return T directly.
+            return Ok(elems.pop().unwrap());
+        }
+        Ok(Type {
+            kind: TypeKind::Tuple(elems),
+            span: Span::new(lp.start, rp.end),
+        })
+    }
+
     fn parse_block(&mut self) -> Result<Block, Error> {
         let lb = self.expect(&TokenKind::LBrace, "`{`")?;
         let mut stmts: Vec<Stmt> = Vec::new();
@@ -749,19 +792,20 @@ impl Parser {
                 }));
                 continue;
             }
-            // Block-like expressions (`unsafe { … }` and `{ … }`) without a
-            // tail can sit as bare statements with no trailing `;`. They're
-            // unit-typed; we simply walk them for side effects in later passes.
-            if is_unit_block_like(&expr) {
-                // Block-like exprs without a tail are unit-typed; pocket-
-                // rust has no unit value, so treat them as statements
-                // even when they sit at the very end of the enclosing
-                // block (which means the block has no tail).
+            if self.peek_kind(&TokenKind::Semi) {
+                // Plain expression statement: `expr;` — value (if any)
+                // is discarded; the expression is walked for its side
+                // effects.
+                self.pos += 1;
                 stmts.push(Stmt::Expr(expr));
-                if self.peek_kind(&TokenKind::RBrace) {
-                    tail = None;
-                    break;
-                }
+                continue;
+            }
+            // Block-like expressions (`unsafe { … }`, `{ … }`, `if`)
+            // without a `;` can still sit as bare statements — their
+            // braces already delimit them. Treat those as statements
+            // when they're not the final tail-position expression.
+            if is_unit_block_like(&expr) && !self.peek_kind(&TokenKind::RBrace) {
+                stmts.push(Stmt::Expr(expr));
                 continue;
             }
             tail = Some(expr);
@@ -979,6 +1023,35 @@ impl Parser {
         let mut expr = self.parse_atom()?;
         while self.peek_kind(&TokenKind::Dot) {
             self.pos += 1;
+            // `.<integer>` — tuple-index access. We accept any non-
+            // negative integer literal here; range-checks (against the
+            // tuple's arity) happen in typeck.
+            if self.pos < self.tokens.len() {
+                if let TokenKind::IntLit(n) = &self.tokens[self.pos].kind {
+                    let n = *n;
+                    let index_span = self.tokens[self.pos].span.copy();
+                    if n > u32::MAX as u64 {
+                        return Err(Error {
+                            file: self.file.clone(),
+                            message: "tuple index too large".to_string(),
+                            span: index_span,
+                        });
+                    }
+                    self.pos += 1;
+                    let span = Span::new(expr.span.start.copy(), index_span.end.copy());
+                    let id = self.alloc_node_id();
+                    expr = Expr {
+                        kind: ExprKind::TupleIndex {
+                            base: Box::new(expr),
+                            index: n as u32,
+                            index_span,
+                        },
+                        span,
+                        id,
+                    };
+                    continue;
+                }
+            }
             let (field, field_span) = self.expect_ident()?;
             // Optional method-call turbofish: `.method::<'a, T>(args)`.
             // Lifetime args are parsed but ignored (Phase A).
@@ -1067,13 +1140,47 @@ impl Parser {
             TokenKind::LBrace => self.parse_block_expr(),
             TokenKind::Unsafe => self.parse_unsafe_block(),
             TokenKind::LParen => {
+                let lp = self.tokens[self.pos].span.copy();
                 self.pos += 1;
+                // `()` — unit value (empty tuple).
+                if self.peek_kind(&TokenKind::RParen) {
+                    let rp = self.expect(&TokenKind::RParen, "`)`")?;
+                    let id = self.alloc_node_id();
+                    return Ok(Expr {
+                        kind: ExprKind::Tuple(Vec::new()),
+                        span: Span::new(lp.start, rp.end),
+                        id,
+                    });
+                }
                 let saved = self.no_struct_lit;
                 self.no_struct_lit = false;
-                let expr = self.parse_expr()?;
+                let first = self.parse_expr()?;
                 self.no_struct_lit = saved;
+                if self.peek_kind(&TokenKind::Comma) {
+                    // Tuple expression: at least one trailing comma.
+                    // `(a,)` → 1-tuple, `(a, b)` → 2-tuple, etc.
+                    let mut elems: Vec<Expr> = Vec::new();
+                    elems.push(first);
+                    while self.peek_kind(&TokenKind::Comma) {
+                        self.pos += 1;
+                        if self.peek_kind(&TokenKind::RParen) {
+                            break;
+                        }
+                        let saved2 = self.no_struct_lit;
+                        self.no_struct_lit = false;
+                        elems.push(self.parse_expr()?);
+                        self.no_struct_lit = saved2;
+                    }
+                    let rp = self.expect(&TokenKind::RParen, "`)`")?;
+                    let id = self.alloc_node_id();
+                    return Ok(Expr {
+                        kind: ExprKind::Tuple(elems),
+                        span: Span::new(lp.start, rp.end),
+                        id,
+                    });
+                }
                 self.expect(&TokenKind::RParen, "`)`")?;
-                Ok(expr)
+                Ok(first)
             }
             other => {
                 let msg = format!("expected expression, got {}", token_kind_name(other));
@@ -1103,10 +1210,11 @@ impl Parser {
     // and `{ … }` — both with `tail.is_none()`.
 
 
-    // `if cond { … } else { … }` — both arms required (no unit type yet).
-    // The `else` may be another `if` (chained `else if … else …`) or a
-    // brace block. Struct literals are disallowed in the condition; wrap
-    // in parens to use them.
+    // `if cond { … } else { … }` — `else` is optional: `if cond { … }`
+    // implicitly elses to an empty block (unit-typed). Chained `else if`
+    // desugars to a block whose tail is the chained if expression.
+    // Struct literals are disallowed in the condition; wrap in parens
+    // to use them.
     fn parse_if_expr(&mut self) -> Result<Expr, Error> {
         let if_span = self.expect(&TokenKind::If, "`if`")?;
         let saved = self.no_struct_lit;
@@ -1114,19 +1222,28 @@ impl Parser {
         let cond = self.parse_expr()?;
         self.no_struct_lit = saved;
         let then_block = self.parse_block()?;
-        self.expect(&TokenKind::Else, "`else`")?;
-        let else_block = if self.peek_kind(&TokenKind::If) {
-            // Desugar `else if … else …` into a block whose tail is the
-            // chained if expression.
-            let chained = self.parse_if_expr()?;
-            let span = chained.span.copy();
-            Block {
-                stmts: Vec::new(),
-                tail: Some(chained),
-                span,
+        let else_block = if self.peek_kind(&TokenKind::Else) {
+            self.pos += 1;
+            if self.peek_kind(&TokenKind::If) {
+                let chained = self.parse_if_expr()?;
+                let span = chained.span.copy();
+                Block {
+                    stmts: Vec::new(),
+                    tail: Some(chained),
+                    span,
+                }
+            } else {
+                self.parse_block()?
             }
         } else {
-            self.parse_block()?
+            // No `else` — synthesize an empty block at the end of the
+            // then-block. Its type is `()`.
+            let end = then_block.span.end.copy();
+            Block {
+                stmts: Vec::new(),
+                tail: None,
+                span: Span::new(end.copy(), end),
+            }
         };
         let end = else_block.span.end.copy();
         let span = Span::new(if_span.start, end);
@@ -1515,10 +1632,16 @@ impl Parser {
     }
 }
 
+// Expressions whose syntax already delimits them with braces and which
+// can therefore sit in statement position without a trailing `;`. Their
+// value (if any) is discarded by the enclosing block — codegen_expr_stmt
+// emits the matching number of `drop`s. `if`/`else if` chains and any
+// brace block are recognised here.
 fn is_unit_block_like(expr: &Expr) -> bool {
     match &expr.kind {
-        ExprKind::Block(b) => b.tail.is_none(),
-        ExprKind::Unsafe(b) => b.tail.is_none(),
+        ExprKind::Block(_) => true,
+        ExprKind::Unsafe(_) => true,
+        ExprKind::If(_) => true,
         _ => false,
     }
 }

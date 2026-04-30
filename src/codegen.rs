@@ -283,6 +283,18 @@ fn collect_leaves(
             signed: false,
             valtype: wasm::ValType::I32,
         }),
+        RType::Tuple(elems) => {
+            // Tuple layout matches struct layout: tightly packed in
+            // declaration order, no alignment padding. The unit type
+            // `()` has no leaves at all.
+            let mut off = base_offset;
+            let mut i = 0;
+            while i < elems.len() {
+                collect_leaves(&elems[i], structs, off, out);
+                off += byte_size_of(&elems[i], structs);
+                i += 1;
+            }
+        }
     }
 }
 
@@ -444,6 +456,16 @@ fn walk_expr_drop_marks(
                 i += 1;
             }
         }
+        ExprKind::Tuple(elems) => {
+            let mut i = 0;
+            while i < elems.len() {
+                walk_expr_drop_marks(&elems[i], expr_types, traits, info);
+                i += 1;
+            }
+        }
+        ExprKind::TupleIndex { base, .. } => {
+            walk_expr_drop_marks(base, expr_types, traits, info);
+        }
     }
 }
 
@@ -600,6 +622,14 @@ fn walk_expr_addr(
                 i += 1;
             }
         }
+        ExprKind::Tuple(elems) => {
+            let mut i = 0;
+            while i < elems.len() {
+                walk_expr_addr(&elems[i], stack, info);
+                i += 1;
+            }
+        }
+        ExprKind::TupleIndex { base, .. } => walk_expr_addr(base, stack, info),
     }
 }
 
@@ -933,6 +963,14 @@ fn collect_lets_in_expr(expr: &Expr, out: &mut Vec<u32>) {
             }
         }
         ExprKind::Block(b) | ExprKind::Unsafe(b) => collect_let_value_ids(b.as_ref(), out),
+        ExprKind::Tuple(elems) => {
+            let mut i = 0;
+            while i < elems.len() {
+                collect_lets_in_expr(&elems[i], out);
+                i += 1;
+            }
+        }
+        ExprKind::TupleIndex { base, .. } => collect_lets_in_expr(base, out),
     }
 }
 
@@ -1326,11 +1364,26 @@ fn codegen_block(ctx: &mut FnCtx, block: &Block) -> Result<(), Error> {
 }
 
 fn codegen_expr_stmt(ctx: &mut FnCtx, expr: &Expr) -> Result<(), Error> {
-    // Only block-like, tail-less expressions land here (parser-enforced); they
-    // produce nothing on the WASM stack, so we just walk for side effects.
+    // Two flavours land here:
+    //  - tail-less block-like exprs (`unsafe { … }`, `{ … }`) — they
+    //    produce nothing on the WASM stack, just side effects.
+    //  - any other expression followed by `;` — we evaluate and then
+    //    drop the resulting flat scalars (one `drop` per scalar).
     match &expr.kind {
-        ExprKind::Block(b) | ExprKind::Unsafe(b) => codegen_unit_block_stmt(ctx, b.as_ref()),
-        _ => unreachable!("only block-like exprs reach codegen_expr_stmt"),
+        ExprKind::Block(b) | ExprKind::Unsafe(b) if b.tail.is_none() => {
+            codegen_unit_block_stmt(ctx, b.as_ref())
+        }
+        _ => {
+            let ty = codegen_expr(ctx, expr)?;
+            let mut vts: Vec<wasm::ValType> = Vec::new();
+            flatten_rtype(&ty, ctx.structs, &mut vts);
+            let mut k = 0;
+            while k < vts.len() {
+                ctx.instructions.push(wasm::Instruction::Drop);
+                k += 1;
+            }
+            Ok(())
+        }
     }
 }
 
@@ -1593,29 +1646,46 @@ fn codegen_assign_stmt(ctx: &mut FnCtx, assign: &AssignStmt) -> Result<(), Error
     let mut chain_offset: u32 = 0;
     let mut i = 1;
     while i < chain.len() {
-        let (struct_path, struct_args) = match &current_ty {
-            RType::Struct { path, type_args, .. } => (clone_path(path), rtype_vec_clone(type_args)),
-            _ => unreachable!("typeck verified chain navigates structs"),
-        };
-        let entry = struct_lookup(ctx.structs, &struct_path).expect("resolved struct");
-        let env = make_struct_env(&entry.type_params, &struct_args);
-        let mut field_offset: u32 = 0;
-        let mut found_field = false;
-        let mut j = 0;
-        while j < entry.fields.len() {
-            let fty = substitute_rtype(&entry.fields[j].ty, &env);
-            let s = byte_size_of(&fty, ctx.structs);
-            if entry.fields[j].name == chain[i] {
-                chain_offset += field_offset;
-                current_ty = fty;
-                found_field = true;
-                break;
+        match &current_ty {
+            RType::Struct { path, type_args, .. } => {
+                let struct_path = clone_path(path);
+                let struct_args = rtype_vec_clone(type_args);
+                let entry = struct_lookup(ctx.structs, &struct_path).expect("resolved struct");
+                let env = make_struct_env(&entry.type_params, &struct_args);
+                let mut field_offset: u32 = 0;
+                let mut found_field = false;
+                let mut j = 0;
+                while j < entry.fields.len() {
+                    let fty = substitute_rtype(&entry.fields[j].ty, &env);
+                    let s = byte_size_of(&fty, ctx.structs);
+                    if entry.fields[j].name == chain[i] {
+                        chain_offset += field_offset;
+                        current_ty = fty;
+                        found_field = true;
+                        break;
+                    }
+                    field_offset += s;
+                    j += 1;
+                }
+                if !found_field {
+                    unreachable!("typeck verified the field exists");
+                }
             }
-            field_offset += s;
-            j += 1;
-        }
-        if !found_field {
-            unreachable!("typeck verified the field exists");
+            RType::Tuple(elems) => {
+                let elems = rtype_vec_clone(elems);
+                let idx: usize = chain[i]
+                    .parse()
+                    .expect("typeck verified tuple-index segment");
+                let mut elem_offset: u32 = 0;
+                let mut j = 0;
+                while j < idx {
+                    elem_offset += byte_size_of(&elems[j], ctx.structs);
+                    j += 1;
+                }
+                chain_offset += elem_offset;
+                current_ty = rtype_clone(&elems[idx]);
+            }
+            _ => unreachable!("typeck verified chain navigates structs/tuples"),
         }
         i += 1;
     }
@@ -1670,31 +1740,48 @@ fn flat_chain_offset(ctx: &FnCtx, chain: &Vec<String>, binding_idx: usize) -> u3
     let mut flat_off: u32 = 0;
     let mut i = 1;
     while i < chain.len() {
-        let (struct_path, struct_args) = match &current_ty {
-            RType::Struct { path, type_args, .. } => (clone_path(path), rtype_vec_clone(type_args)),
-            _ => unreachable!("typeck verified chain navigates structs"),
-        };
-        let entry = struct_lookup(ctx.structs, &struct_path).expect("resolved struct");
-        let env = make_struct_env(&entry.type_params, &struct_args);
-        let mut field_flat_off: u32 = 0;
-        let mut found = false;
-        let mut j = 0;
-        while j < entry.fields.len() {
-            let fty = substitute_rtype(&entry.fields[j].ty, &env);
-            let mut vts: Vec<wasm::ValType> = Vec::new();
-            flatten_rtype(&fty, ctx.structs, &mut vts);
-            let s = vts.len() as u32;
-            if entry.fields[j].name == chain[i] {
-                flat_off += field_flat_off;
-                current_ty = fty;
-                found = true;
-                break;
+        match &current_ty {
+            RType::Struct { path, type_args, .. } => {
+                let struct_path = clone_path(path);
+                let struct_args = rtype_vec_clone(type_args);
+                let entry = struct_lookup(ctx.structs, &struct_path).expect("resolved struct");
+                let env = make_struct_env(&entry.type_params, &struct_args);
+                let mut field_flat_off: u32 = 0;
+                let mut found = false;
+                let mut j = 0;
+                while j < entry.fields.len() {
+                    let fty = substitute_rtype(&entry.fields[j].ty, &env);
+                    let mut vts: Vec<wasm::ValType> = Vec::new();
+                    flatten_rtype(&fty, ctx.structs, &mut vts);
+                    let s = vts.len() as u32;
+                    if entry.fields[j].name == chain[i] {
+                        flat_off += field_flat_off;
+                        current_ty = fty;
+                        found = true;
+                        break;
+                    }
+                    field_flat_off += s;
+                    j += 1;
+                }
+                if !found {
+                    unreachable!("typeck verified the field exists");
+                }
             }
-            field_flat_off += s;
-            j += 1;
-        }
-        if !found {
-            unreachable!("typeck verified the field exists");
+            RType::Tuple(elems) => {
+                let elems = rtype_vec_clone(elems);
+                let idx: usize = chain[i]
+                    .parse()
+                    .expect("typeck verified tuple-index segment");
+                let mut j = 0;
+                while j < idx {
+                    let mut vts: Vec<wasm::ValType> = Vec::new();
+                    flatten_rtype(&elems[j], ctx.structs, &mut vts);
+                    flat_off += vts.len() as u32;
+                    j += 1;
+                }
+                current_ty = rtype_clone(&elems[idx]);
+            }
+            _ => unreachable!("typeck verified chain navigates structs/tuples"),
         }
         i += 1;
     }
@@ -1719,6 +1806,10 @@ fn extract_deref_chain<'a>(expr: &'a Expr) -> Option<(&'a Expr, Vec<String>)> {
             ExprKind::FieldAccess(fa) => {
                 fields.push(fa.field.clone());
                 current = &fa.base;
+            }
+            ExprKind::TupleIndex { base, index, .. } => {
+                fields.push(format!("{}", index));
+                current = base;
             }
             _ => return None,
         }
@@ -1808,6 +1899,10 @@ fn extract_place(expr: &Expr) -> Option<Vec<String>> {
                 chain.push(fa.field.clone());
                 current = &fa.base;
             }
+            ExprKind::TupleIndex { base, index, .. } => {
+                chain.push(format!("{}", index));
+                current = base;
+            }
             _ => return None,
         }
     }
@@ -1862,7 +1957,117 @@ fn codegen_expr(ctx: &mut FnCtx, expr: &Expr) -> Result<RType, Error> {
         }
         ExprKind::If(if_expr) => codegen_if_expr(ctx, if_expr, expr.id),
         ExprKind::Builtin { name, args, .. } => codegen_builtin(ctx, name, args, expr.id),
+        ExprKind::Tuple(elems) => codegen_tuple_lit(ctx, elems),
+        ExprKind::TupleIndex { base, index, .. } => codegen_tuple_index(ctx, base, *index),
     }
+}
+
+// `(a, b, c)` — codegen each elem in source order, leaving its
+// flat scalars on the wasm stack. The tuple's flat representation
+// is the concatenation; `()` produces no instructions at all.
+fn codegen_tuple_lit(ctx: &mut FnCtx, elems: &Vec<Expr>) -> Result<RType, Error> {
+    let mut elem_tys: Vec<RType> = Vec::new();
+    let mut i = 0;
+    while i < elems.len() {
+        let ty = codegen_expr(ctx, &elems[i])?;
+        elem_tys.push(ty);
+        i += 1;
+    }
+    Ok(RType::Tuple(elem_tys))
+}
+
+// `t.<index>` — analogous to `codegen_field_access`. Try the place-rooted
+// path (chain bottoms at a Var or a chain through &/structs/tuples) for
+// direct memory access; otherwise fall back to evaluating the whole base
+// onto the stack and stash-extracting the element.
+fn codegen_tuple_index(ctx: &mut FnCtx, base: &Expr, index: u32) -> Result<RType, Error> {
+    let chain = {
+        let mut tmp: Vec<String> = Vec::new();
+        tmp.push(format!("{}", index));
+        if collect_place_chain(base, &mut tmp) {
+            let mut reversed: Vec<String> = Vec::new();
+            let mut i = tmp.len();
+            while i > 0 {
+                i -= 1;
+                reversed.push(tmp[i].clone());
+            }
+            Some(reversed)
+        } else {
+            None
+        }
+    };
+    if let Some(chain) = chain {
+        return codegen_place_chain_load(ctx, &chain);
+    }
+    let base_type = codegen_expr(ctx, base)?;
+    extract_tuple_elem_from_stack(ctx, &base_type, index)
+}
+
+// Stack-position twin of `extract_field_from_stack`. The tuple's flat
+// scalars are on the stack in declaration order; we need to keep only
+// the slice belonging to element `index`.
+fn extract_tuple_elem_from_stack(
+    ctx: &mut FnCtx,
+    base_type: &RType,
+    index: u32,
+) -> Result<RType, Error> {
+    let elems: Vec<RType> = match base_type {
+        RType::Tuple(elems) => rtype_vec_clone(elems),
+        RType::Ref { inner, .. } => match inner.as_ref() {
+            RType::Tuple(elems) => rtype_vec_clone(elems),
+            _ => unreachable!("typeck rejects tuple-index on non-tuple"),
+        },
+        _ => unreachable!("typeck rejects tuple-index on non-tuple"),
+    };
+    let mut total_flat: u32 = 0;
+    let mut field_flat_off: u32 = 0;
+    let mut field_valtypes: Vec<wasm::ValType> = Vec::new();
+    let mut field_ty: RType = RType::Int(IntKind::I32);
+    let mut i = 0;
+    while i < elems.len() {
+        let mut vts: Vec<wasm::ValType> = Vec::new();
+        flatten_rtype(&elems[i], ctx.structs, &mut vts);
+        let s = vts.len() as u32;
+        if i as u32 == index {
+            field_flat_off = total_flat;
+            field_valtypes = vts;
+            field_ty = rtype_clone(&elems[i]);
+        }
+        total_flat += s;
+        i += 1;
+    }
+    let field_size = field_valtypes.len() as u32;
+    let drop_top = total_flat - field_flat_off - field_size;
+    let mut i = 0;
+    while i < drop_top {
+        ctx.instructions.push(wasm::Instruction::Drop);
+        i += 1;
+    }
+    let stash_start = ctx.next_wasm_local;
+    let mut k = 0;
+    while k < field_valtypes.len() {
+        ctx.extra_locals.push(field_valtypes[k].copy());
+        ctx.next_wasm_local += 1;
+        k += 1;
+    }
+    let mut k = 0;
+    while k < field_size {
+        ctx.instructions
+            .push(wasm::Instruction::LocalSet(stash_start + field_size - 1 - k));
+        k += 1;
+    }
+    let mut i = 0;
+    while i < field_flat_off {
+        ctx.instructions.push(wasm::Instruction::Drop);
+        i += 1;
+    }
+    let mut k = 0;
+    while k < field_size {
+        ctx.instructions
+            .push(wasm::Instruction::LocalGet(stash_start + k));
+        k += 1;
+    }
+    Ok(field_ty)
 }
 
 // Lower `¤name(args)` to its wasm op(s). Args are codegen'd in order
@@ -2309,7 +2514,7 @@ fn codegen_method_call(
             let tmpl_env = build_env(&tmpl.type_params, &concrete);
             match &tmpl.return_type {
                 Some(rt) => substitute_rtype(rt, &tmpl_env),
-                None => unreachable!("typeck rejects unit methods used as values"),
+                None => RType::Tuple(Vec::new()),
             }
         };
         let idx = ctx.mono.intern(template_idx, concrete);
@@ -2320,7 +2525,7 @@ fn codegen_method_call(
             let entry = &ctx.funcs.entries[callee_idx_to_table_idx(ctx, callee_idx)];
             match &entry.return_type {
                 Some(rt) => rtype_clone(rt),
-                None => unreachable!("typeck rejects unit methods used as values"),
+                None => RType::Tuple(Vec::new()),
             }
         };
         (callee_idx, return_rt)
@@ -2656,7 +2861,10 @@ fn codegen_block_expr(ctx: &mut FnCtx, block: &Block) -> Result<RType, Error> {
     }
     let result_ty = match &block.tail {
         Some(expr) => codegen_expr(ctx, expr)?,
-        None => unreachable!("typeck rejects block expressions without a tail"),
+        // No tail ⇒ block evaluates to `()` (the empty tuple). Nothing
+        // to push on the wasm stack; nothing to save across the drop
+        // sequence below.
+        None => RType::Tuple(Vec::new()),
     };
     // T4.5: drop in-scope Drop-typed bindings before yielding the tail
     // value. Save the tail to fresh locals, emit drops, reload.
@@ -2765,9 +2973,10 @@ fn codegen_call(
     {
         CallResolution::Direct(idx) => {
             let entry = &ctx.funcs.entries[*idx];
+            // No declared return type ⇒ function returns `()`.
             let rt = match &entry.return_type {
                 Some(rt) => rtype_clone(rt),
-                None => unreachable!("typeck rejects unit functions used as values"),
+                None => RType::Tuple(Vec::new()),
             };
             (entry.idx, rt)
         }
@@ -2785,7 +2994,7 @@ fn codegen_call(
                 let tmpl_env = build_env(&tmpl.type_params, &concrete);
                 match &tmpl.return_type {
                     Some(rt) => substitute_rtype(rt, &tmpl_env),
-                    None => unreachable!("typeck rejects unit functions used as values"),
+                    None => RType::Tuple(Vec::new()),
                 }
             };
             let idx = ctx.mono.intern(template_idx_copy, concrete);
@@ -2947,6 +3156,10 @@ fn collect_place_chain(expr: &Expr, out: &mut Vec<String>) -> bool {
             out.push(fa.field.clone());
             collect_place_chain(&fa.base, out)
         }
+        ExprKind::TupleIndex { base, index, .. } => {
+            out.push(format!("{}", index));
+            collect_place_chain(base, out)
+        }
         _ => false,
     }
 }
@@ -2985,29 +3198,46 @@ fn codegen_place_chain_load(
     let mut chain_offset: u32 = 0;
     let mut i = 1;
     while i < chain.len() {
-        let (struct_path, struct_args) = match &current_ty {
-            RType::Struct { path, type_args, .. } => (clone_path(path), rtype_vec_clone(type_args)),
-            _ => unreachable!("typeck verified chain navigates structs"),
-        };
-        let entry = struct_lookup(ctx.structs, &struct_path).expect("resolved struct");
-        let env = make_struct_env(&entry.type_params, &struct_args);
-        let mut field_offset: u32 = 0;
-        let mut found_field = false;
-        let mut j = 0;
-        while j < entry.fields.len() {
-            let fty = substitute_rtype(&entry.fields[j].ty, &env);
-            let s = byte_size_of(&fty, ctx.structs);
-            if entry.fields[j].name == chain[i] {
-                chain_offset += field_offset;
-                current_ty = fty;
-                found_field = true;
-                break;
+        match &current_ty {
+            RType::Struct { path, type_args, .. } => {
+                let struct_path = clone_path(path);
+                let struct_args = rtype_vec_clone(type_args);
+                let entry = struct_lookup(ctx.structs, &struct_path).expect("resolved struct");
+                let env = make_struct_env(&entry.type_params, &struct_args);
+                let mut field_offset: u32 = 0;
+                let mut found_field = false;
+                let mut j = 0;
+                while j < entry.fields.len() {
+                    let fty = substitute_rtype(&entry.fields[j].ty, &env);
+                    let s = byte_size_of(&fty, ctx.structs);
+                    if entry.fields[j].name == chain[i] {
+                        chain_offset += field_offset;
+                        current_ty = fty;
+                        found_field = true;
+                        break;
+                    }
+                    field_offset += s;
+                    j += 1;
+                }
+                if !found_field {
+                    unreachable!("typeck verified the field exists");
+                }
             }
-            field_offset += s;
-            j += 1;
-        }
-        if !found_field {
-            unreachable!("typeck verified the field exists");
+            RType::Tuple(elems) => {
+                let elems = rtype_vec_clone(elems);
+                let idx: usize = chain[i]
+                    .parse()
+                    .expect("typeck verified tuple-index segment");
+                let mut elem_offset: u32 = 0;
+                let mut j = 0;
+                while j < idx {
+                    elem_offset += byte_size_of(&elems[j], ctx.structs);
+                    j += 1;
+                }
+                chain_offset += elem_offset;
+                current_ty = rtype_clone(&elems[idx]);
+            }
+            _ => unreachable!("typeck verified chain navigates structs/tuples"),
         }
         i += 1;
     }

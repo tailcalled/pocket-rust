@@ -137,6 +137,10 @@ pub enum RType {
     // operations needing layout (byte_size_of, flatten_rtype) reject `Param`.
     Param(String),
     Bool,
+    // Tuple type. Empty Vec is the unit type `()` — the type of
+    // value-less expressions (function bodies without a tail, blocks
+    // ending in `;`, ifs without an else).
+    Tuple(Vec<RType>),
 }
 
 #[derive(Clone)]
@@ -220,7 +224,10 @@ fn satisfies_num(
             let rt = infer_to_rtype_for_check(t);
             crate::typeck::solve_impl(&num_path, &rt, traits, 0).is_some()
         }
-        InferType::Ref { .. } | InferType::RawPtr { .. } | InferType::Bool => false,
+        InferType::Ref { .. }
+        | InferType::RawPtr { .. }
+        | InferType::Bool
+        | InferType::Tuple(_) => false,
     }
 }
 
@@ -257,6 +264,15 @@ fn infer_to_rtype_for_check(t: &InferType) -> RType {
         },
         InferType::Param(n) => RType::Param(n.clone()),
         InferType::Bool => RType::Bool,
+        InferType::Tuple(elems) => {
+            let mut out: Vec<RType> = Vec::new();
+            let mut i = 0;
+            while i < elems.len() {
+                out.push(infer_to_rtype_for_check(&elems[i]));
+                i += 1;
+            }
+            RType::Tuple(out)
+        }
     }
 }
 
@@ -598,6 +614,22 @@ fn try_match_against_infer(
             } => ma == mb && try_match_against_infer(ia, ib, subst, env, pending),
             _ => false,
         },
+        RType::Tuple(pa) => match &resolved {
+            InferType::Tuple(pb) => {
+                if pa.len() != pb.len() {
+                    return false;
+                }
+                let mut i = 0;
+                while i < pa.len() {
+                    if !try_match_against_infer(&pa[i], &pb[i], subst, env, pending) {
+                        return false;
+                    }
+                    i += 1;
+                }
+                true
+            }
+            _ => false,
+        },
     }
 }
 
@@ -657,6 +689,13 @@ fn freshen_inferred_lifetimes(rt: &mut RType, next_id: &mut u32) {
             }
         }
         RType::Int(_) | RType::Param(_) | RType::Bool => {}
+        RType::Tuple(elems) => {
+            let mut i = 0;
+            while i < elems.len() {
+                freshen_inferred_lifetimes(&mut elems[i], next_id);
+                i += 1;
+            }
+        }
     }
 }
 
@@ -702,6 +741,14 @@ fn require_no_inferred_lifetimes(
             Ok(())
         }
         RType::Int(_) | RType::Param(_) | RType::Bool => Ok(()),
+        RType::Tuple(elems) => {
+            let mut i = 0;
+            while i < elems.len() {
+                require_no_inferred_lifetimes(&elems[i], span, file)?;
+                i += 1;
+            }
+            Ok(())
+        }
     }
 }
 
@@ -736,6 +783,14 @@ fn validate_named_lifetimes(
             Ok(())
         }
         RType::Int(_) | RType::Param(_) | RType::Bool => Ok(()),
+        RType::Tuple(elems) => {
+            let mut i = 0;
+            while i < elems.len() {
+                require_no_inferred_lifetimes(&elems[i], span, file)?;
+                i += 1;
+            }
+            Ok(())
+        }
     }
 }
 
@@ -785,6 +840,7 @@ pub fn rtype_clone(t: &RType) -> RType {
         },
         RType::Param(n) => RType::Param(n.clone()),
         RType::Bool => RType::Bool,
+        RType::Tuple(elems) => RType::Tuple(rtype_vec_clone(elems)),
     }
 }
 
@@ -851,6 +907,7 @@ pub fn rtype_eq(a: &RType, b: &RType) -> bool {
             },
         ) => ma == mb && rtype_eq(ia, ib),
         (RType::Param(a), RType::Param(b)) => a == b,
+        (RType::Tuple(a), RType::Tuple(b)) => rtype_vec_eq(a, b),
         _ => false,
     }
 }
@@ -892,6 +949,23 @@ pub fn rtype_to_string(t: &RType) -> String {
             }
         }
         RType::Param(n) => n.clone(),
+        RType::Tuple(elems) => {
+            let mut s = String::from("(");
+            let mut i = 0;
+            while i < elems.len() {
+                if i > 0 {
+                    s.push_str(", ");
+                }
+                s.push_str(&rtype_to_string(&elems[i]));
+                i += 1;
+            }
+            // Trailing comma for 1-tuples (matches Rust output).
+            if elems.len() == 1 {
+                s.push(',');
+            }
+            s.push(')');
+            s
+        }
     }
 }
 
@@ -916,6 +990,15 @@ pub fn rtype_size(ty: &RType, structs: &StructTable) -> u32 {
         }
         RType::Ref { .. } | RType::RawPtr { .. } => 1,
         RType::Param(_) => unreachable!("rtype_size called on unresolved type parameter"),
+        RType::Tuple(elems) => {
+            let mut s: u32 = 0;
+            let mut i = 0;
+            while i < elems.len() {
+                s += rtype_size(&elems[i], structs);
+                i += 1;
+            }
+            s
+        }
     }
 }
 
@@ -957,6 +1040,13 @@ pub fn flatten_rtype(ty: &RType, structs: &StructTable, out: &mut Vec<crate::was
         }
         RType::Ref { .. } | RType::RawPtr { .. } => out.push(crate::wasm::ValType::I32),
         RType::Param(_) => unreachable!("flatten_rtype called on unresolved type parameter"),
+        RType::Tuple(elems) => {
+            let mut i = 0;
+            while i < elems.len() {
+                flatten_rtype(&elems[i], structs, out);
+                i += 1;
+            }
+        }
     }
 }
 
@@ -984,6 +1074,15 @@ pub fn byte_size_of(rt: &RType, structs: &StructTable) -> u32 {
             total
         }
         RType::Param(_) => unreachable!("byte_size_of called on unresolved type parameter"),
+        RType::Tuple(elems) => {
+            let mut total: u32 = 0;
+            let mut i = 0;
+            while i < elems.len() {
+                total += byte_size_of(&elems[i], structs);
+                i += 1;
+            }
+            total
+        }
     }
 }
 
@@ -1026,6 +1125,15 @@ pub fn substitute_rtype(rt: &RType, env: &Vec<(String, RType)>) -> RType {
                 i += 1;
             }
             RType::Param(name.clone())
+        }
+        RType::Tuple(elems) => {
+            let mut out: Vec<RType> = Vec::new();
+            let mut i = 0;
+            while i < elems.len() {
+                out.push(substitute_rtype(&elems[i], env));
+                i += 1;
+            }
+            RType::Tuple(out)
         }
     }
 }
@@ -2125,6 +2233,24 @@ pub fn resolve_type(
                 span: ty.span.copy(),
             }),
         },
+        TypeKind::Tuple(elems) => {
+            let mut out: Vec<RType> = Vec::new();
+            let mut i = 0;
+            while i < elems.len() {
+                out.push(resolve_type(
+                    &elems[i],
+                    current_module,
+                    structs,
+                    self_target,
+                    type_params,
+                    use_scope,
+                    reexports,
+                    file,
+                )?);
+                i += 1;
+            }
+            Ok(RType::Tuple(out))
+        }
     }
 }
 
@@ -3479,6 +3605,7 @@ enum InferType {
     RawPtr { inner: Box<InferType>, mutable: bool },
     Param(String),
     Bool,
+    Tuple(Vec<InferType>),
 }
 
 fn infer_clone(t: &InferType) -> InferType {
@@ -3501,6 +3628,7 @@ fn infer_clone(t: &InferType) -> InferType {
         },
         InferType::Param(n) => InferType::Param(n.clone()),
         InferType::Bool => InferType::Bool,
+        InferType::Tuple(elems) => InferType::Tuple(infer_vec_clone(elems)),
     }
 }
 
@@ -3559,6 +3687,15 @@ fn rtype_to_infer(rt: &RType) -> InferType {
         },
         RType::Param(n) => InferType::Param(n.clone()),
         RType::Bool => InferType::Bool,
+        RType::Tuple(elems) => {
+            let mut out: Vec<InferType> = Vec::new();
+            let mut i = 0;
+            while i < elems.len() {
+                out.push(rtype_to_infer(&elems[i]));
+                i += 1;
+            }
+            InferType::Tuple(out)
+        }
     }
 }
 
@@ -3602,6 +3739,15 @@ fn infer_substitute(t: &InferType, env: &Vec<(String, InferType)>) -> InferType 
             InferType::Param(name.clone())
         }
         InferType::Bool => InferType::Bool,
+        InferType::Tuple(elems) => {
+            let mut out: Vec<InferType> = Vec::new();
+            let mut i = 0;
+            while i < elems.len() {
+                out.push(infer_substitute(&elems[i], env));
+                i += 1;
+            }
+            InferType::Tuple(out)
+        }
     }
 }
 
@@ -3643,6 +3789,22 @@ fn infer_to_string(t: &InferType) -> String {
         }
         InferType::Param(n) => n.clone(),
         InferType::Bool => "bool".to_string(),
+        InferType::Tuple(elems) => {
+            let mut s = String::from("(");
+            let mut i = 0;
+            while i < elems.len() {
+                if i > 0 {
+                    s.push_str(", ");
+                }
+                s.push_str(&infer_to_string(&elems[i]));
+                i += 1;
+            }
+            if elems.len() == 1 {
+                s.push(',');
+            }
+            s.push(')');
+            s
+        }
     }
 }
 
@@ -3704,6 +3866,15 @@ impl Subst {
             },
             InferType::Param(n) => InferType::Param(n.clone()),
             InferType::Bool => InferType::Bool,
+            InferType::Tuple(elems) => {
+                let mut out: Vec<InferType> = Vec::new();
+                let mut i = 0;
+                while i < elems.len() {
+                    out.push(self.substitute(&elems[i]));
+                    i += 1;
+                }
+                InferType::Tuple(out)
+            }
         }
     }
 
@@ -3920,6 +4091,33 @@ impl Subst {
                 }
             }
             (InferType::Bool, InferType::Bool) => Ok(()),
+            (InferType::Tuple(ea), InferType::Tuple(eb)) => {
+                if ea.len() != eb.len() {
+                    return Err(Error {
+                        file: file.to_string(),
+                        message: format!(
+                            "tuple arity mismatch: expected {}-tuple, got {}-tuple",
+                            eb.len(),
+                            ea.len()
+                        ),
+                        span: span.copy(),
+                    });
+                }
+                let mut i = 0;
+                while i < ea.len() {
+                    self.unify(
+                        &ea[i],
+                        &eb[i],
+                        traits,
+                        type_params,
+                        type_param_bounds,
+                        span,
+                        file,
+                    )?;
+                    i += 1;
+                }
+                Ok(())
+            }
             (a, b) => Err(Error {
                 file: file.to_string(),
                 message: format!(
@@ -3960,6 +4158,15 @@ impl Subst {
                 mutable,
             },
             InferType::Bool => RType::Bool,
+            InferType::Tuple(elems) => {
+                let mut out: Vec<RType> = Vec::new();
+                let mut i = 0;
+                while i < elems.len() {
+                    out.push(self.finalize(&elems[i]));
+                    i += 1;
+                }
+                RType::Tuple(out)
+            }
         }
     }
 }
@@ -4390,35 +4597,27 @@ fn check_block(
     return_type: &Option<RType>,
 ) -> Result<(), Error> {
     let actual = check_block_inner(ctx, block)?;
-    match (actual, return_type) {
-        (Some(a), Some(e)) => {
-            let expected_infer = rtype_to_infer(e);
-            ctx.subst.unify(
-                &a,
-                &expected_infer,
-                ctx.traits,
-                ctx.type_params,
-                ctx.type_param_bounds,
-                &tail_span_or_block(block),
-                ctx.current_file,
-            )?;
-            Ok(())
-        }
-        (None, None) => Ok(()),
-        (Some(_), None) => Err(Error {
-            file: ctx.current_file.to_string(),
-            message: "function returns unit but body has a tail expression".to_string(),
-            span: tail_span_or_block(block),
-        }),
-        (None, Some(_)) => Err(Error {
-            file: ctx.current_file.to_string(),
-            message: "function expects a return value but body is empty".to_string(),
-            span: block.span.copy(),
-        }),
-    }
+    // No declared return type ⇒ function returns `()` (the unit tuple).
+    let expected: RType = match return_type {
+        Some(rt) => rtype_clone(rt),
+        None => RType::Tuple(Vec::new()),
+    };
+    let expected_infer = rtype_to_infer(&expected);
+    ctx.subst.unify(
+        &actual,
+        &expected_infer,
+        ctx.traits,
+        ctx.type_params,
+        ctx.type_param_bounds,
+        &tail_span_or_block(block),
+        ctx.current_file,
+    )?;
+    Ok(())
 }
 
-fn check_block_inner(ctx: &mut CheckCtx, block: &Block) -> Result<Option<InferType>, Error> {
+// A block always has a type. With a tail expression, it's the tail's
+// type; without one, it's `()` (the empty tuple).
+fn check_block_inner(ctx: &mut CheckCtx, block: &Block) -> Result<InferType, Error> {
     let mut i = 0;
     while i < block.stmts.len() {
         match &block.stmts[i] {
@@ -4426,11 +4625,6 @@ fn check_block_inner(ctx: &mut CheckCtx, block: &Block) -> Result<Option<InferTy
             Stmt::Assign(assign) => check_assign_stmt(ctx, assign)?,
             Stmt::Expr(expr) => check_expr_stmt(ctx, expr)?,
             Stmt::Use(decl) => {
-                // Push this use's flattened entries onto the active
-                // scope. Visible from this stmt forward; the surrounding
-                // `check_block_expr` / `check_expr_stmt` truncates back
-                // on block exit. Crate root for `crate::…` resolution
-                // comes from the enclosing module's path.
                 let crate_root: &str = if ctx.current_module.is_empty() {
                     ""
                 } else {
@@ -4442,42 +4636,26 @@ fn check_block_inner(ctx: &mut CheckCtx, block: &Block) -> Result<Option<InferTy
         i += 1;
     }
     match &block.tail {
-        Some(expr) => Ok(Some(check_expr(ctx, expr)?)),
-        None => Ok(None),
+        Some(expr) => Ok(check_expr(ctx, expr)?),
+        None => Ok(InferType::Tuple(Vec::new())),
     }
 }
 
-// Statement-position check for block-like expressions (`unsafe { … }`,
-// `{ … }`) that don't carry a tail value. Walks the inner stmts but skips
-// the "must end with a tail" check that `check_block_expr` enforces.
+// `expr;` — type-check the expression, then discard its value (any
+// type is fine in stmt position). Any expression may sit here now that
+// we have a unit type.
 fn check_expr_stmt(ctx: &mut CheckCtx, expr: &Expr) -> Result<(), Error> {
-    let block = match &expr.kind {
-        ExprKind::Block(b) | ExprKind::Unsafe(b) => b.as_ref(),
-        _ => unreachable!("parser guarantees Stmt::Expr is a block-like"),
-    };
-    let mark = ctx.locals.len();
-    let use_mark = ctx.use_scope.len();
-    let _ = check_block_inner(ctx, block)?;
-    ctx.locals.truncate(mark);
-    ctx.use_scope.truncate(use_mark);
+    let _ = check_expr(ctx, expr)?;
     Ok(())
 }
 
 fn check_block_expr(ctx: &mut CheckCtx, block: &Block) -> Result<InferType, Error> {
     let mark = ctx.locals.len();
     let use_mark = ctx.use_scope.len();
-    let result = check_block_inner(ctx, block)?;
+    let ty = check_block_inner(ctx, block)?;
     ctx.locals.truncate(mark);
     ctx.use_scope.truncate(use_mark);
-    match result {
-        Some(ty) => Ok(ty),
-        None => Err(Error {
-            file: ctx.current_file.to_string(),
-            message: "block expression must end with an expression that produces a value"
-                .to_string(),
-            span: block.span.copy(),
-        }),
-    }
+    Ok(ty)
 }
 
 fn tail_span_or_block(block: &Block) -> Span {
@@ -4757,6 +4935,10 @@ fn extract_place_for_assign(expr: &Expr) -> Option<Vec<String>> {
                 chain.push(fa.field.clone());
                 current = &fa.base;
             }
+            ExprKind::TupleIndex { base, index, .. } => {
+                chain.push(format!("{}", index));
+                current = base;
+            }
             _ => return None,
         }
     }
@@ -4772,6 +4954,49 @@ fn walk_chain_type(
     let mut current = infer_clone(start);
     let mut i = 1;
     while i < chain.len() {
+        // Tuple-index chain segment: digit-only string. The type
+        // of the segment is the corresponding tuple element. This
+        // takes precedence over struct-field lookup so a struct
+        // with a `0` field would still resolve there only if the
+        // current type is actually a struct.
+        let is_tuple_seg = !chain[i].is_empty() && chain[i].bytes().all(|b| b.is_ascii_digit());
+        if is_tuple_seg {
+            let elems: Vec<InferType> = match &current {
+                InferType::Tuple(es) => infer_vec_clone(es),
+                InferType::Ref { inner, .. } => match inner.as_ref() {
+                    InferType::Tuple(es) => infer_vec_clone(es),
+                    _ => {
+                        return Err(Error {
+                            file: file.to_string(),
+                            message: "tuple-index assignment on non-tuple value".to_string(),
+                            span: span.copy(),
+                        });
+                    }
+                },
+                _ => {
+                    return Err(Error {
+                        file: file.to_string(),
+                        message: "tuple-index assignment on non-tuple value".to_string(),
+                        span: span.copy(),
+                    });
+                }
+            };
+            let idx: usize = chain[i].parse().expect("digit-only segment");
+            if idx >= elems.len() {
+                return Err(Error {
+                    file: file.to_string(),
+                    message: format!(
+                        "tuple index {} out of range (length {})",
+                        idx,
+                        elems.len()
+                    ),
+                    span: span.copy(),
+                });
+            }
+            current = infer_clone(&elems[idx]);
+            i += 1;
+            continue;
+        }
         let (struct_path, type_args) = match &current {
             InferType::Struct { path, type_args, .. } => (clone_path(path), infer_vec_clone(type_args)),
             InferType::Ref { inner, .. } => match inner.as_ref() {
@@ -4883,12 +5108,58 @@ fn check_expr_inner(ctx: &mut CheckCtx, expr: &Expr) -> Result<InferType, Error>
         ExprKind::Builtin { name, name_span, args } => {
             check_builtin(ctx, name, name_span, args, expr)
         }
+        ExprKind::Tuple(elems) => {
+            let mut tys: Vec<InferType> = Vec::new();
+            let mut i = 0;
+            while i < elems.len() {
+                tys.push(check_expr(ctx, &elems[i])?);
+                i += 1;
+            }
+            Ok(InferType::Tuple(tys))
+        }
+        ExprKind::TupleIndex { base, index, index_span } => {
+            let base_ty = check_expr(ctx, base)?;
+            // Auto-deref through any number of references — `r.0` on
+            // `&(u32, u32)` reads element 0. (Tuple elements that are
+            // non-Copy through a ref will still be rejected by the
+            // borrow-aware path, but for now we only have integer/bool
+            // tuples in tests.)
+            let mut cur = ctx.subst.substitute(&base_ty);
+            while let InferType::Ref { inner, .. } = cur {
+                cur = ctx.subst.substitute(&inner);
+            }
+            match cur {
+                InferType::Tuple(elems) => {
+                    let n = elems.len();
+                    if (*index as usize) >= n {
+                        return Err(Error {
+                            file: ctx.current_file.to_string(),
+                            message: format!(
+                                "tuple index {} out of range (length {})",
+                                index, n
+                            ),
+                            span: index_span.copy(),
+                        });
+                    }
+                    Ok(infer_clone(&elems[*index as usize]))
+                }
+                other => Err(Error {
+                    file: ctx.current_file.to_string(),
+                    message: format!(
+                        "tuple index `.{}` on non-tuple type `{}`",
+                        index,
+                        infer_to_string(&other)
+                    ),
+                    span: expr.span.copy(),
+                }),
+            }
+        }
     }
 }
 
 // `if cond { … } else { … }` — cond must be `bool`, the two arms'
-// tail types unify, and the if-expression takes that type. Both arms
-// are required (no unit type yet, so neither arm can be tail-less).
+// tail types unify, and the if-expression takes that type. A
+// tail-less arm yields `()`, so a both-tail-less if is unit-typed.
 fn check_if_expr(
     ctx: &mut CheckCtx,
     if_expr: &crate::ast::IfExpr,
@@ -5346,20 +5617,14 @@ fn check_method_call_symbolic(
         }),
     });
     // Return type comes from the trait method's declared signature with
-    // Self + method-level type-params substituted.
-    if let Some(ret_rt) = &trait_return_type {
-        let infer = infer_substitute(&rtype_to_infer(ret_rt), &method_subst);
-        Ok(infer)
-    } else {
-        Err(Error {
-            file: ctx.current_file.to_string(),
-            message: format!(
-                "method `{}` returns unit and can't be used as a value",
-                mc.method
-            ),
-            span: call_expr.span.copy(),
-        })
-    }
+    // Self + method-level type-params substituted. Tail-less methods
+    // return `()`.
+    let _ = call_expr;
+    let infer = match &trait_return_type {
+        Some(ret_rt) => infer_substitute(&rtype_to_infer(ret_rt), &method_subst),
+        None => InferType::Tuple(Vec::new()),
+    };
+    Ok(infer)
 }
 
 fn check_method_call(
@@ -5851,17 +6116,11 @@ fn check_method_call(
                 | ReceiverAdjust::ByRef
         );
     ctx.method_resolutions[call_expr.id as usize].as_mut().unwrap().ret_borrows_receiver = ret_borrows_recv;
-    match return_infer {
-        Some(rt) => Ok(rt),
-        None => Err(Error {
-            file: ctx.current_file.to_string(),
-            message: format!(
-                "method `{}` returns unit and can't be used as a value",
-                mc.method
-            ),
-            span: call_expr.span.copy(),
-        }),
-    }
+    let _ = mc;
+    Ok(match return_infer {
+        Some(rt) => rt,
+        None => InferType::Tuple(Vec::new()),
+    })
 }
 
 enum RecvShape {
@@ -5966,7 +6225,10 @@ fn is_mutable_place(ctx: &CheckCtx, expr: &Expr) -> bool {
 // as a value — borrowck won't track such borrows).
 fn check_place_expr(ctx: &mut CheckCtx, expr: &Expr) -> Result<InferType, Error> {
     match &expr.kind {
-        ExprKind::Var(_) | ExprKind::FieldAccess(_) | ExprKind::Deref(_) => {
+        ExprKind::Var(_)
+        | ExprKind::FieldAccess(_)
+        | ExprKind::Deref(_)
+        | ExprKind::TupleIndex { .. } => {
             let ty = check_place_inner(ctx, expr)?;
             ctx.expr_infer_types[expr.id as usize] = Some(infer_clone(&ty));
             Ok(ty)
@@ -6054,7 +6316,41 @@ fn check_place_inner(ctx: &mut CheckCtx, expr: &Expr) -> Result<InferType, Error
                 }),
             }
         }
-        _ => unreachable!("check_place_inner only dispatches Var/FieldAccess/Deref"),
+        ExprKind::TupleIndex { base, index, index_span } => {
+            let base_ty = check_place_expr(ctx, base)?;
+            let mut resolved = ctx.subst.substitute(&base_ty);
+            // Auto-deref through `&T` / `&mut T` (matches value-position
+            // tuple-index behavior).
+            while let InferType::Ref { inner, .. } = resolved {
+                resolved = ctx.subst.substitute(&inner);
+            }
+            match resolved {
+                InferType::Tuple(elems) => {
+                    let n = elems.len();
+                    if (*index as usize) >= n {
+                        return Err(Error {
+                            file: ctx.current_file.to_string(),
+                            message: format!(
+                                "tuple index {} out of range (length {})",
+                                index, n
+                            ),
+                            span: index_span.copy(),
+                        });
+                    }
+                    Ok(infer_clone(&elems[*index as usize]))
+                }
+                other => Err(Error {
+                    file: ctx.current_file.to_string(),
+                    message: format!(
+                        "tuple index `.{}` on non-tuple type `{}`",
+                        index,
+                        infer_to_string(&other)
+                    ),
+                    span: expr.span.copy(),
+                }),
+            }
+        }
+        _ => unreachable!("check_place_inner only dispatches Var/FieldAccess/Deref/TupleIndex"),
     }
 }
 
@@ -6228,9 +6524,9 @@ fn check_call(ctx: &mut CheckCtx, call: &Call, call_expr: &Expr) -> Result<Infer
             param_infer.push(rtype_to_infer(&entry.param_types[k]));
             k += 1;
         }
-        let return_infer: Option<InferType> = match &entry.return_type {
-            Some(rt) => Some(rtype_to_infer(rt)),
-            None => None,
+        let return_infer: InferType = match &entry.return_type {
+            Some(rt) => rtype_to_infer(rt),
+            None => InferType::Tuple(Vec::new()),
         };
         ctx.call_resolutions[call_expr.id as usize] = Some(PendingCall::Direct(entry_idx));
         let mut i = 0;
@@ -6247,17 +6543,7 @@ fn check_call(ctx: &mut CheckCtx, call: &Call, call_expr: &Expr) -> Result<Infer
             )?;
             i += 1;
         }
-        return match return_infer {
-            Some(rt) => Ok(rt),
-            None => Err(Error {
-                file: ctx.current_file.to_string(),
-                message: format!(
-                    "function `{}` returns unit and can't be used as a value",
-                    segments_to_string(&call.callee.segments)
-                ),
-                span: call_expr.span.copy(),
-            }),
-        };
+        return Ok(return_infer);
     }
     // Try a generic template.
     if let Some((template_idx, _)) = template_lookup(ctx.funcs, &full) {
@@ -6355,9 +6641,10 @@ fn check_call(ctx: &mut CheckCtx, call: &Call, call_expr: &Expr) -> Result<Infer
             param_infer.push(infer_substitute(&rtype_to_infer(&tmpl_param_types[k]), &env));
             k += 1;
         }
-        let return_infer: Option<InferType> = tmpl_return_type
-            .as_ref()
-            .map(|rt| infer_substitute(&rtype_to_infer(rt), &env));
+        let return_infer: InferType = match &tmpl_return_type {
+            Some(rt) => infer_substitute(&rtype_to_infer(rt), &env),
+            None => InferType::Tuple(Vec::new()),
+        };
         ctx.call_resolutions[call_expr.id as usize] = Some(PendingCall::Generic {
             template_idx,
             type_var_ids: var_ids,
@@ -6376,17 +6663,7 @@ fn check_call(ctx: &mut CheckCtx, call: &Call, call_expr: &Expr) -> Result<Infer
             )?;
             i += 1;
         }
-        return match return_infer {
-            Some(rt) => Ok(rt),
-            None => Err(Error {
-                file: ctx.current_file.to_string(),
-                message: format!(
-                    "function `{}` returns unit and can't be used as a value",
-                    segments_to_string(&call.callee.segments)
-                ),
-                span: call_expr.span.copy(),
-            }),
-        };
+        return Ok(return_infer);
     }
     Err(Error {
         file: ctx.current_file.to_string(),

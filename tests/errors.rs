@@ -544,11 +544,13 @@ fn let_then_use_after_move_is_rejected() {
 }
 
 #[test]
-fn block_expr_without_tail_is_rejected() {
-    let err = compile_source("fn f() -> usize { let x = { let y = 5; }; x }");
+fn tailless_block_assigned_to_typed_let_is_rejected() {
+    // Tail-less blocks evaluate to `()`; binding one to a `usize`-typed
+    // let mismatches.
+    let err = compile_source("fn f() -> usize { let x: usize = { let y = 5; }; x }");
     assert!(
-        err.contains("block expression must end with"),
-        "expected tailless block-expr error, got: {}",
+        err.contains("expected `usize`") && err.contains("got `()`"),
+        "expected unit/usize mismatch, got: {}",
         err
     );
 }
@@ -1169,3 +1171,33 @@ fn read_after_maybe_moved_in_if_is_rejected() {
     );
 }
 
+
+#[test]
+fn tuple_index_out_of_range_is_rejected() {
+    let err = compile_source("fn f() -> u32 { let t: (u32, u32) = (1, 2); t.5 }");
+    assert!(
+        err.contains("tuple index 5 out of range"),
+        "expected tuple-index out-of-range error, got: {}",
+        err
+    );
+}
+
+#[test]
+fn tuple_index_on_non_tuple_is_rejected() {
+    let err = compile_source("fn f() -> u32 { let x: u32 = 5; x.0 }");
+    assert!(
+        err.contains("tuple index `.0` on non-tuple type"),
+        "expected non-tuple tuple-index error, got: {}",
+        err
+    );
+}
+
+#[test]
+fn tuple_unit_used_as_value_is_rejected() {
+    let err = compile_source("fn f() -> u32 { let x: u32 = (); x }");
+    assert!(
+        err.contains("expected `u32`") && err.contains("got `()`"),
+        "expected u32/unit mismatch, got: {}",
+        err
+    );
+}

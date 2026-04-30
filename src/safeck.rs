@@ -176,6 +176,15 @@ fn walk_expr(state: &mut SafeState, expr: &Expr) -> Result<(), Error> {
             }
             Ok(())
         }
+        ExprKind::Tuple(elems) => {
+            let mut i = 0;
+            while i < elems.len() {
+                walk_expr(state, &elems[i])?;
+                i += 1;
+            }
+            Ok(())
+        }
+        ExprKind::TupleIndex { base, .. } => walk_expr(state, base),
     }
 }
 

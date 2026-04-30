@@ -704,3 +704,46 @@ fn if_generic_t_returns_42() {
 fn if_generic_t_u128_returns_42() {
     expect_answer("if_generic_t_u128", (42i64, 0i64));
 }
+
+// Tuples + unit type. Construction, indexing, nested, unit value
+// `()` as a tail-less return type, expression statements that
+// discard their value, and tuple-field assignment via `t.0 = …`.
+#[test]
+fn tuple_basic_returns_42() {
+    expect_answer("tuple_basic", 42u32);
+}
+
+#[test]
+fn tuple_index_returns_42() {
+    expect_answer("tuple_index", 42u32);
+}
+
+#[test]
+fn tuple_unit_returns_42() {
+    expect_answer("tuple_unit", 42u32);
+}
+
+#[test]
+fn tuple_nested_returns_42() {
+    expect_answer("tuple_nested", 42u32);
+}
+
+#[test]
+fn tuple_expr_stmt_returns_42() {
+    expect_answer("tuple_expr_stmt", 42u32);
+}
+
+#[test]
+fn tuple_field_assign_returns_42() {
+    expect_answer("tuple_field_assign", 42u32);
+}
+
+#[test]
+fn tuple_borrow_returns_42() {
+    expect_answer("tuple_borrow", 42u32);
+}
+
+#[test]
+fn if_without_else_returns_42() {
+    expect_answer("if_without_else", 42u32);
+}

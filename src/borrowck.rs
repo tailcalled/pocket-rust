@@ -520,6 +520,16 @@ fn walk_expr_for_liveness(expr: &Expr, step: &mut u32, info: &mut Liveness) {
                 i += 1;
             }
         }
+        ExprKind::Tuple(elems) => {
+            let mut i = 0;
+            while i < elems.len() {
+                walk_expr_for_liveness(&elems[i], step, info);
+                i += 1;
+            }
+        }
+        ExprKind::TupleIndex { base, .. } => {
+            walk_expr_for_liveness(base, step, info);
+        }
     }
 }
 
@@ -674,6 +684,10 @@ fn walk_expr(state: &mut BorrowState, expr: &Expr) -> Result<ValueDesc, Error> {
                 i += 1;
             }
             Ok(empty_desc())
+        }
+        ExprKind::Tuple(elems) => walk_tuple(state, elems),
+        ExprKind::TupleIndex { base, index, .. } => {
+            walk_tuple_index(state, base, *index, expr)
         }
     }
 }
@@ -1293,6 +1307,149 @@ fn walk_struct_lit(state: &mut BorrowState, lit: &StructLit) -> Result<ValueDesc
     })
 }
 
+// `(a, b, c)` — analogous to a struct literal. Each element gets a
+// positional field name `"0"`, `"1"`, …, so per-slot borrow tracking
+// uses the same `field_holds` machinery as structs (a `&T`-typed
+// element produces a FieldHold at path `["0"]`, etc.).
+fn walk_tuple(state: &mut BorrowState, elems: &Vec<Expr>) -> Result<ValueDesc, Error> {
+    state.holders.push(Holder {
+        name: None,
+        rtype: None,
+        holds: Vec::new(),
+        field_holds: Vec::new(),
+    });
+    let synth_idx = state.holders.len() - 1;
+    let mut field_borrows: Vec<FieldHold> = Vec::new();
+    let mut i = 0;
+    while i < elems.len() {
+        let desc = walk_expr(state, &elems[i])?;
+        let name = format!("{}", i);
+        if !desc.borrows.is_empty() {
+            let mut grouped: Vec<HeldBorrow> = Vec::new();
+            let mut k = 0;
+            while k < desc.borrows.len() {
+                let new = HeldBorrow {
+                    place: clone_path(&desc.borrows[k].place),
+                    mutable: desc.borrows[k].mutable,
+                };
+                check_borrow_conflict(state, &new, &elems[i].span)?;
+                state.holders[synth_idx].holds.push(new);
+                grouped.push(HeldBorrow {
+                    place: clone_path(&desc.borrows[k].place),
+                    mutable: desc.borrows[k].mutable,
+                });
+                k += 1;
+            }
+            field_borrows.push(FieldHold {
+                field: vec![name.clone()],
+                borrows: grouped,
+            });
+        }
+        let mut f = 0;
+        while f < desc.field_borrows.len() {
+            let mut grouped: Vec<HeldBorrow> = Vec::new();
+            let mut k = 0;
+            while k < desc.field_borrows[f].borrows.len() {
+                let new = HeldBorrow {
+                    place: clone_path(&desc.field_borrows[f].borrows[k].place),
+                    mutable: desc.field_borrows[f].borrows[k].mutable,
+                };
+                check_borrow_conflict(state, &new, &elems[i].span)?;
+                state.holders[synth_idx].holds.push(new);
+                grouped.push(HeldBorrow {
+                    place: clone_path(&desc.field_borrows[f].borrows[k].place),
+                    mutable: desc.field_borrows[f].borrows[k].mutable,
+                });
+                k += 1;
+            }
+            let mut nested: Vec<String> = Vec::new();
+            nested.push(name.clone());
+            let mut s = 0;
+            while s < desc.field_borrows[f].field.len() {
+                nested.push(desc.field_borrows[f].field[s].clone());
+                s += 1;
+            }
+            field_borrows.push(FieldHold {
+                field: nested,
+                borrows: grouped,
+            });
+            f += 1;
+        }
+        i += 1;
+    }
+    state.holders.truncate(synth_idx);
+    Ok(ValueDesc {
+        borrows: Vec::new(),
+        field_borrows,
+    })
+}
+
+// `t.<index>` — tuple-position analog of `walk_field_access`. Behaves
+// identically except we use the numeric index (as a string) as the
+// segment name when consulting per-slot field_holds.
+fn walk_tuple_index(
+    state: &mut BorrowState,
+    base: &Expr,
+    index: u32,
+    expr: &Expr,
+) -> Result<ValueDesc, Error> {
+    match extract_place(expr) {
+        Some(place) => {
+            let root_idx =
+                find_binding(state, &place[0]).expect("typeck verified the variable exists");
+            if is_ref_holder(&state.holders[root_idx]) {
+                Ok(empty_desc())
+            } else {
+                let elem_ty = state.expr_types[expr.id as usize]
+                    .as_ref()
+                    .map(rtype_clone);
+                let elem_is_ref = matches!(&elem_ty, Some(RType::Ref { .. }));
+                let elem_is_copy = elem_ty
+                    .as_ref()
+                    .map(|t| {
+                        is_copy_with_bounds(
+                            t,
+                            state.traits,
+                            &state.type_params,
+                            &state.type_param_bounds,
+                        )
+                    })
+                    .unwrap_or(false);
+                check_not_moved(state, &place, &expr.span)?;
+                if elem_is_ref && place.len() >= 2 {
+                    let sub = &place[1..];
+                    let mut found_borrows: Vec<HeldBorrow> = Vec::new();
+                    let mut k = 0;
+                    while k < state.holders[root_idx].field_holds.len() {
+                        if field_path_matches(&state.holders[root_idx].field_holds[k].field, sub) {
+                            found_borrows = clone_held_borrows(
+                                &state.holders[root_idx].field_holds[k].borrows,
+                            );
+                            break;
+                        }
+                        k += 1;
+                    }
+                    return Ok(ValueDesc {
+                        borrows: found_borrows,
+                        field_borrows: Vec::new(),
+                    });
+                }
+                if elem_is_copy {
+                    // already checked not-moved above
+                } else {
+                    try_move(state, place, expr.span.copy())?;
+                }
+                Ok(empty_desc())
+            }
+        }
+        None => {
+            walk_expr(state, base)?;
+            let _ = index;
+            Ok(empty_desc())
+        }
+    }
+}
+
 fn walk_field_access(
     state: &mut BorrowState,
     fa: &FieldAccess,
@@ -1466,6 +1623,7 @@ fn is_deref_rooted_assign(expr: &Expr) -> bool {
         match &current.kind {
             ExprKind::Deref(_) => return true,
             ExprKind::FieldAccess(fa) => current = &fa.base,
+            ExprKind::TupleIndex { base, .. } => current = base,
             _ => return false,
         }
     }
@@ -1481,6 +1639,7 @@ fn walk_assign_lhs(state: &mut BorrowState, expr: &Expr) -> Result<(), Error> {
             Ok(())
         }
         ExprKind::FieldAccess(fa) => walk_assign_lhs(state, &fa.base),
+        ExprKind::TupleIndex { base, .. } => walk_assign_lhs(state, base),
         _ => {
             walk_expr(state, expr)?;
             Ok(())
@@ -1506,6 +1665,10 @@ fn extract_place(expr: &Expr) -> Option<Vec<String>> {
             ExprKind::FieldAccess(fa) => {
                 chain.push(fa.field.clone());
                 current = &fa.base;
+            }
+            ExprKind::TupleIndex { base, index, .. } => {
+                chain.push(format!("{}", index));
+                current = base;
             }
             _ => return None,
         }
