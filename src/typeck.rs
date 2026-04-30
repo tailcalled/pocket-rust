@@ -4880,6 +4880,9 @@ fn check_expr_inner(ctx: &mut CheckCtx, expr: &Expr) -> Result<InferType, Error>
         ExprKind::MethodCall(mc) => check_method_call(ctx, mc, expr),
         ExprKind::BoolLit(_) => Ok(InferType::Bool),
         ExprKind::If(if_expr) => check_if_expr(ctx, if_expr, expr),
+        ExprKind::Builtin { name, name_span, args } => {
+            check_builtin(ctx, name, name_span, args, expr)
+        }
     }
 }
 
@@ -4891,7 +4894,10 @@ fn check_if_expr(
     if_expr: &crate::ast::IfExpr,
     outer: &Expr,
 ) -> Result<InferType, Error> {
-    let cond_ty = check_expr_inner(ctx, &if_expr.cond)?;
+    // `check_expr` (not `check_expr_inner`) so the cond's type is
+    // recorded under its NodeId — codegen for some sub-exprs (e.g.
+    // `Builtin`) reads its own result type back out.
+    let cond_ty = check_expr(ctx, &if_expr.cond)?;
     ctx.subst.unify(
         &cond_ty,
         &InferType::Bool,
@@ -4913,6 +4919,138 @@ fn check_if_expr(
         ctx.current_file,
     )?;
     Ok(then_ty)
+}
+
+// Builtin intrinsic check. The name encodes (type, op) — e.g.
+// `u32_add`, `i64_eq`, `bool_and`, `bool_not`. Looks up the
+// signature, verifies arg arity + types, returns the result type.
+//
+// Operation kinds:
+//   - Arithmetic on int types (add, sub, mul, div, rem): (T, T) -> T.
+//   - Comparison on int types (eq, ne, lt, le, gt, ge): (T, T) -> bool.
+//   - Bool: and/or (bool, bool) -> bool; not (bool) -> bool;
+//     eq/ne (bool, bool) -> bool.
+fn check_builtin(
+    ctx: &mut CheckCtx,
+    name: &str,
+    name_span: &Span,
+    args: &Vec<Expr>,
+    expr: &Expr,
+) -> Result<InferType, Error> {
+    let sig = match builtin_signature(name) {
+        Some(s) => s,
+        None => {
+            return Err(Error {
+                file: ctx.current_file.to_string(),
+                message: format!("unknown builtin `¤{}`", name),
+                span: name_span.copy(),
+            });
+        }
+    };
+    if args.len() != sig.params.len() {
+        return Err(Error {
+            file: ctx.current_file.to_string(),
+            message: format!(
+                "builtin `¤{}` takes {} argument(s), got {}",
+                name,
+                sig.params.len(),
+                args.len()
+            ),
+            span: expr.span.copy(),
+        });
+    }
+    let mut k = 0;
+    while k < args.len() {
+        let arg_ty = check_expr(ctx, &args[k])?;
+        let expected = rtype_to_infer(&sig.params[k]);
+        ctx.subst.unify(
+            &arg_ty,
+            &expected,
+            ctx.traits,
+            ctx.type_params,
+            ctx.type_param_bounds,
+            &args[k].span,
+            ctx.current_file,
+        )?;
+        k += 1;
+    }
+    Ok(rtype_to_infer(&sig.result))
+}
+
+pub struct BuiltinSig {
+    pub params: Vec<RType>,
+    pub result: RType,
+}
+
+// Recognized builtins. The name's first segment is the type (one of
+// `bool`, `u8`, `i8`, `u16`, `i16`, `u32`, `i32`, `u64`, `i64`,
+// `usize`, `isize`); the rest is the operation. Returns `None` for
+// any name we don't recognize. 128-bit builtins aren't supported yet
+// (operands flatten to two wasm scalars; lowering needs a small
+// runtime sequence).
+pub fn builtin_signature(name: &str) -> Option<BuiltinSig> {
+    // Split on the last `_` to separate type prefix from op suffix.
+    // The op is one of a small fixed set; everything before the op
+    // is the type name (which contains no `_`).
+    let ops = [
+        "add", "sub", "mul", "div", "rem", "eq", "ne", "lt", "le",
+        "gt", "ge", "and", "or", "not", "xor",
+    ];
+    let mut found_op: Option<&str> = None;
+    let mut k = 0;
+    while k < ops.len() {
+        let op = ops[k];
+        if name.len() > op.len() + 1 {
+            let prefix_end = name.len() - op.len();
+            if name.as_bytes()[prefix_end - 1] == b'_'
+                && &name[prefix_end..] == op
+            {
+                found_op = Some(op);
+                break;
+            }
+        }
+        k += 1;
+    }
+    let op = found_op?;
+    let ty_name = &name[..name.len() - op.len() - 1];
+    let ty = match ty_name {
+        "bool" => RType::Bool,
+        _ => RType::Int(int_kind_from_name(ty_name)?),
+    };
+    // Bool ops:
+    if matches!(ty, RType::Bool) {
+        match op {
+            "and" | "or" | "xor" | "eq" | "ne" => {
+                return Some(BuiltinSig {
+                    params: vec![RType::Bool, RType::Bool],
+                    result: RType::Bool,
+                });
+            }
+            "not" => {
+                return Some(BuiltinSig {
+                    params: vec![RType::Bool],
+                    result: RType::Bool,
+                });
+            }
+            _ => return None,
+        }
+    }
+    // Int ops:
+    let is_arith = matches!(op, "add" | "sub" | "mul" | "div" | "rem" | "and" | "or" | "xor");
+    let is_cmp = matches!(op, "eq" | "ne" | "lt" | "le" | "gt" | "ge");
+    if is_arith {
+        return Some(BuiltinSig {
+            params: vec![rtype_clone(&ty), rtype_clone(&ty)],
+            result: ty,
+        });
+    }
+    if is_cmp {
+        return Some(BuiltinSig {
+            params: vec![rtype_clone(&ty), ty],
+            result: RType::Bool,
+        });
+    }
+    None
 }
 
 // `recv.method(args)` resolution. Type-check the receiver, peel one layer of

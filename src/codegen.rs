@@ -437,6 +437,13 @@ fn walk_expr_drop_marks(
             walk_block_drop_marks(if_expr.then_block.as_ref(), expr_types, traits, info);
             walk_block_drop_marks(if_expr.else_block.as_ref(), expr_types, traits, info);
         }
+        ExprKind::Builtin { args, .. } => {
+            let mut i = 0;
+            while i < args.len() {
+                walk_expr_drop_marks(&args[i], expr_types, traits, info);
+                i += 1;
+            }
+        }
     }
 }
 
@@ -520,6 +527,13 @@ fn walk_expr_addr(
             walk_expr_addr(&if_expr.cond, stack, info);
             walk_block_addr(if_expr.then_block.as_ref(), stack, info);
             walk_block_addr(if_expr.else_block.as_ref(), stack, info);
+        }
+        ExprKind::Builtin { args, .. } => {
+            let mut i = 0;
+            while i < args.len() {
+                walk_expr_addr(&args[i], stack, info);
+                i += 1;
+            }
         }
         ExprKind::Borrow { inner, .. } => {
             if let Some(chain) = extract_place(inner) {
@@ -884,6 +898,13 @@ fn collect_lets_in_expr(expr: &Expr, out: &mut Vec<u32>) {
             collect_lets_in_expr(&if_expr.cond, out);
             collect_let_value_ids(if_expr.then_block.as_ref(), out);
             collect_let_value_ids(if_expr.else_block.as_ref(), out);
+        }
+        ExprKind::Builtin { args, .. } => {
+            let mut i = 0;
+            while i < args.len() {
+                collect_lets_in_expr(&args[i], out);
+                i += 1;
+            }
         }
         ExprKind::Borrow { inner, .. } => collect_lets_in_expr(inner, out),
         ExprKind::Cast { inner, .. } => collect_lets_in_expr(inner, out),
@@ -1840,7 +1861,310 @@ fn codegen_expr(ctx: &mut FnCtx, expr: &Expr) -> Result<RType, Error> {
             Ok(RType::Bool)
         }
         ExprKind::If(if_expr) => codegen_if_expr(ctx, if_expr, expr.id),
+        ExprKind::Builtin { name, args, .. } => codegen_builtin(ctx, name, args, expr.id),
     }
+}
+
+// Lower `¤name(args)` to its wasm op(s). Args are codegen'd in order
+// (left-to-right); then the corresponding wasm instruction is
+// emitted. The result type is the same as what typeck returned for
+// this Builtin's NodeId — read it back from `ctx.expr_types` rather
+// than re-deriving from the name (saves a parse).
+fn codegen_builtin(
+    ctx: &mut FnCtx,
+    name: &str,
+    args: &Vec<Expr>,
+    node_id: crate::ast::NodeId,
+) -> Result<RType, Error> {
+    // Codegen each arg in order. Each pushes its flattened scalar(s)
+    // onto the stack. For 128-bit args, that's (low, high) — two i64s
+    // per arg; codegen_builtin_128 takes care of the multi-scalar
+    // unpack. For ≤64-bit, args produce a single scalar.
+    let mut k = 0;
+    while k < args.len() {
+        codegen_expr(ctx, &args[k])?;
+        k += 1;
+    }
+    let (ty_name, op) = split_builtin_name(name)
+        .expect("typeck rejects unknown builtins before codegen");
+    if matches!(ty_name, "u128" | "i128") {
+        let signed = ty_name == "i128";
+        codegen_builtin_128(ctx, op, signed);
+        let ty = rtype_clone(
+            ctx.expr_types[node_id as usize]
+                .as_ref()
+                .expect("typeck recorded the builtin's result type"),
+        );
+        return Ok(ty);
+    }
+    // Pick the wasm class. bool and ≤32-bit ints use I32 ops; 64-bit
+    // ints use I64 ops. Signed-vs-unsigned matters for div/rem and
+    // for ordered comparisons (lt/le/gt/ge).
+    let is_i64 = matches!(ty_name, "u64" | "i64");
+    let is_signed = matches!(ty_name, "i8" | "i16" | "i32" | "i64" | "isize");
+    let inst = match (is_i64, op) {
+        (false, "add") => wasm::Instruction::I32Add,
+        (false, "sub") => wasm::Instruction::I32Sub,
+        (false, "mul") => wasm::Instruction::I32Mul,
+        (false, "div") => {
+            if is_signed { wasm::Instruction::I32DivS } else { wasm::Instruction::I32DivU }
+        }
+        (false, "rem") => {
+            if is_signed { wasm::Instruction::I32RemS } else { wasm::Instruction::I32RemU }
+        }
+        (false, "and") => wasm::Instruction::I32And,
+        (false, "or") => wasm::Instruction::I32Or,
+        (false, "xor") => wasm::Instruction::I32Xor,
+        (false, "eq") => wasm::Instruction::I32Eq,
+        (false, "ne") => wasm::Instruction::I32Ne,
+        (false, "lt") => {
+            if is_signed { wasm::Instruction::I32LtS } else { wasm::Instruction::I32LtU }
+        }
+        (false, "le") => {
+            if is_signed { wasm::Instruction::I32LeS } else { wasm::Instruction::I32LeU }
+        }
+        (false, "gt") => {
+            if is_signed { wasm::Instruction::I32GtS } else { wasm::Instruction::I32GtU }
+        }
+        (false, "ge") => {
+            if is_signed { wasm::Instruction::I32GeS } else { wasm::Instruction::I32GeU }
+        }
+        (false, "not") => {
+            // Implemented as `i32.eqz` — turns 0 into 1 and any
+            // nonzero (1) into 0.
+            wasm::Instruction::I32Eqz
+        }
+        (true, "add") => wasm::Instruction::I64Add,
+        (true, "sub") => wasm::Instruction::I64Sub,
+        (true, "mul") => wasm::Instruction::I64Mul,
+        (true, "div") => {
+            if is_signed { wasm::Instruction::I64DivS } else { wasm::Instruction::I64DivU }
+        }
+        (true, "rem") => {
+            if is_signed { wasm::Instruction::I64RemS } else { wasm::Instruction::I64RemU }
+        }
+        (true, "and") => wasm::Instruction::I64And,
+        (true, "or") => wasm::Instruction::I64Or,
+        (true, "xor") => wasm::Instruction::I64Xor,
+        (true, "eq") => wasm::Instruction::I64Eq,
+        (true, "ne") => wasm::Instruction::I64Ne,
+        (true, "lt") => {
+            if is_signed { wasm::Instruction::I64LtS } else { wasm::Instruction::I64LtU }
+        }
+        (true, "le") => {
+            if is_signed { wasm::Instruction::I64LeS } else { wasm::Instruction::I64LeU }
+        }
+        (true, "gt") => {
+            if is_signed { wasm::Instruction::I64GtS } else { wasm::Instruction::I64GtU }
+        }
+        (true, "ge") => {
+            if is_signed { wasm::Instruction::I64GeS } else { wasm::Instruction::I64GeU }
+        }
+        _ => unreachable!("unknown builtin (typeck should have rejected): ¤{}", name),
+    };
+    ctx.instructions.push(inst);
+    let ty = rtype_clone(
+        ctx.expr_types[node_id as usize]
+            .as_ref()
+            .expect("typeck recorded the builtin's result type"),
+    );
+    Ok(ty)
+}
+
+// Lower a 128-bit builtin to a multi-instruction sequence. On entry,
+// the wasm stack carries the two args' flattened forms in source
+// order: bottom-to-top is `[low_a, high_a, low_b, high_b]`. Each arg
+// is `(low: i64, high: i64)`, so 4 i64 slots in total. We pop them
+// into fresh locals, compute, and push the result.
+//
+// add/sub: result is two i64s (low, high) on the stack — same flat
+//   layout as the input. Signed and unsigned use the same bitwise
+//   sequence (two's complement).
+// eq/ne/lt/le/gt/ge: result is a single i32 (0 or 1).
+//
+// Not implemented: mul, div, rem (need wider runtime sequences;
+// nothing in pocket-rust's bootstrap path needs them yet).
+fn codegen_builtin_128(ctx: &mut FnCtx, op: &str, signed: bool) {
+    // Allocate four i64 locals to hold the args.
+    let low_a = alloc_i64_local(ctx);
+    let high_a = alloc_i64_local(ctx);
+    let low_b = alloc_i64_local(ctx);
+    let high_b = alloc_i64_local(ctx);
+    // Pop in reverse-push order: high_b is on top.
+    ctx.instructions.push(wasm::Instruction::LocalSet(high_b));
+    ctx.instructions.push(wasm::Instruction::LocalSet(low_b));
+    ctx.instructions.push(wasm::Instruction::LocalSet(high_a));
+    ctx.instructions.push(wasm::Instruction::LocalSet(low_a));
+    match op {
+        "add" => emit_128_add(ctx, low_a, high_a, low_b, high_b),
+        "sub" => emit_128_sub(ctx, low_a, high_a, low_b, high_b),
+        "eq" => emit_128_eq(ctx, low_a, high_a, low_b, high_b, /*invert=*/ false),
+        "ne" => emit_128_eq(ctx, low_a, high_a, low_b, high_b, /*invert=*/ true),
+        "lt" => emit_128_cmp(ctx, low_a, high_a, low_b, high_b, signed, Cmp128::Lt),
+        "le" => emit_128_cmp(ctx, low_a, high_a, low_b, high_b, signed, Cmp128::Le),
+        "gt" => emit_128_cmp(ctx, low_a, high_a, low_b, high_b, signed, Cmp128::Gt),
+        "ge" => emit_128_cmp(ctx, low_a, high_a, low_b, high_b, signed, Cmp128::Ge),
+        // mul/div/rem not yet implemented (need 64×64→128 widening
+        // multiply or long-division). Emit wasm `unreachable` so the
+        // function compiles cleanly; calling it traps at runtime.
+        // Pocket-rust's bootstrap path doesn't multiply/divide u128.
+        _ => {
+            let _ = signed;
+            ctx.instructions.push(wasm::Instruction::Unreachable);
+        }
+    }
+}
+
+fn alloc_i64_local(ctx: &mut FnCtx) -> u32 {
+    let idx = ctx.next_wasm_local;
+    ctx.extra_locals.push(wasm::ValType::I64);
+    ctx.next_wasm_local += 1;
+    idx
+}
+
+// 128-bit add: low_r = low_a + low_b; carry = (low_r < low_a) ? 1 : 0;
+// high_r = high_a + high_b + carry. Stack at end: [low_r, high_r].
+fn emit_128_add(ctx: &mut FnCtx, low_a: u32, high_a: u32, low_b: u32, high_b: u32) {
+    // Compute low_r and save it.
+    ctx.instructions.push(wasm::Instruction::LocalGet(low_a));
+    ctx.instructions.push(wasm::Instruction::LocalGet(low_b));
+    ctx.instructions.push(wasm::Instruction::I64Add);
+    let low_r = alloc_i64_local(ctx);
+    ctx.instructions.push(wasm::Instruction::LocalSet(low_r));
+    // carry = (low_r < low_a) as u64 — overflow detection.
+    ctx.instructions.push(wasm::Instruction::LocalGet(low_r));
+    ctx.instructions.push(wasm::Instruction::LocalGet(low_a));
+    ctx.instructions.push(wasm::Instruction::I64LtU);
+    ctx.instructions.push(wasm::Instruction::I64ExtendI32U);
+    // high_r = high_a + high_b + carry.
+    ctx.instructions.push(wasm::Instruction::LocalGet(high_a));
+    ctx.instructions.push(wasm::Instruction::I64Add);
+    ctx.instructions.push(wasm::Instruction::LocalGet(high_b));
+    ctx.instructions.push(wasm::Instruction::I64Add);
+    let high_r = alloc_i64_local(ctx);
+    ctx.instructions.push(wasm::Instruction::LocalSet(high_r));
+    // Push result in flat order: low first, then high.
+    ctx.instructions.push(wasm::Instruction::LocalGet(low_r));
+    ctx.instructions.push(wasm::Instruction::LocalGet(high_r));
+}
+
+// 128-bit sub: low_r = low_a - low_b; borrow = (low_a < low_b) ? 1 : 0;
+// high_r = high_a - high_b - borrow. Sub is non-commutative, so we
+// stash the borrow in a local and do `high_a - borrow - high_b` in
+// stack order.
+fn emit_128_sub(ctx: &mut FnCtx, low_a: u32, high_a: u32, low_b: u32, high_b: u32) {
+    ctx.instructions.push(wasm::Instruction::LocalGet(low_a));
+    ctx.instructions.push(wasm::Instruction::LocalGet(low_b));
+    ctx.instructions.push(wasm::Instruction::I64Sub);
+    let low_r = alloc_i64_local(ctx);
+    ctx.instructions.push(wasm::Instruction::LocalSet(low_r));
+    // borrow = (low_a < low_b) → i32 → i64.
+    ctx.instructions.push(wasm::Instruction::LocalGet(low_a));
+    ctx.instructions.push(wasm::Instruction::LocalGet(low_b));
+    ctx.instructions.push(wasm::Instruction::I64LtU);
+    ctx.instructions.push(wasm::Instruction::I64ExtendI32U);
+    let borrow = alloc_i64_local(ctx);
+    ctx.instructions.push(wasm::Instruction::LocalSet(borrow));
+    // high_r = (high_a - borrow) - high_b.
+    ctx.instructions.push(wasm::Instruction::LocalGet(high_a));
+    ctx.instructions.push(wasm::Instruction::LocalGet(borrow));
+    ctx.instructions.push(wasm::Instruction::I64Sub);
+    ctx.instructions.push(wasm::Instruction::LocalGet(high_b));
+    ctx.instructions.push(wasm::Instruction::I64Sub);
+    let high_r = alloc_i64_local(ctx);
+    ctx.instructions.push(wasm::Instruction::LocalSet(high_r));
+    ctx.instructions.push(wasm::Instruction::LocalGet(low_r));
+    ctx.instructions.push(wasm::Instruction::LocalGet(high_r));
+}
+
+// 128-bit eq: (low_a == low_b) AND (high_a == high_b). For ne, the
+// caller passes invert=true and we flip the result with i32.eqz.
+fn emit_128_eq(
+    ctx: &mut FnCtx,
+    low_a: u32,
+    high_a: u32,
+    low_b: u32,
+    high_b: u32,
+    invert: bool,
+) {
+    ctx.instructions.push(wasm::Instruction::LocalGet(low_a));
+    ctx.instructions.push(wasm::Instruction::LocalGet(low_b));
+    ctx.instructions.push(wasm::Instruction::I64Eq);
+    ctx.instructions.push(wasm::Instruction::LocalGet(high_a));
+    ctx.instructions.push(wasm::Instruction::LocalGet(high_b));
+    ctx.instructions.push(wasm::Instruction::I64Eq);
+    ctx.instructions.push(wasm::Instruction::I32And);
+    if invert {
+        ctx.instructions.push(wasm::Instruction::I32Eqz);
+    }
+}
+
+#[derive(Clone, Copy)]
+enum Cmp128 {
+    Lt,
+    Le,
+    Gt,
+    Ge,
+}
+
+// 128-bit ordered comparison. Decomposes into:
+//   high comparison (signed for i128, unsigned for u128) OR
+//   (high equal AND low comparison unsigned).
+// For Le/Ge the low comparison uses ≤/≥; for Lt/Gt it uses </>.
+fn emit_128_cmp(
+    ctx: &mut FnCtx,
+    low_a: u32,
+    high_a: u32,
+    low_b: u32,
+    high_b: u32,
+    signed: bool,
+    cmp: Cmp128,
+) {
+    let (high_op, low_op) = match (signed, cmp) {
+        (false, Cmp128::Lt) => (wasm::Instruction::I64LtU, wasm::Instruction::I64LtU),
+        (false, Cmp128::Le) => (wasm::Instruction::I64LtU, wasm::Instruction::I64LeU),
+        (false, Cmp128::Gt) => (wasm::Instruction::I64GtU, wasm::Instruction::I64GtU),
+        (false, Cmp128::Ge) => (wasm::Instruction::I64GtU, wasm::Instruction::I64GeU),
+        (true, Cmp128::Lt) => (wasm::Instruction::I64LtS, wasm::Instruction::I64LtU),
+        (true, Cmp128::Le) => (wasm::Instruction::I64LtS, wasm::Instruction::I64LeU),
+        (true, Cmp128::Gt) => (wasm::Instruction::I64GtS, wasm::Instruction::I64GtU),
+        (true, Cmp128::Ge) => (wasm::Instruction::I64GtS, wasm::Instruction::I64GeU),
+    };
+    // (high_a OP high_b)
+    ctx.instructions.push(wasm::Instruction::LocalGet(high_a));
+    ctx.instructions.push(wasm::Instruction::LocalGet(high_b));
+    ctx.instructions.push(high_op);
+    // OR
+    // ((high_a == high_b) AND (low_a low_op low_b))
+    ctx.instructions.push(wasm::Instruction::LocalGet(high_a));
+    ctx.instructions.push(wasm::Instruction::LocalGet(high_b));
+    ctx.instructions.push(wasm::Instruction::I64Eq);
+    ctx.instructions.push(wasm::Instruction::LocalGet(low_a));
+    ctx.instructions.push(wasm::Instruction::LocalGet(low_b));
+    ctx.instructions.push(low_op);
+    ctx.instructions.push(wasm::Instruction::I32And);
+    ctx.instructions.push(wasm::Instruction::I32Or);
+}
+
+fn split_builtin_name(name: &str) -> Option<(&str, &str)> {
+    let ops = [
+        "add", "sub", "mul", "div", "rem", "eq", "ne", "lt", "le", "gt", "ge",
+        "and", "or", "not", "xor",
+    ];
+    let mut k = 0;
+    while k < ops.len() {
+        let op = ops[k];
+        if name.len() > op.len() + 1 {
+            let prefix_end = name.len() - op.len();
+            if name.as_bytes()[prefix_end - 1] == b'_'
+                && &name[prefix_end..] == op
+            {
+                return Some((&name[..prefix_end - 1], op));
+            }
+        }
+        k += 1;
+    }
+    None
 }
 
 fn codegen_if_expr(

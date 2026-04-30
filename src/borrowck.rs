@@ -513,6 +513,13 @@ fn walk_expr_for_liveness(expr: &Expr, step: &mut u32, info: &mut Liveness) {
             walk_block_for_liveness(if_expr.then_block.as_ref(), step, info);
             walk_block_for_liveness(if_expr.else_block.as_ref(), step, info);
         }
+        ExprKind::Builtin { args, .. } => {
+            let mut i = 0;
+            while i < args.len() {
+                walk_expr_for_liveness(&args[i], step, info);
+                i += 1;
+            }
+        }
     }
 }
 
@@ -657,6 +664,17 @@ fn walk_expr(state: &mut BorrowState, expr: &Expr) -> Result<ValueDesc, Error> {
         ExprKind::MethodCall(mc) => walk_method_call(state, mc, expr.id),
         ExprKind::BoolLit(_) => Ok(empty_desc()),
         ExprKind::If(if_expr) => walk_if_expr(state, if_expr),
+        ExprKind::Builtin { args, .. } => {
+            // Builtins consume their args by value (Copy primitives —
+            // ints, bools). Walk for side effects but produce no
+            // borrows: the result is a fresh primitive value.
+            let mut i = 0;
+            while i < args.len() {
+                walk_expr(state, &args[i])?;
+                i += 1;
+            }
+            Ok(empty_desc())
+        }
     }
 }
 

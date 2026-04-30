@@ -803,7 +803,122 @@ impl Parser {
     }
 
     fn parse_expr(&mut self) -> Result<Expr, Error> {
-        self.parse_cast()
+        self.parse_comparison()
+    }
+
+    // Comparison ops are non-associative (precedence layer right above
+    // additive). Parsing `a < b < c` would give an error in real Rust;
+    // here we accept left-associativity for simplicity (`(a < b) < c`).
+    fn parse_comparison(&mut self) -> Result<Expr, Error> {
+        let mut expr = self.parse_additive()?;
+        loop {
+            let method_name: &str = if self.peek_kind(&TokenKind::EqEq) {
+                "eq"
+            } else if self.peek_kind(&TokenKind::NotEq) {
+                "ne"
+            } else if self.peek_kind(&TokenKind::LAngle) {
+                "lt"
+            } else if self.peek_kind(&TokenKind::LtEq) {
+                "le"
+            } else if self.peek_kind(&TokenKind::RAngle) {
+                "gt"
+            } else if self.peek_kind(&TokenKind::GtEq) {
+                "ge"
+            } else {
+                break;
+            };
+            let op_span = self.tokens[self.pos].span.copy();
+            self.pos += 1;
+            let rhs = self.parse_additive()?;
+            // Comparison methods take `&self, &Self`. Wrap rhs in a
+            // borrow; receiver autorefs via method dispatch.
+            let rhs_span = rhs.span.copy();
+            let rhs_id = self.alloc_node_id();
+            let rhs_borrow = Expr {
+                kind: ExprKind::Borrow {
+                    inner: Box::new(rhs),
+                    mutable: false,
+                },
+                span: rhs_span,
+                id: rhs_id,
+            };
+            let span = Span::new(expr.span.start.copy(), rhs_borrow.span.end.copy());
+            let id = self.alloc_node_id();
+            expr = Expr {
+                kind: ExprKind::MethodCall(MethodCall {
+                    receiver: Box::new(expr),
+                    method: method_name.to_string(),
+                    method_span: op_span,
+                    turbofish_args: Vec::new(),
+                    args: vec![rhs_borrow],
+                }),
+                span,
+                id,
+            };
+        }
+        Ok(expr)
+    }
+
+    fn parse_additive(&mut self) -> Result<Expr, Error> {
+        let mut expr = self.parse_multiplicative()?;
+        loop {
+            let method_name: &str = if self.peek_kind(&TokenKind::Plus) {
+                "add"
+            } else if self.peek_kind(&TokenKind::Minus) {
+                "sub"
+            } else {
+                break;
+            };
+            let op_span = self.tokens[self.pos].span.copy();
+            self.pos += 1;
+            let rhs = self.parse_multiplicative()?;
+            let span = Span::new(expr.span.start.copy(), rhs.span.end.copy());
+            let id = self.alloc_node_id();
+            expr = Expr {
+                kind: ExprKind::MethodCall(MethodCall {
+                    receiver: Box::new(expr),
+                    method: method_name.to_string(),
+                    method_span: op_span,
+                    turbofish_args: Vec::new(),
+                    args: vec![rhs],
+                }),
+                span,
+                id,
+            };
+        }
+        Ok(expr)
+    }
+
+    fn parse_multiplicative(&mut self) -> Result<Expr, Error> {
+        let mut expr = self.parse_cast()?;
+        loop {
+            let method_name: &str = if self.peek_kind(&TokenKind::Star) {
+                "mul"
+            } else if self.peek_kind(&TokenKind::Slash) {
+                "div"
+            } else if self.peek_kind(&TokenKind::Percent) {
+                "rem"
+            } else {
+                break;
+            };
+            let op_span = self.tokens[self.pos].span.copy();
+            self.pos += 1;
+            let rhs = self.parse_cast()?;
+            let span = Span::new(expr.span.start.copy(), rhs.span.end.copy());
+            let id = self.alloc_node_id();
+            expr = Expr {
+                kind: ExprKind::MethodCall(MethodCall {
+                    receiver: Box::new(expr),
+                    method: method_name.to_string(),
+                    method_span: op_span,
+                    turbofish_args: Vec::new(),
+                    args: vec![rhs],
+                }),
+                span,
+                id,
+            };
+        }
+        Ok(expr)
     }
 
     fn parse_cast(&mut self) -> Result<Expr, Error> {
@@ -936,6 +1051,7 @@ impl Parser {
                 Ok(Expr { kind: ExprKind::BoolLit(false), span, id })
             }
             TokenKind::If => self.parse_if_expr(),
+            TokenKind::Builtin => self.parse_builtin(),
             TokenKind::Ident(_) => self.parse_path_atom(),
             TokenKind::SelfUpper => self.parse_path_atom(),
             TokenKind::SelfLower => {
@@ -1021,6 +1137,28 @@ impl Parser {
                 then_block: Box::new(then_block),
                 else_block: Box::new(else_block),
             }),
+            span,
+            id,
+        })
+    }
+
+    // `¤name(arg, ...)` — a compiler-builtin call. The name is a
+    // single identifier (no path segments); arg list is parsed like a
+    // regular call. Typeck validates the name + arg shape; codegen
+    // lowers to wasm ops.
+    fn parse_builtin(&mut self) -> Result<Expr, Error> {
+        let cur_span = self.expect(&TokenKind::Builtin, "`¤`")?;
+        let (name, name_span) = self.expect_ident()?;
+        let args = self.parse_call_args()?;
+        let end = self.tokens[self.pos - 1].span.end.copy();
+        let span = Span::new(cur_span.start, end);
+        let id = self.alloc_node_id();
+        Ok(Expr {
+            kind: ExprKind::Builtin {
+                name,
+                name_span,
+                args,
+            },
             span,
             id,
         })
@@ -1340,6 +1478,15 @@ impl Parser {
             (TokenKind::False, TokenKind::False) => true,
             (TokenKind::Use, TokenKind::Use) => true,
             (TokenKind::Pub, TokenKind::Pub) => true,
+            (TokenKind::Builtin, TokenKind::Builtin) => true,
+            (TokenKind::Minus, TokenKind::Minus) => true,
+            (TokenKind::Slash, TokenKind::Slash) => true,
+            (TokenKind::Percent, TokenKind::Percent) => true,
+            (TokenKind::Bang, TokenKind::Bang) => true,
+            (TokenKind::EqEq, TokenKind::EqEq) => true,
+            (TokenKind::NotEq, TokenKind::NotEq) => true,
+            (TokenKind::LtEq, TokenKind::LtEq) => true,
+            (TokenKind::GtEq, TokenKind::GtEq) => true,
             _ => false,
         }
     }

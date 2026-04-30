@@ -1067,6 +1067,38 @@ fn if_arms_must_unify() {
 }
 
 #[test]
+fn unknown_builtin_is_rejected() {
+    let err = compile_source("fn answer() -> u32 { ¤u32_unknown(1, 2) }");
+    assert!(
+        err.contains("unknown builtin"),
+        "expected unknown-builtin error, got: {}",
+        err
+    );
+}
+
+#[test]
+fn builtin_wrong_arg_count_is_rejected() {
+    let err = compile_source("fn answer() -> u32 { ¤u32_add(1) }");
+    assert!(
+        err.contains("argument"),
+        "expected wrong-arity error, got: {}",
+        err
+    );
+}
+
+#[test]
+fn builtin_arg_type_mismatch_is_rejected() {
+    let err = compile_source(
+        "fn answer() -> u32 { let a: u32 = 1; let b: u64 = 2; ¤u32_add(a, b) }",
+    );
+    assert!(
+        err.contains("type mismatch"),
+        "expected type-mismatch error, got: {}",
+        err
+    );
+}
+
+#[test]
 fn private_function_call_from_outside_module_is_rejected() {
     let err = compile_sources(&[
         ("lib.rs", "mod inner;\nfn answer() -> u32 { inner::secret() }"),

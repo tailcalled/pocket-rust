@@ -61,6 +61,7 @@ pub struct FuncBody {
 }
 
 pub enum Instruction {
+    Unreachable,
     I32Const(i32),
     I64Const(i64),
     LocalGet(u32),
@@ -71,6 +72,46 @@ pub enum Instruction {
     Call(u32),
     I32Add,
     I32Sub,
+    I32Mul,
+    I32DivS,
+    I32DivU,
+    I32RemS,
+    I32RemU,
+    I32And,
+    I32Or,
+    I32Xor,
+    I32Eqz,
+    I32Eq,
+    I32Ne,
+    I32LtS,
+    I32LtU,
+    I32GtS,
+    I32GtU,
+    I32LeS,
+    I32LeU,
+    I32GeS,
+    I32GeU,
+    I64Add,
+    I64Sub,
+    I64Mul,
+    I64DivS,
+    I64DivU,
+    I64RemS,
+    I64RemU,
+    I64And,
+    I64Or,
+    I64Xor,
+    I64Eqz,
+    I64Eq,
+    I64Ne,
+    I64LtS,
+    I64LtU,
+    I64GtS,
+    I64GtU,
+    I64LeS,
+    I64LeU,
+    I64GeS,
+    I64GeU,
     I32WrapI64,
     I64ExtendI32S,
     I64ExtendI32U,
@@ -319,6 +360,7 @@ fn encode_locals(out: &mut Vec<u8>, locals: &Vec<ValType>) {
 
 fn encode_instruction(out: &mut Vec<u8>, inst: &Instruction) {
     match inst {
+        Instruction::Unreachable => out.push(0x00),
         Instruction::I32Const(n) => {
             out.push(0x41);
             write_sleb128(out, *n);
@@ -350,12 +392,48 @@ fn encode_instruction(out: &mut Vec<u8>, inst: &Instruction) {
             out.push(0x24);
             write_uleb128(out, *idx);
         }
-        Instruction::I32Add => {
-            out.push(0x6a);
-        }
-        Instruction::I32Sub => {
-            out.push(0x6b);
-        }
+        Instruction::I32Add => out.push(0x6a),
+        Instruction::I32Sub => out.push(0x6b),
+        Instruction::I32Mul => out.push(0x6c),
+        Instruction::I32DivS => out.push(0x6d),
+        Instruction::I32DivU => out.push(0x6e),
+        Instruction::I32RemS => out.push(0x6f),
+        Instruction::I32RemU => out.push(0x70),
+        Instruction::I32And => out.push(0x71),
+        Instruction::I32Or => out.push(0x72),
+        Instruction::I32Xor => out.push(0x73),
+        Instruction::I32Eqz => out.push(0x45),
+        Instruction::I32Eq => out.push(0x46),
+        Instruction::I32Ne => out.push(0x47),
+        Instruction::I32LtS => out.push(0x48),
+        Instruction::I32LtU => out.push(0x49),
+        Instruction::I32GtS => out.push(0x4a),
+        Instruction::I32GtU => out.push(0x4b),
+        Instruction::I32LeS => out.push(0x4c),
+        Instruction::I32LeU => out.push(0x4d),
+        Instruction::I32GeS => out.push(0x4e),
+        Instruction::I32GeU => out.push(0x4f),
+        Instruction::I64Add => out.push(0x7c),
+        Instruction::I64Sub => out.push(0x7d),
+        Instruction::I64Mul => out.push(0x7e),
+        Instruction::I64DivS => out.push(0x7f),
+        Instruction::I64DivU => out.push(0x80),
+        Instruction::I64RemS => out.push(0x81),
+        Instruction::I64RemU => out.push(0x82),
+        Instruction::I64And => out.push(0x83),
+        Instruction::I64Or => out.push(0x84),
+        Instruction::I64Xor => out.push(0x85),
+        Instruction::I64Eqz => out.push(0x50),
+        Instruction::I64Eq => out.push(0x51),
+        Instruction::I64Ne => out.push(0x52),
+        Instruction::I64LtS => out.push(0x53),
+        Instruction::I64LtU => out.push(0x54),
+        Instruction::I64GtS => out.push(0x55),
+        Instruction::I64GtU => out.push(0x56),
+        Instruction::I64LeS => out.push(0x57),
+        Instruction::I64LeU => out.push(0x58),
+        Instruction::I64GeS => out.push(0x59),
+        Instruction::I64GeU => out.push(0x5a),
         Instruction::I32WrapI64 => {
             out.push(0xa7);
         }

@@ -25,6 +25,11 @@ pub enum TokenKind {
     False,
     Use,
     Pub,
+    // The currency-sign character `¤` (U+00A4). Prefixes a builtin
+    // intrinsic call: `¤name(args)`. The lexer emits this as a
+    // standalone token; the following identifier (and parenthesized
+    // arg list) belong to the builtin syntax in the parser.
+    Builtin,
     LAngle,
     RAngle,
     Ident(String),
@@ -43,6 +48,14 @@ pub enum TokenKind {
     Amp,
     Star,
     Plus,
+    Minus,
+    Slash,
+    Percent,
+    Bang,
+    EqEq,
+    NotEq,
+    LtEq,
+    GtEq,
     Eq,
     IntLit(u64),
 }
@@ -68,6 +81,7 @@ pub fn token_kind_name(t: &TokenKind) -> &'static str {
         TokenKind::False => "`false`",
         TokenKind::Use => "`use`",
         TokenKind::Pub => "`pub`",
+        TokenKind::Builtin => "`¤`",
         TokenKind::LAngle => "`<`",
         TokenKind::RAngle => "`>`",
         TokenKind::Ident(_) => "identifier",
@@ -85,6 +99,14 @@ pub fn token_kind_name(t: &TokenKind) -> &'static str {
         TokenKind::Amp => "`&`",
         TokenKind::Star => "`*`",
         TokenKind::Plus => "`+`",
+        TokenKind::Minus => "`-`",
+        TokenKind::Slash => "`/`",
+        TokenKind::Percent => "`%`",
+        TokenKind::Bang => "`!`",
+        TokenKind::EqEq => "`==`",
+        TokenKind::NotEq => "`!=`",
+        TokenKind::LtEq => "`<=`",
+        TokenKind::GtEq => "`>=`",
         TokenKind::Eq => "`=`",
         TokenKind::IntLit(_) => "integer literal",
     }
@@ -268,12 +290,45 @@ pub fn tokenize(file: &str, source: &str) -> Result<Vec<Token>, Error> {
         } else if b == b'+' {
             push_single(&mut tokens, TokenKind::Plus, line, &mut col);
             byte_pos += 1;
+        } else if b == b'/' {
+            push_single(&mut tokens, TokenKind::Slash, line, &mut col);
+            byte_pos += 1;
+        } else if b == b'%' {
+            push_single(&mut tokens, TokenKind::Percent, line, &mut col);
+            byte_pos += 1;
+        } else if b == b'=' && (byte_pos + 1) < bytes.len() && bytes[byte_pos + 1] == b'=' {
+            let start = Pos::new(line, col);
+            col += 2;
+            let end = Pos::new(line, col);
+            tokens.push(Token { kind: TokenKind::EqEq, span: Span::new(start, end) });
+            byte_pos += 2;
         } else if b == b'=' {
             push_single(&mut tokens, TokenKind::Eq, line, &mut col);
             byte_pos += 1;
+        } else if b == b'!' && (byte_pos + 1) < bytes.len() && bytes[byte_pos + 1] == b'=' {
+            let start = Pos::new(line, col);
+            col += 2;
+            let end = Pos::new(line, col);
+            tokens.push(Token { kind: TokenKind::NotEq, span: Span::new(start, end) });
+            byte_pos += 2;
+        } else if b == b'!' {
+            push_single(&mut tokens, TokenKind::Bang, line, &mut col);
+            byte_pos += 1;
+        } else if b == b'<' && (byte_pos + 1) < bytes.len() && bytes[byte_pos + 1] == b'=' {
+            let start = Pos::new(line, col);
+            col += 2;
+            let end = Pos::new(line, col);
+            tokens.push(Token { kind: TokenKind::LtEq, span: Span::new(start, end) });
+            byte_pos += 2;
         } else if b == b'<' {
             push_single(&mut tokens, TokenKind::LAngle, line, &mut col);
             byte_pos += 1;
+        } else if b == b'>' && (byte_pos + 1) < bytes.len() && bytes[byte_pos + 1] == b'=' {
+            let start = Pos::new(line, col);
+            col += 2;
+            let end = Pos::new(line, col);
+            tokens.push(Token { kind: TokenKind::GtEq, span: Span::new(start, end) });
+            byte_pos += 2;
         } else if b == b'>' {
             push_single(&mut tokens, TokenKind::RAngle, line, &mut col);
             byte_pos += 1;
@@ -313,6 +368,9 @@ pub fn tokenize(file: &str, source: &str) -> Result<Vec<Token>, Error> {
                 span: Span::new(start, end),
             });
             byte_pos += 2;
+        } else if b == b'-' {
+            push_single(&mut tokens, TokenKind::Minus, line, &mut col);
+            byte_pos += 1;
         } else if b == b':' && (byte_pos + 1) < bytes.len() && bytes[byte_pos + 1] == b':' {
             let start = Pos::new(line, col);
             col += 2;
@@ -325,6 +383,17 @@ pub fn tokenize(file: &str, source: &str) -> Result<Vec<Token>, Error> {
         } else if b == b':' {
             push_single(&mut tokens, TokenKind::Colon, line, &mut col);
             byte_pos += 1;
+        } else if b == 0xc2 && (byte_pos + 1) < bytes.len() && bytes[byte_pos + 1] == 0xa4 {
+            // `¤` U+00A4 — UTF-8 encoded as the two bytes 0xC2 0xA4.
+            // Counts as one column (one user-visible char).
+            let start = Pos::new(line, col);
+            col += 1;
+            let end = Pos::new(line, col);
+            tokens.push(Token {
+                kind: TokenKind::Builtin,
+                span: Span::new(start, end),
+            });
+            byte_pos += 2;
         } else {
             let start = Pos::new(line, col);
             let end = Pos::new(line, col + 1);

@@ -237,6 +237,16 @@ pub enum ExprKind {
     Block(Box<Block>),
     MethodCall(MethodCall),
     If(IfExpr),
+    // `¤name(args)` — a compiler-builtin intrinsic call. The name
+    // identifies which primitive op (e.g. `u32_add`, `i64_eq`,
+    // `bool_and`) and determines the expected arg types and result
+    // type at typeck-time. Codegen lowers each builtin to a small
+    // sequence of wasm instructions.
+    Builtin {
+        name: String,
+        name_span: Span,
+        args: Vec<Expr>,
+    },
 }
 
 #[derive(Clone)]

@@ -168,6 +168,14 @@ fn walk_expr(state: &mut SafeState, expr: &Expr) -> Result<(), Error> {
             walk_block(state, if_expr.else_block.as_ref())?;
             Ok(())
         }
+        ExprKind::Builtin { args, .. } => {
+            let mut i = 0;
+            while i < args.len() {
+                walk_expr(state, &args[i])?;
+                i += 1;
+            }
+            Ok(())
+        }
     }
 }
 

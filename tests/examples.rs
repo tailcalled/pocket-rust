@@ -570,6 +570,49 @@ fn use_crate_returns_77() {
     expect_answer("use_crate", 77i32);
 }
 
+// `¤<type>_<op>(args)` builtins lower to wasm primitive ops. Here
+// `¤u32_add(30, 12)` emits an `i32.add` and returns 42.
+#[test]
+fn builtin_arith_returns_42() {
+    expect_answer("builtin_arith", 42i32);
+}
+
+// Comparison builtin in if-condition: `¤i32_lt(5, 7)` is true, so
+// the if returns 11.
+#[test]
+fn builtin_cmp_in_if_returns_11() {
+    expect_answer("builtin_cmp_in_if", 11i32);
+}
+
+// 128-bit arithmetic and comparison: both args sum to over 2^63 so
+// the addition carries into the high half, exercising the carry
+// emission. Equality and lt builtins on u128 also tested.
+#[test]
+fn builtin_u128_returns_11() {
+    expect_answer("builtin_u128", 11i32);
+}
+
+// `+` operator desugars to `<T as Num>::add(self, other)`. 30 + 12
+// dispatches via `<u32 as Num>::add` which calls `¤u32_add`.
+#[test]
+fn op_arith_returns_42() {
+    expect_answer("op_arith", 42i32);
+}
+
+// `==` desugars to `<T as Eq>::eq(&self, &other)` returning bool.
+// `5 == 5` is true → returns 11.
+#[test]
+fn op_eq_in_if_returns_11() {
+    expect_answer("op_eq_in_if", 11i32);
+}
+
+// `<` desugars to `<T as Ord>::lt(&self, &other)`. Signed lt picks
+// `¤i32_lt` (signed wasm op) — `5 < 7` is true → returns 11.
+#[test]
+fn op_ord_in_if_returns_11() {
+    expect_answer("op_ord_in_if", 11i32);
+}
+
 // `pub use` re-exports. Module `b` has `pub use crate::a::deep;`,
 // which makes `b::deep` resolve (from outside `b`) to `a::deep`.
 // The caller writes `b::deep()` and it dispatches to the original
