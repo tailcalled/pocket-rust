@@ -1267,6 +1267,24 @@ fn match_partial_move_invalidates_scrutinee() {
 }
 
 #[test]
+fn impl_without_supertrait_impl_is_rejected() {
+    // `trait Sub: Super` requires `impl Super for T` to exist whenever
+    // `impl Sub for T` is registered.
+    let err = compile_source(
+        "trait Super { fn s(&self) -> u32; }\n\
+         trait Sub: Super { fn x(&self) -> u32; }\n\
+         struct Foo { n: u32 }\n\
+         impl Sub for Foo { fn x(&self) -> u32 { self.n } }\n\
+         fn f() -> u32 { 0 }",
+    );
+    assert!(
+        err.contains("trait bound") && err.contains("Super"),
+        "expected supertrait obligation error, got: {}",
+        err
+    );
+}
+
+#[test]
 fn match_ref_binding_outstanding_borrow_blocks_mut() {
     // `ref rx` against a place creates a borrow of that place. While
     // `rx` is live, taking `&mut p` should conflict.

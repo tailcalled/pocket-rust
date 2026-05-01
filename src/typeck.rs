@@ -210,30 +210,9 @@ fn satisfies_num(
     let num_path = vec!["std".to_string(), "ops".to_string(), "Num".to_string()];
     match t {
         InferType::Int(_) | InferType::Var(_) => true,
-        InferType::Param(name) => {
-            let mut i = 0;
-            while i < type_params.len() {
-                if type_params[i] == *name && i < type_param_bounds.len() {
-                    let mut b = 0;
-                    while b < type_param_bounds[i].len() {
-                        if path_eq(&type_param_bounds[i][b], &num_path) {
-                            return true;
-                        }
-                        b += 1;
-                    }
-                    break;
-                }
-                i += 1;
-            }
-            false
-        }
-        InferType::Struct { .. } => {
-            // Best-effort: convert via a quick finalize-style walk
-            // (substituting unresolved Vars to a placeholder Int) and
-            // run solve_impl. For T5.5 minimal we only need this to
-            // succeed for fully-concrete structs.
+        InferType::Param(_) | InferType::Struct { .. } => {
             let rt = infer_to_rtype_for_check(t);
-            crate::typeck::solve_impl(&num_path, &rt, traits, 0).is_some()
+            solve_impl_in_ctx(&num_path, &rt, traits, type_params, type_param_bounds, 0).is_some()
         }
         InferType::Ref { .. }
         | InferType::RawPtr { .. }
@@ -339,7 +318,51 @@ pub fn solve_impl(
     traits: &TraitTable,
     depth: u32,
 ) -> Option<ImplResolution> {
+    solve_impl_in_ctx(trait_path, concrete, traits, &Vec::new(), &Vec::new(), depth)
+}
+
+// Like `solve_impl`, but also recognizes a `Param(name)` concrete as
+// satisfying `trait_path` when one of the param's in-scope bounds (or
+// any of that bound's transitive supertraits) equals `trait_path`. The
+// `type_params`/`type_param_bounds` slices align in length and order;
+// they're threaded through the recursive impl-bound check so nested
+// generic obligations like `impl<T: PartialEq> Eq for Wrap<T>` (which
+// recurses to `Wrap<T>: PartialEq` → `T: PartialEq`) resolve via the
+// outer context.
+pub fn solve_impl_in_ctx(
+    trait_path: &Vec<String>,
+    concrete: &RType,
+    traits: &TraitTable,
+    type_params: &Vec<String>,
+    type_param_bounds: &Vec<Vec<Vec<String>>>,
+    depth: u32,
+) -> Option<ImplResolution> {
     if depth > 32 {
+        return None;
+    }
+    if let RType::Param(name) = concrete {
+        let mut i = 0;
+        while i < type_params.len() {
+            if type_params[i] == *name && i < type_param_bounds.len() {
+                let mut b = 0;
+                while b < type_param_bounds[i].len() {
+                    let closure = supertrait_closure(&type_param_bounds[i][b], traits);
+                    let mut k = 0;
+                    while k < closure.len() {
+                        if path_eq(&closure[k], trait_path) {
+                            return Some(ImplResolution {
+                                impl_idx: usize::MAX,
+                                subst: Vec::new(),
+                            });
+                        }
+                        k += 1;
+                    }
+                    b += 1;
+                }
+                return None;
+            }
+            i += 1;
+        }
         return None;
     }
     let mut i = 0;
@@ -354,12 +377,9 @@ pub fn solve_impl(
             i += 1;
             continue;
         }
-        // For each impl-type-param, every bound must hold for that
-        // param's concrete binding.
         let mut all_bounds_ok = true;
         let mut p = 0;
         while p < row.impl_type_params.len() {
-            // Find the concrete type bound to this impl-param.
             let name = &row.impl_type_params[p];
             let mut bound_concrete: Option<RType> = None;
             let mut k = 0;
@@ -374,7 +394,16 @@ pub fn solve_impl(
                 let mut b = 0;
                 while b < row.impl_type_param_bounds[p].len() {
                     let bound_trait = &row.impl_type_param_bounds[p][b];
-                    if solve_impl(bound_trait, &tc, traits, depth + 1).is_none() {
+                    if solve_impl_in_ctx(
+                        bound_trait,
+                        &tc,
+                        traits,
+                        type_params,
+                        type_param_bounds,
+                        depth + 1,
+                    )
+                    .is_none()
+                    {
                         all_bounds_ok = false;
                         break;
                     }
@@ -548,6 +577,44 @@ pub fn try_match_rtype(
                 mutable: mb,
             },
         ) => ma == mb && try_match_rtype(ia, ib, subst),
+        (RType::Bool, RType::Bool) => true,
+        (RType::Tuple(a), RType::Tuple(b)) => {
+            if a.len() != b.len() {
+                return false;
+            }
+            let mut i = 0;
+            while i < a.len() {
+                if !try_match_rtype(&a[i], &b[i], subst) {
+                    return false;
+                }
+                i += 1;
+            }
+            true
+        }
+        (
+            RType::Enum {
+                path: pa,
+                type_args: aa,
+                ..
+            },
+            RType::Enum {
+                path: pb,
+                type_args: ab,
+                ..
+            },
+        ) => {
+            if !path_eq(pa, pb) || aa.len() != ab.len() {
+                return false;
+            }
+            let mut i = 0;
+            while i < aa.len() {
+                if !try_match_rtype(&aa[i], &ab[i], subst) {
+                    return false;
+                }
+                i += 1;
+            }
+            true
+        }
         _ => false,
     }
 }
@@ -1363,25 +1430,7 @@ pub fn is_copy_with_bounds(
     type_params: &Vec<String>,
     type_param_bounds: &Vec<Vec<Vec<String>>>,
 ) -> bool {
-    let copy_path = copy_trait_path();
-    if let RType::Param(name) = t {
-        let mut i = 0;
-        while i < type_params.len() {
-            if type_params[i] == *name && i < type_param_bounds.len() {
-                let mut b = 0;
-                while b < type_param_bounds[i].len() {
-                    if path_eq(&type_param_bounds[i][b], &copy_path) {
-                        return true;
-                    }
-                    b += 1;
-                }
-                break;
-            }
-            i += 1;
-        }
-        return false;
-    }
-    solve_impl(&copy_path, t, traits, 0).is_some()
+    solve_impl_in_ctx(&copy_trait_path(), t, traits, type_params, type_param_bounds, 0).is_some()
 }
 
 pub fn copy_trait_path() -> Vec<String> {
@@ -1981,6 +2030,7 @@ pub struct TraitEntry {
     pub file: String,
     pub methods: Vec<TraitMethodEntry>,
     pub is_pub: bool,
+    pub supertraits: Vec<Vec<String>>,
 }
 
 pub struct TraitMethodEntry {
@@ -2037,6 +2087,39 @@ pub fn trait_lookup<'a>(table: &'a TraitTable, path: &Vec<String>) -> Option<&'a
         i += 1;
     }
     None
+}
+
+// Returns `start` plus every transitive supertrait, deduplicated. Cycles
+// are broken by the dedup check (a trait already in `out` is not pushed
+// or recursed into again), so a malformed `trait A: B` / `trait B: A`
+// pair just produces `[A, B]` rather than looping.
+pub fn supertrait_closure(start: &Vec<String>, traits: &TraitTable) -> Vec<Vec<String>> {
+    let mut out: Vec<Vec<String>> = Vec::new();
+    out.push(clone_path(start));
+    let mut i = 0;
+    while i < out.len() {
+        if let Some(entry) = trait_lookup(traits, &out[i]) {
+            let mut s = 0;
+            while s < entry.supertraits.len() {
+                let sup = &entry.supertraits[s];
+                let mut already = false;
+                let mut j = 0;
+                while j < out.len() {
+                    if path_eq(&out[j], sup) {
+                        already = true;
+                        break;
+                    }
+                    j += 1;
+                }
+                if !already {
+                    out.push(clone_path(sup));
+                }
+                s += 1;
+            }
+        }
+        i += 1;
+    }
+    out
 }
 
 pub struct FnSymbol {
@@ -2692,6 +2775,8 @@ pub fn check(
     push_root_name(&mut path, root);
     collect_funcs(root, &mut path, funcs, next_idx, structs, enums, traits, reexports)?;
 
+    validate_supertrait_obligations(traits)?;
+
     let mut path: Vec<String> = Vec::new();
     push_root_name(&mut path, root);
     let mut current_file = root.source_file.clone();
@@ -2741,6 +2826,7 @@ fn collect_trait_names(module: &Module, path: &mut Vec<String>, table: &mut Trai
                     file: module.source_file.clone(),
                     methods,
                     is_pub: td.is_pub,
+                    supertraits: Vec::new(),
                 });
             }
             Item::Module(m) => {
@@ -2793,6 +2879,21 @@ fn resolve_trait_methods(
                     e += 1;
                 }
                 let entry_idx = entry_idx.expect("trait registered above");
+                let mut supertraits: Vec<Vec<String>> = Vec::new();
+                let mut s = 0;
+                while s < td.supertraits.len() {
+                    let resolved = resolve_trait_path(
+                        &td.supertraits[s].path,
+                        path,
+                        traits,
+                        &use_scope,
+                        reexports,
+                        &module.source_file,
+                    )?;
+                    supertraits.push(resolved);
+                    s += 1;
+                }
+                traits.entries[entry_idx].supertraits = supertraits;
                 let mut k = 0;
                 while k < td.methods.len() {
                     let m = &td.methods[k];
@@ -3832,6 +3933,55 @@ fn register_trait_impl(
         file: file.to_string(),
         span: ib.span.copy(),
     });
+    Ok(())
+}
+
+// Walks every registered `impl Trait for T` and verifies that for each
+// supertrait `S` of `Trait`, there is also an `impl S for T`. Done after
+// all impls are registered (in any source order). The impl-target may be
+// a generic pattern with `Param(name)` slots; supertrait checks consult
+// the impl's own type-param bounds via `solve_impl_in_ctx` so that
+// `impl<T: PartialEq> Eq for Wrap<T>` is satisfied by the generic
+// `impl<T: PartialEq> PartialEq for Wrap<T>` row.
+fn validate_supertrait_obligations(traits: &TraitTable) -> Result<(), Error> {
+    let mut i = 0;
+    while i < traits.impls.len() {
+        let row = &traits.impls[i];
+        let entry = match trait_lookup(traits, &row.trait_path) {
+            Some(e) => e,
+            None => {
+                i += 1;
+                continue;
+            }
+        };
+        let mut s = 0;
+        while s < entry.supertraits.len() {
+            let sup = &entry.supertraits[s];
+            if solve_impl_in_ctx(
+                sup,
+                &row.target,
+                traits,
+                &row.impl_type_params,
+                &row.impl_type_param_bounds,
+                0,
+            )
+            .is_none()
+            {
+                return Err(Error {
+                    file: row.file.clone(),
+                    message: format!(
+                        "the trait bound `{}: {}` is not satisfied (required by `{}`)",
+                        rtype_to_string(&row.target),
+                        place_to_string(sup),
+                        place_to_string(&row.trait_path)
+                    ),
+                    span: row.span.copy(),
+                });
+            }
+            s += 1;
+        }
+        i += 1;
+    }
     Ok(())
 }
 
@@ -7473,15 +7623,23 @@ fn check_method_call_symbolic(
     };
     let mut bi = 0;
     while bi < bounds.len() {
-        if let Some(trait_entry) = trait_lookup(ctx.traits, &bounds[bi]) {
-            let mut mi = 0;
-            while mi < trait_entry.methods.len() {
-                if trait_entry.methods[mi].name == mc.method {
-                    matching_traits.push(clone_path(&bounds[bi]));
-                    break;
+        let closure = supertrait_closure(&bounds[bi], ctx.traits);
+        let mut ci = 0;
+        while ci < closure.len() {
+            if let Some(trait_entry) = trait_lookup(ctx.traits, &closure[ci]) {
+                let mut mi = 0;
+                while mi < trait_entry.methods.len() {
+                    if trait_entry.methods[mi].name == mc.method {
+                        let already = matching_traits.iter().any(|t| path_eq(t, &closure[ci]));
+                        if !already {
+                            matching_traits.push(clone_path(&closure[ci]));
+                        }
+                        break;
+                    }
+                    mi += 1;
                 }
-                mi += 1;
             }
+            ci += 1;
         }
         bi += 1;
     }

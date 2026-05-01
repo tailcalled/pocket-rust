@@ -81,6 +81,7 @@ pub struct ImplBlock {
 pub struct TraitDef {
     pub name: String,
     pub name_span: Span,
+    pub supertraits: Vec<TraitBound>,
     pub methods: Vec<TraitMethodSig>,
     pub span: Span,
     pub is_pub: bool,

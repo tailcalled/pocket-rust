@@ -274,6 +274,15 @@ impl Parser {
     fn parse_trait_def_with_vis(&mut self, is_pub: bool) -> Result<TraitDef, Error> {
         let trait_kw = self.expect(&TokenKind::Trait, "`trait`")?;
         let (name, name_span) = self.expect_ident()?;
+        let mut supertraits: Vec<TraitBound> = Vec::new();
+        if self.peek_kind(&TokenKind::Colon) {
+            self.pos += 1;
+            supertraits.push(self.parse_trait_bound()?);
+            while self.peek_kind(&TokenKind::Plus) {
+                self.pos += 1;
+                supertraits.push(self.parse_trait_bound()?);
+            }
+        }
         self.expect(&TokenKind::LBrace, "`{`")?;
         let mut methods: Vec<TraitMethodSig> = Vec::new();
         while !self.peek_kind(&TokenKind::RBrace) {
@@ -286,6 +295,7 @@ impl Parser {
         Ok(TraitDef {
             name,
             name_span,
+            supertraits,
             methods,
             span: Span::new(trait_kw.start, rb.end),
             is_pub,

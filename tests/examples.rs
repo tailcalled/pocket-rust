@@ -925,3 +925,24 @@ fn if_let_else_returns_42() {
 fn if_let_chain_returns_42() {
     expect_answer("if_let_chain", 42u32);
 }
+
+#[test]
+fn supertrait_eq_via_partialeq_returns_42() {
+    // `<T: Eq>` calling `t.eq(&u)`: `eq` is declared on the supertrait
+    // PartialEq. Method dispatch through bounds walks the supertrait
+    // closure to find it.
+    expect_answer("supertrait_eq_via_partialeq", 42u32);
+}
+
+#[test]
+fn partialord_lt_returns_42() {
+    // `<T: PartialOrd>` calling `t.lt(&u)`: PartialOrd's own method.
+    expect_answer("partialord_lt", 42u32);
+}
+
+#[test]
+fn supertrait_methods_through_bound_returns_22() {
+    // `<T: Dog>` (Dog: Animal) reaches Animal::legs through the
+    // supertrait. legs=4 + bark=7 = 11; *2 = 22.
+    expect_answer("supertrait_methods_through_bound", 22u32);
+}
