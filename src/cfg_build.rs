@@ -328,14 +328,15 @@ impl<'a> Builder<'a> {
             ExprKind::Var(name) => {
                 let local = self.lookup(name).expect("typeck verified");
                 let place = local_place(local);
-                self.move_or_copy(&place, self.locals[local as usize].ty.clone(), span, nid)
+                let ty = self.locals[local as usize].ty.clone();
+                self.materialize_if_move(&place, ty, span, nid)
             }
             ExprKind::FieldAccess(_)
             | ExprKind::TupleIndex { .. }
             | ExprKind::Deref(_) => {
                 let place = self.lower_expr_place(expr);
                 let ty = self.expr_type(expr.id);
-                self.move_or_copy(&place, ty, span, nid)
+                self.materialize_if_move(&place, ty, span, nid)
             }
             _ => {
                 // Other expressions need a temporary.
@@ -373,6 +374,58 @@ impl<'a> Builder<'a> {
             OperandKind::Move(place.clone())
         };
         Operand { kind, span, node_id }
+    }
+
+    // For a place-shaped operand: if the operand would be a Move
+    // (non-Copy), emit `temp = move place` here so the move-effect lands
+    // in the CFG at source-evaluation order — not deferred to the outer
+    // statement that consumes the operand. Without this, e.g.
+    // `f(o.x, g(&o))` would record both args' effects in the outer
+    // Call's stmt, with `&o` (lowered through nested temps) processed
+    // first and `move o.x` processed last; subsequent borrows that
+    // should fail because of the move would spuriously succeed.
+    //
+    // Copy reads need no materialization (they have no move-effect, and
+    // reading a Copy place again later is fine).
+    fn materialize_if_move(
+        &mut self,
+        place: &Place,
+        ty: RType,
+        span: Span,
+        node_id: Option<ast::NodeId>,
+    ) -> Operand {
+        let copy = is_copy_with_bounds(
+            &ty,
+            self.ctx.traits,
+            self.ctx.type_params,
+            self.ctx.type_param_bounds,
+        );
+        if copy {
+            return Operand {
+                kind: OperandKind::Copy(place.clone()),
+                span,
+                node_id,
+            };
+        }
+        let temp = self.alloc_temp(ty.clone(), span.copy());
+        self.push_stmt(CfgStmtKind::StorageLive(temp), span.copy());
+        let move_op = Operand {
+            kind: OperandKind::Move(place.clone()),
+            span: span.copy(),
+            node_id,
+        };
+        self.push_stmt(
+            CfgStmtKind::Assign {
+                place: local_place(temp),
+                rvalue: Rvalue::Use(move_op),
+            },
+            span.copy(),
+        );
+        Operand {
+            kind: OperandKind::Move(local_place(temp)),
+            span,
+            node_id: None,
+        }
     }
 
     // Lower an expression to a Place (used as borrow target or

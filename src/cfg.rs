@@ -58,6 +58,35 @@ impl Place {
     pub fn overlaps(&self, other: &Place) -> bool {
         self.is_prefix_of(other) || other.is_prefix_of(self)
     }
+
+    // Render a place as `name.field.0.field2`-style for error messages.
+    // Compiler-introduced temporaries (no name) render as `<temp>` so the
+    // message still scans even though the actual offender is a synthesized
+    // local; source-level locals always have a name set by lowering.
+    pub fn render(&self, locals: &Vec<LocalDecl>) -> String {
+        let mut out = match &locals[self.root as usize].name {
+            Some(n) => n.clone(),
+            None => "<temp>".to_string(),
+        };
+        let mut i = 0;
+        while i < self.projections.len() {
+            match &self.projections[i] {
+                Projection::Field(f) => {
+                    out.push('.');
+                    out.push_str(f);
+                }
+                Projection::TupleIndex(n) => {
+                    out.push('.');
+                    out.push_str(&n.to_string());
+                }
+                Projection::Deref => {
+                    out = format!("(*{})", out);
+                }
+            }
+            i += 1;
+        }
+        out
+    }
 }
 
 // An operand: either a copy of a place's value (Copy types) or a move

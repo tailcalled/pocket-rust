@@ -18,6 +18,7 @@ use crate::cfg::{
     Terminator,
 };
 use crate::span::{Error, Span};
+use crate::typeck::{is_drop, TraitTable};
 
 #[derive(Clone, PartialEq, Eq)]
 pub enum MoveStatus {
@@ -192,7 +193,7 @@ pub struct MovedLocal {
     pub status: MoveStatus,
 }
 
-pub fn analyze(cfg: &Cfg, file: &str) -> MoveAnalysis {
+pub fn analyze(cfg: &Cfg, traits: &TraitTable, file: &str) -> MoveAnalysis {
     let n = cfg.blocks.len();
     let mut block_in: Vec<MoveSet> = (0..n).map(|_| MoveSet::empty()).collect();
     let mut block_out: Vec<MoveSet> = (0..n).map(|_| MoveSet::empty()).collect();
@@ -245,6 +246,7 @@ pub fn analyze(cfg: &Cfg, file: &str) -> MoveAnalysis {
             &mut block_errors,
             &mut move_sites_raw,
             cfg,
+            traits,
             file,
         );
         errors.extend(block_errors);
@@ -430,15 +432,16 @@ fn apply_block_transfer(
     errors: &mut Vec<Error>,
     move_sites: &mut Vec<(crate::ast::NodeId, String)>,
     cfg: &Cfg,
+    traits: &TraitTable,
     file: &str,
 ) {
     let mut i = 0;
     while i < block.stmts.len() {
-        apply_stmt(&block.stmts[i], state, errors, move_sites, cfg, file);
+        apply_stmt(&block.stmts[i], state, errors, move_sites, cfg, traits, file);
         i += 1;
     }
     // Terminator may also read operands.
-    apply_terminator_reads(&block.terminator, state, errors, move_sites, cfg, file);
+    apply_terminator_reads(&block.terminator, state, errors, move_sites, cfg, traits, file);
 }
 
 fn apply_stmt(
@@ -447,15 +450,16 @@ fn apply_stmt(
     errors: &mut Vec<Error>,
     move_sites: &mut Vec<(crate::ast::NodeId, String)>,
     cfg: &Cfg,
+    traits: &TraitTable,
     file: &str,
 ) {
     match &stmt.kind {
         CfgStmtKind::Assign { place, rvalue } => {
-            apply_rvalue(rvalue, state, errors, move_sites, cfg, file, &stmt.span);
+            apply_rvalue(rvalue, state, errors, move_sites, cfg, traits, file, &stmt.span);
             state.init(place);
         }
         CfgStmtKind::Drop(place) => {
-            check_read(state, place, &stmt.span, errors, file);
+            check_read(state, place, &stmt.span, errors, cfg, file);
         }
         CfgStmtKind::StorageLive(_) | CfgStmtKind::StorageDead(_) => {}
     }
@@ -467,33 +471,36 @@ fn apply_rvalue(
     errors: &mut Vec<Error>,
     move_sites: &mut Vec<(crate::ast::NodeId, String)>,
     cfg: &Cfg,
+    traits: &TraitTable,
     file: &str,
     fallback_span: &Span,
 ) {
     match rv {
-        Rvalue::Use(op) => apply_operand(op, state, errors, move_sites, cfg, file),
+        Rvalue::Use(op) => apply_operand(op, state, errors, move_sites, cfg, traits, file),
         Rvalue::Borrow { place, .. } => {
-            check_read(state, place, fallback_span, errors, file);
+            check_read(state, place, fallback_span, errors, cfg, file);
         }
-        Rvalue::Cast { source, .. } => apply_operand(source, state, errors, move_sites, cfg, file),
+        Rvalue::Cast { source, .. } => {
+            apply_operand(source, state, errors, move_sites, cfg, traits, file)
+        }
         Rvalue::Call { args, .. } => {
             let mut i = 0;
             while i < args.len() {
-                apply_operand(&args[i], state, errors, move_sites, cfg, file);
+                apply_operand(&args[i], state, errors, move_sites, cfg, traits, file);
                 i += 1;
             }
         }
         Rvalue::StructLit { fields, .. } => {
             let mut i = 0;
             while i < fields.len() {
-                apply_operand(&fields[i].1, state, errors, move_sites, cfg, file);
+                apply_operand(&fields[i].1, state, errors, move_sites, cfg, traits, file);
                 i += 1;
             }
         }
         Rvalue::Tuple(ops) => {
             let mut i = 0;
             while i < ops.len() {
-                apply_operand(&ops[i], state, errors, move_sites, cfg, file);
+                apply_operand(&ops[i], state, errors, move_sites, cfg, traits, file);
                 i += 1;
             }
         }
@@ -504,14 +511,14 @@ fn apply_rvalue(
                 VariantFields::Tuple(ops) => {
                     let mut i = 0;
                     while i < ops.len() {
-                        apply_operand(&ops[i], state, errors, move_sites, cfg, file);
+                        apply_operand(&ops[i], state, errors, move_sites, cfg, traits, file);
                         i += 1;
                     }
                 }
                 VariantFields::Struct(fields) => {
                     let mut i = 0;
                     while i < fields.len() {
-                        apply_operand(&fields[i].1, state, errors, move_sites, cfg, file);
+                        apply_operand(&fields[i].1, state, errors, move_sites, cfg, traits, file);
                         i += 1;
                     }
                 }
@@ -520,12 +527,12 @@ fn apply_rvalue(
         Rvalue::Builtin { args, .. } => {
             let mut i = 0;
             while i < args.len() {
-                apply_operand(&args[i], state, errors, move_sites, cfg, file);
+                apply_operand(&args[i], state, errors, move_sites, cfg, traits, file);
                 i += 1;
             }
         }
         Rvalue::Discriminant(place) => {
-            check_read(state, place, fallback_span, errors, file);
+            check_read(state, place, fallback_span, errors, cfg, file);
         }
     }
 }
@@ -536,11 +543,28 @@ fn apply_operand(
     errors: &mut Vec<Error>,
     move_sites: &mut Vec<(crate::ast::NodeId, String)>,
     cfg: &Cfg,
+    traits: &TraitTable,
     file: &str,
 ) {
     match &op.kind {
         OperandKind::Move(place) => {
-            check_read(state, place, &op.span, errors, file);
+            check_read(state, place, &op.span, errors, cfg, file);
+            // Partial-move-of-Drop check: moving a sub-place of a
+            // Drop-typed root would leave a hole the destructor can't
+            // run over soundly, so it's rejected.
+            if !place.projections.is_empty() {
+                let root_ty = &cfg.locals[place.root as usize].ty;
+                if is_drop(root_ty, traits) {
+                    errors.push(Error {
+                        file: file.to_string(),
+                        message: format!(
+                            "cannot move out of `{}`: type implements `Drop`",
+                            place.render(&cfg.locals)
+                        ),
+                        span: op.span.copy(),
+                    });
+                }
+            }
             // Record a move-site if this is a whole-binding move of a
             // named local (= a let-binding or pattern binding, not a
             // temp).
@@ -556,7 +580,7 @@ fn apply_operand(
             state.mark(place.clone(), MoveStatus::Moved);
         }
         OperandKind::Copy(place) => {
-            check_read(state, place, &op.span, errors, file);
+            check_read(state, place, &op.span, errors, cfg, file);
         }
         OperandKind::ConstInt(_)
         | OperandKind::ConstBool(_)
@@ -570,12 +594,15 @@ fn apply_terminator_reads(
     errors: &mut Vec<Error>,
     move_sites: &mut Vec<(crate::ast::NodeId, String)>,
     cfg: &Cfg,
+    traits: &TraitTable,
     file: &str,
 ) {
     match term {
-        Terminator::If { cond, .. } => apply_operand(cond, state, errors, move_sites, cfg, file),
+        Terminator::If { cond, .. } => {
+            apply_operand(cond, state, errors, move_sites, cfg, traits, file)
+        }
         Terminator::SwitchInt { operand, .. } => {
-            apply_operand(operand, state, errors, move_sites, cfg, file)
+            apply_operand(operand, state, errors, move_sites, cfg, traits, file)
         }
         Terminator::Goto(_) | Terminator::Return | Terminator::Unreachable => {}
     }
@@ -586,12 +613,14 @@ fn check_read(
     place: &Place,
     span: &Span,
     errors: &mut Vec<Error>,
+    cfg: &Cfg,
     file: &str,
 ) {
     if let Some(status) = state.check_readable(place) {
+        let rendered = format!("`{}`", place.render(&cfg.locals));
         let msg = match status {
-            MoveStatus::Moved => "use of moved value".to_string(),
-            MoveStatus::MaybeMoved => "use of possibly-moved value".to_string(),
+            MoveStatus::Moved => format!("{} was already moved", rendered),
+            MoveStatus::MaybeMoved => format!("{} was already moved (on some paths)", rendered),
         };
         errors.push(Error {
             file: file.to_string(),

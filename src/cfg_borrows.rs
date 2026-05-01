@@ -124,6 +124,7 @@ pub fn analyze(cfg: &Cfg, liveness: &LivenessAnalysis, file: &str) -> BorrowChec
         let mut block_errors: Vec<Error> = Vec::new();
         apply_block(
             &cfg.blocks[b as usize],
+            cfg,
             &mut state,
             liveness,
             b,
@@ -152,6 +153,7 @@ pub fn analyze(cfg: &Cfg, liveness: &LivenessAnalysis, file: &str) -> BorrowChec
 
 fn apply_block(
     block: &BasicBlock,
+    cfg: &Cfg,
     state: &mut BorrowSet,
     liveness: &LivenessAnalysis,
     block_id: BlockId,
@@ -167,7 +169,7 @@ fn apply_block(
 
     let mut i = 0;
     while i < block.stmts.len() {
-        apply_stmt(&block.stmts[i], state, errors, file);
+        apply_stmt(&block.stmts[i], cfg, state, errors, file);
         // Prune borrows whose destination local is now dead.
         state.prune(&live_after[i]);
         i += 1;
@@ -299,75 +301,141 @@ fn insert_local(state: &mut Vec<LocalId>, l: LocalId) {
     }
 }
 
-fn apply_stmt(stmt: &CfgStmt, state: &mut BorrowSet, errors: &mut Vec<Error>, file: &str) {
+fn apply_stmt(stmt: &CfgStmt, cfg: &Cfg, state: &mut BorrowSet, errors: &mut Vec<Error>, file: &str) {
     match &stmt.kind {
         CfgStmtKind::Assign { place, rvalue } => {
             // First check writes/borrows in the rvalue against the
             // active set.
-            apply_rvalue(rvalue, place, state, errors, file, &stmt.span);
+            apply_rvalue(rvalue, place, cfg, state, errors, file, &stmt.span);
             // Then add any borrows produced by the rvalue.
-            if let Rvalue::Borrow {
-                mutable,
-                place: borrowed_place,
-                region,
-            } = rvalue
-            {
-                state.borrows.push(ActiveBorrow {
-                    id: *region,
-                    place: borrowed_place.clone(),
-                    mutable: *mutable,
-                    dest: place.root,
-                    span: stmt.span.copy(),
-                });
+            match rvalue {
+                Rvalue::Borrow {
+                    mutable,
+                    place: borrowed_place,
+                    region,
+                } => {
+                    state.borrows.push(ActiveBorrow {
+                        id: *region,
+                        place: borrowed_place.clone(),
+                        mutable: *mutable,
+                        dest: place.root,
+                        span: stmt.span.copy(),
+                    });
+                }
+                // Borrow propagation: when the rvalue carries the value
+                // of one or more "source" locals (via Use/Cast operands,
+                // or Call/StructLit/Tuple/Variant/Builtin args), and the
+                // destination has the same root as one of those sources'
+                // borrowed locals, duplicate every borrow whose dest is
+                // a source local with `dest = place.root`. This keeps
+                // borrows alive as long as some live local carries them.
+                _ => {
+                    // Only propagate borrows when the destination
+                    // could plausibly hold a reference. A call returning
+                    // a primitive (bool, integer) doesn't carry the
+                    // input's borrows even if input args do.
+                    let dest_ty = &cfg.locals[place.root as usize].ty;
+                    if rtype_contains_ref(dest_ty) {
+                        let mut sources: Vec<LocalId> = Vec::new();
+                        collect_rvalue_source_locals(rvalue, &mut sources);
+                        if !sources.is_empty() {
+                            let mut to_add: Vec<ActiveBorrow> = Vec::new();
+                            let mut i = 0;
+                            while i < state.borrows.len() {
+                                let b = &state.borrows[i];
+                                if sources.contains(&b.dest) && b.dest != place.root {
+                                    to_add.push(ActiveBorrow {
+                                        id: b.id,
+                                        place: b.place.clone(),
+                                        mutable: b.mutable,
+                                        dest: place.root,
+                                        span: stmt.span.copy(),
+                                    });
+                                }
+                                i += 1;
+                            }
+                            state.borrows.extend(to_add);
+                        }
+                    }
+                }
             }
             // Writes to a place: if place has any projections (writing
             // to a sub-place), check it doesn't overlap any borrow.
             // For whole-local writes, also check (you can't reassign
             // a borrowed local).
-            check_write(place, state, &stmt.span, errors, file);
+            check_write(place, state, &stmt.span, errors, cfg, file);
         }
         CfgStmtKind::Drop(place) => {
             // Drop is a write — calls destructor, which mutates.
-            check_write(place, state, &stmt.span, errors, file);
+            check_write(place, state, &stmt.span, errors, cfg, file);
         }
         CfgStmtKind::StorageLive(_) | CfgStmtKind::StorageDead(_) => {}
     }
 }
 
-fn apply_rvalue(
-    rv: &Rvalue,
-    _dest: &Place,
-    state: &mut BorrowSet,
-    errors: &mut Vec<Error>,
-    file: &str,
-    fallback_span: &Span,
-) {
-    match rv {
-        Rvalue::Borrow {
-            mutable, place, ..
-        } => {
-            check_borrow(*mutable, place, state, fallback_span, errors, file);
+// Does this RType carry a reference anywhere in its structure? Refs,
+// struct fields with refs, tuple elements with refs all qualify. Used
+// by borrow propagation: a call/use whose dest type is purely "owned"
+// (bool, integer, owned struct of owned data) can't keep the input's
+// borrows alive, so we skip propagation in that case.
+fn rtype_contains_ref(t: &crate::typeck::RType) -> bool {
+    use crate::typeck::RType;
+    match t {
+        RType::Ref { .. } => true,
+        RType::RawPtr { .. } => false,
+        RType::Int(_) | RType::Bool | RType::Param(_) => false,
+        RType::Tuple(elems) => elems.iter().any(rtype_contains_ref),
+        // For Struct/Enum: type_args + a non-empty lifetime_args (any
+        // lifetime parameter implies a ref field somewhere). This is a
+        // sound over-approximation — types like `Wrapper<u32>` with no
+        // lifetime params correctly fall through.
+        RType::Struct {
+            type_args,
+            lifetime_args,
+            ..
+        } => !lifetime_args.is_empty() || type_args.iter().any(rtype_contains_ref),
+        RType::Enum {
+            type_args,
+            lifetime_args,
+            ..
+        } => !lifetime_args.is_empty() || type_args.iter().any(rtype_contains_ref),
+    }
+}
+
+// Collect every local that contributes its value to this rvalue: the
+// place root of every Operand inside, plus the place root for
+// Discriminant. Used by borrow propagation to identify which active
+// borrows should "ride along" to the rvalue's destination.
+fn collect_rvalue_source_locals(rv: &Rvalue, out: &mut Vec<LocalId>) {
+    let push_op = |op: &Operand, out: &mut Vec<LocalId>| match &op.kind {
+        OperandKind::Move(p) | OperandKind::Copy(p) => {
+            if !out.contains(&p.root) {
+                out.push(p.root);
+            }
         }
-        Rvalue::Use(op) => apply_operand_read(op, state, errors, file),
-        Rvalue::Cast { source, .. } => apply_operand_read(source, state, errors, file),
+        OperandKind::ConstInt(_) | OperandKind::ConstBool(_) | OperandKind::ConstUnit => {}
+    };
+    match rv {
+        Rvalue::Use(op) => push_op(op, out),
+        Rvalue::Cast { source, .. } => push_op(source, out),
         Rvalue::Call { args, .. } => {
             let mut i = 0;
             while i < args.len() {
-                apply_operand_read(&args[i], state, errors, file);
+                push_op(&args[i], out);
                 i += 1;
             }
         }
         Rvalue::StructLit { fields, .. } => {
             let mut i = 0;
             while i < fields.len() {
-                apply_operand_read(&fields[i].1, state, errors, file);
+                push_op(&fields[i].1, out);
                 i += 1;
             }
         }
         Rvalue::Tuple(ops) => {
             let mut i = 0;
             while i < ops.len() {
-                apply_operand_read(&ops[i], state, errors, file);
+                push_op(&ops[i], out);
                 i += 1;
             }
         }
@@ -378,14 +446,14 @@ fn apply_rvalue(
                 VariantFields::Tuple(ops) => {
                     let mut i = 0;
                     while i < ops.len() {
-                        apply_operand_read(&ops[i], state, errors, file);
+                        push_op(&ops[i], out);
                         i += 1;
                     }
                 }
                 VariantFields::Struct(fields) => {
                     let mut i = 0;
                     while i < fields.len() {
-                        apply_operand_read(&fields[i].1, state, errors, file);
+                        push_op(&fields[i].1, out);
                         i += 1;
                     }
                 }
@@ -394,21 +462,90 @@ fn apply_rvalue(
         Rvalue::Builtin { args, .. } => {
             let mut i = 0;
             while i < args.len() {
-                apply_operand_read(&args[i], state, errors, file);
+                push_op(&args[i], out);
+                i += 1;
+            }
+        }
+        Rvalue::Discriminant(_) | Rvalue::Borrow { .. } => {}
+    }
+}
+
+fn apply_rvalue(
+    rv: &Rvalue,
+    _dest: &Place,
+    cfg: &Cfg,
+    state: &mut BorrowSet,
+    errors: &mut Vec<Error>,
+    file: &str,
+    fallback_span: &Span,
+) {
+    match rv {
+        Rvalue::Borrow {
+            mutable, place, ..
+        } => {
+            check_borrow(*mutable, place, state, fallback_span, errors, cfg, file);
+        }
+        Rvalue::Use(op) => apply_operand_read(op, cfg, state, errors, file),
+        Rvalue::Cast { source, .. } => apply_operand_read(source, cfg, state, errors, file),
+        Rvalue::Call { args, .. } => {
+            let mut i = 0;
+            while i < args.len() {
+                apply_operand_read(&args[i], cfg, state, errors, file);
+                i += 1;
+            }
+        }
+        Rvalue::StructLit { fields, .. } => {
+            let mut i = 0;
+            while i < fields.len() {
+                apply_operand_read(&fields[i].1, cfg, state, errors, file);
+                i += 1;
+            }
+        }
+        Rvalue::Tuple(ops) => {
+            let mut i = 0;
+            while i < ops.len() {
+                apply_operand_read(&ops[i], cfg, state, errors, file);
+                i += 1;
+            }
+        }
+        Rvalue::Variant { fields, .. } => {
+            use crate::cfg::VariantFields;
+            match fields {
+                VariantFields::Unit => {}
+                VariantFields::Tuple(ops) => {
+                    let mut i = 0;
+                    while i < ops.len() {
+                        apply_operand_read(&ops[i], cfg, state, errors, file);
+                        i += 1;
+                    }
+                }
+                VariantFields::Struct(fields) => {
+                    let mut i = 0;
+                    while i < fields.len() {
+                        apply_operand_read(&fields[i].1, cfg, state, errors, file);
+                        i += 1;
+                    }
+                }
+            }
+        }
+        Rvalue::Builtin { args, .. } => {
+            let mut i = 0;
+            while i < args.len() {
+                apply_operand_read(&args[i], cfg, state, errors, file);
                 i += 1;
             }
         }
         Rvalue::Discriminant(place) => {
             // Reading the disc is a shared read.
-            check_read_shared(place, state, fallback_span, errors, file);
+            check_read_shared(place, state, fallback_span, errors, cfg, file);
         }
     }
 }
 
-fn apply_operand_read(op: &Operand, state: &mut BorrowSet, errors: &mut Vec<Error>, file: &str) {
+fn apply_operand_read(op: &Operand, cfg: &Cfg, state: &mut BorrowSet, errors: &mut Vec<Error>, file: &str) {
     match &op.kind {
-        OperandKind::Move(p) => check_move(p, state, &op.span, errors, file),
-        OperandKind::Copy(p) => check_read_shared(p, state, &op.span, errors, file),
+        OperandKind::Move(p) => check_move(p, state, &op.span, errors, cfg, file),
+        OperandKind::Copy(p) => check_read_shared(p, state, &op.span, errors, cfg, file),
         OperandKind::ConstInt(_) | OperandKind::ConstBool(_) | OperandKind::ConstUnit => {}
     }
 }
@@ -419,8 +556,10 @@ fn check_borrow(
     state: &BorrowSet,
     span: &Span,
     errors: &mut Vec<Error>,
+    cfg: &Cfg,
     file: &str,
 ) {
+    let rendered = format!("`{}`", new_place.render(&cfg.locals));
     let mut i = 0;
     while i < state.borrows.len() {
         let b = &state.borrows[i];
@@ -430,13 +569,11 @@ fn check_borrow(
                 errors.push(Error {
                     file: file.to_string(),
                     message: if new_mutable && b.mutable {
-                        "cannot borrow as mutable more than once at a time".to_string()
+                        format!("cannot borrow {} as mutable: already borrowed as mutable", rendered)
                     } else if new_mutable {
-                        "cannot borrow as mutable because it is also borrowed as immutable"
-                            .to_string()
+                        format!("cannot borrow {} as mutable: already borrowed as immutable", rendered)
                     } else {
-                        "cannot borrow as immutable because it is also borrowed as mutable"
-                            .to_string()
+                        format!("cannot borrow {} as immutable: already borrowed as mutable", rendered)
                     },
                     span: span.copy(),
                 });
@@ -451,6 +588,7 @@ fn check_write(
     state: &BorrowSet,
     span: &Span,
     errors: &mut Vec<Error>,
+    cfg: &Cfg,
     file: &str,
 ) {
     let mut i = 0;
@@ -459,7 +597,10 @@ fn check_write(
         if b.place.overlaps(place) {
             errors.push(Error {
                 file: file.to_string(),
-                message: "cannot assign to value because it is borrowed".to_string(),
+                message: format!(
+                    "cannot assign to `{}` while it is borrowed",
+                    place.render(&cfg.locals)
+                ),
                 span: span.copy(),
             });
             return;
@@ -473,6 +614,7 @@ fn check_move(
     state: &BorrowSet,
     span: &Span,
     errors: &mut Vec<Error>,
+    cfg: &Cfg,
     file: &str,
 ) {
     let mut i = 0;
@@ -481,7 +623,10 @@ fn check_move(
         if b.place.overlaps(place) {
             errors.push(Error {
                 file: file.to_string(),
-                message: "cannot move out of borrowed value".to_string(),
+                message: format!(
+                    "cannot move `{}` while it is borrowed",
+                    place.render(&cfg.locals)
+                ),
                 span: span.copy(),
             });
             return;
@@ -495,6 +640,7 @@ fn check_read_shared(
     state: &BorrowSet,
     span: &Span,
     errors: &mut Vec<Error>,
+    cfg: &Cfg,
     file: &str,
 ) {
     // A shared read conflicts only with active mutable borrows.
@@ -504,7 +650,10 @@ fn check_read_shared(
         if b.mutable && b.place.overlaps(place) {
             errors.push(Error {
                 file: file.to_string(),
-                message: "cannot use value because it is mutably borrowed".to_string(),
+                message: format!(
+                    "cannot use `{}` because it is mutably borrowed",
+                    place.render(&cfg.locals)
+                ),
                 span: span.copy(),
             });
             return;
