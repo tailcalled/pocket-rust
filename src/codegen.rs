@@ -800,45 +800,63 @@ fn emit_module(
             Item::Struct(_) => {}
             Item::Enum(_) => {}
             Item::Impl(ib) => {
-                // Determine the method-path prefix (must mirror what
-                // typeck stored in the registered method's path).
+                // Determine the method-path prefix that mirrors what typeck
+                // stored. For Path-targeted impls (`impl Foo`, `impl Trait
+                // for Foo`), the prefix is the path's first segment. For
+                // non-Path trait impls (`impl Trait for (u32, u32)`,
+                // `impl<T> Trait for &T`, …) typeck synthesizes
+                // `__trait_impl_<idx>` where `idx` is the impl's row in
+                // the TraitTable; we recover that idx via the impl's
+                // (file, span) identity. The `target_rt` for codegen's
+                // `Self` resolution comes straight from the registered
+                // `TraitImplEntry.target` — no need to re-resolve here.
                 let target_name = match &ib.target.kind {
                     crate::ast::TypeKind::Path(p) if p.segments.len() == 1 => {
                         Some(p.segments[0].name.clone())
                     }
                     _ => None,
                 };
+                let trait_impl_idx = if ib.trait_path.is_some() {
+                    crate::typeck::find_trait_impl_idx_by_span(
+                        traits,
+                        &module.source_file,
+                        &ib.span,
+                    )
+                } else {
+                    None
+                };
                 let mut method_prefix = clone_path(path);
                 let mut target_path = clone_path(path);
-                if let Some(name) = &target_name {
-                    method_prefix.push(name.clone());
-                    target_path.push(name.clone());
-                } else {
-                    // Synthetic prefix for non-struct trait targets.
-                    // typeck used `__trait_impl_<idx>` — but we don't have
-                    // idx here. For now, skip codegen (T2 will route
-                    // through the trait impl table anyway).
-                    i += 1;
-                    continue;
-                }
-                let mut impl_param_args: Vec<RType> = Vec::new();
-                let mut k = 0;
-                while k < ib.type_params.len() {
-                    impl_param_args.push(RType::Param(ib.type_params[k].name.clone()));
-                    k += 1;
-                }
-                let mut impl_lifetime_args: Vec<crate::typeck::LifetimeRepr> = Vec::new();
-                let mut k = 0;
-                while k < ib.lifetime_params.len() {
-                    impl_lifetime_args.push(crate::typeck::LifetimeRepr::Named(
-                        ib.lifetime_params[k].name.clone(),
-                    ));
-                    k += 1;
-                }
-                let target_rt = RType::Struct {
-                    path: target_path,
-                    type_args: impl_param_args,
-                    lifetime_args: impl_lifetime_args,
+                let target_rt: RType = match &target_name {
+                    Some(name) => {
+                        method_prefix.push(name.clone());
+                        target_path.push(name.clone());
+                        let mut impl_param_args: Vec<RType> = Vec::new();
+                        let mut k = 0;
+                        while k < ib.type_params.len() {
+                            impl_param_args.push(RType::Param(ib.type_params[k].name.clone()));
+                            k += 1;
+                        }
+                        let mut impl_lifetime_args: Vec<crate::typeck::LifetimeRepr> = Vec::new();
+                        let mut k = 0;
+                        while k < ib.lifetime_params.len() {
+                            impl_lifetime_args.push(crate::typeck::LifetimeRepr::Named(
+                                ib.lifetime_params[k].name.clone(),
+                            ));
+                            k += 1;
+                        }
+                        RType::Struct {
+                            path: target_path,
+                            type_args: impl_param_args,
+                            lifetime_args: impl_lifetime_args,
+                        }
+                    }
+                    None => {
+                        let idx = trait_impl_idx
+                            .expect("non-Path impl target must be a trait impl with a registered row");
+                        method_prefix.push(format!("__trait_impl_{}", idx));
+                        rtype_clone(&traits.impls[idx].target)
+                    }
                 };
                 let impl_is_generic = !ib.type_params.is_empty();
                 let mut k = 0;
@@ -4776,7 +4794,10 @@ fn codegen_field_access_general_for_chain(
     let mut current_ty = rtype_clone(&ctx.locals[binding_idx].rtype);
     let mut i = 1;
     while i < chain.len() {
-        current_ty = extract_field_from_stack(ctx, &current_ty, &chain[i])?;
+        current_ty = match chain[i].parse::<u32>() {
+            Ok(idx) => extract_tuple_elem_from_stack(ctx, &current_ty, idx)?,
+            Err(_) => extract_field_from_stack(ctx, &current_ty, &chain[i])?,
+        };
         i += 1;
     }
     Ok(current_ty)

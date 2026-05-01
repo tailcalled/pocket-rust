@@ -946,3 +946,30 @@ fn supertrait_methods_through_bound_returns_22() {
     // supertrait. legs=4 + bark=7 = 11; *2 = 22.
     expect_answer("supertrait_methods_through_bound", 22u32);
 }
+
+#[test]
+fn impl_trait_for_bool_returns_42() {
+    // Exercises `try_match_rtype` Bool arm: supertrait obligation for
+    // `impl Derived for bool` requires matching `Bool` against the
+    // `impl Base for bool` row's Bool target. `<T: Derived>` dispatch at
+    // codegen also runs `solve_impl(Derived, Bool)`. derived(true)=32 +
+    // base(true)=10 = 42.
+    expect_answer("impl_trait_for_bool", 42u32);
+}
+
+#[test]
+fn impl_trait_for_tuple_returns_42() {
+    // `try_match_rtype` Tuple arm: supertrait obligation matches
+    // `(u32, u32)` against the Base impl's tuple target. Generic
+    // dispatch through `<T: Derived>` runs `solve_impl(Derived,
+    // Tuple([u32, u32]))`. 20 + 22 = 42.
+    expect_answer("impl_trait_for_tuple", 42u32);
+}
+
+#[test]
+fn impl_trait_for_enum_returns_42() {
+    // `try_match_rtype` Enum arm: supertrait obligation matches
+    // `Choice` against the Base impl's enum target. Generic dispatch
+    // through `<T: Derived>` runs `solve_impl(Derived, Enum(Choice))`.
+    expect_answer("impl_trait_for_enum", 42u32);
+}

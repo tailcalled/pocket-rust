@@ -2078,6 +2078,29 @@ pub struct TraitImplEntry {
     pub span: Span,
 }
 
+// Find the registered impl row for an `impl` AST block by matching the
+// stored (file, span) identity. Used by codegen to recover the
+// trait_impl_idx that typeck assigned, so it can re-derive the same
+// method-path prefix that typeck stored on `FnSymbol.path`.
+pub fn find_trait_impl_idx_by_span(
+    table: &TraitTable,
+    file: &str,
+    span: &Span,
+) -> Option<usize> {
+    let mut i = 0;
+    while i < table.impls.len() {
+        let row = &table.impls[i];
+        if row.file == file
+            && row.span.start.line == span.start.line
+            && row.span.start.col == span.start.col
+        {
+            return Some(i);
+        }
+        i += 1;
+    }
+    None
+}
+
 pub fn trait_lookup<'a>(table: &'a TraitTable, path: &Vec<String>) -> Option<&'a TraitEntry> {
     let mut i = 0;
     while i < table.entries.len() {

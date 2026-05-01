@@ -12,6 +12,7 @@ impl Copy for u128 {}
 impl Copy for i128 {}
 impl Copy for usize {}
 impl Copy for isize {}
+impl Copy for bool {}
 
 impl<T> Copy for &T {}
 
