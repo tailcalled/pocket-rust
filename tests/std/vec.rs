@@ -45,3 +45,13 @@ fn vec_get_mut_modifies_returns_42() {
 fn vec_drop_runs_on_elements_returns_3() {
     expect_answer("std/vec/drop_runs_on_elements", 3u32);
 }
+
+#[test]
+fn vec_inference_challenge_returns_42() {
+    expect_answer("std/vec/inference_challenge", 42u32);
+}
+
+#[test]
+fn vec_inference_nested_returns_42() {
+    expect_answer("std/vec/inference_nested", 42u32);
+}
