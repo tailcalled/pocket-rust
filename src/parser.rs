@@ -1753,6 +1753,17 @@ impl Parser {
     fn parse_builtin(&mut self) -> Result<Expr, Error> {
         let cur_span = self.expect(&TokenKind::Builtin, "`¤`")?;
         let (name, name_span) = self.expect_ident()?;
+        // Optional turbofish: `¤name::<T1, T2>(args)`. Lifetime args
+        // aren't accepted (no builtin needs them today); they're parsed
+        // and dropped to keep error reporting uniform with method-call
+        // turbofish.
+        let type_args = if self.peek_two(&TokenKind::PathSep, &TokenKind::LAngle) {
+            self.pos += 1; // skip `::`
+            let (_lifetime_args, args) = self.parse_angle_args()?;
+            args
+        } else {
+            Vec::new()
+        };
         let args = self.parse_call_args()?;
         let end = self.tokens[self.pos - 1].span.end.copy();
         let span = Span::new(cur_span.start, end);
@@ -1761,6 +1772,7 @@ impl Parser {
             kind: ExprKind::Builtin {
                 name,
                 name_span,
+                type_args,
                 args,
             },
             span,

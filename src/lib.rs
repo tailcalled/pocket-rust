@@ -100,10 +100,23 @@ pub fn compile(
         min_pages: 1,
         max_pages: Some(1),
     });
+    // Global 0: shadow-stack pointer (`__sp`). Initialized to the top
+    // of the page (65536); shadow stack grows down for spilled
+    // bindings, enum construction, sret slots, etc.
     wasm_mod.globals.push(wasm::Global {
         ty: wasm::ValType::I32,
         mutable: true,
         init: wasm::Instruction::I32Const(65536),
+    });
+    // Global 1: heap pointer (`__heap_top`). Bump-allocated by `¤alloc`,
+    // grows upward from offset 8 (offset 0..7 reserved as null-pointer
+    // territory for future debugging). `¤free` is currently a no-op
+    // stub; allocations are leaked. Heap and shadow stack collide
+    // silently if either grows past the other — there's no OOM check.
+    wasm_mod.globals.push(wasm::Global {
+        ty: wasm::ValType::I32,
+        mutable: true,
+        init: wasm::Instruction::I32Const(8),
     });
 
     let mut i = 0;

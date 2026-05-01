@@ -1818,8 +1818,8 @@ fn check_expr_inner(ctx: &mut CheckCtx, expr: &Expr) -> Result<InferType, Error>
         ExprKind::MethodCall(mc) => check_method_call(ctx, mc, expr),
         ExprKind::BoolLit(_) => Ok(InferType::Bool),
         ExprKind::If(if_expr) => check_if_expr(ctx, if_expr, expr),
-        ExprKind::Builtin { name, name_span, args } => {
-            check_builtin(ctx, name, name_span, args, expr)
+        ExprKind::Builtin { name, name_span, type_args, args } => {
+            check_builtin(ctx, name, name_span, type_args, args, expr)
         }
         ExprKind::Tuple(elems) => {
             let mut tys: Vec<InferType> = Vec::new();
@@ -2130,21 +2130,46 @@ fn check_if_let_expr(
 
 
 // Builtin intrinsic check. The name encodes (type, op) — e.g.
-// `u32_add`, `i64_eq`, `bool_and`, `bool_not`. Looks up the
-// signature, verifies arg arity + types, returns the result type.
+// `u32_add`, `i64_eq`, `bool_and`, `bool_not` — or names a typed
+// intrinsic like `alloc`, `free`, `cast`. Looks up the signature,
+// verifies arg arity + types, returns the result type.
 //
 // Operation kinds:
 //   - Arithmetic on int types (add, sub, mul, div, rem): (T, T) -> T.
 //   - Comparison on int types (eq, ne, lt, le, gt, ge): (T, T) -> bool.
 //   - Bool: and/or (bool, bool) -> bool; not (bool) -> bool;
 //     eq/ne (bool, bool) -> bool.
+//   - `alloc(n: usize) -> *mut u8`: bump-allocate `n` bytes from the
+//     heap; never fails (out-of-memory traps in the wasm host).
+//   - `free(p: *mut u8)`: no-op stub today (heap is bump-only); takes
+//     and discards a `*mut u8`. Provided as the future hook point for a
+//     real allocator.
+//   - `cast::<A, B>(p: *const B) -> *const A` and the analogous `*mut B
+//     -> *mut A`: changes the pointee type only (mutability is preserved
+//     based on the actual arg). Turbofish args A and B are mandatory;
+//     type inference is not used. The operation is a no-op at runtime
+//     (raw pointers are i32 addresses).
 fn check_builtin(
     ctx: &mut CheckCtx,
     name: &str,
     name_span: &Span,
+    type_args: &Vec<crate::ast::Type>,
     args: &Vec<Expr>,
     expr: &Expr,
 ) -> Result<InferType, Error> {
+    match name {
+        "alloc" => return check_builtin_alloc(ctx, type_args, args, expr),
+        "free" => return check_builtin_free(ctx, type_args, args, expr),
+        "cast" => return check_builtin_cast(ctx, type_args, args, expr),
+        _ => {}
+    }
+    if !type_args.is_empty() {
+        return Err(Error {
+            file: ctx.current_file.to_string(),
+            message: format!("builtin `¤{}` does not take type arguments", name),
+            span: name_span.copy(),
+        });
+    }
     let sig = match builtin_signature(name) {
         Some(s) => s,
         None => {
@@ -2183,6 +2208,159 @@ fn check_builtin(
         k += 1;
     }
     Ok(rtype_to_infer(&sig.result))
+}
+
+fn check_builtin_alloc(
+    ctx: &mut CheckCtx,
+    type_args: &Vec<crate::ast::Type>,
+    args: &Vec<Expr>,
+    expr: &Expr,
+) -> Result<InferType, Error> {
+    if !type_args.is_empty() {
+        return Err(Error {
+            file: ctx.current_file.to_string(),
+            message: "builtin `¤alloc` does not take type arguments".to_string(),
+            span: expr.span.copy(),
+        });
+    }
+    if args.len() != 1 {
+        return Err(Error {
+            file: ctx.current_file.to_string(),
+            message: format!("builtin `¤alloc` takes 1 argument, got {}", args.len()),
+            span: expr.span.copy(),
+        });
+    }
+    let arg_ty = check_expr(ctx, &args[0])?;
+    let expected = rtype_to_infer(&RType::Int(IntKind::Usize));
+    ctx.subst.unify(
+        &arg_ty,
+        &expected,
+        ctx.traits,
+        ctx.type_params,
+        ctx.type_param_bounds,
+        &args[0].span,
+        ctx.current_file,
+    )?;
+    Ok(rtype_to_infer(&RType::RawPtr {
+        inner: Box::new(RType::Int(IntKind::U8)),
+        mutable: true,
+    }))
+}
+
+fn check_builtin_free(
+    ctx: &mut CheckCtx,
+    type_args: &Vec<crate::ast::Type>,
+    args: &Vec<Expr>,
+    expr: &Expr,
+) -> Result<InferType, Error> {
+    if !type_args.is_empty() {
+        return Err(Error {
+            file: ctx.current_file.to_string(),
+            message: "builtin `¤free` does not take type arguments".to_string(),
+            span: expr.span.copy(),
+        });
+    }
+    if args.len() != 1 {
+        return Err(Error {
+            file: ctx.current_file.to_string(),
+            message: format!("builtin `¤free` takes 1 argument, got {}", args.len()),
+            span: expr.span.copy(),
+        });
+    }
+    let arg_ty = check_expr(ctx, &args[0])?;
+    let expected = rtype_to_infer(&RType::RawPtr {
+        inner: Box::new(RType::Int(IntKind::U8)),
+        mutable: true,
+    });
+    ctx.subst.unify(
+        &arg_ty,
+        &expected,
+        ctx.traits,
+        ctx.type_params,
+        ctx.type_param_bounds,
+        &args[0].span,
+        ctx.current_file,
+    )?;
+    Ok(InferType::Tuple(Vec::new()))
+}
+
+fn check_builtin_cast(
+    ctx: &mut CheckCtx,
+    type_args: &Vec<crate::ast::Type>,
+    args: &Vec<Expr>,
+    expr: &Expr,
+) -> Result<InferType, Error> {
+    if type_args.len() != 2 {
+        return Err(Error {
+            file: ctx.current_file.to_string(),
+            message: format!(
+                "builtin `¤cast` takes 2 type arguments (`A` and `B`), got {}",
+                type_args.len()
+            ),
+            span: expr.span.copy(),
+        });
+    }
+    if args.len() != 1 {
+        return Err(Error {
+            file: ctx.current_file.to_string(),
+            message: format!("builtin `¤cast` takes 1 argument, got {}", args.len()),
+            span: expr.span.copy(),
+        });
+    }
+    let new_pointee = resolve_type(
+        &type_args[0],
+        ctx.current_module,
+        ctx.structs,
+        ctx.enums,
+        ctx.self_target,
+        ctx.type_params,
+        &ctx.use_scope,
+        ctx.reexports,
+        ctx.current_file,
+    )?;
+    let old_pointee = resolve_type(
+        &type_args[1],
+        ctx.current_module,
+        ctx.structs,
+        ctx.enums,
+        ctx.self_target,
+        ctx.type_params,
+        &ctx.use_scope,
+        ctx.reexports,
+        ctx.current_file,
+    )?;
+    let arg_ty = check_expr(ctx, &args[0])?;
+    let resolved = ctx.subst.substitute(&arg_ty);
+    let mutable = match &resolved {
+        InferType::RawPtr { mutable, .. } => *mutable,
+        _ => {
+            return Err(Error {
+                file: ctx.current_file.to_string(),
+                message: format!(
+                    "builtin `¤cast` argument must be a raw pointer, got `{}`",
+                    infer_to_string(&resolved)
+                ),
+                span: args[0].span.copy(),
+            });
+        }
+    };
+    let expected_arg = rtype_to_infer(&RType::RawPtr {
+        inner: Box::new(old_pointee),
+        mutable,
+    });
+    ctx.subst.unify(
+        &arg_ty,
+        &expected_arg,
+        ctx.traits,
+        ctx.type_params,
+        ctx.type_param_bounds,
+        &args[0].span,
+        ctx.current_file,
+    )?;
+    Ok(rtype_to_infer(&RType::RawPtr {
+        inner: Box::new(new_pointee),
+        mutable,
+    }))
 }
 
 mod builtins;

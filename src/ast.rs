@@ -286,14 +286,17 @@ pub enum ExprKind {
         index: u32,
         index_span: Span,
     },
-    // `¤name(args)` — a compiler-builtin intrinsic call. The name
-    // identifies which primitive op (e.g. `u32_add`, `i64_eq`,
-    // `bool_and`) and determines the expected arg types and result
-    // type at typeck-time. Codegen lowers each builtin to a small
-    // sequence of wasm instructions.
+    // `¤name(args)` or `¤name::<TypeArgs...>(args)` — a compiler-
+    // builtin intrinsic call. The name identifies which primitive op
+    // (e.g. `u32_add`, `i64_eq`, `bool_and`, `alloc`, `free`, `cast`).
+    // Type-parameterized builtins (currently only `cast`) require an
+    // explicit turbofish; type inference is not used. Typeck validates
+    // the name + arg shape; codegen lowers to a small sequence of wasm
+    // instructions.
     Builtin {
         name: String,
         name_span: Span,
+        type_args: Vec<Type>,
         args: Vec<Expr>,
     },
     // `match scrut { pat1 => arm1, pat2 if guard => arm2, _ => arm3 }`.

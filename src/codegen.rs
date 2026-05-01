@@ -9,8 +9,11 @@ use crate::typeck::{
 };
 use crate::wasm;
 
-// We seed the module with one global at index 0 — the shadow-stack pointer.
+// Globals seeded by `lib.rs`: index 0 is the shadow-stack pointer
+// (`__sp`); index 1 is the heap top (`__heap_top`, bump-allocator
+// cursor for `¤alloc`).
 const SP_GLOBAL: u32 = 0;
+const HEAP_GLOBAL: u32 = 1;
 
 // Tracks monomorphic instantiations of generic templates. Maps each
 // (template_idx, concrete type_args) to a wasm function index; queues new ones
@@ -2439,6 +2442,14 @@ fn codegen_builtin(
     args: &Vec<Expr>,
     node_id: crate::ast::NodeId,
 ) -> Result<RType, Error> {
+    // Typed intrinsics (alloc/free/cast) don't fit the `<int_kind>_<op>`
+    // shape. Dispatch them here so split_builtin_name doesn't need to.
+    match name {
+        "alloc" => return codegen_builtin_alloc(ctx, args, node_id),
+        "free" => return codegen_builtin_free(ctx, args, node_id),
+        "cast" => return codegen_builtin_cast(ctx, args, node_id),
+        _ => {}
+    }
     // Codegen each arg in order. Each pushes its flattened scalar(s)
     // onto the stack. For 128-bit args, that's (low, high) — two i64s
     // per arg; codegen_builtin_128 takes care of the multi-scalar
@@ -2574,6 +2585,83 @@ fn codegen_builtin_128(ctx: &mut FnCtx, op: &str, signed: bool) {
             ctx.instructions.push(wasm::Instruction::Unreachable);
         }
     }
+}
+
+// ¤alloc(n: usize) -> *mut u8. Bump-allocates `n` bytes from the heap.
+// Currently a pure bump allocator — the heap grows up from offset 8;
+// `¤free` doesn't reclaim. Out-of-memory traps as a normal wasm
+// memory-access fault when the heap collides with the shadow stack
+// (no explicit OOM check today).
+//
+// Wasm sequence:
+//   <eval n>                ; stack: [n]
+//   local.set n_temp        ; n_temp = n
+//   global.get __heap_top   ; stack: [old]
+//   local.set result_temp   ; result_temp = old
+//   local.get result_temp   ; stack: [old]
+//   local.get n_temp        ; stack: [old, n]
+//   i32.add                 ; stack: [old + n]
+//   global.set __heap_top   ; __heap_top = old + n
+//   local.get result_temp   ; stack: [old]  -- return value
+fn codegen_builtin_alloc(
+    ctx: &mut FnCtx,
+    args: &Vec<Expr>,
+    node_id: crate::ast::NodeId,
+) -> Result<RType, Error> {
+    codegen_expr(ctx, &args[0])?;
+    let n_temp = alloc_i32_local(ctx);
+    let result_temp = alloc_i32_local(ctx);
+    ctx.instructions.push(wasm::Instruction::LocalSet(n_temp));
+    ctx.instructions.push(wasm::Instruction::GlobalGet(HEAP_GLOBAL));
+    ctx.instructions.push(wasm::Instruction::LocalSet(result_temp));
+    ctx.instructions.push(wasm::Instruction::LocalGet(result_temp));
+    ctx.instructions.push(wasm::Instruction::LocalGet(n_temp));
+    ctx.instructions.push(wasm::Instruction::I32Add);
+    ctx.instructions.push(wasm::Instruction::GlobalSet(HEAP_GLOBAL));
+    ctx.instructions.push(wasm::Instruction::LocalGet(result_temp));
+    let ty = ctx.expr_types[node_id as usize]
+        .as_ref()
+        .expect("typeck recorded the builtin's result type")
+        .clone();
+    Ok(ty)
+}
+
+// ¤free(p: *mut u8). No-op stub today — evaluates `p` for its side
+// effects (move tracking, etc.) and discards the address. The heap is
+// pure bump-allocation; freed memory is not reclaimed. Provided as the
+// future hook point for a real allocator.
+fn codegen_builtin_free(
+    ctx: &mut FnCtx,
+    args: &Vec<Expr>,
+    _node_id: crate::ast::NodeId,
+) -> Result<RType, Error> {
+    codegen_expr(ctx, &args[0])?;
+    ctx.instructions.push(wasm::Instruction::Drop);
+    Ok(RType::Tuple(Vec::new()))
+}
+
+// ¤cast::<A, B>(p: *X B) -> *X A (where X is const or mut, preserved).
+// Pure no-op at runtime — raw pointers flatten to a single i32 address
+// regardless of pointee type, so the wasm value passes through
+// unchanged. Typeck has already validated the turbofish args.
+fn codegen_builtin_cast(
+    ctx: &mut FnCtx,
+    args: &Vec<Expr>,
+    node_id: crate::ast::NodeId,
+) -> Result<RType, Error> {
+    codegen_expr(ctx, &args[0])?;
+    let ty = ctx.expr_types[node_id as usize]
+        .as_ref()
+        .expect("typeck recorded the builtin's result type")
+        .clone();
+    Ok(ty)
+}
+
+fn alloc_i32_local(ctx: &mut FnCtx) -> u32 {
+    let idx = ctx.next_wasm_local;
+    ctx.extra_locals.push(wasm::ValType::I32);
+    ctx.next_wasm_local += 1;
+    idx
 }
 
 fn alloc_i64_local(ctx: &mut FnCtx) -> u32 {
