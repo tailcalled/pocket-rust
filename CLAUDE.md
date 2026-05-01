@@ -7,6 +7,12 @@ pocket-rust
 
 The real Rust compiler (`rustc`) is too complex to run in WebAssembly. `pocket-rust` is a from-scratch, minimal Rust-subset compiler small enough that its own subset can express it — so it can eventually self-host inside WASM.
 
+## Project rules
+
+- **All supported features must interact smoothly — no silent deferrals.** Every existing first-class feature must keep working end-to-end with each new one. If `if` is supported and structs/`u128` flatten to multi-value, then if-results must work for multi-value too — don't ship a half-feature with a runtime error or a quiet rejection in the corners. The compiler will eventually eat itself; every silent gap is a bootstrap landmine. If an interaction is genuinely out of scope, name it explicitly in the plan *before implementing* and get user approval — don't bury it in a TODO. "Threading X through is annoying" is not a reason to defer; it's a reason to do the threading.
+- **Maintain CLAUDE.md in the same change.** When an architectural decision, convention, layout choice, or project-wide rule emerges or changes during work, edit CLAUDE.md in the same turn — don't leave it to drift. Keep entries concise and load-bearing.
+- **Tests reveal flaws — never restructure tests to avoid gaps.** When a test fails because of a gap or a deferral, fix the gap; expand the test if anything. Restructuring the test to dodge the failure (using different inputs, removing the assertion, etc.) silently sweeps the gap under the rug and removes the only signal a future change would have to surface it. If a failure is "unrelated" to the feature under test, it's still a real bug — fix it, or at minimum keep the failing assertion in place so the conversation gets forced.
+
 ## Architecture
 
 - `src/lib.rs` — public surface: `Vfs` and `compile`. Drives the pipeline and resolves modules across files. **No I/O.**

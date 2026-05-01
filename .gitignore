@@ -1,4 +1,4 @@
 /target
 pull.sh
-.claude
+.claude/settings.local.json
 Cargo.lock
