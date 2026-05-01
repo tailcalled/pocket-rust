@@ -1,16 +1,12 @@
 use super::{
-    CallResolution, CheckCtx, FnSymbol, FuncTable, GenericTemplate, ImplResolution, InferType,
-    LifetimeRepr, MethodCandidate, MethodResolution, PendingMethodCall, PendingTraitDispatch,
-    RType, ReceiverAdjust, Subst, TraitDispatch, TraitEntry, TraitImplEntry, TraitMethodEntry,
-    TraitReceiverShape, TraitTable, build_infer_env, check_expr, extract_place_for_assign,
-    find_lifetime_source, find_method_candidates, find_trait_impl_method, infer_substitute,
-    infer_to_rtype_for_check, infer_to_string, is_copy, is_copy_with_bounds, is_mutable_place,
-    is_visible_from, outer_lifetime, place_to_string, resolve_full_path, resolve_type, rtype_eq,
-    rtype_to_infer, rtype_to_string, solve_impl, solve_impl_in_ctx, struct_lookup,
-    substitute_rtype, supertrait_closure, template_lookup, trait_lookup, try_match_against_infer,
-    type_defining_module,
+    CheckCtx, InferType,
+    LifetimeRepr, MethodCandidate, PendingMethodCall, PendingTraitDispatch,
+    RType, ReceiverAdjust,
+    TraitReceiverShape, check_expr,
+    find_lifetime_source, find_method_candidates, infer_substitute, infer_to_string, is_mutable_place, place_to_string, resolve_type,
+    rtype_to_infer, supertrait_closure, trait_lookup, try_match_against_infer,
 };
-use crate::ast::{Expr, ExprKind, MethodCall, Type};
+use crate::ast::Expr;
 use crate::span::{Error, Span};
 
 fn check_method_call_symbolic(
@@ -367,7 +363,7 @@ pub(super) fn check_method_call(
         },
         _ => Vec::new(),
     };
-    let recv_type_args: Vec<InferType> = match &resolved_recv {
+    let _recv_type_args: Vec<InferType> = match &resolved_recv {
         InferType::Struct { type_args, .. } => type_args.clone(),
         InferType::Ref { inner, .. } => match inner.as_ref() {
             InferType::Struct { type_args, .. } => type_args.clone(),

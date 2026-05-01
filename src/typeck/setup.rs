@@ -1,16 +1,14 @@
 use super::{
     EnumEntry, EnumTable, EnumVariantEntry, FnSymbol, FuncTable, GenericTemplate, LifetimeRepr,
     RType, RTypedField, ReExportTable, StructEntry, StructTable, TraitEntry, TraitImplEntry,
-    TraitMethodEntry, TraitReceiverShape, TraitTable, UseEntry, VariantPayloadResolved,
-    build_reexport_table, copy_trait_path, drop_trait_path, enum_lookup, field_visible_from,
-    find_elision_source, flatten_use_tree, freshen_inferred_lifetimes, func_lookup,
+    TraitMethodEntry, TraitReceiverShape, TraitTable, UseEntry, VariantPayloadResolved, copy_trait_path, drop_trait_path,
+    find_elision_source, freshen_inferred_lifetimes, func_lookup,
     is_copy_with_bounds, is_visible_from, module_use_entries, outer_lifetime, place_to_string,
-    require_no_inferred_lifetimes, resolve_type, resolve_via_reexports, resolve_via_use_scopes,
-    rtype_eq, rtype_to_string, segments_to_string, solve_impl_in_ctx, struct_env, struct_lookup,
-    struct_lookup_resolved, substitute_rtype, supertrait_closure, template_lookup, trait_lookup,
+    require_no_inferred_lifetimes, resolve_type, resolve_via_use_scopes,
+    rtype_eq, rtype_to_string, segments_to_string, solve_impl_in_ctx, struct_env, struct_lookup, substitute_rtype, template_lookup, trait_lookup,
     trait_lookup_resolved, type_defining_module, validate_named_lifetimes,
 };
-use crate::ast::{Function, Item, Module, Path, PathSegment, Type, TypeKind};
+use crate::ast::{Function, Item, Module};
 use crate::span::{Error, Span};
 
 pub(super) fn push_root_name(path: &mut Vec<String>, root: &Module) {

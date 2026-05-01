@@ -1,12 +1,12 @@
 use super::{
-    CheckCtx, EnumEntry, EnumTable, InferType, LifetimeRepr, RType, RTypedField, StructTable,
-    VariantPayloadResolved, enum_lookup, enum_lookup_resolved, field_visible_from,
+    CheckCtx, InferType, LifetimeRepr, RType, RTypedField,
+    VariantPayloadResolved, enum_lookup,
     infer_substitute, infer_to_rtype_for_check, infer_to_string, is_visible_from,
     lookup_variant_path, place_to_string, resolve_via_use_scopes, rtype_to_infer,
     segments_to_string, struct_lookup, struct_lookup_resolved, substitute_rtype,
     type_defining_module,
 };
-use crate::ast::{Path, Pattern, PatternKind};
+use crate::ast::{Path, Pattern};
 use crate::span::{Error, Span};
 
 // Type-check a pattern against `scrutinee_ty`, appending `(name, ty,
@@ -754,7 +754,7 @@ pub(super) fn check_match_exhaustive(
 
 // Returns true if the union of `pats` covers every value of `ty`.
 fn exhausted(ctx: &CheckCtx, ty: &InferType, pats: &Vec<&Pattern>) -> bool {
-    use crate::ast::PatternKind;
+    
     // If any pattern at this level is an unconditional matcher
     // (Wildcard, Ident binding, At-binding wrapping unconditional),
     // we're trivially exhausted.
@@ -1064,7 +1064,7 @@ fn variant_covered(
     payload: &VariantPayloadResolved,
     enum_env: &Vec<(String, RType)>,
 ) -> bool {
-    use crate::ast::PatternKind;
+    
     // Collect sub-patterns inside this variant from any matching arm,
     // and require the union to cover all payload values.
     let mut sub_pats_per_position: Vec<Vec<&Pattern>> = match payload {

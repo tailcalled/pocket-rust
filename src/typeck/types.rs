@@ -36,7 +36,7 @@ pub fn int_kind_name(k: &IntKind) -> &'static str {
     }
 }
 
-pub(super) fn int_kind_from_name(name: &str) -> Option<IntKind> {
+pub(crate) fn int_kind_from_name(name: &str) -> Option<IntKind> {
     match name {
         "u8" => Some(IntKind::U8),
         "i8" => Some(IntKind::I8),

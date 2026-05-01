@@ -5,8 +5,7 @@ use crate::ast::{
 use crate::span::Error;
 use crate::typeck::{
     CallResolution, FuncTable, GenericTemplate, IntKind, MethodResolution, RType, ReceiverAdjust,
-    StructTable, byte_size_of, flatten_rtype, func_lookup, is_ref_mutable,
-    resolve_type, rtype_eq, struct_lookup, substitute_rtype,
+    StructTable, byte_size_of, flatten_rtype, func_lookup, rtype_eq, struct_lookup, substitute_rtype,
 };
 use crate::wasm;
 
