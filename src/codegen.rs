@@ -222,6 +222,11 @@ struct FnCtx<'a> {
     pattern_addressed: Vec<bool>,
     method_resolutions: Vec<Option<MethodResolution>>,
     call_resolutions: Vec<Option<CallResolution>>,
+    // Per-NodeId resolved type-args for builtins that need them at codegen
+    // (currently only `¤size_of::<T>()`). Substituted through the mono env
+    // by the caller; codegen reads with `expr.id` and uses
+    // `byte_size_of(T, structs, enums)`.
+    builtin_type_targets: Vec<Option<Vec<RType>>>,
     self_target: Option<RType>,
     // T4.6: borrowck's snapshot of every place whose move-state at scope
     // end was non-Init (Moved or MaybeMoved). emit_drops_for_locals_range
@@ -996,6 +1001,7 @@ fn emit_monomorphic(
     let expr_types = subst_opt_vec(&tmpl.expr_types, &env);
     let method_resolutions = subst_opt_method_resolutions(&tmpl.method_resolutions, &env);
     let call_resolutions = subst_opt_call_resolutions(&tmpl.call_resolutions, &env);
+    let builtin_type_targets = subst_opt_vec_vec(&tmpl.builtin_type_targets, &env);
     // Move tracking is independent of concrete type args — the template's
     // snapshot from borrowck applies to every monomorphization.
     let moved_places = clone_moved_places(&tmpl.moved_places);
@@ -1024,6 +1030,7 @@ fn emit_monomorphic(
         expr_types,
         method_resolutions,
         call_resolutions,
+        builtin_type_targets,
         moved_places,
         move_sites,
         env,
@@ -1031,6 +1038,22 @@ fn emit_monomorphic(
         work.wasm_idx,
         false, // monomorphic instances are never exported
     )
+}
+
+fn subst_opt_vec_vec(
+    v: &Vec<Option<Vec<RType>>>,
+    env: &Vec<(String, RType)>,
+) -> Vec<Option<Vec<RType>>> {
+    let mut out: Vec<Option<Vec<RType>>> = Vec::new();
+    let mut i = 0;
+    while i < v.len() {
+        match &v[i] {
+            Some(ts) => out.push(Some(subst_vec(ts, env))),
+            None => out.push(None),
+        }
+        i += 1;
+    }
+    out
 }
 
 fn subst_opt_vec(v: &Vec<Option<RType>>, env: &Vec<(String, RType)>) -> Vec<Option<RType>> {
@@ -1229,6 +1252,7 @@ fn emit_function(
     let expr_types = entry.expr_types.clone();
     let method_resolutions = entry.method_resolutions.clone();
     let call_resolutions = entry.call_resolutions.clone();
+    let builtin_type_targets = clone_btt(&entry.builtin_type_targets);
     let moved_places = clone_moved_places(&entry.moved_places);
     let move_sites = clone_move_sites(&entry.move_sites);
     let wasm_idx = entry.idx;
@@ -1249,6 +1273,7 @@ fn emit_function(
         expr_types,
         method_resolutions,
         call_resolutions,
+        builtin_type_targets,
         moved_places,
         move_sites,
         Vec::new(),
@@ -1256,6 +1281,19 @@ fn emit_function(
         wasm_idx,
         is_export,
     )
+}
+
+fn clone_btt(v: &Vec<Option<Vec<RType>>>) -> Vec<Option<Vec<RType>>> {
+    let mut out: Vec<Option<Vec<RType>>> = Vec::new();
+    let mut i = 0;
+    while i < v.len() {
+        match &v[i] {
+            Some(ts) => out.push(Some(ts.clone())),
+            None => out.push(None),
+        }
+        i += 1;
+    }
+    out
 }
 
 fn clone_moved_places(v: &Vec<crate::typeck::MovedPlace>) -> Vec<crate::typeck::MovedPlace> {
@@ -1296,6 +1334,7 @@ fn emit_function_concrete(
     expr_types: Vec<Option<RType>>,
     method_resolutions: Vec<Option<MethodResolution>>,
     call_resolutions: Vec<Option<CallResolution>>,
+    builtin_type_targets: Vec<Option<Vec<RType>>>,
     moved_places: Vec<crate::typeck::MovedPlace>,
     move_sites: Vec<(crate::ast::NodeId, String)>,
     env: Vec<(String, RType)>,
@@ -1433,6 +1472,7 @@ fn emit_function_concrete(
         pattern_addressed: address_info.pattern_addressed.clone(),
         method_resolutions,
         call_resolutions,
+        builtin_type_targets,
         self_target: self_target.cloned(),
         moved_places,
         move_sites,
@@ -1498,8 +1538,14 @@ fn emit_function_concrete(
         // `store_flat_to_memory`'s inline representation for spilled
         // let-bindings — `load_flat_from_memory` for an enum then
         // produces the slot's own address regardless of source.
+        //
+        // The cursor tracks the wasm local index of the next user-param
+        // scalar. For sret-returning functions, wasm local 0 is the
+        // caller-supplied sret_addr — user params start at local 1.
+        // Without this offset, the spill prologue copies sret_addr into
+        // the first spilled-param slot, corrupting `self`.
         let mut p = 0;
-        let mut wasm_local_cursor: u32 = 0;
+        let mut wasm_local_cursor: u32 = if returns_enum { 1 } else { 0 };
         while p < func.params.len() {
             let pty = ctx.locals[p].rtype.clone();
             let mut vts: Vec<wasm::ValType> = Vec::new();
@@ -1943,11 +1989,18 @@ fn emit_drop_call_for_local(
         }
     };
     // Push `&mut binding` — the binding's address in shadow-stack memory.
+    // Use `frame_base_local`, not live `__sp`: by the time scope-end
+    // drops fire, the body may have allocated literal-borrow temps,
+    // sret slots, or enum constructions that drifted `__sp` below the
+    // frame's true base. Spilled bindings sit at fixed offsets
+    // relative to the post-prologue base, captured into
+    // `frame_base_local`.
     let frame_offset = match &ctx.locals[idx].storage {
         Storage::Memory { frame_offset } => *frame_offset,
         _ => unreachable!("Drop binding must be address-marked"),
     };
-    ctx.instructions.push(wasm::Instruction::GlobalGet(0));
+    ctx.instructions
+        .push(wasm::Instruction::LocalGet(ctx.frame_base_local));
     if frame_offset != 0 {
         ctx.instructions
             .push(wasm::Instruction::I32Const(frame_offset as i32));
@@ -2550,6 +2603,7 @@ fn codegen_builtin(
         "alloc" => return codegen_builtin_alloc(ctx, args, node_id),
         "free" => return codegen_builtin_free(ctx, args, node_id),
         "cast" => return codegen_builtin_cast(ctx, args, node_id),
+        "size_of" => return codegen_builtin_size_of(ctx, node_id),
         "ptr_usize_add" => return codegen_builtin_ptr_arith(ctx, args, node_id, PtrArith::Add),
         "ptr_usize_sub" => return codegen_builtin_ptr_arith(ctx, args, node_id, PtrArith::Sub),
         "ptr_isize_offset" => {
@@ -2762,6 +2816,24 @@ fn codegen_builtin_cast(
         .expect("typeck recorded the builtin's result type")
         .clone();
     Ok(ty)
+}
+
+// `¤size_of::<T>() -> usize`. Compile-time-constant: at this point T is
+// concrete (after monomorphization), so we just emit `i32.const
+// byte_size_of(T)`. The result type is `usize`, which flattens to an
+// i32 on wasm32.
+fn codegen_builtin_size_of(
+    ctx: &mut FnCtx,
+    node_id: crate::ast::NodeId,
+) -> Result<RType, Error> {
+    let ts = ctx.builtin_type_targets[node_id as usize]
+        .as_ref()
+        .expect("typeck recorded `¤size_of`'s T");
+    let t = &ts[0];
+    let size = byte_size_of(t, ctx.structs, ctx.enums);
+    ctx.instructions
+        .push(wasm::Instruction::I32Const(size as i32));
+    Ok(RType::Int(IntKind::Usize))
 }
 
 #[derive(Copy, Clone)]
@@ -5237,6 +5309,23 @@ fn extract_field_from_stack(
 }
 
 fn codegen_borrow(ctx: &mut FnCtx, inner: &Expr, mutable: bool) -> Result<RType, Error> {
+    // `&*ptr` / `&mut *ptr` is a place borrow (a *re*-borrow, when
+    // `ptr` is a ref; a raw-to-safe transition, when `ptr` is a raw
+    // pointer). The result's address is `ptr`'s value — no value
+    // copy, no fresh slot. Codegen the inner pointer expression
+    // directly and use its i32 as the borrow's address.
+    if let ExprKind::Deref(ptr_expr) = &inner.kind {
+        let ptr_ty = codegen_expr(ctx, ptr_expr)?;
+        let pointee = match ptr_ty {
+            RType::Ref { inner, .. } | RType::RawPtr { inner, .. } => *inner,
+            _ => unreachable!("typeck verified deref target is a ref/raw-ptr"),
+        };
+        return Ok(RType::Ref {
+            inner: Box::new(pointee),
+            mutable,
+            lifetime: crate::typeck::LifetimeRepr::Inferred(0),
+        });
+    }
     // Non-place inner (e.g. `&42`, `&foo()`): codegen the inner
     // expression's value, spill to a fresh shadow-stack slot, push
     // the slot's address. The slot lives until the function exits

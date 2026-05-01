@@ -1,8 +1,10 @@
 pub mod marker;
 pub mod ops;
 pub mod cmp;
+pub mod mem;
 pub mod option;
 pub mod primitive;
+pub mod vec;
 pub mod dummy;
 
 pub use crate::marker::Copy;
@@ -14,3 +16,4 @@ pub use crate::cmp::Eq;
 pub use crate::cmp::PartialOrd;
 pub use crate::cmp::Ord;
 pub use crate::option::Option;
+pub use crate::vec::Vec;

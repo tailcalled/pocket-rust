@@ -881,6 +881,10 @@ pub(crate) struct CheckCtx<'a> {
     // Pending per-MethodCall and per-Call resolutions, indexed by Expr.id.
     pub(crate) method_resolutions: Vec<Option<PendingMethodCall>>,
     pub(crate) call_resolutions: Vec<Option<PendingCall>>,
+    // Per-NodeId resolved RType type-args for builtins that need them at
+    // codegen (`¤size_of::<T>()`). `None` outside builtin-with-types
+    // sites. Finalized into FnSymbol.builtin_type_targets at end-of-fn.
+    pub(crate) builtin_type_targets: Vec<Option<Vec<RType>>>,
     pub(crate) subst: Subst,
     pub(crate) current_module: &'a Vec<String>,
     pub(crate) current_file: &'a str,
@@ -1072,15 +1076,17 @@ fn check_function(
     };
 
     let node_count = func.node_count as usize;
-    let (expr_infer_types, lit_constraints, method_resolutions, call_resolutions, subst) = {
+    let (expr_infer_types, lit_constraints, method_resolutions, call_resolutions, builtin_type_targets, subst) = {
         let mut method_res: Vec<Option<PendingMethodCall>> = Vec::with_capacity(node_count);
         let mut call_res: Vec<Option<PendingCall>> = Vec::with_capacity(node_count);
         let mut expr_infer: Vec<Option<InferType>> = Vec::with_capacity(node_count);
+        let mut btt: Vec<Option<Vec<RType>>> = Vec::with_capacity(node_count);
         let mut i = 0;
         while i < node_count {
             method_res.push(None);
             call_res.push(None);
             expr_infer.push(None);
+            btt.push(None);
             i += 1;
         }
         // Initialize the use scope with the module's flattened entries.
@@ -1098,6 +1104,7 @@ fn check_function(
             lit_constraints: Vec::new(),
             method_resolutions: method_res,
             call_resolutions: call_res,
+            builtin_type_targets: btt,
             subst: Subst {
                 bindings: Vec::new(),
                 is_num_lit: Vec::new(),
@@ -1121,6 +1128,7 @@ fn check_function(
             ctx.lit_constraints,
             ctx.method_resolutions,
             ctx.call_resolutions,
+            ctx.builtin_type_targets,
             ctx.subst,
         )
     };
@@ -1281,6 +1289,7 @@ fn check_function(
         funcs.entries[e].expr_types = expr_types;
         funcs.entries[e].method_resolutions = method_resolutions;
         funcs.entries[e].call_resolutions = call_resolutions;
+        funcs.entries[e].builtin_type_targets = builtin_type_targets;
     } else {
         let mut t = 0;
         while t < funcs.templates.len() {
@@ -1288,6 +1297,7 @@ fn check_function(
                 funcs.templates[t].expr_types = expr_types;
                 funcs.templates[t].method_resolutions = method_resolutions;
                 funcs.templates[t].call_resolutions = call_resolutions;
+                funcs.templates[t].builtin_type_targets = builtin_type_targets;
                 break;
             }
             t += 1;
@@ -2206,6 +2216,7 @@ fn check_builtin(
         "alloc" => return check_builtin_alloc(ctx, type_args, args, expr),
         "free" => return check_builtin_free(ctx, type_args, args, expr),
         "cast" => return check_builtin_cast(ctx, type_args, args, expr),
+        "size_of" => return check_builtin_size_of(ctx, type_args, args, expr),
         "ptr_usize_add" | "ptr_usize_sub" => {
             return check_builtin_ptr_usize_offset(ctx, name, type_args, args, expr);
         }
@@ -2412,6 +2423,54 @@ fn check_builtin_cast(
         inner: Box::new(new_pointee),
         mutable,
     }))
+}
+
+// `¤size_of::<T>() -> usize`. Mandatory turbofish (no inference). The
+// result is a compile-time-known constant — at codegen time T is
+// concrete (after monomorphization) and `byte_size_of(T)` decides the
+// emitted `i32.const`.
+fn check_builtin_size_of(
+    ctx: &mut CheckCtx,
+    type_args: &Vec<crate::ast::Type>,
+    args: &Vec<Expr>,
+    expr: &Expr,
+) -> Result<InferType, Error> {
+    if type_args.len() != 1 {
+        return Err(Error {
+            file: ctx.current_file.to_string(),
+            message: format!(
+                "builtin `¤size_of` takes 1 type argument (`T`), got {}",
+                type_args.len()
+            ),
+            span: expr.span.copy(),
+        });
+    }
+    if !args.is_empty() {
+        return Err(Error {
+            file: ctx.current_file.to_string(),
+            message: format!(
+                "builtin `¤size_of` takes 0 arguments, got {}",
+                args.len()
+            ),
+            span: expr.span.copy(),
+        });
+    }
+    // Resolve T and stash on the per-NodeId artifact so codegen can
+    // compute byte_size_of(T) at the call site (substituted through the
+    // mono env if T is a Param).
+    let t = resolve_type(
+        &type_args[0],
+        ctx.current_module,
+        ctx.structs,
+        ctx.enums,
+        ctx.self_target,
+        ctx.type_params,
+        &ctx.use_scope,
+        ctx.reexports,
+        ctx.current_file,
+    )?;
+    ctx.builtin_type_targets[expr.id as usize] = Some(vec![t]);
+    Ok(rtype_to_infer(&RType::Int(IntKind::Usize)))
 }
 
 // `¤ptr_usize_add(p, n)` and `¤ptr_usize_sub(p, n)`: byte-wise pointer

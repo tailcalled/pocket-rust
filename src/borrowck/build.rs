@@ -657,7 +657,16 @@ impl<'a> Builder<'a> {
         let recv = match recv_adjust {
             ReceiverAdjust::BorrowImm => self.synth_borrow(&mc.receiver, false),
             ReceiverAdjust::BorrowMut => self.synth_borrow(&mc.receiver, true),
-            ReceiverAdjust::Move | ReceiverAdjust::ByRef => self.lower_expr_operand(&mc.receiver),
+            ReceiverAdjust::Move => self.lower_expr_operand(&mc.receiver),
+            // ByRef: the receiver is already a ref (`&T` or `&mut T`)
+            // and the method takes a ref-typed self. Lower as a
+            // **reborrow**: we copy the receiver's i32 ref value into
+            // the call instead of consuming the binding. Semantically
+            // valid because the callee only borrows for the call's
+            // duration; after the call the source binding resumes.
+            // Without this, `&mut self` methods couldn't transitively
+            // call other `&mut self` methods on the same binding.
+            ReceiverAdjust::ByRef => self.lower_recv_reborrow(&mc.receiver),
         };
         let mut args: Vec<Operand> = Vec::new();
         args.push(recv);
@@ -670,6 +679,23 @@ impl<'a> Builder<'a> {
             callee: CallTarget::MethodResolution(node_id),
             args,
             call_node_id: node_id,
+        }
+    }
+
+    // Reborrow lowering for a method-call receiver that is already a
+    // ref (`&T` or `&mut T`). Always emits `Operand::Copy(place)` —
+    // even when the place's resolved type is `&mut T` (which is not
+    // Copy), copying its i32 representation is sound because the
+    // callee scope-bounds the borrow. The original ref-typed binding
+    // remains live for use after the call.
+    fn lower_recv_reborrow(&mut self, expr: &Expr) -> Operand {
+        let span = expr.span.copy();
+        let nid = Some(expr.id);
+        let place = self.lower_expr_place(expr);
+        Operand {
+            kind: OperandKind::Copy(place),
+            span,
+            node_id: nid,
         }
     }
 

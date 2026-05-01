@@ -1466,6 +1466,7 @@ pub(super) fn register_function(
             call_resolutions: Vec::new(),
             moved_places: Vec::new(),
             move_sites: Vec::new(),
+            builtin_type_targets: Vec::new(),
         });
     } else {
         funcs.entries.push(FnSymbol {
@@ -1484,6 +1485,7 @@ pub(super) fn register_function(
             call_resolutions: Vec::new(),
             moved_places: Vec::new(),
             move_sites: Vec::new(),
+            builtin_type_targets: Vec::new(),
         });
         *next_idx += 1;
     }

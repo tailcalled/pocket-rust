@@ -29,6 +29,14 @@ impl<T> *const T {
         let addr: usize = self as usize;
         addr == 0
     }
+
+    // Reinterpret the pointer as `*const U` (preserving its const-ness
+    // and address). Always safe — only dereferencing the resulting
+    // pointer is unsafe. Wraps the `¤cast` intrinsic, which is a
+    // codegen no-op (raw pointers all flatten to a wasm `i32`).
+    pub fn cast<U>(self) -> *const U {
+        ¤cast::<U, T>(self)
+    }
 }
 
 impl<T> *mut T {
@@ -48,6 +56,10 @@ impl<T> *mut T {
         let addr: usize = self as usize;
         addr == 0
     }
+
+    pub fn cast<U>(self) -> *mut U {
+        ¤cast::<U, T>(self)
+    }
 }
 
 // TODOs — methods we'd want eventually but pocket-rust doesn't yet
@@ -57,7 +69,6 @@ impl<T> *mut T {
 // TODO: addr(self) — would just be `self as usize`; semantically distinct in Rust (provenance handling) but pocket-rust has no provenance model.
 // TODO: align_offset(self, align) — needs the alignment math + a non-trivial generic body that works for arbitrary T.
 // TODO: as_ref(self) -> Option<&T> / as_mut(self) -> Option<&mut T> — needs an unsafe-flavoured cast from `*const T` to `&T` plus null-checking; the `&T`/`&mut T` flavours have lifetime concerns we haven't tackled.
-// TODO: cast::<U>(self) — needs the inherent-method turbofish path through the existing `¤cast::<A, B>` intrinsic; achievable today, hold for a small follow-up.
 // TODO: copy_from(dst, src, count) / copy_from_nonoverlapping — needs a memcpy intrinsic exposed at the language level.
 // TODO: guaranteed_eq(self, other) / guaranteed_ne — needs `bool` returns from `==` on raw pointers, which in turn needs a `PartialEq` impl on raw pointers.
 // TODO: is_aligned(self) / is_aligned_to(self, align) — needs alignment math and `size_of` / `align_of` intrinsics.

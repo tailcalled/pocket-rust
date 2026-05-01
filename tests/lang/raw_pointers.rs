@@ -17,6 +17,26 @@ fn deref_const_pointer_returns_42() {
 }
 
 #[test]
+fn generic_raw_pointer_write_then_read_returns_42() {
+    expect_answer("lang/raw_pointers/generic_write", 42u32);
+}
+
+#[test]
+fn generic_method_write_then_read_returns_42() {
+    expect_answer("lang/raw_pointers/generic_method_write", 42u32);
+}
+
+#[test]
+fn generic_method_grow_then_push_returns_42() {
+    expect_answer("lang/raw_pointers/generic_method_grow", 42u32);
+}
+
+#[test]
+fn local_vec_push_pop_returns_42() {
+    expect_answer("lang/raw_pointers/local_vec_push_pop", 42u32);
+}
+
+#[test]
 fn write_through_mut_pointer_returns_99() {
     let bytes = compile_inline(
         "fn answer() -> u32 { \

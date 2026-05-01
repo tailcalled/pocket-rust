@@ -101,29 +101,53 @@ where
         if probe(&current) {
             return Some(current);
         }
-        let module_len = current.len() - 1;
+        // Try every "split point" where current[..split] could match a
+        // re-export's `module + local_name` (so split runs from
+        // current.len() down to 1). The longest split wins, which
+        // mirrors the natural `[a, b, c]` interpretation: prefer
+        // matching the full prefix `a::b::c` as a re-export over just
+        // `a::b`. Once we find a match, substitute the target into
+        // current and continue chasing chains.
+        //
+        // This covers the middle-segment case: for `std::Vec::new`,
+        // the split = 2 attempt finds re-export `std::Vec ->
+        // std::vec::Vec`, producing `std::vec::Vec::new`.
         let mut found: Option<Vec<String>> = None;
-        let mut i = 0;
-        while i < table.entries.len() {
-            let e = &table.entries[i];
-            if e.module.len() == module_len
-                && e.local_name == current[module_len]
-            {
-                let mut module_eq = true;
-                let mut k = 0;
-                while k < module_len {
-                    if e.module[k] != current[k] {
-                        module_eq = false;
+        let mut split = current.len();
+        while split >= 1 {
+            let module_len = split - 1;
+            let local_name = &current[module_len];
+            let mut i = 0;
+            while i < table.entries.len() {
+                let e = &table.entries[i];
+                if e.module.len() == module_len && &e.local_name == local_name {
+                    let mut module_eq = true;
+                    let mut k = 0;
+                    while k < module_len {
+                        if e.module[k] != current[k] {
+                            module_eq = false;
+                            break;
+                        }
+                        k += 1;
+                    }
+                    if module_eq {
+                        // Substitute: target + remaining tail.
+                        let mut new_path = e.target.clone();
+                        let mut k = split;
+                        while k < current.len() {
+                            new_path.push(current[k].clone());
+                            k += 1;
+                        }
+                        found = Some(new_path);
                         break;
                     }
-                    k += 1;
                 }
-                if module_eq {
-                    found = Some(e.target.clone());
-                    break;
-                }
+                i += 1;
             }
-            i += 1;
+            if found.is_some() {
+                break;
+            }
+            split -= 1;
         }
         match found {
             Some(t) => {

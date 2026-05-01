@@ -226,6 +226,12 @@ pub struct FnSymbol {
     // — Init bindings don't have flags, and Moved bindings drop is just
     // skipped). Empty for fns with no whole-binding moves.
     pub move_sites: Vec<(crate::ast::NodeId, String)>,
+    // Per-NodeId resolved type-args for builtin intrinsics whose codegen
+    // depends on T (currently only `¤size_of::<T>()`). `Some` only at
+    // those Builtin call sites; `None` everywhere else. Each inner Vec
+    // holds the resolved RTypes in the order they appeared in the
+    // turbofish. Codegen substitutes through the mono env before use.
+    pub builtin_type_targets: Vec<Option<Vec<RType>>>,
 }
 
 // How a `Call` expression resolves to a callee. For non-generic functions
@@ -292,6 +298,8 @@ pub struct GenericTemplate {
     pub moved_places: Vec<MovedPlace>,
     // See FnSymbol.move_sites.
     pub move_sites: Vec<(crate::ast::NodeId, String)>,
+    // See FnSymbol.builtin_type_targets.
+    pub builtin_type_targets: Vec<Option<Vec<RType>>>,
 }
 
 #[derive(Clone)]
