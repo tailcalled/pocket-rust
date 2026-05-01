@@ -138,6 +138,11 @@ pub enum Instruction {
     Else,
     End,
     Block(BlockType),
+    // `Loop(BlockType)` opens a loop block. Inside, `Br(0)` jumps
+    // *back* to the loop's start (the loop instruction), unlike a
+    // plain block where `Br(0)` jumps forward past the closing `End`.
+    // Used by while-loop codegen for the back-edge.
+    Loop(BlockType),
     Br(u32),
     BrIf(u32),
 }
@@ -516,6 +521,10 @@ fn encode_instruction(out: &mut Vec<u8>, inst: &Instruction) {
         }
         Instruction::Block(bt) => {
             out.push(0x02);
+            encode_block_type(out, bt);
+        }
+        Instruction::Loop(bt) => {
+            out.push(0x03);
             encode_block_type(out, bt);
         }
         Instruction::Br(label) => {

@@ -306,6 +306,23 @@ pub enum ExprKind {
     // better diagnostics. `else` is optional; an absent else acts like
     // an empty block (unit-typed), same as bare `if`.
     IfLet(IfLetExpr),
+    // `'label: while cond { body }` or `while cond { body }`. The
+    // expression's type is `()` regardless of body. The optional label
+    // can be targeted by `break 'label` / `continue 'label` from
+    // nested loops.
+    While(WhileExpr),
+    // `break;` / `break 'label;`. Type `!` (diverging). The optional
+    // label names which enclosing loop to exit.
+    Break {
+        label: Option<String>,
+        label_span: Option<Span>,
+    },
+    // `continue;` / `continue 'label;`. Type `!` (diverging). Skips
+    // the rest of the loop body and re-enters the named loop.
+    Continue {
+        label: Option<String>,
+        label_span: Option<Span>,
+    },
 }
 
 // Variant construction reuses the existing nodes:
@@ -396,6 +413,14 @@ pub struct IfLetExpr {
     pub scrutinee: Box<Expr>,
     pub then_block: Box<Block>,
     pub else_block: Box<Block>,
+}
+
+#[derive(Clone)]
+pub struct WhileExpr {
+    pub label: Option<String>,
+    pub label_span: Option<Span>,
+    pub cond: Box<Expr>,
+    pub body: Box<Block>,
 }
 
 #[derive(Clone)]

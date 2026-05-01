@@ -28,6 +28,9 @@ pub enum TokenKind {
     Enum,
     Match,
     Ref,
+    While,
+    Break,
+    Continue,
     // The currency-sign character `¤` (U+00A4). Prefixes a builtin
     // intrinsic call: `¤name(args)`. The lexer emits this as a
     // standalone token; the following identifier (and parenthesized
@@ -100,6 +103,9 @@ pub fn token_kind_name(t: &TokenKind) -> &'static str {
         TokenKind::Enum => "`enum`",
         TokenKind::Match => "`match`",
         TokenKind::Ref => "`ref`",
+        TokenKind::While => "`while`",
+        TokenKind::Break => "`break`",
+        TokenKind::Continue => "`continue`",
         TokenKind::Builtin => "`¤`",
         TokenKind::LAngle => "`<`",
         TokenKind::RAngle => "`>`",
@@ -272,6 +278,21 @@ pub fn tokenize(file: &str, source: &str) -> Result<Vec<Token>, Error> {
             } else if text == "ref" {
                 tokens.push(Token {
                     kind: TokenKind::Ref,
+                    span,
+                });
+            } else if text == "while" {
+                tokens.push(Token {
+                    kind: TokenKind::While,
+                    span,
+                });
+            } else if text == "break" {
+                tokens.push(Token {
+                    kind: TokenKind::Break,
+                    span,
+                });
+            } else if text == "continue" {
+                tokens.push(Token {
+                    kind: TokenKind::Continue,
                     span,
                 });
             } else if text == "_" {

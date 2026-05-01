@@ -898,6 +898,10 @@ pub(crate) struct CheckCtx<'a> {
     // `GenericTemplate.type_param_bounds` — `[i]` lists the bound traits
     // on `type_params[i]`. Empty for non-generic functions.
     pub(crate) type_param_bounds: &'a Vec<Vec<Vec<String>>>,
+    // Stack of enclosing loop labels (innermost-last). Each entry is
+    // the loop's optional label; `break`/`continue` validate that any
+    // referenced label is in this stack.
+    pub(crate) loop_labels: Vec<Option<String>>,
 }
 
 fn check_module(
@@ -1097,6 +1101,7 @@ fn check_function(
             type_param_bounds: &type_param_bounds,
             reexports,
             use_scope: initial_use_scope,
+            loop_labels: Vec::new(),
         };
         check_block(&mut ctx, &func.body, &return_rt)?;
         (
@@ -1864,7 +1869,103 @@ fn check_expr_inner(ctx: &mut CheckCtx, expr: &Expr) -> Result<InferType, Error>
         }
         ExprKind::Match(m) => check_match_expr(ctx, m, expr),
         ExprKind::IfLet(il) => check_if_let_expr(ctx, il, expr),
+        ExprKind::While(w) => check_while_expr(ctx, w, expr),
+        ExprKind::Break { label, label_span } => {
+            check_loop_label(ctx, label, label_span, &expr.span)?;
+            // `break` evaluates to `()` in pocket-rust (no `!` type
+            // yet); the surrounding context typically discards it.
+            Ok(InferType::Tuple(Vec::new()))
+        }
+        ExprKind::Continue { label, label_span } => {
+            check_loop_label(ctx, label, label_span, &expr.span)?;
+            Ok(InferType::Tuple(Vec::new()))
+        }
     }
+}
+
+// `while cond { body }`. Cond must be bool; body's tail must be ().
+// The expression itself has type `()`.
+fn check_while_expr(
+    ctx: &mut CheckCtx,
+    w: &crate::ast::WhileExpr,
+    expr: &Expr,
+) -> Result<InferType, Error> {
+    // Disallow duplicate labels in nested scopes (matches Rust).
+    if let Some(name) = &w.label {
+        let mut i = ctx.loop_labels.len();
+        while i > 0 {
+            i -= 1;
+            if ctx.loop_labels[i].as_deref() == Some(name.as_str()) {
+                return Err(Error {
+                    file: ctx.current_file.to_string(),
+                    message: format!("duplicate loop label `'{}`", name),
+                    span: w.label_span.as_ref().map(|s| s.copy()).unwrap_or_else(|| expr.span.copy()),
+                });
+            }
+            i -= 0; // dummy to silence overflow on i==0 path
+        }
+    }
+    let cond_ty = check_expr(ctx, &w.cond)?;
+    ctx.subst.unify(
+        &cond_ty,
+        &InferType::Bool,
+        ctx.traits,
+        ctx.type_params,
+        ctx.type_param_bounds,
+        &w.cond.span,
+        ctx.current_file,
+    )?;
+    ctx.loop_labels.push(w.label.clone());
+    let unit = InferType::Tuple(Vec::new());
+    let body_ty = check_block_inner(ctx, w.body.as_ref())?;
+    ctx.subst.unify(
+        &body_ty,
+        &unit,
+        ctx.traits,
+        ctx.type_params,
+        ctx.type_param_bounds,
+        &w.body.span,
+        ctx.current_file,
+    )?;
+    ctx.loop_labels.pop();
+    let _ = expr;
+    Ok(InferType::Tuple(Vec::new()))
+}
+
+// Validate that a `break`/`continue` is inside a loop, and that any
+// named label refers to an active loop in the stack.
+fn check_loop_label(
+    ctx: &CheckCtx,
+    label: &Option<String>,
+    label_span: &Option<Span>,
+    expr_span: &Span,
+) -> Result<(), Error> {
+    if ctx.loop_labels.is_empty() {
+        return Err(Error {
+            file: ctx.current_file.to_string(),
+            message: "`break`/`continue` outside of a loop".to_string(),
+            span: expr_span.copy(),
+        });
+    }
+    if let Some(name) = label {
+        let mut found = false;
+        let mut i = 0;
+        while i < ctx.loop_labels.len() {
+            if ctx.loop_labels[i].as_deref() == Some(name.as_str()) {
+                found = true;
+                break;
+            }
+            i += 1;
+        }
+        if !found {
+            return Err(Error {
+                file: ctx.current_file.to_string(),
+                message: format!("unknown loop label `'{}`", name),
+                span: label_span.as_ref().map(|s| s.copy()).unwrap_or_else(|| expr_span.copy()),
+            });
+        }
+    }
+    Ok(())
 }
 
 // `if cond { … } else { … }` — cond must be `bool`, the two arms'

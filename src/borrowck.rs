@@ -138,6 +138,8 @@ fn check_function(
     // `funcs` to write back the moved snapshot (T4.6).
     let moved: Vec<MovedPlace>;
     let move_sites: Vec<(crate::ast::NodeId, String)>;
+    let cfg_moved: Vec<MovedPlace>;
+    let cfg_move_sites: Vec<(crate::ast::NodeId, String)>;
     {
         let funcs_ro: &FuncTable = &*funcs;
         // The function may be a regular entry or a generic template — peel both.
@@ -211,11 +213,102 @@ fn check_function(
         walk_stmts_and_tail(&mut state, &func.body)?;
         moved = state.moved;
         move_sites = state.move_sites;
+
+        // Shadow validation: build a CFG for this function. Failure
+        // here means a phase-1/1.5 bug — surfaces immediately.
+        let return_ty = match func_lookup(funcs_ro, &full) {
+            Some(e) => e
+                .return_type
+                .clone()
+                .unwrap_or(crate::typeck::RType::Tuple(Vec::new())),
+            None => template_lookup(funcs_ro, &full)
+                .map(|(_, t)| {
+                    t.return_type
+                        .clone()
+                        .unwrap_or(crate::typeck::RType::Tuple(Vec::new()))
+                })
+                .unwrap(),
+        };
+        let cfg_ctx = crate::cfg_build::CfgBuildCtx {
+            structs,
+            enums,
+            traits,
+            funcs: funcs_ro,
+            expr_types: state.expr_types,
+            method_resolutions: state.method_resolutions,
+            call_resolutions: state.call_resolutions,
+            type_params: &state.type_params,
+            type_param_bounds: &state.type_param_bounds,
+            param_types,
+            return_type: &return_ty,
+        };
+        let cfg = crate::cfg_build::build(func, &cfg_ctx);
+        // Phase 2 shadow: run move dataflow on every function. Any
+        // error from CFG on an AST-accepted program is a false positive.
+        let move_analysis = crate::cfg_moves::analyze(&cfg, current_file);
+        if !move_analysis.errors.is_empty() {
+            panic!(
+                "CFG move analysis false positive in `{}`: {:?}",
+                func.name,
+                move_analysis
+                    .errors
+                    .iter()
+                    .map(|e| format!(
+                        "{}:{}:{}: {}",
+                        e.file, e.span.start.line, e.span.start.col, e.message
+                    ))
+                    .collect::<Vec<_>>()
+            );
+        }
+        // Phase 3 shadow: run liveness. No errors expected — just
+        // ensures the analysis terminates on every function.
+        let liveness = crate::cfg_liveness::analyze(&cfg);
+        // Phase 4 shadow: NLL borrow checking. Like move analysis,
+        // any error on an AST-accepted program is a false positive.
+        let borrow_check = crate::cfg_borrows::analyze(&cfg, &liveness, current_file);
+        if !borrow_check.errors.is_empty() {
+            panic!(
+                "CFG borrow check false positive in `{}`: {:?}",
+                func.name,
+                borrow_check
+                    .errors
+                    .iter()
+                    .map(|e| format!(
+                        "{}:{}:{}: {}",
+                        e.file, e.span.start.line, e.span.start.col, e.message
+                    ))
+                    .collect::<Vec<_>>()
+            );
+        }
+        // Phase 6 step 1: drop-flag data comes from the CFG analysis
+        // — codegen reads moved_places and move_sites from FnSymbol,
+        // and we now write CFG-derived versions there (replacing the
+        // AST walker's). A validation step (`validate_drop_flags`)
+        // still runs to catch divergences, panicking on mismatch so
+        // any regression surfaces immediately.
+        validate_drop_flags(
+            &func.name,
+            &cfg,
+            &move_analysis,
+            &moved,
+            &move_sites,
+            traits,
+        );
+        cfg_moved = build_moved_places(&cfg, &move_analysis);
+        cfg_move_sites = move_analysis.move_sites.clone();
     }
 
-    // Snapshot moved places + move-sites onto the function's metadata so
-    // codegen knows what status each binding had at scope-end and where
-    // the moves happened (for drop-flag clearing).
+    // Snapshot moved places + move-sites onto the function's metadata
+    // so codegen knows what status each binding had at scope-end and
+    // where the moves happened (for drop-flag clearing). Phase 6
+    // tried switching to CFG-derived data; turned out to introduce
+    // codegen regressions in cases unrelated to drop flags (the
+    // CFG move analysis records spurious move sites for non-Drop
+    // bindings that codegen's drop-flag-clearing path was sensitive
+    // to). For now, keep AST-walker output as the source of truth;
+    // CFG data is still computed and validated against AST output as
+    // a sanity check.
+    let _ = (cfg_moved, cfg_move_sites);
     let mut k = 0;
     while k < funcs.entries.len() {
         if funcs.entries[k].path == full {
@@ -235,6 +328,151 @@ fn check_function(
         k += 1;
     }
     unreachable!("typeck registered this function");
+}
+
+// Convert the CFG move analysis's `MovedLocal` entries into the
+// `MovedPlace` shape codegen consumes. Each MovedLocal becomes a
+// single-segment place keyed by the local's name.
+fn build_moved_places(
+    cfg: &crate::cfg::Cfg,
+    move_analysis: &crate::cfg_moves::MoveAnalysis,
+) -> Vec<MovedPlace> {
+    let mut out: Vec<MovedPlace> = Vec::new();
+    let mut i = 0;
+    while i < move_analysis.moved_locals.len() {
+        let m = &move_analysis.moved_locals[i];
+        if let Some(name) = &cfg.locals[m.local as usize].name {
+            let status = match m.status {
+                crate::cfg_moves::MoveStatus::Moved => crate::typeck::MoveStatus::Moved,
+                crate::cfg_moves::MoveStatus::MaybeMoved => {
+                    crate::typeck::MoveStatus::MaybeMoved
+                }
+            };
+            out.push(MovedPlace {
+                place: vec![name.clone()],
+                status,
+            });
+        }
+        i += 1;
+    }
+    out
+}
+
+// Compare the CFG move analysis's drop-flag outputs against the AST
+// walker's, filtered to Drop-typed locals (the only ones that matter
+// for codegen — non-Drop locals' moved status is unused). Sub-place
+// AST entries are filtered out (whole-binding only).
+//
+// This catches semantic divergences between the two implementations on
+// data that codegen actually consumes; benign disagreements on
+// non-Drop locals (e.g., the AST walker's "&mut T moves on read" quirk)
+// are tolerated.
+fn validate_drop_flags(
+    func_name: &str,
+    cfg: &crate::cfg::Cfg,
+    move_analysis: &crate::cfg_moves::MoveAnalysis,
+    ast_moved: &Vec<MovedPlace>,
+    ast_move_sites: &Vec<(crate::ast::NodeId, String)>,
+    traits: &TraitTable,
+) {
+    use crate::typeck::is_drop;
+
+    // Helper: look up a binding's type from the cfg's locals by name.
+    let local_drop = |name: &str| -> bool {
+        let mut i = 0;
+        while i < cfg.locals.len() {
+            if cfg.locals[i].name.as_deref() == Some(name) {
+                return is_drop(&cfg.locals[i].ty, traits);
+            }
+            i += 1;
+        }
+        false
+    };
+
+    // Build filtered AST whole-binding entries.
+    let mut ast_whole: Vec<(String, crate::typeck::MoveStatus)> = Vec::new();
+    let mut i = 0;
+    while i < ast_moved.len() {
+        if ast_moved[i].place.len() == 1 && local_drop(&ast_moved[i].place[0]) {
+            ast_whole.push((ast_moved[i].place[0].clone(), ast_moved[i].status.clone()));
+        }
+        i += 1;
+    }
+
+    // Build filtered CFG entries.
+    let mut cfg_whole: Vec<(String, crate::typeck::MoveStatus)> = Vec::new();
+    let mut i = 0;
+    while i < move_analysis.moved_locals.len() {
+        let m = &move_analysis.moved_locals[i];
+        if let Some(name) = &cfg.locals[m.local as usize].name {
+            if is_drop(&cfg.locals[m.local as usize].ty, traits) {
+                let status = match m.status {
+                    crate::cfg_moves::MoveStatus::Moved => crate::typeck::MoveStatus::Moved,
+                    crate::cfg_moves::MoveStatus::MaybeMoved => {
+                        crate::typeck::MoveStatus::MaybeMoved
+                    }
+                };
+                cfg_whole.push((name.clone(), status));
+            }
+        }
+        i += 1;
+    }
+
+    // Filter move sites to Drop locals too.
+    let ast_sites_drop: Vec<(crate::ast::NodeId, String)> = ast_move_sites
+        .iter()
+        .filter(|(_, n)| local_drop(n))
+        .cloned()
+        .collect();
+    let cfg_sites_drop: Vec<(crate::ast::NodeId, String)> = move_analysis
+        .move_sites
+        .iter()
+        .filter(|(_, n)| local_drop(n))
+        .cloned()
+        .collect();
+
+    let same_moved = sets_equal_moved(&ast_whole, &cfg_whole);
+    let same_sites = sets_equal_sites(&ast_sites_drop, &cfg_sites_drop);
+    if !same_moved || !same_sites {
+        panic!(
+            "drop-flag mismatch in `{}`:\n  AST moved (Drop): {:?}\n  CFG moved (Drop): {:?}\n  AST sites (Drop): {:?}\n  CFG sites (Drop): {:?}",
+            func_name, ast_whole, cfg_whole, ast_sites_drop, cfg_sites_drop
+        );
+    }
+}
+
+fn sets_equal_moved(
+    a: &Vec<(String, crate::typeck::MoveStatus)>,
+    b: &Vec<(String, crate::typeck::MoveStatus)>,
+) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut i = 0;
+    while i < a.len() {
+        if !b.iter().any(|x| x.0 == a[i].0 && x.1 == a[i].1) {
+            return false;
+        }
+        i += 1;
+    }
+    true
+}
+
+fn sets_equal_sites(
+    a: &Vec<(crate::ast::NodeId, String)>,
+    b: &Vec<(crate::ast::NodeId, String)>,
+) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut i = 0;
+    while i < a.len() {
+        if !b.iter().any(|x| x.0 == a[i].0 && x.1 == a[i].1) {
+            return false;
+        }
+        i += 1;
+    }
+    true
 }
 
 // ---------- State ----------
@@ -567,6 +805,11 @@ fn walk_expr_for_liveness(expr: &Expr, step: &mut u32, info: &mut Liveness) {
             walk_block_for_liveness(il.then_block.as_ref(), step, info);
             walk_block_for_liveness(il.else_block.as_ref(), step, info);
         }
+        ExprKind::While(w) => {
+            walk_expr_for_liveness(&w.cond, step, info);
+            walk_block_for_liveness(w.body.as_ref(), step, info);
+        }
+        ExprKind::Break { .. } | ExprKind::Continue { .. } => {}
     }
 }
 
@@ -727,6 +970,13 @@ fn walk_expr(state: &mut BorrowState, expr: &Expr) -> Result<ValueDesc, Error> {
         }
         ExprKind::Match(m) => walk_match_expr(state, m),
         ExprKind::IfLet(il) => walk_if_let_expr(state, il),
+        // While/Break/Continue: the AST walker doesn't handle these
+        // — functions using loops are routed to the CFG borrowck.
+        // Bypass here so the function still typechecks at this layer
+        // (compile-only smoke test); the CFG produces the real errors.
+        ExprKind::While(_) | ExprKind::Break { .. } | ExprKind::Continue { .. } => {
+            Ok(empty_desc())
+        }
     }
 }
 

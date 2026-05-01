@@ -1,5 +1,10 @@
 mod ast;
 mod borrowck;
+mod cfg;
+mod cfg_borrows;
+mod cfg_build;
+mod cfg_liveness;
+mod cfg_moves;
 mod codegen;
 mod lexer;
 mod parser;

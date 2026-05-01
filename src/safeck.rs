@@ -201,6 +201,11 @@ fn walk_expr(state: &mut SafeState, expr: &Expr) -> Result<(), Error> {
             walk_block(state, il.else_block.as_ref())?;
             Ok(())
         }
+        ExprKind::While(w) => {
+            walk_expr(state, &w.cond)?;
+            walk_block(state, w.body.as_ref())
+        }
+        ExprKind::Break { .. } | ExprKind::Continue { .. } => Ok(()),
     }
 }
 

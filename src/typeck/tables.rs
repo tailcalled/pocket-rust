@@ -1,6 +1,7 @@
 use super::{LifetimeRepr, RType};
 use crate::span::Span;
 
+#[derive(Clone)]
 pub struct RTypedField {
     pub name: String,
     pub name_span: Span,
@@ -86,7 +87,7 @@ pub fn enum_lookup<'a>(table: &'a EnumTable, path: &Vec<String>) -> Option<&'a E
 // others (the binding's storage is potentially-init at the place's
 // scope-end, requiring a runtime drop flag in codegen). The implicit
 // third state — `Init` — is "the place isn't in the list at all."
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq, Debug)]
 pub enum MoveStatus {
     Moved,
     MaybeMoved,

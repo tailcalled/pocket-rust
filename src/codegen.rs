@@ -210,6 +210,35 @@ struct FnCtx<'a> {
     // targets). Empty for non-generic.
     type_params: Vec<String>,
     mono: &'a mut MonoState,
+    // Stack of enclosing loops (innermost-last). Each frame records the
+    // wasm structured-control-flow depth at the loop's entry, used to
+    // compute the right `Br` index for break/continue. `loop_depth` is
+    // the depth of the wasm `Loop` instruction (= continue target);
+    // `break_depth` is the depth of the wrapping `Block` (= break
+    // target).
+    loops: Vec<LoopCgFrame>,
+    // Current wasm structured-control-flow depth (number of open
+    // structured constructs: Block, Loop, If). `Br(N)` jumps to the
+    // construct at depth `N` from the innermost. break/continue
+    // compute their `Br` index as `depth_at_emit - frame.depth - 1`.
+    cf_depth: u32,
+    // Wasm local holding `__sp` immediately after the prologue's
+    // `__sp -= frame_size` subtraction. Spilled-binding accesses
+    // (BaseAddr::StackPointer) emit `LocalGet(frame_base_local)` so
+    // they're immune to subsequent `__sp` drift from `&literal` borrow
+    // temps, enum construction, sret allocations, etc.
+    frame_base_local: u32,
+}
+
+struct LoopCgFrame {
+    label: Option<String>,
+    // wasm structured-cf depth of the wrapping Block (= break target).
+    break_depth: u32,
+    // wasm structured-cf depth of the Loop instruction (= continue target).
+    continue_depth: u32,
+    // Number of FnCtx.locals at loop entry. break/continue emit drops
+    // for any in-loop bindings (locals at indices ≥ this) before jumping.
+    locals_len_at_entry: usize,
 }
 
 // ============================================================================
@@ -500,6 +529,11 @@ fn walk_expr_drop_marks(
             walk_block_drop_marks(il.then_block.as_ref(), expr_types, traits, info);
             walk_block_drop_marks(il.else_block.as_ref(), expr_types, traits, info);
         }
+        ExprKind::While(w) => {
+            walk_expr_drop_marks(&w.cond, expr_types, traits, info);
+            walk_block_drop_marks(w.body.as_ref(), expr_types, traits, info);
+        }
+        ExprKind::Break { .. } | ExprKind::Continue { .. } => {}
     }
 }
 
@@ -706,6 +740,11 @@ fn walk_expr_addr(
             }
             walk_block_addr(il.else_block.as_ref(), stack, info);
         }
+        ExprKind::While(w) => {
+            walk_expr_addr(&w.cond, stack, info);
+            walk_block_addr(w.body.as_ref(), stack, info);
+        }
+        ExprKind::Break { .. } | ExprKind::Continue { .. } => {}
     }
 }
 
@@ -1100,6 +1139,11 @@ fn collect_lets_in_expr(expr: &Expr, out: &mut Vec<u32>) {
             collect_let_value_ids(il.then_block.as_ref(), out);
             collect_let_value_ids(il.else_block.as_ref(), out);
         }
+        ExprKind::While(w) => {
+            collect_lets_in_expr(&w.cond, out);
+            collect_let_value_ids(w.body.as_ref(), out);
+        }
+        ExprKind::Break { .. } | ExprKind::Continue { .. } => {}
     }
 }
 
@@ -1339,6 +1383,9 @@ fn emit_function_concrete(
         env,
         type_params,
         mono,
+        loops: Vec::new(),
+        cf_depth: 0,
+        frame_base_local: 0,
     };
 
     // Allocate a wasm local to remember __sp on function entry. Variant
@@ -1365,6 +1412,24 @@ fn emit_function_concrete(
         ctx.instructions.push(wasm::Instruction::I32Sub);
         ctx.instructions
             .push(wasm::Instruction::GlobalSet(SP_GLOBAL));
+    }
+
+    // Save the post-prologue __sp into a wasm local. All spilled-binding
+    // reads/writes go through this stable base, so subsequent __sp drift
+    // (from `&literal` temps, enum construction, etc.) doesn't shift
+    // where the bindings appear. Allocated regardless of frame_size so
+    // BaseAddr::StackPointer always has a valid base to load.
+    {
+        let fb_local = ctx.next_wasm_local;
+        ctx.extra_locals.push(wasm::ValType::I32);
+        ctx.next_wasm_local += 1;
+        ctx.frame_base_local = fb_local;
+        ctx.instructions
+            .push(wasm::Instruction::GlobalGet(SP_GLOBAL));
+        ctx.instructions.push(wasm::Instruction::LocalSet(fb_local));
+    }
+
+    if frame_size > 0 {
 
         // Copy each spilled param from its incoming WASM-local slot into memory.
         // Scan locals[] in declaration order — params are first, in order.
@@ -1578,6 +1643,122 @@ fn codegen_unit_block_stmt(ctx: &mut FnCtx, block: &Block) -> Result<(), Error> 
 // already be addressed (the Drop pre-pass marked them). T4.6: skip
 // any binding whose root path borrowck observed as moved — its
 // destructor runs at the new owner's scope end instead.
+// Count the number of currently-open wasm structured-control-flow
+// constructs (Block, Loop, If) above the current emission point. Each
+// `End` closes one. `Else` doesn't change depth (it's just a separator
+// inside an If).
+//
+// Used by break/continue codegen to compute the correct `Br` index
+// without requiring every other codegen helper that pushes a Block/If
+// to track depth manually.
+fn current_cf_depth(ctx: &FnCtx) -> u32 {
+    let mut depth: i32 = 0;
+    let mut i = 0;
+    while i < ctx.instructions.len() {
+        match &ctx.instructions[i] {
+            wasm::Instruction::Block(_)
+            | wasm::Instruction::Loop(_)
+            | wasm::Instruction::If(_) => depth += 1,
+            wasm::Instruction::End => depth -= 1,
+            _ => {}
+        }
+        i += 1;
+    }
+    depth as u32
+}
+
+// `while cond { body }` lowering. Wasm structure:
+//
+//   Block (Empty)              ; break target
+//     Loop (Empty)             ; continue target
+//       <cond>                 ; produces i32 (bool)
+//       i32.eqz                ; invert: true→0, false→1
+//       BrIf 1                 ; if !cond, exit outer Block
+//       <body>                 ; iteration code
+//       Br 0                   ; back-edge to Loop start
+//     End
+//   End
+//
+// `break` inside body: drop in-loop Drop bindings, then `Br <break_depth>`.
+// `continue` inside body: drop in-loop Drop bindings, then `Br <continue_depth>`.
+fn codegen_while_expr(ctx: &mut FnCtx, w: &crate::ast::WhileExpr) -> Result<RType, Error> {
+    let outer_depth = current_cf_depth(ctx);
+    let locals_at_entry = ctx.locals.len();
+
+    ctx.instructions
+        .push(wasm::Instruction::Block(wasm::BlockType::Empty));
+    ctx.instructions
+        .push(wasm::Instruction::Loop(wasm::BlockType::Empty));
+
+    // Cond on top of stack, eqz, br_if 1 (out of Block on false).
+    let _ = codegen_expr(ctx, &w.cond)?;
+    ctx.instructions.push(wasm::Instruction::I32Eqz);
+    ctx.instructions.push(wasm::Instruction::BrIf(1));
+
+    // Push loop frame so break/continue inside body can find this loop.
+    ctx.loops.push(LoopCgFrame {
+        label: w.label.clone(),
+        break_depth: outer_depth,
+        continue_depth: outer_depth + 1,
+        locals_len_at_entry: locals_at_entry,
+    });
+    codegen_unit_block_stmt(ctx, w.body.as_ref())?;
+    ctx.loops.pop();
+
+    // Back-edge to Loop start.
+    ctx.instructions.push(wasm::Instruction::Br(0));
+
+    ctx.instructions.push(wasm::Instruction::End); // close Loop
+    ctx.instructions.push(wasm::Instruction::End); // close Block
+
+    Ok(RType::Tuple(Vec::new()))
+}
+
+fn codegen_break(ctx: &mut FnCtx, label: Option<&str>) -> Result<RType, Error> {
+    // Find target loop frame.
+    let (frame_idx, locals_at_entry) = find_loop_frame(ctx, label)
+        .expect("typeck verified break has a target");
+    let break_depth = ctx.loops[frame_idx].break_depth;
+    // Emit drops for in-loop Drop bindings before the Br.
+    emit_drops_for_locals_range(ctx, locals_at_entry, ctx.locals.len())?;
+    let cur = current_cf_depth(ctx);
+    // br_index = (cf_depth - outer_depth) - 1, where outer_depth =
+    // break_depth (cf depth at loop entry, just before the Block push).
+    let br_idx = cur.saturating_sub(break_depth + 1);
+    ctx.instructions.push(wasm::Instruction::Br(br_idx));
+    Ok(RType::Tuple(Vec::new()))
+}
+
+fn codegen_continue(ctx: &mut FnCtx, label: Option<&str>) -> Result<RType, Error> {
+    let (frame_idx, locals_at_entry) = find_loop_frame(ctx, label)
+        .expect("typeck verified continue has a target");
+    let continue_depth = ctx.loops[frame_idx].continue_depth;
+    emit_drops_for_locals_range(ctx, locals_at_entry, ctx.locals.len())?;
+    let cur = current_cf_depth(ctx);
+    let br_idx = cur.saturating_sub(continue_depth + 1);
+    ctx.instructions.push(wasm::Instruction::Br(br_idx));
+    Ok(RType::Tuple(Vec::new()))
+}
+
+fn find_loop_frame(ctx: &FnCtx, label: Option<&str>) -> Option<(usize, usize)> {
+    match label {
+        None => ctx
+            .loops
+            .last()
+            .map(|f| (ctx.loops.len() - 1, f.locals_len_at_entry)),
+        Some(name) => {
+            let mut i = ctx.loops.len();
+            while i > 0 {
+                i -= 1;
+                if ctx.loops[i].label.as_deref() == Some(name) {
+                    return Some((i, ctx.loops[i].locals_len_at_entry));
+                }
+            }
+            None
+        }
+    }
+}
+
 fn emit_drops_for_locals_range(ctx: &mut FnCtx, from: usize, to: usize) -> Result<(), Error> {
     let mut i = to;
     while i > from {
@@ -2133,6 +2314,9 @@ fn codegen_expr(ctx: &mut FnCtx, expr: &Expr) -> Result<RType, Error> {
         ExprKind::TupleIndex { base, index, .. } => codegen_tuple_index(ctx, base, *index),
         ExprKind::Match(m) => codegen_match_expr(ctx, m, expr.id),
         ExprKind::IfLet(il) => codegen_if_let_expr(ctx, il, expr.id),
+        ExprKind::While(w) => codegen_while_expr(ctx, w),
+        ExprKind::Break { label, .. } => codegen_break(ctx, label.as_deref()),
+        ExprKind::Continue { label, .. } => codegen_continue(ctx, label.as_deref()),
     }
 }
 
@@ -4906,8 +5090,9 @@ fn codegen_borrow(ctx: &mut FnCtx, inner: &Expr, mutable: bool) -> Result<RType,
         match &ctx.locals[binding_idx].storage {
             Storage::Memory { frame_offset } => {
                 let total = *frame_offset + chain_offset;
+                let fb = ctx.frame_base_local;
                 ctx.instructions
-                    .push(wasm::Instruction::GlobalGet(SP_GLOBAL));
+                    .push(wasm::Instruction::LocalGet(fb));
                 if total != 0 {
                     ctx.instructions
                         .push(wasm::Instruction::I32Const(total as i32));
@@ -4945,11 +5130,12 @@ fn ref_pointee_addr_local(ctx: &mut FnCtx, binding_idx: usize) -> u32 {
         Storage::Local { wasm_start, .. } => *wasm_start,
         Storage::Memory { frame_offset } => {
             let off = *frame_offset;
+            let fb = ctx.frame_base_local;
             let temp = ctx.next_wasm_local;
             ctx.extra_locals.push(wasm::ValType::I32);
             ctx.next_wasm_local += 1;
             ctx.instructions
-                .push(wasm::Instruction::GlobalGet(SP_GLOBAL));
+                .push(wasm::Instruction::LocalGet(fb));
             ctx.instructions
                 .push(wasm::Instruction::I32Load { align: 0, offset: off });
             ctx.instructions.push(wasm::Instruction::LocalSet(temp));
@@ -4999,9 +5185,13 @@ enum BaseAddr {
 
 fn emit_base(ctx: &mut FnCtx, base: BaseAddr) {
     match base {
+        // Spilled-binding accesses use the stable frame base captured
+        // post-prologue, not the live `__sp` (which can drift during
+        // the body from literal-borrow temps, enum construction, sret
+        // allocations, etc.).
         BaseAddr::StackPointer => ctx
             .instructions
-            .push(wasm::Instruction::GlobalGet(SP_GLOBAL)),
+            .push(wasm::Instruction::LocalGet(ctx.frame_base_local)),
         BaseAddr::WasmLocal(i) => ctx.instructions.push(wasm::Instruction::LocalGet(i)),
     }
 }

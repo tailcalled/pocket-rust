@@ -1514,6 +1514,10 @@ impl Parser {
             }
             TokenKind::If => self.parse_if_expr(),
             TokenKind::Match => self.parse_match_expr(),
+            TokenKind::While => self.parse_while_expr(None, None),
+            TokenKind::Break => self.parse_break_expr(),
+            TokenKind::Continue => self.parse_continue_expr(),
+            TokenKind::Lifetime(_) => self.parse_labeled_loop(),
             TokenKind::Builtin => self.parse_builtin(),
             TokenKind::Ident(_) => self.parse_path_atom(),
             TokenKind::SelfUpper => self.parse_path_atom(),
@@ -1760,6 +1764,85 @@ impl Parser {
                 args,
             },
             span,
+            id,
+        })
+    }
+
+    // Parse `while cond { body }`. The condition disallows bare struct
+    // literals (matches Rust's parser).
+    fn parse_while_expr(
+        &mut self,
+        label: Option<String>,
+        label_span: Option<Span>,
+    ) -> Result<Expr, Error> {
+        let while_span = self.expect(&TokenKind::While, "`while`")?;
+        let saved = self.no_struct_lit;
+        self.no_struct_lit = true;
+        let cond = self.parse_expr()?;
+        self.no_struct_lit = saved;
+        let body = self.parse_block()?;
+        let span_start = label_span
+            .as_ref()
+            .map(|s| s.start.copy())
+            .unwrap_or(while_span.start);
+        let span = Span::new(span_start, body.span.end.copy());
+        let id = self.alloc_node_id();
+        Ok(Expr {
+            kind: ExprKind::While(crate::ast::WhileExpr {
+                label,
+                label_span,
+                cond: Box::new(cond),
+                body: Box::new(body),
+            }),
+            span,
+            id,
+        })
+    }
+
+    // `'label: <loop>` — currently only `while` is supported, but the
+    // syntax is shared so this is the entry point.
+    fn parse_labeled_loop(&mut self) -> Result<Expr, Error> {
+        let (name, label_span) = self.expect_lifetime()?;
+        self.expect(&TokenKind::Colon, "`:`")?;
+        if self.peek_kind(&TokenKind::While) {
+            self.parse_while_expr(Some(name), Some(label_span))
+        } else {
+            Err(self.error_at_current(
+                "expected `while` after label (only `'label: while ...` is supported)",
+            ))
+        }
+    }
+
+    fn parse_break_expr(&mut self) -> Result<Expr, Error> {
+        let kw_span = self.expect(&TokenKind::Break, "`break`")?;
+        let (label, label_span, end) = if self.peek_lifetime() {
+            let (n, ls) = self.expect_lifetime()?;
+            let end = ls.end.copy();
+            (Some(n), Some(ls), end)
+        } else {
+            (None, None, kw_span.end.copy())
+        };
+        let id = self.alloc_node_id();
+        Ok(Expr {
+            kind: ExprKind::Break { label, label_span },
+            span: Span::new(kw_span.start, end),
+            id,
+        })
+    }
+
+    fn parse_continue_expr(&mut self) -> Result<Expr, Error> {
+        let kw_span = self.expect(&TokenKind::Continue, "`continue`")?;
+        let (label, label_span, end) = if self.peek_lifetime() {
+            let (n, ls) = self.expect_lifetime()?;
+            let end = ls.end.copy();
+            (Some(n), Some(ls), end)
+        } else {
+            (None, None, kw_span.end.copy())
+        };
+        let id = self.alloc_node_id();
+        Ok(Expr {
+            kind: ExprKind::Continue { label, label_span },
+            span: Span::new(kw_span.start, end),
             id,
         })
     }
@@ -2101,6 +2184,9 @@ impl Parser {
             (TokenKind::Enum, TokenKind::Enum) => true,
             (TokenKind::Match, TokenKind::Match) => true,
             (TokenKind::Ref, TokenKind::Ref) => true,
+            (TokenKind::While, TokenKind::While) => true,
+            (TokenKind::Break, TokenKind::Break) => true,
+            (TokenKind::Continue, TokenKind::Continue) => true,
             (TokenKind::Underscore, TokenKind::Underscore) => true,
             (TokenKind::Pipe, TokenKind::Pipe) => true,
             (TokenKind::At, TokenKind::At) => true,
@@ -2147,6 +2233,7 @@ fn is_unit_block_like(expr: &Expr) -> bool {
         ExprKind::If(_) => true,
         ExprKind::IfLet(_) => true,
         ExprKind::Match(_) => true,
+        ExprKind::While(_) => true,
         _ => false,
     }
 }
