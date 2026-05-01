@@ -49,6 +49,24 @@ fn heap_alloc_struct_returns_42() {
 }
 
 #[test]
+fn ptr_byte_add_returns_42() {
+    // `¤ptr_usize_add(p, n)`: byte-wise pointer advance.
+    expect_answer("lang/builtins/ptr_byte_add", 42u32);
+}
+
+#[test]
+fn ptr_byte_sub_returns_42() {
+    // `¤ptr_usize_sub(p, n)`: byte-wise pointer retreat.
+    expect_answer("lang/builtins/ptr_byte_sub", 42u32);
+}
+
+#[test]
+fn ptr_isize_offset_neg_returns_99() {
+    // `¤ptr_isize_offset(p, n)` accepts negative `n` (signed isize).
+    expect_answer("lang/builtins/ptr_isize_offset_neg", 99u32);
+}
+
+#[test]
 fn unknown_builtin_is_rejected() {
     let err = compile_source("fn answer() -> u32 { ¤u32_unknown(1, 2) }");
     assert!(

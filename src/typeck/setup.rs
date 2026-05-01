@@ -607,7 +607,10 @@ pub(super) fn collect_funcs(
                     };
                 // Method-path prefix. Mirror codegen's derivation: take the
                 // first segment of the target's AST Path. For non-Path
-                // targets (e.g. `&T`), synthesize a unique slot.
+                // trait impls (`impl<T> Show for &T`, …) synthesize a slot
+                // from the trait-impl row. For non-Path inherent impls
+                // (`impl<T> *const T { … }`) synthesize a slot from
+                // `funcs.inherent_synth_count`.
                 let target_name_for_prefix: Option<String> = match &ib.target.kind {
                     crate::ast::TypeKind::Path(p) if !p.segments.is_empty() => {
                         Some(p.segments[0].name.clone())
@@ -617,13 +620,13 @@ pub(super) fn collect_funcs(
                 let mut method_prefix = path.clone();
                 if let Some(name) = &target_name_for_prefix {
                     method_prefix.push(name.clone());
+                } else if let Some(idx) = trait_impl_idx_for_methods {
+                    method_prefix.push(format!("__trait_impl_{}", idx));
                 } else {
-                    // Trait impl on a non-struct (e.g. `&T`): synthesize a
-                    // unique prefix.
-                    method_prefix.push(format!(
-                        "__trait_impl_{}",
-                        trait_impl_idx_for_methods.unwrap_or(0)
-                    ));
+                    let idx = funcs.inherent_synth_specs.len();
+                    funcs.inherent_synth_specs
+                        .push((module.source_file.clone(), ib.span.copy()));
+                    method_prefix.push(format!("__inherent_synth_{}", idx));
                 }
                 let mut k = 0;
                 while k < ib.methods.len() {
@@ -1241,15 +1244,18 @@ pub(super) fn resolve_impl_target(
         file,
     )?;
     if ib.trait_path.is_none() {
-        // Inherent: must be a nominal user type (struct or enum). Refs,
-        // raw pointers, primitives, and tuples can't carry inherent
+        // Inherent: must be a struct, enum, or raw pointer (the
+        // primitive-pointer methods in `lib/std/primitive/pointer.rs`
+        // are inherent on `*const T` / `*mut T`, mirroring Rust's
+        // stdlib). Refs, primitives, and tuples can't carry inherent
         // methods — those go through trait impls.
         match &resolved {
-            RType::Struct { .. } | RType::Enum { .. } => {}
+            RType::Struct { .. } | RType::Enum { .. } | RType::RawPtr { .. } => {}
             _ => {
                 return Err(Error {
                     file: file.to_string(),
-                    message: "inherent impl target must be a struct or enum".to_string(),
+                    message: "inherent impl target must be a struct, enum, or raw pointer"
+                        .to_string(),
                     span: ib.target.span.copy(),
                 });
             }
@@ -1455,6 +1461,7 @@ pub(super) fn register_function(
             impl_target: impl_target_for_storage,
             trait_impl_idx,
             is_pub: f.is_pub,
+            is_unsafe: f.is_unsafe,
             method_resolutions: Vec::new(),
             call_resolutions: Vec::new(),
             moved_places: Vec::new(),
@@ -1472,6 +1479,7 @@ pub(super) fn register_function(
             impl_target: impl_target_for_storage,
             trait_impl_idx,
             is_pub: f.is_pub,
+            is_unsafe: f.is_unsafe,
             method_resolutions: Vec::new(),
             call_resolutions: Vec::new(),
             moved_places: Vec::new(),

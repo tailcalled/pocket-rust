@@ -165,6 +165,11 @@ pub struct Function {
     // (typeck/borrowck/codegen) sized to this length, indexed by Expr.id.
     pub node_count: u32,
     pub is_pub: bool,
+    // `unsafe fn …` — calls to this function must lexically appear
+    // inside an `unsafe { … }` block, and the function's body is
+    // implicitly in unsafe context (so it can deref raw pointers and
+    // call other unsafe functions without an inner block).
+    pub is_unsafe: bool,
 }
 
 #[derive(Clone)]
@@ -260,6 +265,13 @@ pub struct Expr {
 #[derive(Clone)]
 pub enum ExprKind {
     IntLit(u64),
+    // `-INT_LIT` parsed as a single negative literal — e.g. `-4` is
+    // `NegIntLit(4)`. The value stored is the **absolute magnitude**;
+    // typeck pins the literal's type to a signed integer and codegen
+    // lowers as `from_i64(-(value as i64))`. For non-literal unary
+    // minus (`-x`, `-(a + b)`, etc.) the parser desugars to a
+    // `<T as VecSpace>::neg` method call instead.
+    NegIntLit(u64),
     BoolLit(bool),
     Call(Call),
     Var(String),

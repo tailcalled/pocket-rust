@@ -86,3 +86,58 @@ fn integer_literal_in_unbounded_generic_is_rejected() {
         err
     );
 }
+
+#[test]
+fn neg_lit_returns_42() {
+    // `-1isize + 43isize = 42`. Tests that `-INT_LIT` parses as a
+    // single negative literal and pins to the let-annotated type.
+    expect_answer("lang/int_literals/neg_lit", 42u32);
+}
+
+#[test]
+fn neg_arith_returns_42() {
+    // Unary minus on a non-literal expression desugars to a method
+    // call to `<T as VecSpace>::neg`. `(-50) + 92 = 42`.
+    expect_answer("lang/int_literals/neg_arith", 42u32);
+}
+
+#[test]
+fn neg_lit_unsigned_is_rejected() {
+    let err = compile_source("fn f() -> u32 { let n: u32 = -4; n }");
+    assert!(
+        err.contains("cannot apply unary `-`"),
+        "expected unary-minus-on-unsigned error, got: {}",
+        err
+    );
+}
+
+#[test]
+fn literal_arith_returns_42() {
+    // No let-annotations, no other context — both literals are
+    // unbound num-lit vars. Method dispatch on the unbound receiver
+    // goes through the implicit `T: Num` bound (Num supertrait
+    // closure) to find `add` on `VecSpace`. The result type pins to
+    // i32 by default, then casts up via the fn signature.
+    expect_answer("lang/int_literals/literal_arith", 42i32);
+}
+
+#[test]
+fn literal_neg_returns_neg_42() {
+    // Unary minus on a non-literal `(30 + 12)` desugars to a method
+    // call. The inner addition is itself a method call on unbound
+    // num-lit vars; the outer `.neg()` is also dispatched on an
+    // unbound num-lit var (the inner add's result var). Both go
+    // through Num/VecSpace.
+    expect_answer("lang/int_literals/literal_neg", -42i32);
+}
+
+#[test]
+fn neg_i32_min_returns_min() {
+    // `-2147483648` is `i32::MIN`. The magnitude (2147483648) does
+    // NOT fit in `i32`'s positive range (max = 2147483647), so this
+    // would fail under a `2147483648.neg()` desugar — the literal
+    // range check rejects the magnitude before `neg` ever runs.
+    // `NegIntLit` carries the sign through inference, letting the
+    // range check see `-2147483648` against `i32::MIN..=i32::MAX`.
+    expect_answer("lang/int_literals/i32_min", i32::MIN);
+}

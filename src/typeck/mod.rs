@@ -5,11 +5,11 @@ use crate::span::{Error, Span};
 
 mod types;
 pub use types::{
-    IntKind, LifetimeRepr, RType, byte_size_of, copy_trait_path, drop_trait_path, flatten_rtype,
+    IntKind, LifetimeRepr, RType, byte_size_of, copy_trait_path, drop_trait_path, num_trait_path, flatten_rtype,
     int_kind_name, is_copy, is_copy_with_bounds, is_drop, is_raw_ptr, is_ref_mutable,
     outer_lifetime, rtype_eq, rtype_to_string, substitute_rtype,
 };
-use types::{int_kind_from_name, int_kind_max, struct_env};
+use types::{int_kind_from_name, int_kind_max, int_kind_neg_magnitude, int_kind_signed, struct_env};
 
 // T5.5: whether `t` (an InferType, possibly partially resolved) can
 // satisfy `std::Num`. Used by `Subst::bind_var` when an integer-literal
@@ -859,6 +859,10 @@ impl Subst {
 pub(crate) struct LitConstraint {
     var: u32,
     value: u64,
+    // `true` for `NegIntLit(value)` — i.e. the source wrote `-value`.
+    // The range check requires a signed integer kind whose negative
+    // range covers `value`; codegen lowers as `from_i64(-(value as i64))`.
+    negative: bool,
     span: Span,
 }
 
@@ -943,16 +947,24 @@ fn check_module(
                         method_prefix.push(p.segments[0].name.clone());
                     }
                     _ => {
-                        match find_trait_impl_idx(ib, &target_rt, path, traits, &use_scope, reexports, current_file) {
-                            Some(idx) => {
-                                method_prefix.push(format!("__trait_impl_{}", idx));
+                        if ib.trait_path.is_some() {
+                            match find_trait_impl_idx(ib, &target_rt, path, traits, &use_scope, reexports, current_file) {
+                                Some(idx) => {
+                                    method_prefix.push(format!("__trait_impl_{}", idx));
+                                }
+                                None => unreachable!(
+                                    "trait impl with non-Path target must have a registered row"
+                                ),
                             }
-                            None => {
-                                // Inherent impl with non-path target —
-                                // already rejected in collect_funcs.
-                                i += 1;
-                                continue;
-                            }
+                        } else {
+                            // Inherent impl on a non-Path target
+                            // (`impl<T> *const T { … }`). Setup recorded
+                            // a synth idx keyed by `(file, span)`; we
+                            // recover it here so the methods get the
+                            // same `__inherent_synth_<idx>` prefix.
+                            let idx = tables::find_inherent_synth_idx(funcs, current_file, &ib.span)
+                                .expect("setup recorded an inherent-synth idx for this impl");
+                            method_prefix.push(format!("__inherent_synth_{}", idx));
                         }
                     }
                 }
@@ -1131,7 +1143,29 @@ fn check_function(
                 continue;
             }
         };
-        if (lc.value as u128) > int_kind_max(&kind) {
+        if lc.negative {
+            if !int_kind_signed(&kind) {
+                return Err(Error {
+                    file: current_file.to_string(),
+                    message: format!(
+                        "cannot apply unary `-` to unsigned integer type `{}`",
+                        int_kind_name(&kind)
+                    ),
+                    span: lc.span.copy(),
+                });
+            }
+            if (lc.value as u128) > int_kind_neg_magnitude(&kind) {
+                return Err(Error {
+                    file: current_file.to_string(),
+                    message: format!(
+                        "integer literal `-{}` does not fit in `{}`",
+                        lc.value,
+                        int_kind_name(&kind)
+                    ),
+                    span: lc.span.copy(),
+                });
+            }
+        } else if (lc.value as u128) > int_kind_max(&kind) {
             return Err(Error {
                 file: current_file.to_string(),
                 message: format!(
@@ -1776,6 +1810,17 @@ fn check_expr_inner(ctx: &mut CheckCtx, expr: &Expr) -> Result<InferType, Error>
             ctx.lit_constraints.push(LitConstraint {
                 var: v,
                 value: *n,
+                negative: false,
+                span: expr.span.copy(),
+            });
+            Ok(InferType::Var(v))
+        }
+        ExprKind::NegIntLit(n) => {
+            let v = ctx.subst.fresh_int();
+            ctx.lit_constraints.push(LitConstraint {
+                var: v,
+                value: *n,
+                negative: true,
                 span: expr.span.copy(),
             });
             Ok(InferType::Var(v))
@@ -2161,6 +2206,12 @@ fn check_builtin(
         "alloc" => return check_builtin_alloc(ctx, type_args, args, expr),
         "free" => return check_builtin_free(ctx, type_args, args, expr),
         "cast" => return check_builtin_cast(ctx, type_args, args, expr),
+        "ptr_usize_add" | "ptr_usize_sub" => {
+            return check_builtin_ptr_usize_offset(ctx, name, type_args, args, expr);
+        }
+        "ptr_isize_offset" => {
+            return check_builtin_ptr_isize_offset(ctx, type_args, args, expr);
+        }
         _ => {}
     }
     if !type_args.is_empty() {
@@ -2363,6 +2414,122 @@ fn check_builtin_cast(
     }))
 }
 
+// `¤ptr_usize_add(p, n)` and `¤ptr_usize_sub(p, n)`: byte-wise pointer
+// arithmetic. `p` must be `*const T` or `*mut T`; `n` is `usize`. The
+// result keeps the input's mutability and pointee type. Use these as
+// the building block for higher-level methods (`std::primitive::pointer`).
+fn check_builtin_ptr_usize_offset(
+    ctx: &mut CheckCtx,
+    name: &str,
+    type_args: &Vec<crate::ast::Type>,
+    args: &Vec<Expr>,
+    expr: &Expr,
+) -> Result<InferType, Error> {
+    if !type_args.is_empty() {
+        return Err(Error {
+            file: ctx.current_file.to_string(),
+            message: format!("builtin `¤{}` does not take type arguments", name),
+            span: expr.span.copy(),
+        });
+    }
+    if args.len() != 2 {
+        return Err(Error {
+            file: ctx.current_file.to_string(),
+            message: format!("builtin `¤{}` takes 2 arguments, got {}", name, args.len()),
+            span: expr.span.copy(),
+        });
+    }
+    let arg0_ty = check_expr(ctx, &args[0])?;
+    let arg1_ty = check_expr(ctx, &args[1])?;
+    let resolved = ctx.subst.substitute(&arg0_ty);
+    let (mutable, inner) = match &resolved {
+        InferType::RawPtr { mutable, inner } => (*mutable, (**inner).clone()),
+        _ => {
+            return Err(Error {
+                file: ctx.current_file.to_string(),
+                message: format!(
+                    "builtin `¤{}` first argument must be a raw pointer, got `{}`",
+                    name,
+                    infer_to_string(&resolved)
+                ),
+                span: args[0].span.copy(),
+            });
+        }
+    };
+    let expected = rtype_to_infer(&RType::Int(IntKind::Usize));
+    ctx.subst.unify(
+        &arg1_ty,
+        &expected,
+        ctx.traits,
+        ctx.type_params,
+        ctx.type_param_bounds,
+        &args[1].span,
+        ctx.current_file,
+    )?;
+    Ok(InferType::RawPtr {
+        inner: Box::new(inner),
+        mutable,
+    })
+}
+
+// `¤ptr_isize_offset(p, n)`: signed-byte pointer offset. Same shape as
+// the usize variants but takes an `isize` so callers can shift in
+// either direction in one call.
+fn check_builtin_ptr_isize_offset(
+    ctx: &mut CheckCtx,
+    type_args: &Vec<crate::ast::Type>,
+    args: &Vec<Expr>,
+    expr: &Expr,
+) -> Result<InferType, Error> {
+    if !type_args.is_empty() {
+        return Err(Error {
+            file: ctx.current_file.to_string(),
+            message: "builtin `¤ptr_isize_offset` does not take type arguments".to_string(),
+            span: expr.span.copy(),
+        });
+    }
+    if args.len() != 2 {
+        return Err(Error {
+            file: ctx.current_file.to_string(),
+            message: format!(
+                "builtin `¤ptr_isize_offset` takes 2 arguments, got {}",
+                args.len()
+            ),
+            span: expr.span.copy(),
+        });
+    }
+    let arg0_ty = check_expr(ctx, &args[0])?;
+    let arg1_ty = check_expr(ctx, &args[1])?;
+    let resolved = ctx.subst.substitute(&arg0_ty);
+    let (mutable, inner) = match &resolved {
+        InferType::RawPtr { mutable, inner } => (*mutable, (**inner).clone()),
+        _ => {
+            return Err(Error {
+                file: ctx.current_file.to_string(),
+                message: format!(
+                    "builtin `¤ptr_isize_offset` first argument must be a raw pointer, got `{}`",
+                    infer_to_string(&resolved)
+                ),
+                span: args[0].span.copy(),
+            });
+        }
+    };
+    let expected = rtype_to_infer(&RType::Int(IntKind::Isize));
+    ctx.subst.unify(
+        &arg1_ty,
+        &expected,
+        ctx.traits,
+        ctx.type_params,
+        ctx.type_param_bounds,
+        &args[1].span,
+        ctx.current_file,
+    )?;
+    Ok(InferType::RawPtr {
+        inner: Box::new(inner),
+        mutable,
+    })
+}
+
 mod builtins;
 pub use builtins::builtin_signature;
 
@@ -2377,8 +2544,8 @@ pub use tables::{
     CallResolution, EnumEntry, EnumTable, EnumVariantEntry, FnSymbol, FuncTable, GenericTemplate,
     MethodResolution, MoveStatus, MovedPlace, RTypedField, ReceiverAdjust, StructEntry,
     StructTable, TraitDispatch, TraitEntry, TraitImplEntry, TraitMethodEntry, TraitReceiverShape,
-    TraitTable, VariantPayloadResolved, enum_lookup, func_lookup, struct_lookup, template_lookup,
-    trait_lookup,
+    TraitTable, VariantPayloadResolved, enum_lookup, find_inherent_synth_idx, func_lookup,
+    struct_lookup, template_lookup, trait_lookup,
 };
 
 mod traits;
@@ -2632,8 +2799,15 @@ fn check_cast(
                 | InferType::Var(_)
         )
     } else {
-        // Int target: source must be an integer (or unbound integer var).
-        matches!(&resolved_src, InferType::Int(_) | InferType::Var(_))
+        // Int target: source must be an integer, an unbound integer
+        // var, or a raw pointer (the `*T as usize` round-trip is the
+        // only ergonomic way to compare addresses, e.g. `p.is_null()`).
+        // At codegen, raw pointers and integers ≤ 32 bits both flatten
+        // to wasm `i32`, so the cast is a no-op or a standard widening.
+        matches!(
+            &resolved_src,
+            InferType::Int(_) | InferType::Var(_) | InferType::RawPtr { .. }
+        )
     };
     if !src_ok {
         return Err(Error {

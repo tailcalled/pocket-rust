@@ -1,17 +1,24 @@
 // Safety check pass.
 //
-// Single rule: dereferencing a raw pointer (`*const T` / `*mut T`) must
-// happen inside an `unsafe { ... }` block. Dereferencing a reference
-// (`&T` / `&mut T`) is always safe.
+// Two rules:
+//   1. Dereferencing a raw pointer (`*const T` / `*mut T`) must happen
+//      inside an `unsafe { … }` block. Dereferencing a reference
+//      (`&T` / `&mut T`) is always safe.
+//   2. Calling an `unsafe fn` must happen inside an `unsafe { … }` block.
+//
+// Inside the body of an `unsafe fn`, both rules are satisfied implicitly
+// — the body is treated as if wrapped in `unsafe { … }`.
 //
 // We don't redo type analysis here — typeck records each Expr's resolved
-// type at `FnSymbol.expr_types[expr.id]`. For a `Deref(inner)`, safeck reads
-// the inner expr's type at its NodeId and flags raw-pointer derefs outside
-// `unsafe { ... }` blocks.
+// type at `FnSymbol.expr_types[expr.id]` and the per-call resolution at
+// `FnSymbol.call_resolutions[expr.id]` / `method_resolutions[expr.id]`.
+// Safeck reads those.
 
 use crate::ast::{Block, Call, Expr, ExprKind, Function, Item, MethodCall, Module, Stmt, StructLit};
 use crate::span::Error;
-use crate::typeck::{FuncTable, func_lookup, template_lookup};
+use crate::typeck::{
+    CallResolution, FuncTable, MethodResolution, func_lookup, template_lookup,
+};
 
 pub fn check(root: &Module, funcs: &FuncTable) -> Result<(), Error> {
     let mut path: Vec<String> = Vec::new();
@@ -85,17 +92,26 @@ fn check_function(
 ) -> Result<(), Error> {
     let mut full = current_module.clone();
     full.push(func.name.clone());
-    let expr_types: &Vec<Option<crate::typeck::RType>> =
-        if let Some(entry) = func_lookup(funcs, &full) {
-            &entry.expr_types
-        } else if let Some((_, t)) = template_lookup(funcs, &full) {
-            &t.expr_types
-        } else {
-            unreachable!("typeck registered this function");
-        };
+    let (expr_types, method_resolutions, call_resolutions): (
+        &Vec<Option<crate::typeck::RType>>,
+        &Vec<Option<MethodResolution>>,
+        &Vec<Option<CallResolution>>,
+    ) = if let Some(entry) = func_lookup(funcs, &full) {
+        (&entry.expr_types, &entry.method_resolutions, &entry.call_resolutions)
+    } else if let Some((_, t)) = template_lookup(funcs, &full) {
+        (&t.expr_types, &t.method_resolutions, &t.call_resolutions)
+    } else {
+        unreachable!("typeck registered this function");
+    };
     let mut state = SafeState {
         expr_types,
-        in_unsafe: false,
+        method_resolutions,
+        call_resolutions,
+        funcs,
+        // The body of an `unsafe fn` is implicitly inside an unsafe
+        // block — raw derefs and unsafe calls don't need an inner
+        // `unsafe { … }`.
+        in_unsafe: func.is_unsafe,
         file: current_file.to_string(),
     };
     walk_block(&mut state, &func.body)?;
@@ -104,6 +120,9 @@ fn check_function(
 
 struct SafeState<'a> {
     expr_types: &'a Vec<Option<crate::typeck::RType>>,
+    method_resolutions: &'a Vec<Option<MethodResolution>>,
+    call_resolutions: &'a Vec<Option<CallResolution>>,
+    funcs: &'a FuncTable,
     in_unsafe: bool,
     file: String,
 }
@@ -130,7 +149,7 @@ fn walk_block(state: &mut SafeState, block: &Block) -> Result<(), Error> {
 
 fn walk_expr(state: &mut SafeState, expr: &Expr) -> Result<(), Error> {
     match &expr.kind {
-        ExprKind::IntLit(_) | ExprKind::BoolLit(_) | ExprKind::Var(_) => Ok(()),
+        ExprKind::IntLit(_) | ExprKind::NegIntLit(_) | ExprKind::BoolLit(_) | ExprKind::Var(_) => Ok(()),
         ExprKind::Borrow { inner, .. } => walk_expr(state, inner),
         ExprKind::Cast { inner, .. } => walk_expr(state, inner),
         ExprKind::Deref(inner) => {
@@ -151,8 +170,8 @@ fn walk_expr(state: &mut SafeState, expr: &Expr) -> Result<(), Error> {
             }
             Ok(())
         }
-        ExprKind::Call(call) => walk_call(state, call),
-        ExprKind::MethodCall(mc) => walk_method_call(state, mc),
+        ExprKind::Call(call) => walk_call(state, call, expr),
+        ExprKind::MethodCall(mc) => walk_method_call(state, mc, expr),
         ExprKind::StructLit(lit) => walk_struct_lit(state, lit),
         ExprKind::FieldAccess(fa) => walk_expr(state, &fa.base),
         ExprKind::Block(block) => walk_block(state, block.as_ref()),
@@ -209,7 +228,23 @@ fn walk_expr(state: &mut SafeState, expr: &Expr) -> Result<(), Error> {
     }
 }
 
-fn walk_call(state: &mut SafeState, call: &Call) -> Result<(), Error> {
+fn walk_call(state: &mut SafeState, call: &Call, expr: &Expr) -> Result<(), Error> {
+    // Resolve the call to its callee FnSymbol/Template and check
+    // unsafe-ness. Variant constructors aren't unsafe-callable.
+    let callee_unsafe = match state.call_resolutions[expr.id as usize].as_ref() {
+        Some(CallResolution::Direct(idx)) => state.funcs.entries[*idx].is_unsafe,
+        Some(CallResolution::Generic { template_idx, .. }) => {
+            state.funcs.templates[*template_idx].is_unsafe
+        }
+        Some(CallResolution::Variant { .. }) | None => false,
+    };
+    if callee_unsafe && !state.in_unsafe {
+        return Err(Error {
+            file: state.file.clone(),
+            message: "call to unsafe function requires an `unsafe` block".to_string(),
+            span: expr.span.copy(),
+        });
+    }
     let mut i = 0;
     while i < call.args.len() {
         walk_expr(state, &call.args[i])?;
@@ -218,7 +253,33 @@ fn walk_call(state: &mut SafeState, call: &Call) -> Result<(), Error> {
     Ok(())
 }
 
-fn walk_method_call(state: &mut SafeState, mc: &MethodCall) -> Result<(), Error> {
+fn walk_method_call(state: &mut SafeState, mc: &MethodCall, expr: &Expr) -> Result<(), Error> {
+    let callee_unsafe = match state.method_resolutions[expr.id as usize].as_ref() {
+        Some(res) => match res.template_idx {
+            Some(idx) => state.funcs.templates[idx].is_unsafe,
+            None => {
+                // Direct call — find the FnSymbol whose wasm idx matches.
+                let mut found = false;
+                let mut k = 0;
+                while k < state.funcs.entries.len() {
+                    if state.funcs.entries[k].idx == res.callee_idx {
+                        found = state.funcs.entries[k].is_unsafe;
+                        break;
+                    }
+                    k += 1;
+                }
+                found
+            }
+        },
+        None => false,
+    };
+    if callee_unsafe && !state.in_unsafe {
+        return Err(Error {
+            file: state.file.clone(),
+            message: "call to unsafe method requires an `unsafe` block".to_string(),
+            span: expr.span.copy(),
+        });
+    }
     walk_expr(state, &mc.receiver)?;
     let mut i = 0;
     while i < mc.args.len() {

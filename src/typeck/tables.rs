@@ -181,6 +181,10 @@ pub struct FnSymbol {
     // owning impl row. None for free fns and inherent methods.
     pub trait_impl_idx: Option<usize>,
     pub is_pub: bool,
+    // `unsafe fn` — call sites must be lexically inside an `unsafe { … }`
+    // block (enforced by `safeck`); the body is implicitly in unsafe
+    // context.
+    pub is_unsafe: bool,
     // Per `Expr` node, indexed by `Expr.id`. Contains the resolved `RType`
     // for nodes that carry a value type. `None` for nodes without one
     // (currently unused — every Expr produces a value in our subset).
@@ -268,6 +272,7 @@ pub struct GenericTemplate {
     // for free fns and inherent methods.
     pub trait_impl_idx: Option<usize>,
     pub is_pub: bool,
+    pub is_unsafe: bool,
     pub func: crate::ast::Function,
     pub enclosing_module: Vec<String>,
     pub source_file: String,
@@ -328,6 +333,31 @@ pub enum ReceiverAdjust {
 pub struct FuncTable {
     pub entries: Vec<FnSymbol>,
     pub templates: Vec<GenericTemplate>,
+    // Per-impl-block bookkeeping for non-Path inherent impls
+    // (`impl<T> *const T { … }`). Each entry's index is the synth idx
+    // used in the methods' path prefix (`__inherent_synth_<idx>`).
+    // `(file, span)` lets later passes recover the same idx via
+    // `find_inherent_synth_idx`.
+    pub inherent_synth_specs: Vec<(String, crate::span::Span)>,
+}
+
+pub fn find_inherent_synth_idx(
+    funcs: &FuncTable,
+    file: &str,
+    span: &crate::span::Span,
+) -> Option<usize> {
+    let mut i = 0;
+    while i < funcs.inherent_synth_specs.len() {
+        let (f, s) = &funcs.inherent_synth_specs[i];
+        if f == file
+            && s.start.line == span.start.line
+            && s.start.col == span.start.col
+        {
+            return Some(i);
+        }
+        i += 1;
+    }
+    None
 }
 
 pub fn template_lookup<'a>(

@@ -130,6 +130,47 @@ fn push_root_name(path: &mut Vec<String>, root: &Module) {
     }
 }
 
+// Look up an inherent impl block's resolved target by reading the
+// first method's stored `impl_target`. Used for non-Path inherent
+// impls (`impl<T> *const T { … }`), where typeck already resolved the
+// AST target at registration time. If the impl has no methods (rare
+// but legal), returns a placeholder — there's nothing for codegen to
+// emit anyway, so the value is unused.
+fn recover_impl_target_from_methods(
+    funcs: &FuncTable,
+    method_prefix: &Vec<String>,
+    methods: &Vec<crate::ast::Function>,
+) -> RType {
+    let mut k = 0;
+    while k < methods.len() {
+        let mut full = method_prefix.clone();
+        full.push(methods[k].name.clone());
+        // Look up in concrete entries first, then templates.
+        let mut i = 0;
+        while i < funcs.entries.len() {
+            if funcs.entries[i].path == full {
+                if let Some(t) = &funcs.entries[i].impl_target {
+                    return t.clone();
+                }
+            }
+            i += 1;
+        }
+        let mut i = 0;
+        while i < funcs.templates.len() {
+            if funcs.templates[i].path == full {
+                if let Some(t) = &funcs.templates[i].impl_target {
+                    return t.clone();
+                }
+            }
+            i += 1;
+        }
+        k += 1;
+    }
+    // No methods (or none found) — the value is unused. Return unit
+    // tuple as a safe placeholder.
+    RType::Tuple(Vec::new())
+}
+
 // ============================================================================
 // Storage model
 // ============================================================================
@@ -496,7 +537,7 @@ fn walk_expr_drop_marks(
         ExprKind::Cast { inner, .. } => {
             walk_expr_drop_marks(inner, expr_types, traits, info);
         }
-        ExprKind::IntLit(_) | ExprKind::BoolLit(_) | ExprKind::Var(_) => {}
+        ExprKind::IntLit(_) | ExprKind::NegIntLit(_) | ExprKind::BoolLit(_) | ExprKind::Var(_) => {}
         ExprKind::If(if_expr) => {
             walk_expr_drop_marks(&if_expr.cond, expr_types, traits, info);
             walk_block_drop_marks(if_expr.then_block.as_ref(), expr_types, traits, info);
@@ -625,7 +666,7 @@ fn walk_expr_addr(
     info: &mut AddressInfo,
 ) {
     match &expr.kind {
-        ExprKind::IntLit(_) | ExprKind::BoolLit(_) | ExprKind::Var(_) => {}
+        ExprKind::IntLit(_) | ExprKind::NegIntLit(_) | ExprKind::BoolLit(_) | ExprKind::Var(_) => {}
         ExprKind::If(if_expr) => {
             walk_expr_addr(&if_expr.cond, stack, info);
             walk_block_addr(if_expr.then_block.as_ref(), stack, info);
@@ -883,10 +924,25 @@ fn emit_module(
                         }
                     }
                     None => {
-                        let idx = trait_impl_idx
-                            .expect("non-Path impl target must be a trait impl with a registered row");
-                        method_prefix.push(format!("__trait_impl_{}", idx));
-                        traits.impls[idx].target.clone()
+                        // Non-Path target: trait impl row idx, or a
+                        // synth idx for inherent impls (recovered from
+                        // setup's `(file, span)`-keyed table). For
+                        // inherent impls, target_rt comes from the
+                        // first method's stored `impl_target` — typeck
+                        // already resolved the AST type and stored it.
+                        if let Some(idx) = trait_impl_idx {
+                            method_prefix.push(format!("__trait_impl_{}", idx));
+                            traits.impls[idx].target.clone()
+                        } else {
+                            let synth_idx = crate::typeck::find_inherent_synth_idx(
+                                funcs,
+                                &module.source_file,
+                                &ib.span,
+                            )
+                            .expect("setup recorded an inherent-synth idx for this impl");
+                            method_prefix.push(format!("__inherent_synth_{}", synth_idx));
+                            recover_impl_target_from_methods(funcs, &method_prefix, &ib.methods)
+                        }
                     }
                 };
                 let impl_is_generic = !ib.type_params.is_empty();
@@ -1081,7 +1137,7 @@ fn collect_let_value_ids(block: &Block, out: &mut Vec<u32>) {
 
 fn collect_lets_in_expr(expr: &Expr, out: &mut Vec<u32>) {
     match &expr.kind {
-        ExprKind::IntLit(_) | ExprKind::BoolLit(_) | ExprKind::Var(_) => {}
+        ExprKind::IntLit(_) | ExprKind::NegIntLit(_) | ExprKind::BoolLit(_) | ExprKind::Var(_) => {}
         ExprKind::If(if_expr) => {
             collect_lets_in_expr(&if_expr.cond, out);
             collect_let_value_ids(if_expr.then_block.as_ref(), out);
@@ -2300,7 +2356,15 @@ fn codegen_expr(ctx: &mut FnCtx, expr: &Expr) -> Result<RType, Error> {
                 .as_ref()
                 .expect("typeck recorded this literal's type")
                 .clone();
-            emit_int_lit(ctx, &ty, *n);
+            emit_int_lit(ctx, &ty, *n, false);
+            Ok(ty)
+        }
+        ExprKind::NegIntLit(n) => {
+            let ty = ctx.expr_types[expr.id as usize]
+                .as_ref()
+                .expect("typeck recorded this literal's type")
+                .clone();
+            emit_int_lit(ctx, &ty, *n, true);
             Ok(ty)
         }
         ExprKind::Var(name) => codegen_var(ctx, name, expr.id),
@@ -2325,8 +2389,19 @@ fn codegen_expr(ctx: &mut FnCtx, expr: &Expr) -> Result<RType, Error> {
             // Same-flatten kinds (e.g. u8 ↔ i32) are no-ops since pocket-
             // rust stores all ≤32-bit integers in a wasm i32. Refs/raw
             // pointers are also i32 → no-op for those.
-            if let (RType::Int(src_k), RType::Int(tgt_k)) = (&src_ty, &target) {
-                emit_int_to_int_cast(ctx, src_k, tgt_k);
+            //
+            // `*T as <int>` — raw pointers flatten to i32 (wasm32
+            // address). Treat the source as `usize` (an unsigned i32)
+            // for sizing purposes; widen to i64 when the target is
+            // 64-bit, drop the high half for 8/16-bit targets, etc.
+            match (&src_ty, &target) {
+                (RType::Int(src_k), RType::Int(tgt_k)) => {
+                    emit_int_to_int_cast(ctx, src_k, tgt_k);
+                }
+                (RType::RawPtr { .. }, RType::Int(tgt_k)) => {
+                    emit_int_to_int_cast(ctx, &IntKind::Usize, tgt_k);
+                }
+                _ => {}
             }
             Ok(target)
         }
@@ -2475,6 +2550,11 @@ fn codegen_builtin(
         "alloc" => return codegen_builtin_alloc(ctx, args, node_id),
         "free" => return codegen_builtin_free(ctx, args, node_id),
         "cast" => return codegen_builtin_cast(ctx, args, node_id),
+        "ptr_usize_add" => return codegen_builtin_ptr_arith(ctx, args, node_id, PtrArith::Add),
+        "ptr_usize_sub" => return codegen_builtin_ptr_arith(ctx, args, node_id, PtrArith::Sub),
+        "ptr_isize_offset" => {
+            return codegen_builtin_ptr_arith(ctx, args, node_id, PtrArith::Add);
+        }
         _ => {}
     }
     // Codegen each arg in order. Each pushes its flattened scalar(s)
@@ -2677,6 +2757,38 @@ fn codegen_builtin_cast(
     node_id: crate::ast::NodeId,
 ) -> Result<RType, Error> {
     codegen_expr(ctx, &args[0])?;
+    let ty = ctx.expr_types[node_id as usize]
+        .as_ref()
+        .expect("typeck recorded the builtin's result type")
+        .clone();
+    Ok(ty)
+}
+
+#[derive(Copy, Clone)]
+enum PtrArith {
+    Add,
+    Sub,
+}
+
+// `¤ptr_usize_add(p, n) -> *X T`, `¤ptr_usize_sub(p, n) -> *X T`,
+// `¤ptr_isize_offset(p, n) -> *X T` — byte-wise pointer arithmetic.
+// Raw pointers and usize/isize all flatten to wasm `i32` on wasm32, so
+// each lowers to a single `i32.add` / `i32.sub`. Signed offsets use
+// the same unsigned add (two's-complement: `p + (-1i32 as i32)` adds
+// 0xFFFFFFFF, equivalent to `p - 1` in 32-bit arithmetic).
+fn codegen_builtin_ptr_arith(
+    ctx: &mut FnCtx,
+    args: &Vec<Expr>,
+    node_id: crate::ast::NodeId,
+    op: PtrArith,
+) -> Result<RType, Error> {
+    codegen_expr(ctx, &args[0])?;
+    codegen_expr(ctx, &args[1])?;
+    let inst = match op {
+        PtrArith::Add => wasm::Instruction::I32Add,
+        PtrArith::Sub => wasm::Instruction::I32Sub,
+    };
+    ctx.instructions.push(inst);
     let ty = ctx.expr_types[node_id as usize]
         .as_ref()
         .expect("typeck recorded the builtin's result type")
@@ -4327,7 +4439,7 @@ fn int_kind_signed(k: &IntKind) -> bool {
 // `<T as Num>::from_i64(literal_i64)`. Codegen emits an `i64.const`
 // (the only place a primitive integer constant is emitted now) and
 // calls the appropriate impl method, monomorphizing when needed.
-fn emit_int_lit(ctx: &mut FnCtx, ty: &RType, value: u64) {
+fn emit_int_lit(ctx: &mut FnCtx, ty: &RType, value: u64, negative: bool) {
     // Solve `<ty as Num>::from_i64`.
     let num_path = vec!["std".to_string(), "ops".to_string(), "Num".to_string()];
     let resolution = crate::typeck::solve_impl(&num_path, ty, ctx.traits, 0)
@@ -4366,8 +4478,16 @@ fn emit_int_lit(ctx: &mut FnCtx, ty: &RType, value: u64) {
     };
     // Push i64.const VALUE — the only direct integer-const emit; not
     // recursively desugared because it's the argument to from_i64.
+    // For `NegIntLit(N)` we pass `-N` (two's-complement i64). The
+    // typeck range-check already rejected unsigned and out-of-range
+    // signed targets.
+    let signed = if negative {
+        (value as i64).wrapping_neg()
+    } else {
+        value as i64
+    };
     ctx.instructions
-        .push(wasm::Instruction::I64Const(value as i64));
+        .push(wasm::Instruction::I64Const(signed));
     ctx.instructions.push(wasm::Instruction::Call(callee_idx));
 }
 

@@ -74,6 +74,35 @@ pub(super) fn int_kind_max(k: &IntKind) -> u128 {
     }
 }
 
+// Magnitude of the most-negative value representable in this kind:
+// for signed types `2^(bits-1)` (so `-2^(bits-1)` is in range);
+// `0` for unsigned types (no negative range). Used to range-check
+// `-N` literals against the resolved type.
+pub(super) fn int_kind_neg_magnitude(k: &IntKind) -> u128 {
+    match k {
+        IntKind::U8 | IntKind::U16 | IntKind::U32 | IntKind::U64 | IntKind::U128
+        | IntKind::Usize => 0,
+        IntKind::I8 => 1u128 << 7,
+        IntKind::I16 => 1u128 << 15,
+        IntKind::I32 => 1u128 << 31,
+        IntKind::I64 => 1u128 << 63,
+        IntKind::I128 => 1u128 << 127,
+        IntKind::Isize => 1u128 << 31,
+    }
+}
+
+pub(super) fn int_kind_signed(k: &IntKind) -> bool {
+    matches!(
+        k,
+        IntKind::I8
+            | IntKind::I16
+            | IntKind::I32
+            | IntKind::I64
+            | IntKind::I128
+            | IntKind::Isize
+    )
+}
+
 #[derive(Clone)]
 pub enum RType {
     Int(IntKind),
@@ -555,6 +584,10 @@ pub fn copy_trait_path() -> Vec<String> {
 
 pub fn drop_trait_path() -> Vec<String> {
     vec!["std".to_string(), "ops".to_string(), "Drop".to_string()]
+}
+
+pub fn num_trait_path() -> Vec<String> {
+    vec!["std".to_string(), "ops".to_string(), "Num".to_string()]
 }
 
 // Whether `t` implements `std::Drop`. Used by codegen to decide whether

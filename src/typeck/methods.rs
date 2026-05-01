@@ -1,9 +1,9 @@
 use super::{
     CheckCtx, InferType,
     LifetimeRepr, MethodCandidate, PendingMethodCall, PendingTraitDispatch,
-    RType, ReceiverAdjust,
+    RType, ReceiverAdjust, TraitTable,
     TraitReceiverShape, check_expr,
-    find_lifetime_source, find_method_candidates, infer_substitute, infer_to_string, is_mutable_place, place_to_string, resolve_type,
+    find_lifetime_source, find_method_candidates, infer_substitute, infer_to_string, is_mutable_place, num_trait_path, place_to_string, resolve_type,
     rtype_to_infer, supertrait_closure, trait_lookup, try_match_against_infer,
 };
 use crate::ast::Expr;
@@ -36,10 +36,10 @@ fn check_method_call_symbolic(
             });
         }
     };
-    // Find traits that declare this method.
-    let mut matching_traits: Vec<Vec<String>> = Vec::new();
+    // Find traits that declare this method by walking each bound's
+    // supertrait closure.
     let bounds = if idx < ctx.type_param_bounds.len() {
-        &ctx.type_param_bounds[idx]
+        ctx.type_param_bounds[idx].clone()
     } else {
         return Err(Error {
             file: ctx.current_file.to_string(),
@@ -50,15 +50,36 @@ fn check_method_call_symbolic(
             span: mc.method_span.copy(),
         });
     };
+    let matching_traits = collect_traits_declaring_method(ctx.traits, &bounds, &mc.method);
+    dispatch_method_through_trait(
+        ctx,
+        mc,
+        call_expr,
+        InferType::Param(param_name.clone()),
+        matching_traits,
+        recv_through_mut_ref,
+        param_name,
+    )
+}
+
+// Returns the trait paths (post supertrait-closure, deduped) that
+// declare `method`. Used by both the explicit bounded-param symbolic
+// dispatch path and the num-lit-var implicit-bound path below.
+fn collect_traits_declaring_method(
+    traits: &TraitTable,
+    starting_bounds: &Vec<Vec<String>>,
+    method: &str,
+) -> Vec<Vec<String>> {
+    let mut matching_traits: Vec<Vec<String>> = Vec::new();
     let mut bi = 0;
-    while bi < bounds.len() {
-        let closure = supertrait_closure(&bounds[bi], ctx.traits);
+    while bi < starting_bounds.len() {
+        let closure = supertrait_closure(&starting_bounds[bi], traits);
         let mut ci = 0;
         while ci < closure.len() {
-            if let Some(trait_entry) = trait_lookup(ctx.traits, &closure[ci]) {
+            if let Some(trait_entry) = trait_lookup(traits, &closure[ci]) {
                 let mut mi = 0;
                 while mi < trait_entry.methods.len() {
-                    if trait_entry.methods[mi].name == mc.method {
+                    if trait_entry.methods[mi].name == method {
                         let already = matching_traits.iter().any(|t| t == &closure[ci]);
                         if !already {
                             matching_traits.push(closure[ci].clone());
@@ -72,6 +93,29 @@ fn check_method_call_symbolic(
         }
         bi += 1;
     }
+    matching_traits
+}
+
+// Common dispatch logic for "method on a not-yet-pinned type": either
+// `Param(T)` with `T: Bound` (the explicit bounded-symbolic path) or
+// an unbound integer literal var with implicit `T: Num` (the num-lit
+// path).
+//
+// `recv_self_infer`: the Self type to substitute in the trait method's
+//   signature — `Param(name)` for the bounded path, `Var(v)` for the
+//   num-lit path. Borrowck/codegen apply the appropriate adjust later.
+// `display_name`: a name to mention in error messages (`"T"` for a
+//   user-typed param, `"integer"` for a num-lit var).
+fn dispatch_method_through_trait(
+    ctx: &mut CheckCtx,
+    mc: &crate::ast::MethodCall,
+    call_expr: &Expr,
+    recv_self_infer: InferType,
+    matching_traits: Vec<Vec<String>>,
+    recv_through_mut_ref: bool,
+    display_name: String,
+) -> Result<InferType, Error> {
+    let param_name = display_name;
     if matching_traits.is_empty() {
         return Err(Error {
             file: ctx.current_file.to_string(),
@@ -131,7 +175,7 @@ fn check_method_call_symbolic(
     // (`recv.bar::<u32>(...)`) pins them.
     let mut method_subst: Vec<(String, InferType)> = vec![(
         "Self".to_string(),
-        InferType::Param(param_name.clone()),
+        recv_self_infer.clone(),
     )];
     let mut method_type_var_ids: Vec<u32> = Vec::new();
     let mut tp = 0;
@@ -213,7 +257,7 @@ fn check_method_call_symbolic(
     // Ref<Param>) — codegen substitutes Param at mono time.
     let recv_for_storage = if recv_through_mut_ref {
         InferType::Ref {
-            inner: Box::new(InferType::Param(param_name.clone())),
+            inner: Box::new(recv_self_infer.clone()),
             mutable: true,
             lifetime: LifetimeRepr::Inferred(0),
         }
@@ -221,7 +265,7 @@ fn check_method_call_symbolic(
         // The original recv may have been `T` (consume) or `&T` (shared
         // ref); we surface T in either case here. Codegen reapplies the
         // appropriate adjustment.
-        InferType::Param(param_name.clone())
+        recv_self_infer.clone()
     };
     // T2.5: derive recv_adjust from the trait method's declared receiver
     // shape. For symbolic dispatch through a `Param(T)` recv, this drives
@@ -332,6 +376,52 @@ pub(super) fn check_method_call(
                 name.clone(),
                 *mutable,
             );
+        }
+    }
+    // Method on an unbound integer literal var (e.g. `30 + 12` or
+    // `(-x).foo()` where the literal hasn't been pinned yet). Treat
+    // it as if it had an implicit `T: Num` bound and dispatch through
+    // the Num + supertrait closure (so `add`/`sub` find VecSpace,
+    // `mul`/`div` find Num, etc.). The recv stays as the var; codegen
+    // picks up the concrete type after body-end pinning.
+    if let InferType::Var(v) = &resolved_recv {
+        if ctx.subst.is_num_lit[*v as usize] {
+            let num_path = num_trait_path();
+            let matching = collect_traits_declaring_method(
+                ctx.traits,
+                &vec![num_path],
+                &mc.method,
+            );
+            return dispatch_method_through_trait(
+                ctx,
+                mc,
+                call_expr,
+                InferType::Var(*v),
+                matching,
+                false,
+                "integer".to_string(),
+            );
+        }
+    }
+    if let InferType::Ref { inner, mutable, .. } = &resolved_recv {
+        if let InferType::Var(v) = inner.as_ref() {
+            if ctx.subst.is_num_lit[*v as usize] {
+                let num_path = num_trait_path();
+                let matching = collect_traits_declaring_method(
+                    ctx.traits,
+                    &vec![num_path],
+                    &mc.method,
+                );
+                return dispatch_method_through_trait(
+                    ctx,
+                    mc,
+                    call_expr,
+                    InferType::Var(*v),
+                    matching,
+                    *mutable,
+                    "integer".to_string(),
+                );
+            }
         }
     }
     // T2.6: classify recv into recv_kind plus a full + peeled InferType.

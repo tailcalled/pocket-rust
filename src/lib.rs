@@ -91,6 +91,7 @@ pub fn compile(
     let mut funcs = FuncTable {
         entries: Vec::new(),
         templates: Vec::new(),
+        inherent_synth_specs: Vec::new(),
     };
     let mut next_idx: u32 = 0;
     let mut wasm_mod = wasm::Module::new();
@@ -234,14 +235,24 @@ fn resolve_module(
                 name: child_name,
                 name_span: child_name_span,
             } => {
-                let child_path = compute_child_path(file_path, &child_name);
-                if vfs.get(&child_path).is_none() {
+                let (nested, sibling) = compute_child_paths(file_path, &child_name);
+                // Prefer the nested path (`<parent_stem>/<child>.rs`) when
+                // it exists. Falls back to the sibling path
+                // (`<child>.rs`) — the original behaviour.
+                let child_path = if vfs.get(&nested).is_some() {
+                    nested
+                } else if vfs.get(&sibling).is_some() {
+                    sibling
+                } else {
                     return Err(Error {
                         file: file_path.to_string(),
-                        message: format!("module file not found: `{}`", child_path),
+                        message: format!(
+                            "module file not found: tried `{}` and `{}`",
+                            nested, sibling
+                        ),
                         span: child_name_span,
                     });
-                }
+                };
                 let child = resolve_module(vfs, &child_path, &child_name, child_name_span)?;
                 items.push(Item::Module(child));
             }
@@ -255,9 +266,41 @@ fn resolve_module(
     })
 }
 
-fn compute_child_path(parent_path: &str, child_name: &str) -> String {
-    match parent_path.rfind('/') {
-        Some(idx) => format!("{}/{}.rs", &parent_path[..idx], child_name),
-        None => format!("{}.rs", child_name),
-    }
+// Two candidate paths for a `mod child;` declared inside `parent_path`:
+//
+// - `nested`:  `<dir>/<parent_stem>/<child>.rs` — the convention when
+//              the parent file has its own subdirectory of submodules
+//              (e.g. `lib/std/primitive.rs` + `lib/std/primitive/pointer.rs`).
+// - `sibling`: `<dir>/<child>.rs` — the convention when submodules sit
+//              flat next to their parent (e.g. `lib/std/lib.rs` +
+//              `lib/std/marker.rs`). Also used by crate-root files
+//              (`lib.rs`, `main.rs`).
+//
+// `resolve_module` prefers `nested` when it exists, otherwise tries
+// `sibling`. Both are returned so the error message at the call site
+// can name both candidates.
+fn compute_child_paths(parent_path: &str, child_name: &str) -> (String, String) {
+    let (dir, parent_stem) = match parent_path.rfind('/') {
+        Some(idx) => {
+            let dir = &parent_path[..idx];
+            let file = &parent_path[idx + 1..];
+            let stem = file.strip_suffix(".rs").unwrap_or(file);
+            (dir.to_string(), stem.to_string())
+        }
+        None => {
+            let stem = parent_path.strip_suffix(".rs").unwrap_or(parent_path);
+            ("".to_string(), stem.to_string())
+        }
+    };
+    let nested = if dir.is_empty() {
+        format!("{}/{}.rs", parent_stem, child_name)
+    } else {
+        format!("{}/{}/{}.rs", dir, parent_stem, child_name)
+    };
+    let sibling = if dir.is_empty() {
+        format!("{}.rs", child_name)
+    } else {
+        format!("{}/{}.rs", dir, child_name)
+    };
+    (nested, sibling)
 }

@@ -199,3 +199,37 @@ fn unsafe_does_not_extend_outside_block() {
         err
     );
 }
+
+#[test]
+fn unsafe_fn_call_outside_unsafe_is_rejected() {
+    // `byte_add` on `*mut u8` is `unsafe fn`. Calling it outside an
+    // `unsafe { … }` block must be rejected by safeck.
+    let err = compile_source(
+        "fn answer() -> u32 {
+             let p: *mut u8 = unsafe { ¤alloc(4) };
+             let _q: *mut u8 = p.byte_add(2);
+             unsafe { ¤free(p); }
+             0
+         }",
+    );
+    assert!(
+        err.contains("unsafe"),
+        "expected unsafe-fn-outside-block error, got: {}",
+        err
+    );
+}
+
+#[test]
+fn unsafe_fn_body_is_implicit_unsafe() {
+    // Inside the body of an `unsafe fn`, raw derefs and calls to
+    // other unsafe fns don't need an inner `unsafe` block.
+    let bytes = compile_inline(
+        "unsafe fn deref_raw(p: *const u32) -> u32 { *p }
+         fn answer() -> u32 {
+             let x: u32 = 42;
+             let p: *const u32 = &x as *const u32;
+             unsafe { deref_raw(p) }
+         }",
+    );
+    assert_eq!(answer_u32(&bytes), 42);
+}

@@ -66,7 +66,9 @@ impl Parser {
             // `pub mod` is accepted but currently has no extra effect —
             // module items inside still carry their own `pub`.
             self.parse_mod_decl()
-        } else if self.peek_kind(&TokenKind::Fn) {
+        } else if self.peek_kind(&TokenKind::Fn) || self.peek_kind(&TokenKind::Unsafe) {
+            // `parse_function_with_vis` handles the optional leading
+            // `unsafe` token before `fn`.
             Ok(RawItem::Function(self.parse_function_with_vis(is_pub)?))
         } else if self.peek_kind(&TokenKind::Struct) {
             Ok(RawItem::Struct(self.parse_struct_def_with_vis(is_pub)?))
@@ -251,7 +253,15 @@ impl Parser {
             } else {
                 false
             };
-            if !self.peek_kind(&TokenKind::Fn) {
+            // `parse_function_with_vis` consumes an optional leading
+            // `unsafe` token before `fn`; we just need to look past
+            // that here when checking for the `fn` keyword.
+            let next = if self.peek_kind(&TokenKind::Unsafe) {
+                self.pos + 1
+            } else {
+                self.pos
+            };
+            if next >= self.tokens.len() || !matches!(self.tokens[next].kind, TokenKind::Fn) {
                 return Err(self.error_at_current("expected `fn` inside `impl` block"));
             }
             methods.push(self.parse_function_with_vis(method_is_pub)?);
@@ -533,6 +543,15 @@ impl Parser {
     }
 
     fn parse_function_with_vis(&mut self, is_pub: bool) -> Result<Function, Error> {
+        // Optional `unsafe` modifier before `fn`. `pub unsafe fn` /
+        // `unsafe fn` both work; `unsafe pub fn` is rejected (Rust's
+        // canonical order is `pub unsafe fn`).
+        let is_unsafe = if self.peek_kind(&TokenKind::Unsafe) {
+            self.pos += 1;
+            true
+        } else {
+            false
+        };
         self.expect(&TokenKind::Fn, "`fn`")?;
         let (name, name_span) = self.expect_ident()?;
         let (lifetime_params, type_params) = if self.peek_kind(&TokenKind::LAngle) {
@@ -569,6 +588,7 @@ impl Parser {
             body,
             node_count,
             is_pub,
+            is_unsafe,
         })
     }
 
@@ -1401,6 +1421,53 @@ impl Parser {
             let id = self.alloc_node_id();
             return Ok(Expr {
                 kind: ExprKind::Deref(Box::new(inner)),
+                span,
+                id,
+            });
+        }
+        // Unary minus. Two cases:
+        //   - `-INT_LIT` collapses to a single `NegIntLit(value)`
+        //     where `value` is the absolute magnitude. This is what
+        //     makes `i32::MIN` expressible: `-2147483648` is in
+        //     `i32`'s range, but `2147483648` (the magnitude alone)
+        //     overflows `i32`'s positive range, so the
+        //     `2147483648.neg()` desugar would fail the literal's
+        //     range check before `neg` ever ran. `NegIntLit` carries
+        //     the negative sign through inference so the body-end
+        //     range check sees `-2147483648` against `i32`'s full
+        //     range.
+        //   - `-other_expr` desugars to `other_expr.neg()` —
+        //     `VecSpace::neg`, of which `Num` is a subtrait, so
+        //     every numeric kind plus any user `impl VecSpace` works.
+        // Bound tighter than additive (`-a + b` parses as `(-a) + b`).
+        if self.peek_kind(&TokenKind::Minus) {
+            let op_span = self.expect(&TokenKind::Minus, "`-`")?;
+            // Special case `-INT_LIT`.
+            if self.pos < self.tokens.len() {
+                if let TokenKind::IntLit(n) = &self.tokens[self.pos].kind {
+                    let value = *n;
+                    let lit_span = self.tokens[self.pos].span.copy();
+                    self.pos += 1;
+                    let span = Span::new(op_span.start.copy(), lit_span.end.copy());
+                    let id = self.alloc_node_id();
+                    return Ok(Expr {
+                        kind: ExprKind::NegIntLit(value),
+                        span,
+                        id,
+                    });
+                }
+            }
+            let inner = self.parse_unary()?;
+            let span = Span::new(op_span.start.copy(), inner.span.end.copy());
+            let id = self.alloc_node_id();
+            return Ok(Expr {
+                kind: ExprKind::MethodCall(MethodCall {
+                    receiver: Box::new(inner),
+                    method: "neg".to_string(),
+                    method_span: op_span,
+                    turbofish_args: Vec::new(),
+                    args: Vec::new(),
+                }),
                 span,
                 id,
             });
