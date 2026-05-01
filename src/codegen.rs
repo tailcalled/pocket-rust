@@ -5,8 +5,8 @@ use crate::ast::{
 use crate::span::Error;
 use crate::typeck::{
     CallResolution, FuncTable, GenericTemplate, IntKind, MethodResolution, RType, ReceiverAdjust,
-    StructTable, byte_size_of, clone_path, flatten_rtype, func_lookup, is_ref_mutable,
-    resolve_type, rtype_clone, rtype_eq, struct_lookup, substitute_rtype,
+    StructTable, byte_size_of, flatten_rtype, func_lookup, is_ref_mutable,
+    resolve_type, rtype_eq, struct_lookup, substitute_rtype,
 };
 use crate::wasm;
 
@@ -61,7 +61,7 @@ impl MonoState {
         let idx = self.next_idx;
         self.next_idx += 1;
         self.map_template.push(template_idx);
-        self.map_args.push(rtype_vec_clone(&type_args));
+        self.map_args.push(type_args.clone());
         self.map_idx.push(idx);
         self.queue.push(MonoWork {
             template_idx,
@@ -95,20 +95,10 @@ fn make_struct_env(type_params: &Vec<String>, type_args: &Vec<RType>) -> Vec<(St
     };
     let mut i = 0;
     while i < n {
-        env.push((type_params[i].clone(), rtype_clone(&type_args[i])));
+        env.push((type_params[i].clone(), type_args[i].clone()));
         i += 1;
     }
     env
-}
-
-fn rtype_vec_clone(v: &Vec<RType>) -> Vec<RType> {
-    let mut out: Vec<RType> = Vec::new();
-    let mut i = 0;
-    while i < v.len() {
-        out.push(rtype_clone(&v[i]));
-        i += 1;
-    }
-    out
 }
 
 pub fn emit(
@@ -825,8 +815,8 @@ fn emit_module(
                 } else {
                     None
                 };
-                let mut method_prefix = clone_path(path);
-                let mut target_path = clone_path(path);
+                let mut method_prefix = path.clone();
+                let mut target_path = path.clone();
                 let target_rt: RType = match &target_name {
                     Some(name) => {
                         method_prefix.push(name.clone());
@@ -855,7 +845,7 @@ fn emit_module(
                         let idx = trait_impl_idx
                             .expect("non-Path impl target must be a trait impl with a registered row");
                         method_prefix.push(format!("__trait_impl_{}", idx));
-                        rtype_clone(&traits.impls[idx].target)
+                        traits.impls[idx].target.clone()
                     }
                 };
                 let impl_is_generic = !ib.type_params.is_empty();
@@ -907,8 +897,8 @@ fn emit_monomorphic(
     let param_types = subst_vec(&tmpl.param_types, &env);
     let return_type = tmpl.return_type.as_ref().map(|t| substitute_rtype(t, &env));
     let expr_types = subst_opt_vec(&tmpl.expr_types, &env);
-    let method_resolutions = opt_method_resolutions_clone(&tmpl.method_resolutions, &env);
-    let call_resolutions = opt_call_resolutions_clone(&tmpl.call_resolutions, &env);
+    let method_resolutions = subst_opt_method_resolutions(&tmpl.method_resolutions, &env);
+    let call_resolutions = subst_opt_call_resolutions(&tmpl.call_resolutions, &env);
     // Move tracking is independent of concrete type args — the template's
     // snapshot from borrowck applies to every monomorphization.
     let moved_places = clone_moved_places(&tmpl.moved_places);
@@ -959,84 +949,46 @@ fn subst_opt_vec(v: &Vec<Option<RType>>, env: &Vec<(String, RType)>) -> Vec<Opti
     out
 }
 
-fn opt_vec_clone(v: &Vec<Option<RType>>) -> Vec<Option<RType>> {
-    let mut out: Vec<Option<RType>> = Vec::new();
-    let mut i = 0;
-    while i < v.len() {
-        match &v[i] {
-            Some(t) => out.push(Some(rtype_clone(t))),
-            None => out.push(None),
-        }
-        i += 1;
-    }
-    out
-}
-
-fn opt_method_resolutions_clone(
+fn subst_opt_method_resolutions(
     v: &Vec<Option<MethodResolution>>,
     env: &Vec<(String, RType)>,
 ) -> Vec<Option<MethodResolution>> {
     let mut out: Vec<Option<MethodResolution>> = Vec::new();
-    let mut i = 0;
-    while i < v.len() {
-        match &v[i] {
-            Some(m) => {
-                let mut subst_args: Vec<RType> = Vec::new();
-                let mut j = 0;
-                while j < m.type_args.len() {
-                    subst_args.push(substitute_rtype(&m.type_args[j], env));
-                    j += 1;
-                }
-                let trait_dispatch = match &m.trait_dispatch {
-                    Some(td) => Some(crate::typeck::TraitDispatch {
-                        trait_path: clone_path(&td.trait_path),
-                        method_name: td.method_name.clone(),
-                        recv_type: substitute_rtype(&td.recv_type, env),
-                    }),
-                    None => None,
-                };
-                out.push(Some(MethodResolution {
-                    callee_idx: m.callee_idx,
-                    callee_path: clone_path(&m.callee_path),
-                    recv_adjust: copy_recv_adjust(&m.recv_adjust),
-                    ret_borrows_receiver: m.ret_borrows_receiver,
-                    template_idx: m.template_idx,
-                    type_args: subst_args,
-                    trait_dispatch,
-                }));
+    for entry in v {
+        out.push(entry.as_ref().map(|m| {
+            let mut cloned = m.clone();
+            cloned.type_args = subst_vec(&m.type_args, env);
+            if let Some(td) = &m.trait_dispatch {
+                cloned.trait_dispatch = Some(crate::typeck::TraitDispatch {
+                    trait_path: td.trait_path.clone(),
+                    method_name: td.method_name.clone(),
+                    recv_type: substitute_rtype(&td.recv_type, env),
+                });
             }
-            None => out.push(None),
-        }
-        i += 1;
+            cloned
+        }));
     }
     out
 }
 
-fn opt_call_resolutions_clone(
+fn subst_opt_call_resolutions(
     v: &Vec<Option<CallResolution>>,
     env: &Vec<(String, RType)>,
 ) -> Vec<Option<CallResolution>> {
     let mut out: Vec<Option<CallResolution>> = Vec::new();
-    let mut i = 0;
-    while i < v.len() {
-        match &v[i] {
-            Some(CallResolution::Direct(idx)) => out.push(Some(CallResolution::Direct(*idx))),
-            Some(CallResolution::Generic { template_idx, type_args }) => {
-                out.push(Some(CallResolution::Generic {
-                    template_idx: *template_idx,
-                    type_args: subst_vec(type_args, env),
-                }));
-            }
-            Some(CallResolution::Variant { enum_path, disc, type_args }) => {
-                out.push(Some(CallResolution::Variant {
-                    enum_path: clone_path(enum_path),
-                    disc: *disc,
-                    type_args: subst_vec(type_args, env),
-                }));
-            }
-            None => out.push(None),
-        }
-        i += 1;
+    for entry in v {
+        out.push(entry.as_ref().map(|cr| match cr {
+            CallResolution::Direct(idx) => CallResolution::Direct(*idx),
+            CallResolution::Generic { template_idx, type_args } => CallResolution::Generic {
+                template_idx: *template_idx,
+                type_args: subst_vec(type_args, env),
+            },
+            CallResolution::Variant { enum_path, disc, type_args } => CallResolution::Variant {
+                enum_path: enum_path.clone(),
+                disc: *disc,
+                type_args: subst_vec(type_args, env),
+            },
+        }));
     }
     out
 }
@@ -1045,7 +997,7 @@ fn build_env(type_params: &Vec<String>, type_args: &Vec<RType>) -> Vec<(String, 
     let mut env: Vec<(String, RType)> = Vec::new();
     let mut i = 0;
     while i < type_params.len() {
-        env.push((type_params[i].clone(), rtype_clone(&type_args[i])));
+        env.push((type_params[i].clone(), type_args[i].clone()));
         i += 1;
     }
     env
@@ -1152,15 +1104,6 @@ fn collect_lets_in_expr(expr: &Expr, out: &mut Vec<u32>) {
     }
 }
 
-fn copy_recv_adjust(r: &ReceiverAdjust) -> ReceiverAdjust {
-    match r {
-        ReceiverAdjust::Move => ReceiverAdjust::Move,
-        ReceiverAdjust::BorrowImm => ReceiverAdjust::BorrowImm,
-        ReceiverAdjust::BorrowMut => ReceiverAdjust::BorrowMut,
-        ReceiverAdjust::ByRef => ReceiverAdjust::ByRef,
-    }
-}
-
 fn emit_function(
     wasm_mod: &mut wasm::Module,
     func: &Function,
@@ -1173,17 +1116,17 @@ fn emit_function(
     funcs: &FuncTable,
     mono: &mut MonoState,
 ) -> Result<(), Error> {
-    let mut full = clone_path(path_prefix);
+    let mut full = path_prefix.clone();
     full.push(func.name.clone());
     let entry = func_lookup(funcs, &full).expect("typeck registered this function");
     // Snapshot all artifacts before entering the concrete emitter (which takes
     // them by-value). For non-generic fns these are the entry's data; the env
     // is empty (no Param substitution to do).
-    let param_types = rtype_vec_clone(&entry.param_types);
-    let return_type = entry.return_type.as_ref().map(rtype_clone);
-    let expr_types = opt_vec_clone(&entry.expr_types);
-    let method_resolutions = opt_method_resolutions_clone(&entry.method_resolutions, &Vec::new());
-    let call_resolutions = opt_call_resolutions_clone(&entry.call_resolutions, &Vec::new());
+    let param_types = entry.param_types.clone();
+    let return_type = entry.return_type.clone();
+    let expr_types = entry.expr_types.clone();
+    let method_resolutions = entry.method_resolutions.clone();
+    let call_resolutions = entry.call_resolutions.clone();
     let moved_places = clone_moved_places(&entry.moved_places);
     let move_sites = clone_move_sites(&entry.move_sites);
     let wasm_idx = entry.idx;
@@ -1321,7 +1264,7 @@ fn emit_function_concrete(
     let mut locals: Vec<LocalBinding> = Vec::new();
     let mut k = 0;
     while k < func.params.len() {
-        let pty = rtype_clone(&param_types[k]);
+        let pty = param_types[k].clone();
         let storage = match &param_offsets[k] {
             Some(off) => Storage::Memory { frame_offset: *off },
             None => {
@@ -1382,13 +1325,13 @@ fn emit_function_concrete(
         enums,
         traits,
         funcs,
-        current_module: clone_path(current_module),
+        current_module: current_module.clone(),
         expr_types,
         let_offsets,
         pattern_addressed: address_info.pattern_addressed.clone(),
         method_resolutions,
         call_resolutions,
-        self_target: self_target.map(|rt| rtype_clone(rt)),
+        self_target: self_target.cloned(),
         moved_places,
         move_sites,
         drop_flags: Vec::new(),
@@ -1429,7 +1372,7 @@ fn emit_function_concrete(
         let mut p = 0;
         let mut wasm_local_cursor: u32 = 0;
         while p < func.params.len() {
-            let pty = rtype_clone(&ctx.locals[p].rtype);
+            let pty = ctx.locals[p].rtype.clone();
             let mut vts: Vec<wasm::ValType> = Vec::new();
             flatten_rtype(&pty, structs, &mut vts);
             let flat_size = vts.len() as u32;
@@ -1459,7 +1402,7 @@ fn emit_function_concrete(
     let mut p = 0;
     while p < func.params.len() {
         let local_name = ctx.locals[p].name.clone();
-        let rt = rtype_clone(&ctx.locals[p].rtype);
+        let rt = ctx.locals[p].rtype.clone();
         if needs_drop_flag(&ctx.moved_places, &local_name, &rt, ctx.traits) {
             let flag_idx = ctx.next_wasm_local;
             ctx.extra_locals.push(wasm::ValType::I32);
@@ -1640,7 +1583,7 @@ fn emit_drops_for_locals_range(ctx: &mut FnCtx, from: usize, to: usize) -> Resul
     let mut i = to;
     while i > from {
         i -= 1;
-        let rt = rtype_clone(&ctx.locals[i].rtype);
+        let rt = ctx.locals[i].rtype.clone();
         if !crate::typeck::is_drop(&rt, ctx.traits) {
             continue;
         }
@@ -1722,7 +1665,7 @@ fn emit_drop_call_for_local(
                 let mut j = 0;
                 while j < resolution.subst.len() {
                     if resolution.subst[j].0 == *name {
-                        found = Some(rtype_clone(&resolution.subst[j].1));
+                        found = Some(resolution.subst[j].1.clone());
                         break;
                     }
                     j += 1;
@@ -1751,11 +1694,10 @@ fn emit_drop_call_for_local(
 fn codegen_let_stmt(ctx: &mut FnCtx, let_stmt: &LetStmt) -> Result<(), Error> {
     codegen_expr(ctx, &let_stmt.value)?;
     let value_id = let_stmt.value.id as usize;
-    let value_ty = rtype_clone(
-        ctx.expr_types[value_id]
-            .as_ref()
-            .expect("typeck recorded the let's type"),
-    );
+    let value_ty = ctx.expr_types[value_id]
+        .as_ref()
+        .expect("typeck recorded the let's type")
+        .clone();
     let frame_offset_opt = ctx.let_offsets[value_id];
 
     match frame_offset_opt {
@@ -1764,7 +1706,7 @@ fn codegen_let_stmt(ctx: &mut FnCtx, let_stmt: &LetStmt) -> Result<(), Error> {
             store_flat_to_memory(ctx, &value_ty, BaseAddr::StackPointer, frame_offset);
             ctx.locals.push(LocalBinding {
                 name: let_stmt.name.clone(),
-                rtype: rtype_clone(&value_ty),
+                rtype: value_ty.clone(),
                 storage: Storage::Memory { frame_offset },
             });
         }
@@ -1788,7 +1730,7 @@ fn codegen_let_stmt(ctx: &mut FnCtx, let_stmt: &LetStmt) -> Result<(), Error> {
             }
             ctx.locals.push(LocalBinding {
                 name: let_stmt.name.clone(),
-                rtype: rtype_clone(&value_ty),
+                rtype: value_ty.clone(),
                 storage: Storage::Local {
                     wasm_start: start,
                     flat_size,
@@ -1854,7 +1796,7 @@ fn codegen_assign_stmt(ctx: &mut FnCtx, assign: &AssignStmt) -> Result<(), Error
         unreachable!("typeck verified the binding exists");
     }
 
-    let root_ty = rtype_clone(&ctx.locals[binding_idx].rtype);
+    let root_ty = ctx.locals[binding_idx].rtype.clone();
     let through_mut_ref = matches!(&root_ty, RType::Ref { mutable: true, .. });
 
     // Walk the chain to determine the byte offset and the target field's type.
@@ -1862,19 +1804,19 @@ fn codegen_assign_stmt(ctx: &mut FnCtx, assign: &AssignStmt) -> Result<(), Error
     // are relative to the pointed-at value.
     let mut current_ty = if through_mut_ref {
         match &root_ty {
-            RType::Ref { inner, .. } => rtype_clone(inner),
+            RType::Ref { inner, .. } => (**inner).clone(),
             _ => unreachable!(),
         }
     } else {
-        rtype_clone(&root_ty)
+        root_ty.clone()
     };
     let mut chain_offset: u32 = 0;
     let mut i = 1;
     while i < chain.len() {
         match &current_ty {
             RType::Struct { path, type_args, .. } => {
-                let struct_path = clone_path(path);
-                let struct_args = rtype_vec_clone(type_args);
+                let struct_path = path.clone();
+                let struct_args = type_args.clone();
                 let entry = struct_lookup(ctx.structs, &struct_path).expect("resolved struct");
                 let env = make_struct_env(&entry.type_params, &struct_args);
                 let mut field_offset: u32 = 0;
@@ -1897,7 +1839,7 @@ fn codegen_assign_stmt(ctx: &mut FnCtx, assign: &AssignStmt) -> Result<(), Error
                 }
             }
             RType::Tuple(elems) => {
-                let elems = rtype_vec_clone(elems);
+                let elems = elems.clone();
                 let idx: usize = chain[i]
                     .parse()
                     .expect("typeck verified tuple-index segment");
@@ -1908,7 +1850,7 @@ fn codegen_assign_stmt(ctx: &mut FnCtx, assign: &AssignStmt) -> Result<(), Error
                     j += 1;
                 }
                 chain_offset += elem_offset;
-                current_ty = rtype_clone(&elems[idx]);
+                current_ty = elems[idx].clone();
             }
             _ => unreachable!("typeck verified chain navigates structs/tuples"),
         }
@@ -1969,14 +1911,14 @@ fn codegen_assign_stmt(ctx: &mut FnCtx, assign: &AssignStmt) -> Result<(), Error
 // return the flat-scalar offset of the chain's tail within the binding's flat
 // representation. (Flat scalars, not bytes — for WASM-local storage.)
 fn flat_chain_offset(ctx: &FnCtx, chain: &Vec<String>, binding_idx: usize) -> u32 {
-    let mut current_ty = rtype_clone(&ctx.locals[binding_idx].rtype);
+    let mut current_ty = ctx.locals[binding_idx].rtype.clone();
     let mut flat_off: u32 = 0;
     let mut i = 1;
     while i < chain.len() {
         match &current_ty {
             RType::Struct { path, type_args, .. } => {
-                let struct_path = clone_path(path);
-                let struct_args = rtype_vec_clone(type_args);
+                let struct_path = path.clone();
+                let struct_args = type_args.clone();
                 let entry = struct_lookup(ctx.structs, &struct_path).expect("resolved struct");
                 let env = make_struct_env(&entry.type_params, &struct_args);
                 let mut field_flat_off: u32 = 0;
@@ -2001,7 +1943,7 @@ fn flat_chain_offset(ctx: &FnCtx, chain: &Vec<String>, binding_idx: usize) -> u3
                 }
             }
             RType::Tuple(elems) => {
-                let elems = rtype_vec_clone(elems);
+                let elems = elems.clone();
                 let idx: usize = chain[i]
                     .parse()
                     .expect("typeck verified tuple-index segment");
@@ -2012,7 +1954,7 @@ fn flat_chain_offset(ctx: &FnCtx, chain: &Vec<String>, binding_idx: usize) -> u3
                     flat_off += vts.len() as u32;
                     j += 1;
                 }
-                current_ty = rtype_clone(&elems[idx]);
+                current_ty = elems[idx].clone();
             }
             _ => unreachable!("typeck verified chain navigates structs/tuples"),
         }
@@ -2058,7 +2000,7 @@ fn codegen_deref_assign(
     // Compute the address: codegen the deref-inner (pushes i32) and stash.
     let inner_ty = codegen_expr(ctx, deref_inner)?;
     let pointee = match &inner_ty {
-        RType::Ref { inner, .. } | RType::RawPtr { inner, .. } => rtype_clone(inner),
+        RType::Ref { inner, .. } | RType::RawPtr { inner, .. } => (**inner).clone(),
         _ => unreachable!("typeck verified deref target is a ref/raw-ptr"),
     };
     let addr_local = ctx.next_wasm_local;
@@ -2074,7 +2016,7 @@ fn codegen_deref_assign(
     let mut i = 0;
     while i < fields.len() {
         let (struct_path, struct_args) = match &current_ty {
-            RType::Struct { path, type_args, .. } => (clone_path(path), rtype_vec_clone(type_args)),
+            RType::Struct { path, type_args, .. } => (path.clone(), type_args.clone()),
             _ => unreachable!("typeck verified chain navigates structs"),
         };
         let entry = struct_lookup(ctx.structs, &struct_path).expect("resolved struct");
@@ -2144,11 +2086,10 @@ fn extract_place(expr: &Expr) -> Option<Vec<String>> {
 fn codegen_expr(ctx: &mut FnCtx, expr: &Expr) -> Result<RType, Error> {
     match &expr.kind {
         ExprKind::IntLit(n) => {
-            let ty = rtype_clone(
-                ctx.expr_types[expr.id as usize]
-                    .as_ref()
-                    .expect("typeck recorded this literal's type"),
-            );
+            let ty = ctx.expr_types[expr.id as usize]
+                .as_ref()
+                .expect("typeck recorded this literal's type")
+                .clone();
             emit_int_lit(ctx, &ty, *n);
             Ok(ty)
         }
@@ -2162,11 +2103,10 @@ fn codegen_expr(ctx: &mut FnCtx, expr: &Expr) -> Result<RType, Error> {
             // The cast's resolved target type was recorded by typeck on
             // this Cast expr's NodeId — using it directly avoids a
             // re-resolution that would need its own use-scope wiring.
-            let target = rtype_clone(
-                ctx.expr_types[expr.id as usize]
-                    .as_ref()
-                    .expect("typeck recorded the cast's target type"),
-            );
+            let target = ctx.expr_types[expr.id as usize]
+                .as_ref()
+                .expect("typeck recorded the cast's target type")
+                .clone();
             // Apply the monomorphization env in case the cast target
             // contains a `Param` (e.g. inside a generic body).
             let target = substitute_rtype(&target, &ctx.env);
@@ -2247,9 +2187,9 @@ fn extract_tuple_elem_from_stack(
     index: u32,
 ) -> Result<RType, Error> {
     let elems: Vec<RType> = match base_type {
-        RType::Tuple(elems) => rtype_vec_clone(elems),
+        RType::Tuple(elems) => elems.clone(),
         RType::Ref { inner, .. } => match inner.as_ref() {
-            RType::Tuple(elems) => rtype_vec_clone(elems),
+            RType::Tuple(elems) => elems.clone(),
             _ => unreachable!("typeck rejects tuple-index on non-tuple"),
         },
         _ => unreachable!("typeck rejects tuple-index on non-tuple"),
@@ -2266,7 +2206,7 @@ fn extract_tuple_elem_from_stack(
         if i as u32 == index {
             field_flat_off = total_flat;
             field_valtypes = vts;
-            field_ty = rtype_clone(&elems[i]);
+            field_ty = elems[i].clone();
         }
         total_flat += s;
         i += 1;
@@ -2330,11 +2270,10 @@ fn codegen_builtin(
     if matches!(ty_name, "u128" | "i128") {
         let signed = ty_name == "i128";
         codegen_builtin_128(ctx, op, signed);
-        let ty = rtype_clone(
-            ctx.expr_types[node_id as usize]
-                .as_ref()
-                .expect("typeck recorded the builtin's result type"),
-        );
+        let ty = ctx.expr_types[node_id as usize]
+            .as_ref()
+            .expect("typeck recorded the builtin's result type")
+            .clone();
         return Ok(ty);
     }
     // Pick the wasm class. bool and ≤32-bit ints use I32 ops; 64-bit
@@ -2403,11 +2342,10 @@ fn codegen_builtin(
         _ => unreachable!("unknown builtin (typeck should have rejected): ¤{}", name),
     };
     ctx.instructions.push(inst);
-    let ty = rtype_clone(
-        ctx.expr_types[node_id as usize]
-            .as_ref()
-            .expect("typeck recorded the builtin's result type"),
-    );
+    let ty = ctx.expr_types[node_id as usize]
+        .as_ref()
+        .expect("typeck recorded the builtin's result type")
+        .clone();
     Ok(ty)
 }
 
@@ -2614,16 +2552,15 @@ fn codegen_if_expr(
 ) -> Result<RType, Error> {
     // Evaluate the condition (an i32 0/1) onto the stack.
     let _ = codegen_expr(ctx, &if_expr.cond)?;
-    let result_ty = rtype_clone(
-        ctx.expr_types[if_node_id as usize]
-            .as_ref()
-            .expect("typeck recorded the if's type"),
-    );
+    let result_ty = ctx.expr_types[if_node_id as usize]
+        .as_ref()
+        .expect("typeck recorded the if's type")
+        .clone();
     let mut flat: Vec<wasm::ValType> = Vec::new();
     crate::typeck::flatten_rtype(&result_ty, ctx.structs, &mut flat);
     let bt = match flat.len() {
         0 => wasm::BlockType::Empty,
-        1 => wasm::BlockType::Single(val_type_copy(&flat[0])),
+        1 => wasm::BlockType::Single(flat[0]),
         _ => {
             // Multi-value `if` — register a FuncType (no params, these
             // results) and refer to it by index. We dedupe against
@@ -2632,7 +2569,7 @@ fn codegen_if_expr(
             // `wasm_mod.types` at function-emit-end.
             let ft = wasm::FuncType {
                 params: Vec::new(),
-                results: copy_val_type_vec(&flat),
+                results: flat.clone(),
             };
             let mut found: Option<u32> = None;
             let mut k = 0;
@@ -2686,17 +2623,15 @@ fn codegen_match_expr(
     m: &crate::ast::MatchExpr,
     match_node_id: crate::ast::NodeId,
 ) -> Result<RType, Error> {
-    let result_ty = rtype_clone(
-        ctx.expr_types[match_node_id as usize]
-            .as_ref()
-            .expect("typeck recorded the match's type"),
-    );
+    let result_ty = ctx.expr_types[match_node_id as usize]
+        .as_ref()
+        .expect("typeck recorded the match's type")
+        .clone();
     let result_ty = substitute_rtype(&result_ty, &ctx.env);
-    let scrut_ty = rtype_clone(
-        ctx.expr_types[m.scrutinee.id as usize]
-            .as_ref()
-            .expect("typeck recorded the scrutinee's type"),
-    );
+    let scrut_ty = ctx.expr_types[m.scrutinee.id as usize]
+        .as_ref()
+        .expect("typeck recorded the scrutinee's type")
+        .clone();
     let scrut_ty = substitute_rtype(&scrut_ty, &ctx.env);
     // Codegen the scrutinee (pushes its flat scalars or, for enums, its
     // address). Stash into wasm locals for stable read/re-read.
@@ -2781,17 +2716,15 @@ fn codegen_if_let_expr(
     il: &crate::ast::IfLetExpr,
     if_let_node_id: crate::ast::NodeId,
 ) -> Result<RType, Error> {
-    let result_ty = rtype_clone(
-        ctx.expr_types[if_let_node_id as usize]
-            .as_ref()
-            .expect("typeck recorded the if-let's type"),
-    );
+    let result_ty = ctx.expr_types[if_let_node_id as usize]
+        .as_ref()
+        .expect("typeck recorded the if-let's type")
+        .clone();
     let result_ty = substitute_rtype(&result_ty, &ctx.env);
-    let scrut_ty = rtype_clone(
-        ctx.expr_types[il.scrutinee.id as usize]
-            .as_ref()
-            .expect("typeck recorded the scrutinee's type"),
-    );
+    let scrut_ty = ctx.expr_types[il.scrutinee.id as usize]
+        .as_ref()
+        .expect("typeck recorded the scrutinee's type")
+        .clone();
     let scrut_ty = substitute_rtype(&scrut_ty, &ctx.env);
     let _ = codegen_expr(ctx, &il.scrutinee)?;
     let is_enum_scrut = matches!(&scrut_ty, RType::Enum { .. });
@@ -2878,7 +2811,7 @@ fn stash_match_scrutinee(ctx: &mut FnCtx, ty: &RType) -> PatScrut {
         let start = ctx.next_wasm_local;
         let mut k = 0;
         while k < vts.len() {
-            ctx.extra_locals.push(val_type_copy(&vts[k]));
+            ctx.extra_locals.push(vts[k]);
             ctx.next_wasm_local += 1;
             k += 1;
         }
@@ -2898,11 +2831,11 @@ fn block_type_for(ctx: &mut FnCtx, ty: &RType) -> wasm::BlockType {
     crate::typeck::flatten_rtype(ty, ctx.structs, &mut flat);
     match flat.len() {
         0 => wasm::BlockType::Empty,
-        1 => wasm::BlockType::Single(val_type_copy(&flat[0])),
+        1 => wasm::BlockType::Single(flat[0]),
         _ => {
             let ft = wasm::FuncType {
                 params: Vec::new(),
-                results: copy_val_type_vec(&flat),
+                results: flat.clone(),
             };
             let mut found: Option<u32> = None;
             let mut k = 0;
@@ -3000,7 +2933,7 @@ fn codegen_pattern(
         PatternKind::Tuple(elems) => {
             // Recurse into each element's sub-storage.
             let elem_tys = match &resolved_scrut {
-                RType::Tuple(es) => rtype_vec_clone(es),
+                RType::Tuple(es) => es.clone(),
                 _ => unreachable!("typeck verified tuple pattern matches tuple type"),
             };
             // Sub-storage for each element.
@@ -3039,7 +2972,7 @@ fn codegen_pattern(
             // against the pointee, switch to Memory storage rooted at
             // that address.
             let inner_ty = match &resolved_scrut {
-                RType::Ref { inner, .. } => rtype_clone(inner),
+                RType::Ref { inner, .. } => (**inner).clone(),
                 _ => unreachable!("typeck verified ref pattern matches ref type"),
             };
             // Push the address scalar from storage and stash to a fresh local.
@@ -3338,7 +3271,7 @@ fn bind_pattern_ref(
     mutable: bool,
 ) {
     let ref_ty = RType::Ref {
-        inner: Box::new(rtype_clone(ty)),
+        inner: Box::new(ty.clone()),
         mutable,
         lifetime: crate::typeck::LifetimeRepr::Inferred(0),
     };
@@ -3404,7 +3337,7 @@ fn bind_pattern_value(
         }
         ctx.locals.push(LocalBinding {
             name: name.to_string(),
-            rtype: rtype_clone(ty),
+            rtype: ty.clone(),
             storage: Storage::Local {
                 wasm_start: dest,
                 flat_size: 1,
@@ -3465,7 +3398,7 @@ fn bind_pattern_value(
         }
         ctx.locals.push(LocalBinding {
             name: name.to_string(),
-            rtype: rtype_clone(ty),
+            rtype: ty.clone(),
             storage: Storage::MemoryAt { addr_local },
         });
         return;
@@ -3475,7 +3408,7 @@ fn bind_pattern_value(
     let dest_start = ctx.next_wasm_local;
     let mut k = 0;
     while k < vts.len() {
-        ctx.extra_locals.push(val_type_copy(&vts[k]));
+        ctx.extra_locals.push(vts[k]);
         ctx.next_wasm_local += 1;
         k += 1;
     }
@@ -3514,7 +3447,7 @@ fn bind_pattern_value(
     }
     ctx.locals.push(LocalBinding {
         name: name.to_string(),
-        rtype: rtype_clone(ty),
+        rtype: ty.clone(),
         storage: Storage::Local {
             wasm_start: dest_start,
             flat_size: vts.len() as u32,
@@ -3539,7 +3472,7 @@ fn codegen_struct_pattern(
     no_match_target: u32,
 ) -> Result<(), Error> {
     let (struct_path, struct_args) = match scrut_ty {
-        RType::Struct { path, type_args, .. } => (clone_path(path), rtype_vec_clone(type_args)),
+        RType::Struct { path, type_args, .. } => (path.clone(), type_args.clone()),
         _ => unreachable!("struct pattern requires struct scrutinee"),
     };
     let entry =
@@ -3615,7 +3548,7 @@ fn codegen_variant_pattern(
     // enum. This means a name lookup against the scrutinee's variants
     // is sufficient.
     let (enum_path, enum_type_args) = match scrut_ty {
-        RType::Enum { path, type_args, .. } => (clone_path(path), rtype_vec_clone(type_args)),
+        RType::Enum { path, type_args, .. } => (path.clone(), type_args.clone()),
         _ => unreachable!("typeck verified variant pattern against enum"),
     };
     let entry =
@@ -3713,22 +3646,6 @@ fn codegen_variant_pattern(
     }
 }
 
-fn val_type_copy(vt: &wasm::ValType) -> wasm::ValType {
-    match vt {
-        wasm::ValType::I32 => wasm::ValType::I32,
-        wasm::ValType::I64 => wasm::ValType::I64,
-    }
-}
-
-fn copy_val_type_vec(v: &Vec<wasm::ValType>) -> Vec<wasm::ValType> {
-    let mut out: Vec<wasm::ValType> = Vec::new();
-    let mut i = 0;
-    while i < v.len() {
-        out.push(val_type_copy(&v[i]));
-        i += 1;
-    }
-    out
-}
 
 fn func_type_eq(a: &wasm::FuncType, b: &wasm::FuncType) -> bool {
     if a.params.len() != b.params.len() || a.results.len() != b.results.len() {
@@ -3793,7 +3710,7 @@ fn codegen_method_call(
     let template_idx_opt = ctx.method_resolutions[res_idx].as_ref().unwrap().template_idx;
     let (callee_idx, return_rt) = if let Some(template_idx) = template_idx_opt {
         let raw_args =
-            rtype_vec_clone(&ctx.method_resolutions[res_idx].as_ref().unwrap().type_args);
+            ctx.method_resolutions[res_idx].as_ref().unwrap().type_args.clone();
         let concrete = subst_vec(&raw_args, &ctx.env);
         let return_rt = {
             let tmpl = &ctx.funcs.templates[template_idx];
@@ -3810,7 +3727,7 @@ fn codegen_method_call(
         let return_rt = {
             let entry = &ctx.funcs.entries[callee_idx_to_table_idx(ctx, callee_idx)];
             match &entry.return_type {
-                Some(rt) => rtype_clone(rt),
+                Some(rt) => rt.clone(),
                 None => RType::Tuple(Vec::new()),
             }
         };
@@ -3857,16 +3774,16 @@ fn codegen_trait_method_call(
         .trait_dispatch
         .as_ref()
         .map(|t| crate::typeck::TraitDispatch {
-            trait_path: clone_path(&t.trait_path),
+            trait_path: t.trait_path.clone(),
             method_name: t.method_name.clone(),
-            recv_type: rtype_clone(&t.recv_type),
+            recv_type: t.recv_type.clone(),
         })
         .unwrap();
     // Already substituted at the time of mono cloning, but still need to
     // peel any `Ref` wrapper if the recv type was symbolic ref.
     let concrete_recv = match &td.recv_type {
-        RType::Ref { inner, .. } => rtype_clone(inner),
-        other => rtype_clone(other),
+        RType::Ref { inner, .. } => (**inner).clone(),
+        other => other.clone(),
     };
     let resolution = match crate::typeck::solve_impl(&td.trait_path, &concrete_recv, ctx.traits, 0)
     {
@@ -3889,7 +3806,7 @@ fn codegen_trait_method_call(
         crate::typeck::MethodCandidate::Direct(i) => {
             let entry = &ctx.funcs.entries[i];
             let ret = match &entry.return_type {
-                Some(rt) => rtype_clone(rt),
+                Some(rt) => rt.clone(),
                 None => unreachable!(),
             };
             (entry.idx, ret)
@@ -3910,7 +3827,7 @@ fn codegen_trait_method_call(
                 let mut j = 0;
                 while j < resolution.subst.len() {
                     if resolution.subst[j].0 == *name {
-                        found = Some(rtype_clone(&resolution.subst[j].1));
+                        found = Some(resolution.subst[j].1.clone());
                         break;
                     }
                     j += 1;
@@ -3920,7 +3837,7 @@ fn codegen_trait_method_call(
             }
             let method_param_count = tmpl.type_params.len() - impl_param_count;
             let recorded_type_args =
-                rtype_vec_clone(&ctx.method_resolutions[res_idx].as_ref().unwrap().type_args);
+                ctx.method_resolutions[res_idx].as_ref().unwrap().type_args.clone();
             if recorded_type_args.len() != method_param_count {
                 unreachable!(
                     "type_args length {} doesn't match method-level param count {}",
@@ -3944,12 +3861,10 @@ fn codegen_trait_method_call(
     };
     // Codegen receiver per the recorded recv_adjust (derived from the
     // trait method's declared receiver shape during typeck).
-    let recv_adjust = copy_recv_adjust(
-        &ctx.method_resolutions[res_idx]
-            .as_ref()
-            .unwrap()
-            .recv_adjust,
-    );
+    let recv_adjust = ctx.method_resolutions[res_idx]
+        .as_ref()
+        .unwrap()
+        .recv_adjust;
     match recv_adjust {
         ReceiverAdjust::Move => {
             codegen_expr(ctx, &mc.receiver)?;
@@ -4115,7 +4030,7 @@ fn emit_int_lit(ctx: &mut FnCtx, ty: &RType, value: u64) {
                 let mut j = 0;
                 while j < resolution.subst.len() {
                     if resolution.subst[j].0 == *name {
-                        found = Some(rtype_clone(&resolution.subst[j].1));
+                        found = Some(resolution.subst[j].1.clone());
                         break;
                     }
                     j += 1;
@@ -4190,7 +4105,7 @@ fn codegen_var(ctx: &mut FnCtx, name: &str, node_id: crate::ast::NodeId) -> Resu
     while i > 0 {
         i -= 1;
         if ctx.locals[i].name == *name {
-            let rt = rtype_clone(&ctx.locals[i].rtype);
+            let rt = ctx.locals[i].rtype.clone();
             match &ctx.locals[i].storage {
                 Storage::Local { wasm_start, flat_size } => {
                     let start = *wasm_start;
@@ -4264,12 +4179,12 @@ fn codegen_call(
         CallResolution::Direct(idx) => CallResolution::Direct(*idx),
         CallResolution::Generic { template_idx, type_args } => CallResolution::Generic {
             template_idx: *template_idx,
-            type_args: rtype_vec_clone(type_args),
+            type_args: type_args.clone(),
         },
         CallResolution::Variant { enum_path, disc, type_args } => CallResolution::Variant {
-            enum_path: clone_path(enum_path),
+            enum_path: enum_path.clone(),
             disc: *disc,
-            type_args: rtype_vec_clone(type_args),
+            type_args: type_args.clone(),
         },
     };
     if let CallResolution::Variant { enum_path, disc, type_args } = &snapshot {
@@ -4286,7 +4201,7 @@ fn codegen_call(
         CallResolution::Direct(idx) => {
             let entry = &ctx.funcs.entries[*idx];
             let rt = match &entry.return_type {
-                Some(rt) => rtype_clone(rt),
+                Some(rt) => rt.clone(),
                 None => RType::Tuple(Vec::new()),
             };
             (entry.idx, rt)
@@ -4351,8 +4266,8 @@ fn codegen_variant_construction(
 ) -> Result<RType, Error> {
     let concrete_type_args = subst_vec(type_args, &ctx.env);
     let enum_ty = RType::Enum {
-        path: clone_path(enum_path),
-        type_args: rtype_vec_clone(&concrete_type_args),
+        path: enum_path.clone(),
+        type_args: concrete_type_args.clone(),
         lifetime_args: Vec::new(),
     };
     let total_size = byte_size_of(&enum_ty, ctx.structs, ctx.enums);
@@ -4461,7 +4376,7 @@ fn codegen_variant_construction(
     while i < payload_exprs.len() {
         let decl_pos = decl_pos_for_arg[i];
         let off = payload_offsets[decl_pos];
-        let ty = rtype_clone(&payload_types[decl_pos]);
+        let ty = payload_types[decl_pos].clone();
         // codegen the value — pushes its flat scalars onto the wasm stack.
         codegen_expr(ctx, &payload_exprs[i])?;
         // store_flat_to_memory pops the flat scalars and stores them at
@@ -4487,9 +4402,9 @@ fn codegen_struct_lit(
     if let Some(CallResolution::Variant { enum_path, disc, type_args }) =
         ctx.call_resolutions[node_id as usize].as_ref()
     {
-        let enum_path = clone_path(enum_path);
+        let enum_path = enum_path.clone();
         let disc = *disc;
-        let type_args = rtype_vec_clone(type_args);
+        let type_args = type_args.clone();
         let mut payload_exprs: Vec<Expr> = Vec::new();
         let mut field_names: Vec<String> = Vec::new();
         let mut i = 0;
@@ -4511,14 +4426,13 @@ fn codegen_struct_lit(
     // For generic structs, this carries the concrete type_args needed for
     // layout. Substitute under our env in case those args themselves reference
     // outer Param entries (mono of mono).
-    let recorded_ty = rtype_clone(
-        ctx.expr_types[node_id as usize]
-            .as_ref()
-            .expect("typeck recorded this struct lit's type"),
-    );
+    let recorded_ty = ctx.expr_types[node_id as usize]
+        .as_ref()
+        .expect("typeck recorded this struct lit's type")
+        .clone();
     let recorded_ty = substitute_rtype(&recorded_ty, &ctx.env);
     let (full, struct_args) = match &recorded_ty {
-        RType::Struct { path, type_args, .. } => (clone_path(path), rtype_vec_clone(type_args)),
+        RType::Struct { path, type_args, .. } => (path.clone(), type_args.clone()),
         _ => unreachable!("expr_types entry for a struct literal must be a Struct"),
     };
 
@@ -4675,25 +4589,25 @@ fn codegen_place_chain_load(
     if !found {
         unreachable!("typeck verified the binding exists");
     }
-    let root_ty = rtype_clone(&ctx.locals[binding_idx].rtype);
+    let root_ty = ctx.locals[binding_idx].rtype.clone();
     let through_ref = matches!(&root_ty, RType::Ref { .. });
 
     // Walk chain to compute byte offset + final type.
     let mut current_ty = if through_ref {
         match &root_ty {
-            RType::Ref { inner, .. } => rtype_clone(inner),
+            RType::Ref { inner, .. } => (**inner).clone(),
             _ => unreachable!(),
         }
     } else {
-        rtype_clone(&root_ty)
+        root_ty.clone()
     };
     let mut chain_offset: u32 = 0;
     let mut i = 1;
     while i < chain.len() {
         match &current_ty {
             RType::Struct { path, type_args, .. } => {
-                let struct_path = clone_path(path);
-                let struct_args = rtype_vec_clone(type_args);
+                let struct_path = path.clone();
+                let struct_args = type_args.clone();
                 let entry = struct_lookup(ctx.structs, &struct_path).expect("resolved struct");
                 let env = make_struct_env(&entry.type_params, &struct_args);
                 let mut field_offset: u32 = 0;
@@ -4716,7 +4630,7 @@ fn codegen_place_chain_load(
                 }
             }
             RType::Tuple(elems) => {
-                let elems = rtype_vec_clone(elems);
+                let elems = elems.clone();
                 let idx: usize = chain[i]
                     .parse()
                     .expect("typeck verified tuple-index segment");
@@ -4727,7 +4641,7 @@ fn codegen_place_chain_load(
                     j += 1;
                 }
                 chain_offset += elem_offset;
-                current_ty = rtype_clone(&elems[idx]);
+                current_ty = elems[idx].clone();
             }
             _ => unreachable!("typeck verified chain navigates structs/tuples"),
         }
@@ -4791,7 +4705,7 @@ fn codegen_field_access_general_for_chain(
         _ => unreachable!(),
     };
     let _ = start;
-    let mut current_ty = rtype_clone(&ctx.locals[binding_idx].rtype);
+    let mut current_ty = ctx.locals[binding_idx].rtype.clone();
     let mut i = 1;
     while i < chain.len() {
         current_ty = match chain[i].parse::<u32>() {
@@ -4810,9 +4724,9 @@ fn extract_field_from_stack(
 ) -> Result<RType, Error> {
     // Compute total flat size, field flat offset, field flat size, field type.
     let (struct_path, struct_args) = match base_type {
-        RType::Struct { path, type_args, .. } => (clone_path(path), rtype_vec_clone(type_args)),
+        RType::Struct { path, type_args, .. } => (path.clone(), type_args.clone()),
         RType::Ref { inner, .. } => match inner.as_ref() {
-            RType::Struct { path, type_args, .. } => (clone_path(path), rtype_vec_clone(type_args)),
+            RType::Struct { path, type_args, .. } => (path.clone(), type_args.clone()),
             _ => unreachable!("typeck rejects field access on non-struct"),
         },
         _ => unreachable!("typeck rejects field access on non-struct"),
@@ -4929,7 +4843,7 @@ fn codegen_borrow(ctx: &mut FnCtx, inner: &Expr, mutable: bool) -> Result<RType,
     if !found {
         unreachable!("typeck verified the binding exists");
     }
-    let root_ty = rtype_clone(&ctx.locals[binding_idx].rtype);
+    let root_ty = ctx.locals[binding_idx].rtype.clone();
     // Borrowing `&r.field…` where r is a ref binding doesn't take r's address —
     // it takes the *pointee's* field address. The base is r's i32 value, not
     // SP+frame_offset. (For chain.len() == 1, falls into the SP-relative path
@@ -4939,17 +4853,17 @@ fn codegen_borrow(ctx: &mut FnCtx, inner: &Expr, mutable: bool) -> Result<RType,
     // Walk chain to byte offset + final type.
     let mut current_ty = if through_ref {
         match &root_ty {
-            RType::Ref { inner, .. } => rtype_clone(inner),
+            RType::Ref { inner, .. } => (**inner).clone(),
             _ => unreachable!(),
         }
     } else {
-        rtype_clone(&root_ty)
+        root_ty.clone()
     };
     let mut chain_offset: u32 = 0;
     let mut i = 1;
     while i < chain.len() {
         let (struct_path, struct_args) = match &current_ty {
-            RType::Struct { path, type_args, .. } => (clone_path(path), rtype_vec_clone(type_args)),
+            RType::Struct { path, type_args, .. } => (path.clone(), type_args.clone()),
             _ => unreachable!("typeck verified chain navigates structs"),
         };
         let entry = struct_lookup(ctx.structs, &struct_path).expect("resolved struct");
@@ -5061,7 +4975,7 @@ fn codegen_deref(ctx: &mut FnCtx, inner: &Expr) -> Result<RType, Error> {
     // pointee type from address+leaf_offset.
     let inner_ty = codegen_expr(ctx, inner)?;
     let pointee = match &inner_ty {
-        RType::Ref { inner, .. } | RType::RawPtr { inner, .. } => rtype_clone(inner),
+        RType::Ref { inner, .. } | RType::RawPtr { inner, .. } => (**inner).clone(),
         _ => unreachable!("typeck rejects deref of non-reference"),
     };
     // Stash the address in a fresh i32 local so we can reuse it across leaves.

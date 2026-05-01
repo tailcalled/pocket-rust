@@ -23,6 +23,7 @@ pub struct FuncType {
     pub results: Vec<ValType>,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub enum ValType {
     I32,
     I64,

@@ -5,8 +5,8 @@ use crate::ast::{
 use crate::span::{Error, Span};
 use crate::typeck::{
     CallResolution, FuncTable, MethodResolution, MoveStatus, MovedPlace, RType, ReceiverAdjust,
-    StructTable, TraitTable, clone_path, find_lifetime_source, func_lookup, is_copy_with_bounds,
-    path_eq, rtype_clone, template_lookup,
+    StructTable, TraitTable, find_lifetime_source, func_lookup, is_copy_with_bounds,
+    template_lookup,
 };
 
 pub fn check(
@@ -72,9 +72,9 @@ fn check_module(
                         continue;
                     }
                 };
-                let mut method_prefix = clone_path(current_module);
+                let mut method_prefix = current_module.clone();
                 method_prefix.push(target_name.clone());
-                let mut target_full = clone_path(current_module);
+                let mut target_full = current_module.clone();
                 target_full.push(target_name);
                 let mut impl_param_args: Vec<RType> = Vec::new();
                 let mut k = 0;
@@ -101,7 +101,7 @@ fn check_module(
                         &ib.methods[k],
                         current_module,
                         &method_prefix,
-                        Some(rtype_clone(&target_rt)),
+                        Some(target_rt.clone()),
                         current_file,
                         structs,
                         enums,
@@ -130,7 +130,7 @@ fn check_function(
     traits: &TraitTable,
     funcs: &mut FuncTable,
 ) -> Result<(), Error> {
-    let mut full = clone_path(path_prefix);
+    let mut full = path_prefix.clone();
     full.push(func.name.clone());
 
     // Walk the body using an immutable view of `funcs`; capture state.moved
@@ -201,7 +201,7 @@ fn check_function(
         while k < func.params.len() {
             state.holders.push(Holder {
                 name: Some(func.params[k].name.clone()),
-                rtype: Some(rtype_clone(&param_types[k])),
+                rtype: Some(param_types[k].clone()),
                 holds: Vec::new(),
                 field_holds: Vec::new(),
             });
@@ -218,7 +218,7 @@ fn check_function(
     // the moves happened (for drop-flag clearing).
     let mut k = 0;
     while k < funcs.entries.len() {
-        if path_eq(&funcs.entries[k].path, &full) {
+        if funcs.entries[k].path == full {
             funcs.entries[k].moved_places = moved;
             funcs.entries[k].move_sites = move_sites;
             return Ok(());
@@ -227,7 +227,7 @@ fn check_function(
     }
     let mut k = 0;
     while k < funcs.templates.len() {
-        if path_eq(&funcs.templates[k].path, &full) {
+        if funcs.templates[k].path == full {
             funcs.templates[k].moved_places = moved;
             funcs.templates[k].move_sites = move_sites;
             return Ok(());
@@ -332,7 +332,7 @@ fn clone_field_holds(v: &Vec<FieldHold>) -> Vec<FieldHold> {
     let mut i = 0;
     while i < v.len() {
         out.push(FieldHold {
-            field: clone_path(&v[i].field),
+            field: v[i].field.clone(),
             borrows: clone_held_borrows(&v[i].borrows),
         });
         i += 1;
@@ -668,11 +668,10 @@ fn chain_is_prefix_of(prefix: &Vec<String>, full: &Vec<String>) -> bool {
 
 fn walk_let_stmt(state: &mut BorrowState, let_stmt: &LetStmt) -> Result<(), Error> {
     let desc = walk_expr(state, &let_stmt.value)?;
-    let ty = rtype_clone(
-        state.expr_types[let_stmt.value.id as usize]
-            .as_ref()
-            .expect("typeck recorded this binding's type"),
-    );
+    let ty = state.expr_types[let_stmt.value.id as usize]
+        .as_ref()
+        .expect("typeck recorded this binding's type")
+        .clone();
     state.holders.push(Holder {
         name: Some(let_stmt.name.clone()),
         rtype: Some(ty),
@@ -740,8 +739,7 @@ fn walk_match_expr(
     // "type at the top of the pattern" and descends as it peels
     // layers.
     let scrut_ty: RType = state.expr_types[m.scrutinee.id as usize]
-        .as_ref()
-        .map(rtype_clone)
+        .clone()
         .unwrap_or(RType::Tuple(Vec::new()));
     // Try to identify the scrutinee as a place expression. If yes,
     // pattern bindings can record borrows / partial moves rooted at
@@ -809,7 +807,7 @@ fn walk_match_expr(
         let mut k = 0;
         while k < arm_desc.borrows.len() {
             tail_borrows.push(HeldBorrow {
-                place: clone_path(&arm_desc.borrows[k].place),
+                place: arm_desc.borrows[k].place.clone(),
                 mutable: arm_desc.borrows[k].mutable,
             });
             k += 1;
@@ -817,7 +815,7 @@ fn walk_match_expr(
         let mut k = 0;
         while k < arm_desc.field_borrows.len() {
             tail_field_borrows.push(FieldHold {
-                field: clone_path(&arm_desc.field_borrows[k].field),
+                field: arm_desc.field_borrows[k].field.clone(),
                 borrows: clone_held_borrows(&arm_desc.field_borrows[k].borrows),
             });
             k += 1;
@@ -841,8 +839,7 @@ fn walk_if_let_expr(
     il: &crate::ast::IfLetExpr,
 ) -> Result<ValueDesc, Error> {
     let scrut_ty: RType = state.expr_types[il.scrutinee.id as usize]
-        .as_ref()
-        .map(rtype_clone)
+        .clone()
         .unwrap_or(RType::Tuple(Vec::new()));
     let scrut_place: Option<Vec<String>> = extract_place(&il.scrutinee);
     if let Some(p) = &scrut_place {
@@ -887,7 +884,7 @@ fn walk_if_let_expr(
     let mut k = 0;
     while k < else_desc.borrows.len() {
         borrows.push(HeldBorrow {
-            place: clone_path(&else_desc.borrows[k].place),
+            place: else_desc.borrows[k].place.clone(),
             mutable: else_desc.borrows[k].mutable,
         });
         k += 1;
@@ -896,7 +893,7 @@ fn walk_if_let_expr(
     let mut k = 0;
     while k < else_desc.field_borrows.len() {
         field_borrows.push(FieldHold {
-            field: clone_path(&else_desc.field_borrows[k].field),
+            field: else_desc.field_borrows[k].field.clone(),
             borrows: clone_held_borrows(&else_desc.field_borrows[k].borrows),
         });
         k += 1;
@@ -959,19 +956,19 @@ fn walk_pattern_for_borrowck(
                 // is recorded on the holder so downstream
                 // conflict-with-`&mut` checks see it.
                 let ref_ty = RType::Ref {
-                    inner: Box::new(rtype_clone(scrut_ty)),
+                    inner: Box::new(scrut_ty.clone()),
                     mutable: *mutable,
                     lifetime: crate::typeck::LifetimeRepr::Inferred(0),
                 };
                 let holds: Vec<HeldBorrow> = match scrut_path {
                     Some(p) => {
                         let new = HeldBorrow {
-                            place: clone_path(p),
+                            place: p.clone(),
                             mutable: *mutable,
                         };
                         check_borrow_conflict(state, &new, span)?;
                         vec![HeldBorrow {
-                            place: clone_path(p),
+                            place: p.clone(),
                             mutable: *mutable,
                         }]
                     }
@@ -997,12 +994,12 @@ fn walk_pattern_for_borrowck(
                         &state.type_param_bounds,
                     );
                     if !copy {
-                        try_move(state, clone_path(p), span.copy())?;
+                        try_move(state, p.clone(), span.copy())?;
                     }
                 }
                 state.holders.push(Holder {
                     name: Some(name.clone()),
-                    rtype: Some(rtype_clone(scrut_ty)),
+                    rtype: Some(scrut_ty.clone()),
                     holds: Vec::new(),
                     field_holds: Vec::new(),
                 });
@@ -1021,12 +1018,12 @@ fn walk_pattern_for_borrowck(
                     &state.type_param_bounds,
                 );
                 if !copy {
-                    try_move(state, clone_path(p), span.copy())?;
+                    try_move(state, p.clone(), span.copy())?;
                 }
             }
             state.holders.push(Holder {
                 name: Some(name.clone()),
-                rtype: Some(rtype_clone(scrut_ty)),
+                rtype: Some(scrut_ty.clone()),
                 holds: Vec::new(),
                 field_holds: Vec::new(),
             });
@@ -1037,7 +1034,7 @@ fn walk_pattern_for_borrowck(
                 let mut i = 0;
                 while i < elems.len() && i < elem_tys.len() {
                     let sub_path = scrut_path.map(|p| {
-                        let mut np = clone_path(p);
+                        let mut np = p.clone();
                         np.push(format!("{}", i));
                         np
                     });
@@ -1096,7 +1093,7 @@ fn walk_pattern_for_borrowck(
                         let sub_ty =
                             crate::typeck::substitute_rtype(&payload_tys[i], &env);
                         let sub_path = scrut_path.map(|p| {
-                            let mut np = clone_path(p);
+                            let mut np = p.clone();
                             np.push(variant_name.clone());
                             np.push(format!("{}", i));
                             np
@@ -1159,7 +1156,7 @@ fn walk_pattern_for_borrowck(
                                     &env,
                                 );
                                 let sub_path = scrut_path.map(|p| {
-                                    let mut np = clone_path(p);
+                                    let mut np = p.clone();
                                     np.push(variant_name.clone());
                                     np.push(fields[k].name.clone());
                                     np
@@ -1197,7 +1194,7 @@ fn walk_pattern_for_borrowck(
                             let sub_ty =
                                 crate::typeck::substitute_rtype(&entry.fields[j].ty, &env);
                             let sub_path = scrut_path.map(|p| {
-                                let mut np = clone_path(p);
+                                let mut np = p.clone();
                                 np.push(fields[k].name.clone());
                                 np
                             });
@@ -1258,17 +1255,17 @@ fn collect_pattern_bindings_typed(
         PatternKind::Binding { name, by_ref, mutable, .. } => {
             let ty = if *by_ref {
                 RType::Ref {
-                    inner: Box::new(rtype_clone(scrut_ty)),
+                    inner: Box::new(scrut_ty.clone()),
                     mutable: *mutable,
                     lifetime: crate::typeck::LifetimeRepr::Inferred(0),
                 }
             } else {
-                rtype_clone(scrut_ty)
+                scrut_ty.clone()
             };
             out.push((name.clone(), ty));
         }
         PatternKind::At { name, inner, .. } => {
-            out.push((name.clone(), rtype_clone(scrut_ty)));
+            out.push((name.clone(), scrut_ty.clone()));
             collect_pattern_bindings_typed(inner, scrut_ty, structs, enums, out);
         }
         PatternKind::Tuple(elems) => {
@@ -1434,7 +1431,7 @@ fn enum_type_env(params: &Vec<String>, args: &Vec<RType>) -> Vec<(String, RType)
     let n = if params.len() < args.len() { params.len() } else { args.len() };
     let mut i = 0;
     while i < n {
-        env.push((params[i].clone(), rtype_clone(&args[i])));
+        env.push((params[i].clone(), args[i].clone()));
         i += 1;
     }
     env
@@ -1540,7 +1537,7 @@ fn walk_if_expr(
     let mut k = 0;
     while k < arm2_desc.borrows.len() {
         borrows.push(HeldBorrow {
-            place: clone_path(&arm2_desc.borrows[k].place),
+            place: arm2_desc.borrows[k].place.clone(),
             mutable: arm2_desc.borrows[k].mutable,
         });
         k += 1;
@@ -1549,7 +1546,7 @@ fn walk_if_expr(
     let mut k = 0;
     while k < arm2_desc.field_borrows.len() {
         field_borrows.push(FieldHold {
-            field: clone_path(&arm2_desc.field_borrows[k].field),
+            field: arm2_desc.field_borrows[k].field.clone(),
             borrows: clone_held_borrows(&arm2_desc.field_borrows[k].borrows),
         });
         k += 1;
@@ -1591,7 +1588,7 @@ fn restore_holders_state(
     let mut i = 0;
     while i < saved.len() && i < state.holders.len() {
         state.holders[i].holds = saved[i].0.iter().map(|b| HeldBorrow {
-            place: clone_path(&b.place),
+            place: b.place.clone(),
             mutable: b.mutable,
         }).collect();
         state.holders[i].field_holds = clone_field_holds(&saved[i].1);
@@ -1613,7 +1610,7 @@ fn merge_moved_sets(a: &Vec<MovedPlace>, b: &Vec<MovedPlace>) -> Vec<MovedPlace>
             _ => MoveStatus::MaybeMoved,
         };
         out.push(MovedPlace {
-            place: clone_path(&a[i].place),
+            place: a[i].place.clone(),
             status: merged_status,
         });
         i += 1;
@@ -1623,7 +1620,7 @@ fn merge_moved_sets(a: &Vec<MovedPlace>, b: &Vec<MovedPlace>) -> Vec<MovedPlace>
         if find_place(a, &b[j].place).is_none() {
             // Only in b → MaybeMoved (a's path is implicitly Init).
             out.push(MovedPlace {
-                place: clone_path(&b[j].place),
+                place: b[j].place.clone(),
                 status: MoveStatus::MaybeMoved,
             });
         }
@@ -1635,7 +1632,7 @@ fn merge_moved_sets(a: &Vec<MovedPlace>, b: &Vec<MovedPlace>) -> Vec<MovedPlace>
 fn find_place(set: &Vec<MovedPlace>, place: &Vec<String>) -> Option<MoveStatus> {
     let mut i = 0;
     while i < set.len() {
-        if path_eq(&set[i].place, place) {
+        if &set[i].place == place {
             return Some(set[i].status.clone());
         }
         i += 1;
@@ -1675,7 +1672,7 @@ fn walk_method_call(
             let mut k = 0;
             while k < desc.borrows.len() {
                 let new = HeldBorrow {
-                    place: clone_path(&desc.borrows[k].place),
+                    place: desc.borrows[k].place.clone(),
                     mutable: desc.borrows[k].mutable,
                 };
                 check_borrow_conflict(state, &new, &mc.receiver.span)?;
@@ -1697,7 +1694,7 @@ fn walk_method_call(
             let mut k = 0;
             while k < desc.borrows.len() {
                 let new = HeldBorrow {
-                    place: clone_path(&desc.borrows[k].place),
+                    place: desc.borrows[k].place.clone(),
                     mutable: desc.borrows[k].mutable,
                 };
                 check_borrow_conflict(state, &new, &mc.receiver.span)?;
@@ -1715,7 +1712,7 @@ fn walk_method_call(
         let mut k = 0;
         while k < desc.borrows.len() {
             let new = HeldBorrow {
-                place: clone_path(&desc.borrows[k].place),
+                place: desc.borrows[k].place.clone(),
                 mutable: desc.borrows[k].mutable,
             };
             check_borrow_conflict(state, &new, &mc.args[i].span)?;
@@ -1727,7 +1724,7 @@ fn walk_method_call(
             let mut k = 0;
             while k < desc.field_borrows[f].borrows.len() {
                 let new = HeldBorrow {
-                    place: clone_path(&desc.field_borrows[f].borrows[k].place),
+                    place: desc.field_borrows[f].borrows[k].place.clone(),
                     mutable: desc.field_borrows[f].borrows[k].mutable,
                 };
                 check_borrow_conflict(state, &new, &mc.args[i].span)?;
@@ -1789,7 +1786,7 @@ fn walk_synth_borrow(
         i += 1;
     }
     let new = HeldBorrow {
-        place: clone_path(&place),
+        place: place.clone(),
         mutable,
     };
     check_borrow_conflict(state, &new, &inner.span)?;
@@ -1913,7 +1910,7 @@ fn walk_call(
             let mut k = 0;
             while k < desc.field_borrows[f].borrows.len() {
                 combined.push(HeldBorrow {
-                    place: clone_path(&desc.field_borrows[f].borrows[k].place),
+                    place: desc.field_borrows[f].borrows[k].place.clone(),
                     mutable: desc.field_borrows[f].borrows[k].mutable,
                 });
                 k += 1;
@@ -1925,7 +1922,7 @@ fn walk_call(
         while k < combined.len() {
             // Conflict-check the new borrow against every other holder's holds.
             let new = HeldBorrow {
-                place: clone_path(&combined[k].place),
+                place: combined[k].place.clone(),
                 mutable: combined[k].mutable,
             };
             check_borrow_conflict(state, &new, &call.args[i].span)?;
@@ -1946,7 +1943,7 @@ fn walk_call(
         let mut k = 0;
         while k < arg_borrow_snapshots[idx].len() {
             combined.push(HeldBorrow {
-                place: clone_path(&arg_borrow_snapshots[idx][k].place),
+                place: arg_borrow_snapshots[idx][k].place.clone(),
                 mutable: arg_borrow_snapshots[idx][k].mutable,
             });
             k += 1;
@@ -2043,13 +2040,13 @@ fn walk_struct_lit(state: &mut BorrowState, lit: &StructLit) -> Result<ValueDesc
             let mut k = 0;
             while k < desc.borrows.len() {
                 let new = HeldBorrow {
-                    place: clone_path(&desc.borrows[k].place),
+                    place: desc.borrows[k].place.clone(),
                     mutable: desc.borrows[k].mutable,
                 };
                 check_borrow_conflict(state, &new, &lit.fields[i].value.span)?;
                 state.holders[synth_idx].holds.push(new);
                 grouped.push(HeldBorrow {
-                    place: clone_path(&desc.borrows[k].place),
+                    place: desc.borrows[k].place.clone(),
                     mutable: desc.borrows[k].mutable,
                 });
                 k += 1;
@@ -2069,13 +2066,13 @@ fn walk_struct_lit(state: &mut BorrowState, lit: &StructLit) -> Result<ValueDesc
             let mut k = 0;
             while k < desc.field_borrows[f].borrows.len() {
                 let new = HeldBorrow {
-                    place: clone_path(&desc.field_borrows[f].borrows[k].place),
+                    place: desc.field_borrows[f].borrows[k].place.clone(),
                     mutable: desc.field_borrows[f].borrows[k].mutable,
                 };
                 check_borrow_conflict(state, &new, &lit.fields[i].value.span)?;
                 state.holders[synth_idx].holds.push(new);
                 grouped.push(HeldBorrow {
-                    place: clone_path(&desc.field_borrows[f].borrows[k].place),
+                    place: desc.field_borrows[f].borrows[k].place.clone(),
                     mutable: desc.field_borrows[f].borrows[k].mutable,
                 });
                 k += 1;
@@ -2124,13 +2121,13 @@ fn walk_tuple(state: &mut BorrowState, elems: &Vec<Expr>) -> Result<ValueDesc, E
             let mut k = 0;
             while k < desc.borrows.len() {
                 let new = HeldBorrow {
-                    place: clone_path(&desc.borrows[k].place),
+                    place: desc.borrows[k].place.clone(),
                     mutable: desc.borrows[k].mutable,
                 };
                 check_borrow_conflict(state, &new, &elems[i].span)?;
                 state.holders[synth_idx].holds.push(new);
                 grouped.push(HeldBorrow {
-                    place: clone_path(&desc.borrows[k].place),
+                    place: desc.borrows[k].place.clone(),
                     mutable: desc.borrows[k].mutable,
                 });
                 k += 1;
@@ -2146,13 +2143,13 @@ fn walk_tuple(state: &mut BorrowState, elems: &Vec<Expr>) -> Result<ValueDesc, E
             let mut k = 0;
             while k < desc.field_borrows[f].borrows.len() {
                 let new = HeldBorrow {
-                    place: clone_path(&desc.field_borrows[f].borrows[k].place),
+                    place: desc.field_borrows[f].borrows[k].place.clone(),
                     mutable: desc.field_borrows[f].borrows[k].mutable,
                 };
                 check_borrow_conflict(state, &new, &elems[i].span)?;
                 state.holders[synth_idx].holds.push(new);
                 grouped.push(HeldBorrow {
-                    place: clone_path(&desc.field_borrows[f].borrows[k].place),
+                    place: desc.field_borrows[f].borrows[k].place.clone(),
                     mutable: desc.field_borrows[f].borrows[k].mutable,
                 });
                 k += 1;
@@ -2195,9 +2192,7 @@ fn walk_tuple_index(
             if is_ref_holder(&state.holders[root_idx]) {
                 Ok(empty_desc())
             } else {
-                let elem_ty = state.expr_types[expr.id as usize]
-                    .as_ref()
-                    .map(rtype_clone);
+                let elem_ty = state.expr_types[expr.id as usize].clone();
                 let elem_is_ref = matches!(&elem_ty, Some(RType::Ref { .. }));
                 let elem_is_copy = elem_ty
                     .as_ref()
@@ -2261,9 +2256,7 @@ fn walk_field_access(
                 Ok(empty_desc())
             } else {
                 // Field access on an owned root.
-                let field_ty = state.expr_types[expr.id as usize]
-                    .as_ref()
-                    .map(rtype_clone);
+                let field_ty = state.expr_types[expr.id as usize].clone();
                 let field_is_ref = matches!(&field_ty, Some(RType::Ref { .. }));
                 let field_is_copy = field_ty
                     .as_ref()
@@ -2340,7 +2333,7 @@ fn walk_borrow(state: &mut BorrowState, expr: &Expr) -> Result<ValueDesc, Error>
                 i += 1;
             }
             let new = HeldBorrow {
-                place: clone_path(&place),
+                place: place.clone(),
                 mutable,
             };
             check_borrow_conflict(state, &new, &expr.span)?;
@@ -2600,7 +2593,7 @@ fn clone_held_borrows(holds: &Vec<HeldBorrow>) -> Vec<HeldBorrow> {
     let mut i = 0;
     while i < holds.len() {
         out.push(HeldBorrow {
-            place: clone_path(&holds[i].place),
+            place: holds[i].place.clone(),
             mutable: holds[i].mutable,
         });
         i += 1;

@@ -11,7 +11,7 @@
 
 use crate::ast::{Block, Call, Expr, ExprKind, Function, Item, MethodCall, Module, Stmt, StructLit};
 use crate::span::Error;
-use crate::typeck::{FuncTable, clone_path, func_lookup, template_lookup};
+use crate::typeck::{FuncTable, func_lookup, template_lookup};
 
 pub fn check(root: &Module, funcs: &FuncTable) -> Result<(), Error> {
     let mut path: Vec<String> = Vec::new();
@@ -83,7 +83,7 @@ fn check_function(
     current_file: &str,
     funcs: &FuncTable,
 ) -> Result<(), Error> {
-    let mut full = clone_path(current_module);
+    let mut full = current_module.clone();
     full.push(func.name.clone());
     let expr_types: &Vec<Option<crate::typeck::RType>> =
         if let Some(entry) = func_lookup(funcs, &full) {

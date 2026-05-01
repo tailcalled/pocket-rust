@@ -1,0 +1,4955 @@
+use crate::ast::{
+    AssignStmt, Block, Call, Expr, ExprKind, FieldAccess, Function, Item, LetStmt, Module, Path,
+    PathSegment, Pattern, Stmt, StructLit, Type, TypeKind,
+};
+use crate::span::{Error, Span};
+
+mod types;
+pub use types::{
+    IntKind, LifetimeRepr, RType, byte_size_of, copy_trait_path, drop_trait_path, flatten_rtype,
+    int_kind_name, is_copy, is_copy_with_bounds, is_drop, is_raw_ptr, is_ref_mutable,
+    outer_lifetime, rtype_eq, rtype_size, rtype_to_string, substitute_rtype,
+    variant_payload_byte_size,
+};
+use types::{int_kind_from_name, int_kind_max, rtype_vec_eq, struct_env};
+
+// T5.5: whether `t` (an InferType, possibly partially resolved) can
+// satisfy `std::Num`. Used by `Subst::bind_var` when an integer-literal
+// var is being unified with `t` — admits any of:
+// - `Int(_)`: stdlib provides `impl Num for u8/i8/.../isize`.
+// - `Var(_)`: unconstrained; the caller propagates the literal flag.
+// - `Param(name)`: name's bound list (via `type_param_bounds`) must
+//   include `std::Num`.
+// - `Struct{...}`: fully concrete enough for `solve_impl(Num, _, …)`
+//   to find an impl — might not succeed if inner Vars are unresolved.
+// Refs and raw pointers don't satisfy.
+fn satisfies_num(
+    t: &InferType,
+    traits: &TraitTable,
+    type_params: &Vec<String>,
+    type_param_bounds: &Vec<Vec<Vec<String>>>,
+) -> bool {
+    let num_path = vec!["std".to_string(), "ops".to_string(), "Num".to_string()];
+    match t {
+        InferType::Int(_) | InferType::Var(_) => true,
+        InferType::Param(_) | InferType::Struct { .. } => {
+            let rt = infer_to_rtype_for_check(t);
+            solve_impl_in_ctx(&num_path, &rt, traits, type_params, type_param_bounds, 0).is_some()
+        }
+        InferType::Ref { .. }
+        | InferType::RawPtr { .. }
+        | InferType::Bool
+        | InferType::Tuple(_)
+        | InferType::Enum { .. } => false,
+    }
+}
+
+// Convert an `InferType` to an `RType` for the purposes of impl-table
+// lookup. Unresolved Vars become `RType::Int(I32)` (the literal
+// default) so that `solve_impl` has something to match against; this is
+// a best-effort heuristic for the bound-check path only and isn't used
+// for actual type assignment.
+pub(crate) fn infer_to_rtype_for_check(t: &InferType) -> RType {
+    match t {
+        InferType::Var(_) => RType::Int(IntKind::I32),
+        InferType::Int(k) => RType::Int(*k),
+        InferType::Struct { path, type_args, lifetime_args } => {
+            let mut args: Vec<RType> = Vec::new();
+            let mut i = 0;
+            while i < type_args.len() {
+                args.push(infer_to_rtype_for_check(&type_args[i]));
+                i += 1;
+            }
+            RType::Struct {
+                path: path.clone(),
+                type_args: args,
+                lifetime_args: lifetime_args.clone(),
+            }
+        }
+        InferType::Ref { inner, mutable, lifetime } => RType::Ref {
+            inner: Box::new(infer_to_rtype_for_check(inner)),
+            mutable: *mutable,
+            lifetime: lifetime.clone(),
+        },
+        InferType::RawPtr { inner, mutable } => RType::RawPtr {
+            inner: Box::new(infer_to_rtype_for_check(inner)),
+            mutable: *mutable,
+        },
+        InferType::Param(n) => RType::Param(n.clone()),
+        InferType::Bool => RType::Bool,
+        InferType::Tuple(elems) => {
+            let mut out: Vec<RType> = Vec::new();
+            let mut i = 0;
+            while i < elems.len() {
+                out.push(infer_to_rtype_for_check(&elems[i]));
+                i += 1;
+            }
+            RType::Tuple(out)
+        }
+        InferType::Enum { path, type_args, lifetime_args } => {
+            let mut args: Vec<RType> = Vec::new();
+            let mut i = 0;
+            while i < type_args.len() {
+                args.push(infer_to_rtype_for_check(&type_args[i]));
+                i += 1;
+            }
+            RType::Enum {
+                path: path.clone(),
+                type_args: args,
+                lifetime_args: lifetime_args.clone(),
+            }
+        }
+    }
+}
+
+// Result of solving `(trait, concrete_type)` against the impl table:
+// the impl row's index plus the substitution from the impl's type-params
+// to the concrete pieces of the type that filled them.
+pub struct ImplResolution {
+    pub impl_idx: usize,
+    pub subst: Vec<(String, RType)>,
+}
+
+// Recursive impl resolver. Given a (trait, concrete_type) query, find an
+// impl row whose target pattern matches and whose `where T: Bound`
+// constraints all recursively resolve. Depth-bounded to prevent runaway
+// recursion via pathological self-referential impls.
+pub fn solve_impl(
+    trait_path: &Vec<String>,
+    concrete: &RType,
+    traits: &TraitTable,
+    depth: u32,
+) -> Option<ImplResolution> {
+    solve_impl_in_ctx(trait_path, concrete, traits, &Vec::new(), &Vec::new(), depth)
+}
+
+// Like `solve_impl`, but also recognizes a `Param(name)` concrete as
+// satisfying `trait_path` when one of the param's in-scope bounds (or
+// any of that bound's transitive supertraits) equals `trait_path`. The
+// `type_params`/`type_param_bounds` slices align in length and order;
+// they're threaded through the recursive impl-bound check so nested
+// generic obligations like `impl<T: PartialEq> Eq for Wrap<T>` (which
+// recurses to `Wrap<T>: PartialEq` → `T: PartialEq`) resolve via the
+// outer context.
+pub fn solve_impl_in_ctx(
+    trait_path: &Vec<String>,
+    concrete: &RType,
+    traits: &TraitTable,
+    type_params: &Vec<String>,
+    type_param_bounds: &Vec<Vec<Vec<String>>>,
+    depth: u32,
+) -> Option<ImplResolution> {
+    if depth > 32 {
+        return None;
+    }
+    if let RType::Param(name) = concrete {
+        let mut i = 0;
+        while i < type_params.len() {
+            if type_params[i] == *name && i < type_param_bounds.len() {
+                let mut b = 0;
+                while b < type_param_bounds[i].len() {
+                    let closure = supertrait_closure(&type_param_bounds[i][b], traits);
+                    let mut k = 0;
+                    while k < closure.len() {
+                        if &closure[k] == trait_path {
+                            return Some(ImplResolution {
+                                impl_idx: usize::MAX,
+                                subst: Vec::new(),
+                            });
+                        }
+                        k += 1;
+                    }
+                    b += 1;
+                }
+                return None;
+            }
+            i += 1;
+        }
+        return None;
+    }
+    let mut i = 0;
+    while i < traits.impls.len() {
+        let row = &traits.impls[i];
+        if &row.trait_path != trait_path {
+            i += 1;
+            continue;
+        }
+        let mut subst: Vec<(String, RType)> = Vec::new();
+        if !try_match_rtype(&row.target, concrete, &mut subst) {
+            i += 1;
+            continue;
+        }
+        let mut all_bounds_ok = true;
+        let mut p = 0;
+        while p < row.impl_type_params.len() {
+            let name = &row.impl_type_params[p];
+            let mut bound_concrete: Option<RType> = None;
+            let mut k = 0;
+            while k < subst.len() {
+                if subst[k].0 == *name {
+                    bound_concrete = Some(subst[k].1.clone());
+                    break;
+                }
+                k += 1;
+            }
+            if let Some(tc) = bound_concrete {
+                let mut b = 0;
+                while b < row.impl_type_param_bounds[p].len() {
+                    let bound_trait = &row.impl_type_param_bounds[p][b];
+                    if solve_impl_in_ctx(
+                        bound_trait,
+                        &tc,
+                        traits,
+                        type_params,
+                        type_param_bounds,
+                        depth + 1,
+                    )
+                    .is_none()
+                    {
+                        all_bounds_ok = false;
+                        break;
+                    }
+                    b += 1;
+                }
+            }
+            if !all_bounds_ok {
+                break;
+            }
+            p += 1;
+        }
+        if all_bounds_ok {
+            return Some(ImplResolution {
+                impl_idx: i,
+                subst,
+            });
+        }
+        i += 1;
+    }
+    None
+}
+
+// Find a method by name within a registered trait impl. Returns the
+// FuncTable position so the caller can dispatch / monomorphize.
+pub fn find_trait_impl_method(
+    funcs: &FuncTable,
+    impl_idx: usize,
+    method_name: &str,
+) -> Option<MethodCandidate> {
+    let mut i = 0;
+    while i < funcs.entries.len() {
+        if funcs.entries[i].trait_impl_idx == Some(impl_idx)
+            && !funcs.entries[i].path.is_empty()
+            && funcs.entries[i].path[funcs.entries[i].path.len() - 1] == method_name
+        {
+            return Some(MethodCandidate::Direct(i));
+        }
+        i += 1;
+    }
+    let mut i = 0;
+    while i < funcs.templates.len() {
+        if funcs.templates[i].trait_impl_idx == Some(impl_idx)
+            && !funcs.templates[i].path.is_empty()
+            && funcs.templates[i].path[funcs.templates[i].path.len() - 1] == method_name
+        {
+            return Some(MethodCandidate::Template(i));
+        }
+        i += 1;
+    }
+    None
+}
+
+// One method-resolution candidate: either a non-generic concrete method
+// (`Direct(idx)` indexes into `FuncTable.entries`) or a generic-method
+// template (`Template(idx)` indexes into `FuncTable.templates`).
+#[derive(Clone, Copy)]
+pub enum MethodCandidate {
+    Direct(usize),
+    Template(usize),
+}
+
+// Walks the FuncTable for every method-shaped entry/template whose name
+// (last path segment) matches `method_name`. T2.6: no longer filters by
+// the impl_target's outermost struct path — that previously hid
+// blanket impls like `impl<T> Show for &T` or `impl Show for u32` whose
+// targets aren't structs. The caller runs `try_match_against_infer`
+// against each candidate's `impl_target` to filter to those that
+// actually match the receiver type.
+pub fn find_method_candidates(
+    funcs: &FuncTable,
+    method_name: &str,
+) -> Vec<MethodCandidate> {
+    let mut out: Vec<MethodCandidate> = Vec::new();
+    let mut i = 0;
+    while i < funcs.entries.len() {
+        if funcs.entries[i].impl_target.is_some()
+            && !funcs.entries[i].path.is_empty()
+            && funcs.entries[i].path[funcs.entries[i].path.len() - 1] == method_name
+        {
+            out.push(MethodCandidate::Direct(i));
+        }
+        i += 1;
+    }
+    let mut i = 0;
+    while i < funcs.templates.len() {
+        if funcs.templates[i].impl_target.is_some()
+            && !funcs.templates[i].path.is_empty()
+            && funcs.templates[i].path[funcs.templates[i].path.len() - 1] == method_name
+        {
+            out.push(MethodCandidate::Template(i));
+        }
+        i += 1;
+    }
+    out
+}
+
+// Structural pattern matcher for impl-target lookup. Walks `pattern` and
+// `concrete` in lockstep; whenever `pattern` reaches `RType::Param(name)`,
+// either binds `name` in `subst` or, if already bound, requires equality
+// with the existing binding (so `impl<T> Pair<T, T>` only matches
+// `Pair<X, X>` for some X). Returns true on success and leaves new
+// bindings in `subst`; returns false on shape mismatch (subst may be
+// partially mutated — caller should snapshot/restore if it cares).
+//
+// Lifetime handling: pattern `Named(impl_lt)` matches any concrete
+// lifetime (lifetimes in patterns aren't tracked through the subst yet —
+// follow-up). Pattern `Inferred(_)` likewise matches anything. Concrete
+// lifetimes only need to match shape-wise, not by id.
+pub fn try_match_rtype(
+    pattern: &RType,
+    concrete: &RType,
+    subst: &mut Vec<(String, RType)>,
+) -> bool {
+    match (pattern, concrete) {
+        (RType::Param(name), c) => {
+            // Already bound? Must equal.
+            let mut i = 0;
+            while i < subst.len() {
+                if subst[i].0 == *name {
+                    return rtype_eq(&subst[i].1, c);
+                }
+                i += 1;
+            }
+            subst.push((name.clone(), c.clone()));
+            true
+        }
+        (RType::Int(ka), RType::Int(kb)) => ka == kb,
+        (
+            RType::Struct {
+                path: pa,
+                type_args: aa,
+                ..
+            },
+            RType::Struct {
+                path: pb,
+                type_args: ab,
+                ..
+            },
+        ) => {
+            if pa != pb || aa.len() != ab.len() {
+                return false;
+            }
+            let mut i = 0;
+            while i < aa.len() {
+                if !try_match_rtype(&aa[i], &ab[i], subst) {
+                    return false;
+                }
+                i += 1;
+            }
+            true
+        }
+        (
+            RType::Ref {
+                inner: ia,
+                mutable: ma,
+                ..
+            },
+            RType::Ref {
+                inner: ib,
+                mutable: mb,
+                ..
+            },
+        ) => ma == mb && try_match_rtype(ia, ib, subst),
+        (
+            RType::RawPtr {
+                inner: ia,
+                mutable: ma,
+            },
+            RType::RawPtr {
+                inner: ib,
+                mutable: mb,
+            },
+        ) => ma == mb && try_match_rtype(ia, ib, subst),
+        (RType::Bool, RType::Bool) => true,
+        (RType::Tuple(a), RType::Tuple(b)) => {
+            if a.len() != b.len() {
+                return false;
+            }
+            let mut i = 0;
+            while i < a.len() {
+                if !try_match_rtype(&a[i], &b[i], subst) {
+                    return false;
+                }
+                i += 1;
+            }
+            true
+        }
+        (
+            RType::Enum {
+                path: pa,
+                type_args: aa,
+                ..
+            },
+            RType::Enum {
+                path: pb,
+                type_args: ab,
+                ..
+            },
+        ) => {
+            if pa != pb || aa.len() != ab.len() {
+                return false;
+            }
+            let mut i = 0;
+            while i < aa.len() {
+                if !try_match_rtype(&aa[i], &ab[i], subst) {
+                    return false;
+                }
+                i += 1;
+            }
+            true
+        }
+        _ => false,
+    }
+}
+
+// InferType-flavored variant of `try_match_rtype`: matches an `RType`
+// pattern against an `InferType` concrete value, after substituting the
+// concrete through `subst` to resolve any bound vars. Repeat-param cases
+// (`impl<T> Pair<T, T>` matched against `Pair<?v, ?w>`) accumulate
+// pending unifications for the caller to commit if this candidate wins.
+pub(crate) fn try_match_against_infer(
+    pattern: &RType,
+    concrete: &InferType,
+    subst: &Subst,
+    env: &mut Vec<(String, InferType)>,
+    pending: &mut Vec<(InferType, InferType)>,
+) -> bool {
+    let resolved = subst.substitute(concrete);
+    match pattern {
+        RType::Param(name) => {
+            // Already bound? Stage a unification with the prior binding.
+            let mut existing: Option<InferType> = None;
+            let mut k = 0;
+            while k < env.len() {
+                if env[k].0 == *name {
+                    existing = Some(env[k].1.clone());
+                    break;
+                }
+                k += 1;
+            }
+            match existing {
+                Some(prior) => {
+                    pending.push((prior, resolved));
+                    true
+                }
+                None => {
+                    env.push((name.clone(), resolved));
+                    true
+                }
+            }
+        }
+        RType::Int(ka) => match &resolved {
+            InferType::Int(kb) => ka == kb,
+            _ => false,
+        },
+        RType::Bool => matches!(resolved, InferType::Bool),
+        RType::Struct {
+            path: pa,
+            type_args: aa,
+            ..
+        } => match &resolved {
+            InferType::Struct {
+                path: pb,
+                type_args: ab,
+                ..
+            } => {
+                if pa != pb || aa.len() != ab.len() {
+                    return false;
+                }
+                let mut i = 0;
+                while i < aa.len() {
+                    if !try_match_against_infer(&aa[i], &ab[i], subst, env, pending) {
+                        return false;
+                    }
+                    i += 1;
+                }
+                true
+            }
+            _ => false,
+        },
+        RType::Ref {
+            inner: ia,
+            mutable: ma,
+            ..
+        } => match &resolved {
+            InferType::Ref {
+                inner: ib,
+                mutable: mb,
+                ..
+            } => ma == mb && try_match_against_infer(ia, ib, subst, env, pending),
+            _ => false,
+        },
+        RType::RawPtr {
+            inner: ia,
+            mutable: ma,
+        } => match &resolved {
+            InferType::RawPtr {
+                inner: ib,
+                mutable: mb,
+            } => ma == mb && try_match_against_infer(ia, ib, subst, env, pending),
+            _ => false,
+        },
+        RType::Tuple(pa) => match &resolved {
+            InferType::Tuple(pb) => {
+                if pa.len() != pb.len() {
+                    return false;
+                }
+                let mut i = 0;
+                while i < pa.len() {
+                    if !try_match_against_infer(&pa[i], &pb[i], subst, env, pending) {
+                        return false;
+                    }
+                    i += 1;
+                }
+                true
+            }
+            _ => false,
+        },
+        RType::Enum {
+            path: pa,
+            type_args: aa,
+            ..
+        } => match &resolved {
+            InferType::Enum {
+                path: pb,
+                type_args: ab,
+                ..
+            } => {
+                if pa != pb || aa.len() != ab.len() {
+                    return false;
+                }
+                let mut i = 0;
+                while i < aa.len() {
+                    if !try_match_against_infer(&aa[i], &ab[i], subst, env, pending) {
+                        return false;
+                    }
+                    i += 1;
+                }
+                true
+            }
+            _ => false,
+        },
+    }
+}
+
+// Returns indices of every param whose outermost ref lifetime equals
+// `target`. Empty if no param matches. Phase D returns multiple matches:
+// when `'a` ties multiple ref params to the return, all those args'
+// borrows propagate into the result (the "combined borrow sets" rule).
+mod lifetimes;
+pub use lifetimes::find_lifetime_source;
+use lifetimes::{
+    find_elision_source, freshen_inferred_lifetimes, require_no_inferred_lifetimes,
+    validate_named_lifetimes,
+};
+
+
+pub struct RTypedField {
+    pub name: String,
+    pub name_span: Span,
+    pub ty: RType,
+    pub is_pub: bool,
+}
+
+pub struct StructEntry {
+    pub path: Vec<String>,
+    pub name_span: Span,
+    pub file: String,
+    pub type_params: Vec<String>,
+    // Lifetime params declared on the struct (e.g., `struct Holder<'a, T>`
+    // gives `lifetime_params = ["a"]`). Empty for non-lifetime-generic
+    // structs. Used to validate lifetime args at type-position uses and to
+    // build a substitution env when reading field types.
+    pub lifetime_params: Vec<String>,
+    pub fields: Vec<RTypedField>,
+    pub is_pub: bool,
+}
+
+pub struct StructTable {
+    pub entries: Vec<StructEntry>,
+}
+
+pub fn struct_lookup<'a>(table: &'a StructTable, path: &Vec<String>) -> Option<&'a StructEntry> {
+    let mut i = 0;
+    while i < table.entries.len() {
+        if &table.entries[i].path == path {
+            return Some(&table.entries[i]);
+        }
+        i += 1;
+    }
+    None
+}
+
+// Enum table — analogous to StructTable. Each entry records the enum's
+// variants with their resolved payload types. Generic enums carry their
+// type/lifetime param names; layout (`byte_size_of` etc.) substitutes
+// type_args at use-site to compute concrete sizes.
+pub struct EnumEntry {
+    pub path: Vec<String>,
+    pub name_span: Span,
+    pub file: String,
+    pub type_params: Vec<String>,
+    pub lifetime_params: Vec<String>,
+    pub variants: Vec<EnumVariantEntry>,
+    pub is_pub: bool,
+}
+
+pub struct EnumVariantEntry {
+    pub name: String,
+    pub name_span: Span,
+    // 0-based discriminant in declaration order. Stored as u32 (we
+    // emit it as i32.const at codegen).
+    pub disc: u32,
+    pub payload: VariantPayloadResolved,
+}
+
+pub enum VariantPayloadResolved {
+    Unit,
+    Tuple(Vec<RType>),
+    Struct(Vec<RTypedField>),
+}
+
+pub struct EnumTable {
+    pub entries: Vec<EnumEntry>,
+}
+
+pub fn enum_lookup<'a>(table: &'a EnumTable, path: &Vec<String>) -> Option<&'a EnumEntry> {
+    let mut i = 0;
+    while i < table.entries.len() {
+        if &table.entries[i].path == path {
+            return Some(&table.entries[i]);
+        }
+        i += 1;
+    }
+    None
+}
+
+// Re-export entry: a `pub use foo::Bar;` in module M makes the name
+// `M::Bar` (or `M::<rename>` for `pub use foo::Bar as Q;`) resolve
+// to `foo::Bar`. The table lets cross-module path lookups follow
+// these re-exports — without it, outside callers would have to know
+// the original definition's path even when the re-export is the
+// public API.
+#[derive(Clone)]
+pub struct ReExport {
+    pub module: Vec<String>,
+    pub local_name: String,
+    pub target: Vec<String>,
+}
+
+pub struct ReExportTable {
+    pub entries: Vec<ReExport>,
+}
+
+// Walk every module recursively, collecting every `pub use ...`
+// entry. Each `pub use foo::Bar;` (or renamed) in module M produces a
+// ReExport entry. Globs `pub use foo::*;` register a wildcard re-
+// export that's expanded lazily at lookup time.
+pub fn build_reexport_table(root: &crate::ast::Module) -> ReExportTable {
+    let mut table = ReExportTable { entries: Vec::new() };
+    let mut path: Vec<String> = Vec::new();
+    if !root.name.is_empty() {
+        path.push(root.name.clone());
+    }
+    let crate_root: String = if path.is_empty() {
+        String::new()
+    } else {
+        path[0].clone()
+    };
+    collect_reexports_in_module(root, &mut path, &crate_root, &mut table);
+    table
+}
+
+fn collect_reexports_in_module(
+    module: &crate::ast::Module,
+    path: &mut Vec<String>,
+    crate_root: &str,
+    table: &mut ReExportTable,
+) {
+    let mut i = 0;
+    while i < module.items.len() {
+        match &module.items[i] {
+            crate::ast::Item::Use(u) if u.is_pub => {
+                // Flatten this pub use's tree into UseEntries (with the
+                // crate-root rewrite), then turn each Explicit entry
+                // into a ReExport at the current module.
+                let mut entries: Vec<UseEntry> = Vec::new();
+                flatten_use_tree(&Vec::new(), &u.tree, crate_root, true, &mut entries);
+                let mut k = 0;
+                while k < entries.len() {
+                    if let UseEntry::Explicit { local_name, full_path, .. } = &entries[k] {
+                        table.entries.push(ReExport {
+                            module: path.clone(),
+                            local_name: local_name.clone(),
+                            target: full_path.clone(),
+                        });
+                    }
+                    // Globs: a `pub use foo::*;` would need lazy
+                    // expansion at lookup time — skip for now (not in
+                    // the bootstrap path). Documented as a limitation.
+                    k += 1;
+                }
+            }
+            crate::ast::Item::Module(m) => {
+                path.push(m.name.clone());
+                collect_reexports_in_module(m, path, crate_root, table);
+                path.pop();
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+}
+
+// Apply re-exports to a path lookup. If `path` is `[mod..., name]`
+// and `[mod...]` has a `pub use ... as name;`, return the target. May
+// chain through multiple levels (a re-export of a re-export). Caller
+// passes `probe` to validate the final destination resolves in their
+// table; we stop chaining once probe accepts.
+pub fn resolve_via_reexports<F>(
+    path: &Vec<String>,
+    table: &ReExportTable,
+    probe: F,
+) -> Option<Vec<String>>
+where
+    F: Fn(&Vec<String>) -> bool,
+{
+    if path.is_empty() {
+        return None;
+    }
+    let mut current = path.clone();
+    let mut depth = 0;
+    while depth < 16 {
+        if probe(&current) {
+            return Some(current);
+        }
+        let module_len = current.len() - 1;
+        let mut found: Option<Vec<String>> = None;
+        let mut i = 0;
+        while i < table.entries.len() {
+            let e = &table.entries[i];
+            if e.module.len() == module_len
+                && e.local_name == current[module_len]
+            {
+                let mut module_eq = true;
+                let mut k = 0;
+                while k < module_len {
+                    if e.module[k] != current[k] {
+                        module_eq = false;
+                        break;
+                    }
+                    k += 1;
+                }
+                if module_eq {
+                    found = Some(e.target.clone());
+                    break;
+                }
+            }
+            i += 1;
+        }
+        match found {
+            Some(t) => {
+                current = t;
+                depth += 1;
+            }
+            None => return None,
+        }
+    }
+    None
+}
+
+// Re-export-aware lookups. When the user writes a path that matches
+// a `pub use` re-export, the actual table holds the entry under the
+// canonical (re-export target) path — these helpers transparently
+// follow the re-export chain so callers don't have to.
+pub fn trait_lookup_resolved<'a>(
+    traits: &'a TraitTable,
+    reexports: &ReExportTable,
+    path: &Vec<String>,
+) -> Option<&'a TraitEntry> {
+    if let Some(e) = trait_lookup(traits, path) {
+        return Some(e);
+    }
+    let target = resolve_via_reexports(path, reexports, |p| {
+        trait_lookup(traits, p).is_some()
+    })?;
+    trait_lookup(traits, &target)
+}
+
+pub fn struct_lookup_resolved<'a>(
+    structs: &'a StructTable,
+    reexports: &ReExportTable,
+    path: &Vec<String>,
+) -> Option<&'a StructEntry> {
+    if let Some(e) = struct_lookup(structs, path) {
+        return Some(e);
+    }
+    let target = resolve_via_reexports(path, reexports, |p| {
+        struct_lookup(structs, p).is_some()
+    })?;
+    struct_lookup(structs, &target)
+}
+
+pub fn func_path_resolved(
+    funcs: &FuncTable,
+    reexports: &ReExportTable,
+    path: &Vec<String>,
+) -> Option<Vec<String>> {
+    if funcs_entry_index(funcs, path).is_some() || template_lookup(funcs, path).is_some() {
+        return Some(path.clone());
+    }
+    resolve_via_reexports(path, reexports, |p| {
+        funcs_entry_index(funcs, p).is_some() || template_lookup(funcs, p).is_some()
+    })
+}
+
+// Visibility check: an item with `is_pub` flag, defined inside
+// `defining_module`, is visible from `accessor_module` iff `is_pub`
+// or `accessor_module` is `defining_module` or a descendant. Mirrors
+// Rust's "private items are visible to the defining module and its
+// descendants."
+//
+mod visibility;
+pub use visibility::{
+    field_visible_from, fn_defining_module, is_visible_from, type_defining_module,
+};
+
+// A flattened entry from a `use` declaration. `Explicit` corresponds
+// to `use a::b::c;` (or a renamed `use a::b::c as d;`) — single name
+// → single full path. `Glob` corresponds to `use a::b::*;` — every
+// item directly under `a::b` is brought into scope, resolved lazily
+// at lookup time via probing the relevant table.
+//
+// `is_pub` carries the originating `UseDecl.is_pub` — for `pub use`,
+// the entry contributes to the enclosing module's re-export table
+// (see `ReExportTable`) so outside modules can reach the imported
+// item via `<this_module>::<local_name>`.
+#[derive(Clone)]
+pub enum UseEntry {
+    Explicit {
+        local_name: String,
+        full_path: Vec<String>,
+        is_pub: bool,
+    },
+    Glob {
+        module_path: Vec<String>,
+        is_pub: bool,
+    },
+}
+
+// Recursively flatten a UseTree into a list of UseEntry, with `prefix`
+// prepended to every contained path. Top-level callers pass an empty
+// prefix; the recursion accumulates prefix segments through Nested.
+//
+// A leading `crate` segment in any use path is rewritten to the
+// enclosing crate's root: for the user crate (root_name == "") it's
+// stripped (so `use crate::foo::bar;` becomes `["foo","bar"]`); for a
+// library (e.g. root_name == "std") it's substituted (so `use
+// crate::Drop` inside std's own source becomes `["std","Drop"]`).
+// The prefix is applied first, then the crate-rewrite acts on the
+// resulting absolute path.
+pub fn flatten_use_tree(
+    prefix: &Vec<String>,
+    tree: &crate::ast::UseTree,
+    crate_root: &str,
+    is_pub: bool,
+    out: &mut Vec<UseEntry>,
+) {
+    match tree {
+        crate::ast::UseTree::Leaf { path, rename, .. } => {
+            let mut full = prefix.clone();
+            let mut i = 0;
+            while i < path.len() {
+                full.push(path[i].clone());
+                i += 1;
+            }
+            // Local name comes from the *original* last segment (or
+            // explicit rename) — `use crate::foo::Bar;` imports `Bar`,
+            // not `crate`, even after the rewrite below.
+            let local_name = match rename {
+                Some(r) => r.clone(),
+                None => {
+                    if full.is_empty() {
+                        return; // nothing to import
+                    }
+                    full[full.len() - 1].clone()
+                }
+            };
+            full = rewrite_crate_prefix(full, crate_root);
+            out.push(UseEntry::Explicit {
+                local_name,
+                full_path: full,
+                is_pub,
+            });
+        }
+        crate::ast::UseTree::Glob { path, .. } => {
+            let mut full = prefix.clone();
+            let mut i = 0;
+            while i < path.len() {
+                full.push(path[i].clone());
+                i += 1;
+            }
+            full = rewrite_crate_prefix(full, crate_root);
+            out.push(UseEntry::Glob {
+                module_path: full,
+                is_pub,
+            });
+        }
+        crate::ast::UseTree::Nested { prefix: p, children, .. } => {
+            let mut combined = prefix.clone();
+            let mut i = 0;
+            while i < p.len() {
+                combined.push(p[i].clone());
+                i += 1;
+            }
+            let mut k = 0;
+            while k < children.len() {
+                flatten_use_tree(&combined, &children[k], crate_root, is_pub, out);
+                k += 1;
+            }
+        }
+    }
+}
+
+fn rewrite_crate_prefix(mut path: Vec<String>, crate_root: &str) -> Vec<String> {
+    if !path.is_empty() && path[0] == "crate" {
+        if crate_root.is_empty() {
+            // User crate: drop the `crate` segment entirely. Items
+            // live at the empty-prefix root, so `crate::foo::bar`
+            // becomes just `foo::bar`.
+            let mut rest: Vec<String> = Vec::new();
+            let mut i = 1;
+            while i < path.len() {
+                rest.push(path[i].clone());
+                i += 1;
+            }
+            return rest;
+        } else {
+            // Library: substitute `crate` → library name. So inside
+            // `std`'s source, `use crate::Drop;` becomes `std::Drop`.
+            path[0] = crate_root.to_string();
+            return path;
+        }
+    }
+    path
+}
+
+// Apply use-table resolution to a path. Looks at the path's first
+// segment; if it matches an explicit use, the imported full path
+// replaces just that first segment (the rest of the path is appended).
+// If no explicit match, each glob in scope is tried by prefixing the
+// glob's module path to the original path and probing the resulting
+// candidate against the caller's lookup target. Returns the
+// use-resolved path, or `None` if no use entry applied.
+//
+// `scope` is a single flat list of `UseEntry`s, ordered with
+// outermost-first / innermost-last; iteration is reverse so the
+// innermost scope's entries shadow outer ones.
+//
+// Examples (with `use std::Drop;` and `use std::*;`):
+//   - `Drop` → `std::Drop` (explicit match, single segment).
+//   - `Pair::new` (with `use foo::Pair;`) → `foo::Pair::new` (the
+//     imported `Pair` becomes the path root; the rest follows).
+//   - `Drop` (with only `use std::*;`, no explicit) → `std::Drop`
+//     iff probe(["std","Drop"]) succeeds.
+pub fn resolve_via_use_scopes<F>(
+    path: &[String],
+    scope: &Vec<UseEntry>,
+    probe: F,
+) -> Option<Vec<String>>
+where
+    F: Fn(&Vec<String>) -> bool,
+{
+    if path.is_empty() {
+        return None;
+    }
+    let head = &path[0];
+    // Explicit match on the first segment — innermost (last-pushed) wins.
+    let mut s = scope.len();
+    while s > 0 {
+        s -= 1;
+        if let UseEntry::Explicit { local_name, full_path, .. } = &scope[s] {
+            if local_name == head {
+                let mut out = full_path.clone();
+                let mut j = 1;
+                while j < path.len() {
+                    out.push(path[j].clone());
+                    j += 1;
+                }
+                return Some(out);
+            }
+        }
+    }
+    // No explicit; try each glob's `module_path :: path` in reverse.
+    let mut s = scope.len();
+    while s > 0 {
+        s -= 1;
+        if let UseEntry::Glob { module_path, .. } = &scope[s] {
+            let mut candidate = module_path.clone();
+            let mut j = 0;
+            while j < path.len() {
+                candidate.push(path[j].clone());
+                j += 1;
+            }
+            if probe(&candidate) {
+                return Some(candidate);
+            }
+        }
+    }
+    None
+}
+
+// Walk a Module's items and flatten every `use` declaration into a
+// single `Vec<UseEntry>`. `crate_root` is the enclosing crate's name
+// (empty for the user crate, or e.g. `"std"` for a library), used by
+// `flatten_use_tree` to rewrite leading `crate` segments. Submodule
+// uses don't propagate up.
+pub fn module_use_entries(module: &crate::ast::Module, crate_root: &str) -> Vec<UseEntry> {
+    let mut out: Vec<UseEntry> = Vec::new();
+    let mut i = 0;
+    while i < module.items.len() {
+        if let crate::ast::Item::Use(u) = &module.items[i] {
+            flatten_use_tree(&Vec::new(), &u.tree, crate_root, u.is_pub, &mut out);
+        }
+        i += 1;
+    }
+    out
+}
+
+// Per-place move state recorded by borrowck. `Moved` means moved on
+// every reachable path; `MaybeMoved` means moved on some paths but not
+// others (the binding's storage is potentially-init at the place's
+// scope-end, requiring a runtime drop flag in codegen). The implicit
+// third state — `Init` — is "the place isn't in the list at all."
+#[derive(Clone, PartialEq, Eq)]
+pub enum MoveStatus {
+    Moved,
+    MaybeMoved,
+}
+
+#[derive(Clone)]
+pub struct MovedPlace {
+    pub place: Vec<String>,
+    pub status: MoveStatus,
+}
+
+// Trait declarations registered during the first typeck pass. Trait
+// methods' signatures are stored with `Self` as `RType::Param("Self")` so
+// impl validation can substitute against the impl target.
+pub struct TraitTable {
+    pub entries: Vec<TraitEntry>,
+    // Each `impl Trait for Target` row registered. Multiple rows for the
+    // same `(trait_path, target_pattern)` are rejected as duplicates.
+    pub impls: Vec<TraitImplEntry>,
+}
+
+pub struct TraitEntry {
+    pub path: Vec<String>,
+    pub name_span: Span,
+    pub file: String,
+    pub methods: Vec<TraitMethodEntry>,
+    pub is_pub: bool,
+    pub supertraits: Vec<Vec<String>>,
+}
+
+pub struct TraitMethodEntry {
+    pub name: String,
+    pub name_span: Span,
+    // Method-level type-params declared on the trait method (e.g. `fn
+    // bar<U>(self, u: U)`). Names appear in `param_types` / `return_type`
+    // as `RType::Param(name)`. Validation against impl methods compares
+    // by arity + α-equivalence (impl's `<V>` matched positionally with
+    // trait's `<U>`); symbolic dispatch allocates fresh inference vars
+    // per call, optionally pinned by turbofish.
+    pub type_params: Vec<String>,
+    // Resolved param types in declaration order. Param 0 is the receiver
+    // (when the method has one); `Self` appears as `RType::Param("Self")`
+    // and gets substituted with the impl target during validation +
+    // dispatch.
+    pub param_types: Vec<RType>,
+    pub return_type: Option<RType>,
+    // Receiver shape if param 0 is a `self` receiver — Move (`self:
+    // Self`), BorrowImm (`&Self`), or BorrowMut (`&mut Self`). None for
+    // associated functions without a receiver.
+    pub receiver_shape: Option<TraitReceiverShape>,
+}
+
+#[derive(Clone, Copy)]
+pub enum TraitReceiverShape {
+    Move,
+    BorrowImm,
+    BorrowMut,
+}
+
+// One `impl Trait for Target` row. `target` is the impl-target pattern
+// (as in inherent impls — see `FnSymbol.impl_target`); `impl_type_params`
+// records the impl's own type-params (not the trait's).
+pub struct TraitImplEntry {
+    pub trait_path: Vec<String>,
+    pub target: RType,
+    pub impl_type_params: Vec<String>,
+    pub impl_lifetime_params: Vec<String>,
+    // Per impl-type-param trait bounds (resolved). Same shape and order as
+    // `impl_type_params`. `solve_impl` enforces these recursively when
+    // matching a candidate impl against a concrete type.
+    pub impl_type_param_bounds: Vec<Vec<Vec<String>>>,
+    pub file: String,
+    pub span: Span,
+}
+
+// Find the registered impl row for an `impl` AST block by matching the
+// stored (file, span) identity. Used by codegen to recover the
+// trait_impl_idx that typeck assigned, so it can re-derive the same
+// method-path prefix that typeck stored on `FnSymbol.path`.
+pub fn find_trait_impl_idx_by_span(
+    table: &TraitTable,
+    file: &str,
+    span: &Span,
+) -> Option<usize> {
+    let mut i = 0;
+    while i < table.impls.len() {
+        let row = &table.impls[i];
+        if row.file == file
+            && row.span.start.line == span.start.line
+            && row.span.start.col == span.start.col
+        {
+            return Some(i);
+        }
+        i += 1;
+    }
+    None
+}
+
+pub fn trait_lookup<'a>(table: &'a TraitTable, path: &Vec<String>) -> Option<&'a TraitEntry> {
+    let mut i = 0;
+    while i < table.entries.len() {
+        if &table.entries[i].path == path {
+            return Some(&table.entries[i]);
+        }
+        i += 1;
+    }
+    None
+}
+
+// Returns `start` plus every transitive supertrait, deduplicated. Cycles
+// are broken by the dedup check (a trait already in `out` is not pushed
+// or recursed into again), so a malformed `trait A: B` / `trait B: A`
+// pair just produces `[A, B]` rather than looping.
+pub fn supertrait_closure(start: &Vec<String>, traits: &TraitTable) -> Vec<Vec<String>> {
+    let mut out: Vec<Vec<String>> = Vec::new();
+    out.push(start.clone());
+    let mut i = 0;
+    while i < out.len() {
+        if let Some(entry) = trait_lookup(traits, &out[i]) {
+            let mut s = 0;
+            while s < entry.supertraits.len() {
+                let sup = &entry.supertraits[s];
+                let mut already = false;
+                let mut j = 0;
+                while j < out.len() {
+                    if &out[j] == sup {
+                        already = true;
+                        break;
+                    }
+                    j += 1;
+                }
+                if !already {
+                    out.push(sup.clone());
+                }
+                s += 1;
+            }
+        }
+        i += 1;
+    }
+    out
+}
+
+pub struct FnSymbol {
+    pub path: Vec<String>,
+    pub idx: u32,
+    pub param_types: Vec<RType>,
+    pub return_type: Option<RType>,
+    // For trait-impl methods, the index into `TraitTable.impls` of the
+    // owning impl row. None for free fns and inherent methods.
+    pub trait_impl_idx: Option<usize>,
+    pub is_pub: bool,
+    // Per `Expr` node, indexed by `Expr.id`. Contains the resolved `RType`
+    // for nodes that carry a value type. `None` for nodes without one
+    // (currently unused — every Expr produces a value in our subset).
+    // Borrowck reads this for binding types (via `let_stmt.value.id`),
+    // codegen reads this for layout (let bindings, lit constants, struct
+    // literals), safeck reads `Deref(inner).inner.id`'s entry to detect
+    // raw-pointer derefs.
+    pub expr_types: Vec<Option<RType>>,
+    // Outermost lifetime of each param's ref type, or None for non-ref
+    // params. Used by borrowck to map a returned ref's lifetime back to the
+    // arg slot(s) whose borrows it inherits.
+    pub param_lifetimes: Vec<Option<LifetimeRepr>>,
+    // Outermost lifetime of the return ref, or None if the return type isn't
+    // a ref. Set by lifetime elision (or copied from a user `'a` annotation).
+    pub ret_lifetime: Option<LifetimeRepr>,
+    // For methods (registered inside an `impl Target { ... }` block): the
+    // impl's target type pattern. `None` for free functions. The pattern may
+    // contain `RType::Param(impl_param_name)` slots that get bound by
+    // matching against the receiver type at each call site.
+    pub impl_target: Option<RType>,
+    // Per `MethodCall` expression, indexed by Expr.id. Some(_) at MethodCall
+    // node ids; None elsewhere.
+    pub method_resolutions: Vec<Option<MethodResolution>>,
+    // Per `Call` expression, indexed by Expr.id.
+    pub call_resolutions: Vec<Option<CallResolution>>,
+    // T4.6: places whose move-state at the binding's scope-end was non-Init,
+    // snapshotted from borrowck's walk. Codegen consults this to decide what
+    // to do at each Drop binding's drop point: `Init` means the binding
+    // wasn't moved at all (unconditional drop); `Moved` means it was moved on
+    // every path (skip drop); `MaybeMoved` means it was moved on some paths
+    // (emit a runtime drop flag — set 1 at decl, 0 at every move site, drop
+    // gated on flag).
+    pub moved_places: Vec<MovedPlace>,
+    // Per whole-binding move site: every (NodeId, binding-name) pair where
+    // borrowck observed a non-Copy whole-binding read that consumed the
+    // binding's storage. Codegen consults this to clear drop flags: at the
+    // codegen for the matching NodeId, emit `flag = 0` for the named
+    // binding (only when that binding's status at scope-end is MaybeMoved
+    // — Init bindings don't have flags, and Moved bindings drop is just
+    // skipped). Empty for fns with no whole-binding moves.
+    pub move_sites: Vec<(crate::ast::NodeId, String)>,
+}
+
+// How a `Call` expression resolves to a callee. For non-generic functions
+// it's an index into FuncTable.entries. For generic functions, it points to
+// a template plus the type arguments at the call site (which may themselves
+// contain `Param` if the calling function is also generic — substituted at
+// monomorphization).
+#[derive(Clone)]
+pub enum CallResolution {
+    Direct(usize),
+    Generic {
+        template_idx: usize,
+        type_args: Vec<RType>,
+    },
+    // Enum variant construction: `Path::Variant(args...)` produces an
+    // enum value. `enum_path` is the canonical enum's path; `disc` is
+    // the variant index; `type_args` are the enum's type-args at this
+    // construction site (substituted under any outer monomorphization
+    // env at codegen time).
+    Variant {
+        enum_path: Vec<String>,
+        disc: u32,
+        type_args: Vec<RType>,
+    },
+}
+
+// A generic function declaration. Its body is type-checked once,
+// polymorphically (so let_types/lit_types/etc. may contain `RType::Param`).
+// Codegen monomorphizes lazily per (template_idx, concrete type_args) pair,
+// substituting Param → concrete in the recorded artifacts.
+pub struct GenericTemplate {
+    pub path: Vec<String>,
+    pub type_params: Vec<String>,
+    // Per type-param trait bounds (resolved to trait paths), in the same
+    // order as `type_params`. Each inner Vec is the bound list for that
+    // type-param. Used by symbolic trait-method dispatch in generic
+    // bodies (`fn f<T: Show>(t: T) { t.show() }`).
+    pub type_param_bounds: Vec<Vec<Vec<String>>>,
+    // Number of leading entries in `type_params` that come from the
+    // enclosing `impl<...>` block (the rest are the method's own type
+    // params). Zero for free generic functions.
+    pub impl_type_param_count: usize,
+    // For trait-impl methods, the index into `TraitTable.impls`. None
+    // for free fns and inherent methods.
+    pub trait_impl_idx: Option<usize>,
+    pub is_pub: bool,
+    pub func: crate::ast::Function,
+    pub enclosing_module: Vec<String>,
+    pub source_file: String,
+    pub param_types: Vec<RType>,
+    pub return_type: Option<RType>,
+    pub expr_types: Vec<Option<RType>>,
+    pub param_lifetimes: Vec<Option<LifetimeRepr>>,
+    pub ret_lifetime: Option<LifetimeRepr>,
+    // For impl methods: the impl's target type pattern (see FnSymbol).
+    // `None` for free generic functions.
+    pub impl_target: Option<RType>,
+    pub method_resolutions: Vec<Option<MethodResolution>>,
+    pub call_resolutions: Vec<Option<CallResolution>>,
+    // T4.6: see FnSymbol.moved_places. For templates the snapshot is taken
+    // from the polymorphic body walk and reused across monomorphizations
+    // (move semantics don't depend on concrete type args).
+    pub moved_places: Vec<MovedPlace>,
+    // See FnSymbol.move_sites.
+    pub move_sites: Vec<(crate::ast::NodeId, String)>,
+}
+
+#[derive(Clone)]
+pub struct MethodResolution {
+    // For concrete methods (non-template), this is the WASM idx. For
+    // generic-method calls, ignored — see `template_idx`/`type_args` instead.
+    pub callee_idx: u32,
+    pub callee_path: Vec<String>,
+    pub recv_adjust: ReceiverAdjust,
+    pub ret_borrows_receiver: bool,
+    // When the method is a generic template (impl-generic and/or method-generic),
+    // these record the resolution for codegen to monomorphize. type_args has
+    // length = template's type_params.len(), in the same order: impl's params
+    // first (bound to receiver type_args), then method's own (fresh vars
+    // resolved by inference).
+    pub template_idx: Option<usize>,
+    pub type_args: Vec<RType>,
+    // T2: deferred trait dispatch — populated when the call goes through
+    // a `T: Trait` bound. Codegen substitutes `recv_type` against the
+    // mono env and runs `solve_impl` to find the concrete impl + method.
+    pub trait_dispatch: Option<TraitDispatch>,
+}
+
+#[derive(Clone)]
+pub struct TraitDispatch {
+    pub trait_path: Vec<String>,
+    pub method_name: String,
+    pub recv_type: RType,
+}
+
+#[derive(Clone, Copy)]
+pub enum ReceiverAdjust {
+    Move,        // recv is consumed; method takes Self
+    BorrowImm,   // recv is owned; method takes &Self → emit &recv
+    BorrowMut,   // recv is owned; method takes &mut Self → emit &mut recv
+    ByRef,       // recv is &Self/&mut Self; pass i32 directly (incl. mut→imm downgrade)
+}
+
+pub struct FuncTable {
+    pub entries: Vec<FnSymbol>,
+    pub templates: Vec<GenericTemplate>,
+}
+
+pub fn template_lookup<'a>(
+    table: &'a FuncTable,
+    path: &Vec<String>,
+) -> Option<(usize, &'a GenericTemplate)> {
+    let mut i = 0;
+    while i < table.templates.len() {
+        if &table.templates[i].path == path {
+            return Some((i, &table.templates[i]));
+        }
+        i += 1;
+    }
+    None
+}
+
+pub fn func_lookup<'a>(table: &'a FuncTable, path: &Vec<String>) -> Option<&'a FnSymbol> {
+    let mut i = 0;
+    while i < table.entries.len() {
+        if &table.entries[i].path == path {
+            return Some(&table.entries[i]);
+        }
+        i += 1;
+    }
+    None
+}
+
+// Resolve a path expression's segments to an absolute lookup path. Handles
+// `Self::…` substitution: replaces a leading `Self` segment with the impl
+// target's struct name. Used by both typeck and codegen for call and struct
+// literal lookups.
+pub fn resolve_full_path(
+    current_module: &Vec<String>,
+    self_target: Option<&RType>,
+    segments: &Vec<PathSegment>,
+) -> Vec<String> {
+    let mut full = current_module.clone();
+    let mut start = 0;
+    if !segments.is_empty() && segments[0].name == "Self" {
+        if let Some(RType::Struct { path: target_path, .. }) = self_target {
+            if let Some(last) = target_path.last() {
+                full.push(last.clone());
+                start = 1;
+            }
+        }
+    }
+    let mut i = start;
+    while i < segments.len() {
+        full.push(segments[i].name.clone());
+        i += 1;
+    }
+    full
+}
+
+pub fn segments_to_string(segs: &Vec<PathSegment>) -> String {
+    let mut s = String::new();
+    let mut i = 0;
+    while i < segs.len() {
+        if i > 0 {
+            s.push_str("::");
+        }
+        s.push_str(&segs[i].name);
+        i += 1;
+    }
+    s
+}
+
+pub fn place_to_string(p: &Vec<String>) -> String {
+    let mut s = String::new();
+    let mut i = 0;
+    while i < p.len() {
+        if i > 0 {
+            s.push('.');
+        }
+        s.push_str(&p[i]);
+        i += 1;
+    }
+    s
+}
+
+pub fn resolve_type(
+    ty: &Type,
+    current_module: &Vec<String>,
+    structs: &StructTable,
+    enums: &EnumTable,
+    self_target: Option<&RType>,
+    type_params: &Vec<String>,
+    use_scope: &Vec<UseEntry>,
+    reexports: &ReExportTable,
+    file: &str,
+) -> Result<RType, Error> {
+    match &ty.kind {
+        TypeKind::Path(path) => {
+            if path.segments.len() == 1 {
+                if path.segments[0].name == "bool" {
+                    return Ok(RType::Bool);
+                }
+                if let Some(k) = int_kind_from_name(&path.segments[0].name) {
+                    return Ok(RType::Int(k));
+                }
+                // Check if it's an in-scope type parameter.
+                let name = &path.segments[0].name;
+                let mut i = 0;
+                while i < type_params.len() {
+                    if type_params[i] == *name {
+                        return Ok(RType::Param(name.clone()));
+                    }
+                    i += 1;
+                }
+            }
+            // Try use-table resolution: probe for both struct and enum
+            // entries (a use-imported name could be either).
+            let raw_segs: Vec<String> =
+                path.segments.iter().map(|s| s.name.clone()).collect();
+            let mut full = if let Some(p) = resolve_via_use_scopes(
+                &raw_segs,
+                use_scope,
+                |cand| {
+                    struct_lookup_resolved(structs, reexports, cand).is_some()
+                        || enum_lookup_resolved(enums, reexports, cand).is_some()
+                },
+            ) {
+                p
+            } else {
+                let mut full = current_module.clone();
+                let mut i = 0;
+                while i < path.segments.len() {
+                    full.push(path.segments[i].name.clone());
+                    i += 1;
+                }
+                full
+            };
+            let last = &path.segments[path.segments.len() - 1];
+            // Try enum first (so a name shared with a struct in different
+            // modules picks the right one through use-scope resolution).
+            // In practice struct/enum names live in disjoint namespaces
+            // per module, so this is just a "look both places, take what
+            // matches."
+            if let Some(e_entry) = enum_lookup_resolved(enums, reexports, &full) {
+                full = e_entry.path.clone();
+                if !is_visible_from(&type_defining_module(&e_entry.path), e_entry.is_pub, current_module) {
+                    return Err(Error {
+                        file: file.to_string(),
+                        message: format!("enum `{}` is private", place_to_string(&e_entry.path)),
+                        span: path.span.copy(),
+                    });
+                }
+                if e_entry.type_params.len() != last.args.len() {
+                    return Err(Error {
+                        file: file.to_string(),
+                        message: format!(
+                            "wrong number of type arguments for `{}`: expected {}, got {}",
+                            place_to_string(&full),
+                            e_entry.type_params.len(),
+                            last.args.len()
+                        ),
+                        span: path.span.copy(),
+                    });
+                }
+                let lifetime_args = resolve_lifetime_args(
+                    &last.lifetime_args,
+                    &e_entry.lifetime_params,
+                    &full,
+                    file,
+                    &path.span,
+                )?;
+                let mut type_args: Vec<RType> = Vec::new();
+                let mut i = 0;
+                while i < last.args.len() {
+                    type_args.push(resolve_type(
+                        &last.args[i],
+                        current_module,
+                        structs,
+                        enums,
+                        self_target,
+                        type_params,
+                        use_scope,
+                        reexports,
+                        file,
+                    )?);
+                    i += 1;
+                }
+                return Ok(RType::Enum {
+                    path: full,
+                    type_args,
+                    lifetime_args,
+                });
+            }
+            let entry = match struct_lookup_resolved(structs, reexports, &full) {
+                Some(e) => e,
+                None => {
+                    return Err(Error {
+                        file: file.to_string(),
+                        message: format!("unknown type: {}", segments_to_string(&path.segments)),
+                        span: path.span.copy(),
+                    });
+                }
+            };
+            // Use the canonical path returned by the resolver — that's
+            // what downstream type representation expects (e.g.
+            // `RType::Struct.path` should be the trait's actual
+            // location, not the re-export alias).
+            full = entry.path.clone();
+            if !is_visible_from(&type_defining_module(&entry.path), entry.is_pub, current_module) {
+                return Err(Error {
+                    file: file.to_string(),
+                    message: format!("struct `{}` is private", place_to_string(&entry.path)),
+                    span: path.span.copy(),
+                });
+            }
+            if entry.type_params.len() != last.args.len() {
+                return Err(Error {
+                    file: file.to_string(),
+                    message: format!(
+                        "wrong number of type arguments for `{}`: expected {}, got {}",
+                        place_to_string(&full),
+                        entry.type_params.len(),
+                        last.args.len()
+                    ),
+                    span: path.span.copy(),
+                });
+            }
+            let lifetime_args = resolve_lifetime_args(
+                &last.lifetime_args,
+                &entry.lifetime_params,
+                &full,
+                file,
+                &path.span,
+            )?;
+            let mut type_args: Vec<RType> = Vec::new();
+            let mut i = 0;
+            while i < last.args.len() {
+                let t = resolve_type(
+                    &last.args[i],
+                    current_module,
+                    structs,
+                    enums,
+                    self_target,
+                    type_params,
+                    use_scope,
+                    reexports,
+                    file,
+                )?;
+                type_args.push(t);
+                i += 1;
+            }
+            Ok(RType::Struct {
+                path: full,
+                type_args,
+                lifetime_args,
+            })
+        }
+        TypeKind::Ref { inner, mutable, lifetime } => {
+            let r = resolve_type(
+                inner,
+                current_module,
+                structs,
+                enums,
+                self_target,
+                type_params,
+                use_scope,
+                reexports,
+                file,
+            )?;
+            // Phase B: structurally carry the lifetime — `'a` becomes
+            // `Named("a")`; elided refs and the `'_` anonymous lifetime
+            // both use the `Inferred(0)` placeholder, freshened later.
+            let lt = match lifetime {
+                Some(lt) if lt.name == "_" => LifetimeRepr::Inferred(0),
+                Some(lt) => LifetimeRepr::Named(lt.name.clone()),
+                None => LifetimeRepr::Inferred(0),
+            };
+            Ok(RType::Ref {
+                inner: Box::new(r),
+                mutable: *mutable,
+                lifetime: lt,
+            })
+        }
+        TypeKind::RawPtr { inner, mutable } => {
+            let r = resolve_type(
+                inner,
+                current_module,
+                structs,
+                enums,
+                self_target,
+                type_params,
+                use_scope,
+                reexports,
+                file,
+            )?;
+            Ok(RType::RawPtr {
+                inner: Box::new(r),
+                mutable: *mutable,
+            })
+        }
+        TypeKind::SelfType => match self_target {
+            Some(rt) => Ok(rt.clone()),
+            None => Err(Error {
+                file: file.to_string(),
+                message: "`Self` is only valid inside an `impl` block".to_string(),
+                span: ty.span.copy(),
+            }),
+        },
+        TypeKind::Tuple(elems) => {
+            let mut out: Vec<RType> = Vec::new();
+            let mut i = 0;
+            while i < elems.len() {
+                out.push(resolve_type(
+                    &elems[i],
+                    current_module,
+                    structs,
+                    enums,
+                    self_target,
+                    type_params,
+                    use_scope,
+                    reexports,
+                    file,
+                )?);
+                i += 1;
+            }
+            Ok(RType::Tuple(out))
+        }
+    }
+}
+
+// Validate and resolve the lifetime args at a struct/enum type-position
+// path against the type's declared `lifetime_params`. Either fully
+// elided (yields `Inferred(0)` placeholders, one per param) or a
+// 1:1 explicit list (each `'a`-style name → `Named`, `'_` → fresh
+// `Inferred(0)`). Used by both the struct and enum branches of
+// `resolve_type` to share the validation.
+fn resolve_lifetime_args(
+    args: &Vec<crate::ast::Lifetime>,
+    params: &Vec<String>,
+    full: &Vec<String>,
+    file: &str,
+    span: &Span,
+) -> Result<Vec<LifetimeRepr>, Error> {
+    if args.is_empty() {
+        let mut out: Vec<LifetimeRepr> = Vec::new();
+        let mut i = 0;
+        while i < params.len() {
+            out.push(LifetimeRepr::Inferred(0));
+            i += 1;
+        }
+        return Ok(out);
+    }
+    if args.len() != params.len() {
+        return Err(Error {
+            file: file.to_string(),
+            message: format!(
+                "wrong number of lifetime arguments for `{}`: expected {}, got {}",
+                place_to_string(full),
+                params.len(),
+                args.len()
+            ),
+            span: span.copy(),
+        });
+    }
+    let mut out: Vec<LifetimeRepr> = Vec::new();
+    let mut i = 0;
+    while i < args.len() {
+        if args[i].name == "_" {
+            out.push(LifetimeRepr::Inferred(0));
+        } else {
+            out.push(LifetimeRepr::Named(args[i].name.clone()));
+        }
+        i += 1;
+    }
+    Ok(out)
+}
+
+// Re-export-aware enum lookup. Mirrors `struct_lookup_resolved`.
+pub fn enum_lookup_resolved<'a>(
+    enums: &'a EnumTable,
+    reexports: &ReExportTable,
+    path: &Vec<String>,
+) -> Option<&'a EnumEntry> {
+    if let Some(e) = enum_lookup(enums, path) {
+        return Some(e);
+    }
+    let target = resolve_via_reexports(path, reexports, |cand| {
+        enum_lookup(enums, cand).is_some()
+    })?;
+    enum_lookup(enums, &target)
+}
+
+// A path matches an enum variant if its prefix names an enum and the
+// last segment matches one of that enum's variants. Returns the
+// canonical enum path + variant index. The probe is use-scope and
+// re-export aware — `Option::Some` resolves through `use std::option::Option`,
+// `std::*` glob, `pub use`, etc.
+pub fn lookup_variant_path(
+    enums: &EnumTable,
+    reexports: &ReExportTable,
+    use_scope: &Vec<UseEntry>,
+    current_module: &Vec<String>,
+    raw_segs: &Vec<String>,
+) -> Option<(Vec<String>, usize)> {
+    if raw_segs.len() < 2 {
+        return None;
+    }
+    let prefix_len = raw_segs.len() - 1;
+    let variant_name = raw_segs[prefix_len].clone();
+    let prefix_segs: Vec<String> = raw_segs[..prefix_len].to_vec();
+    // Try use-scope resolution first; the prefix must name an enum.
+    let enum_path: Vec<String> =
+        resolve_via_use_scopes(&prefix_segs, use_scope, |cand| {
+            enum_lookup_resolved(enums, reexports, cand).is_some()
+        })
+        .unwrap_or_else(|| {
+            let mut full = current_module.clone();
+            let mut i = 0;
+            while i < prefix_segs.len() {
+                full.push(prefix_segs[i].clone());
+                i += 1;
+            }
+            full
+        });
+    let entry = enum_lookup_resolved(enums, reexports, &enum_path)?;
+    let mut i = 0;
+    while i < entry.variants.len() {
+        if entry.variants[i].name == variant_name {
+            return Some((entry.path.clone(), i));
+        }
+        i += 1;
+    }
+    None
+}
+
+// ----- Inference machinery -----
+
+pub fn check(
+    root: &Module,
+    structs: &mut StructTable,
+    enums: &mut EnumTable,
+    traits: &mut TraitTable,
+    funcs: &mut FuncTable,
+    reexports: &mut ReExportTable,
+    next_idx: &mut u32,
+) -> Result<(), Error> {
+    // Build this crate's re-export entries before any pass that does
+    // path resolution, so `pub use` re-exports are visible to lookups.
+    let crate_reexports = build_reexport_table(root);
+    let mut k = 0;
+    while k < crate_reexports.entries.len() {
+        reexports.entries.push(crate_reexports.entries[k].clone());
+        k += 1;
+    }
+    let mut path: Vec<String> = Vec::new();
+    push_root_name(&mut path, root);
+    collect_struct_names(root, &mut path, structs);
+
+    let mut path: Vec<String> = Vec::new();
+    push_root_name(&mut path, root);
+    collect_enum_names(root, &mut path, enums);
+
+    let mut path: Vec<String> = Vec::new();
+    push_root_name(&mut path, root);
+    collect_trait_names(root, &mut path, traits);
+
+    let mut path: Vec<String> = Vec::new();
+    push_root_name(&mut path, root);
+    resolve_struct_fields(root, &mut path, structs, enums, reexports)?;
+
+    let mut path: Vec<String> = Vec::new();
+    push_root_name(&mut path, root);
+    resolve_enum_variants(root, &mut path, enums, structs, reexports)?;
+
+    let mut path: Vec<String> = Vec::new();
+    push_root_name(&mut path, root);
+    resolve_trait_methods(root, &mut path, traits, structs, enums, reexports)?;
+
+    let mut path: Vec<String> = Vec::new();
+    push_root_name(&mut path, root);
+    collect_funcs(root, &mut path, funcs, next_idx, structs, enums, traits, reexports)?;
+
+    validate_supertrait_obligations(traits)?;
+
+    let mut path: Vec<String> = Vec::new();
+    push_root_name(&mut path, root);
+    let mut current_file = root.source_file.clone();
+    check_module(root, &mut path, &mut current_file, structs, enums, traits, funcs, reexports)?;
+
+    Ok(())
+}
+
+
+// ----- InferType -----
+
+#[derive(Clone)]
+pub(crate) enum InferType {
+    Var(u32),
+    Int(IntKind),
+    Struct {
+        path: Vec<String>,
+        type_args: Vec<InferType>,
+        // Mirrors `RType::Struct.lifetime_args`. Carry-only for inference;
+        // unification ignores lifetimes (Phase D structural).
+        lifetime_args: Vec<LifetimeRepr>,
+    },
+    Ref {
+        inner: Box<InferType>,
+        mutable: bool,
+        // Phase B: structural carry only. Mirrors `RType::Ref.lifetime`;
+        // unification ignores it.
+        lifetime: LifetimeRepr,
+    },
+    RawPtr { inner: Box<InferType>, mutable: bool },
+    Param(String),
+    Bool,
+    Tuple(Vec<InferType>),
+    Enum {
+        path: Vec<String>,
+        type_args: Vec<InferType>,
+        lifetime_args: Vec<LifetimeRepr>,
+    },
+}
+
+// Build a name → InferType env from a generic struct/template's type-param
+// names paired with the call site's type arguments. Used to substitute Param
+// in field types or method signatures.
+pub(crate) fn build_infer_env(type_params: &Vec<String>, type_args: &Vec<InferType>) -> Vec<(String, InferType)> {
+    let mut env: Vec<(String, InferType)> = Vec::new();
+    let n = if type_params.len() < type_args.len() {
+        type_params.len()
+    } else {
+        type_args.len()
+    };
+    let mut i = 0;
+    while i < n {
+        env.push((type_params[i].clone(), type_args[i].clone()));
+        i += 1;
+    }
+    env
+}
+
+pub(crate) fn rtype_to_infer(rt: &RType) -> InferType {
+    match rt {
+        RType::Int(k) => InferType::Int(*k),
+        RType::Struct { path, type_args, lifetime_args } => {
+            let mut infer_args: Vec<InferType> = Vec::new();
+            let mut i = 0;
+            while i < type_args.len() {
+                infer_args.push(rtype_to_infer(&type_args[i]));
+                i += 1;
+            }
+            InferType::Struct {
+                path: path.clone(),
+                type_args: infer_args,
+                lifetime_args: lifetime_args.clone(),
+            }
+        }
+        RType::Ref { inner, mutable, lifetime } => InferType::Ref {
+            inner: Box::new(rtype_to_infer(inner)),
+            mutable: *mutable,
+            lifetime: lifetime.clone(),
+        },
+        RType::RawPtr { inner, mutable } => InferType::RawPtr {
+            inner: Box::new(rtype_to_infer(inner)),
+            mutable: *mutable,
+        },
+        RType::Param(n) => InferType::Param(n.clone()),
+        RType::Bool => InferType::Bool,
+        RType::Tuple(elems) => {
+            let mut out: Vec<InferType> = Vec::new();
+            let mut i = 0;
+            while i < elems.len() {
+                out.push(rtype_to_infer(&elems[i]));
+                i += 1;
+            }
+            InferType::Tuple(out)
+        }
+        RType::Enum { path, type_args, lifetime_args } => {
+            let mut infer_args: Vec<InferType> = Vec::new();
+            let mut i = 0;
+            while i < type_args.len() {
+                infer_args.push(rtype_to_infer(&type_args[i]));
+                i += 1;
+            }
+            InferType::Enum {
+                path: path.clone(),
+                type_args: infer_args,
+                lifetime_args: lifetime_args.clone(),
+            }
+        }
+    }
+}
+
+// Substitute type parameters in an InferType using a name → InferType env.
+// Used at generic call sites to map the callee's `Param("T")` slots to fresh
+// inference vars allocated for the call.
+pub(crate) fn infer_substitute(t: &InferType, env: &Vec<(String, InferType)>) -> InferType {
+    match t {
+        InferType::Var(v) => InferType::Var(*v),
+        InferType::Int(k) => InferType::Int(*k),
+        InferType::Struct { path, type_args, lifetime_args } => {
+            let mut subst_args: Vec<InferType> = Vec::new();
+            let mut i = 0;
+            while i < type_args.len() {
+                subst_args.push(infer_substitute(&type_args[i], env));
+                i += 1;
+            }
+            InferType::Struct {
+                path: path.clone(),
+                type_args: subst_args,
+                lifetime_args: lifetime_args.clone(),
+            }
+        }
+        InferType::Ref { inner, mutable, lifetime } => InferType::Ref {
+            inner: Box::new(infer_substitute(inner, env)),
+            mutable: *mutable,
+            lifetime: lifetime.clone(),
+        },
+        InferType::RawPtr { inner, mutable } => InferType::RawPtr {
+            inner: Box::new(infer_substitute(inner, env)),
+            mutable: *mutable,
+        },
+        InferType::Param(name) => {
+            let mut i = 0;
+            while i < env.len() {
+                if env[i].0 == *name {
+                    return env[i].1.clone();
+                }
+                i += 1;
+            }
+            InferType::Param(name.clone())
+        }
+        InferType::Bool => InferType::Bool,
+        InferType::Tuple(elems) => {
+            let mut out: Vec<InferType> = Vec::new();
+            let mut i = 0;
+            while i < elems.len() {
+                out.push(infer_substitute(&elems[i], env));
+                i += 1;
+            }
+            InferType::Tuple(out)
+        }
+        InferType::Enum { path, type_args, lifetime_args } => {
+            let mut subst_args: Vec<InferType> = Vec::new();
+            let mut i = 0;
+            while i < type_args.len() {
+                subst_args.push(infer_substitute(&type_args[i], env));
+                i += 1;
+            }
+            InferType::Enum {
+                path: path.clone(),
+                type_args: subst_args,
+                lifetime_args: lifetime_args.clone(),
+            }
+        }
+    }
+}
+
+pub(crate) fn infer_to_string(t: &InferType) -> String {
+    match t {
+        InferType::Var(v) => format!("?{}", v),
+        InferType::Int(k) => int_kind_name(k).to_string(),
+        InferType::Struct { path, type_args, .. } => {
+            if type_args.is_empty() {
+                place_to_string(path)
+            } else {
+                let mut s = place_to_string(path);
+                s.push('<');
+                let mut i = 0;
+                while i < type_args.len() {
+                    if i > 0 {
+                        s.push_str(", ");
+                    }
+                    s.push_str(&infer_to_string(&type_args[i]));
+                    i += 1;
+                }
+                s.push('>');
+                s
+            }
+        }
+        InferType::Ref { inner, mutable, .. } => {
+            if *mutable {
+                format!("&mut {}", infer_to_string(inner))
+            } else {
+                format!("&{}", infer_to_string(inner))
+            }
+        }
+        InferType::RawPtr { inner, mutable } => {
+            if *mutable {
+                format!("*mut {}", infer_to_string(inner))
+            } else {
+                format!("*const {}", infer_to_string(inner))
+            }
+        }
+        InferType::Param(n) => n.clone(),
+        InferType::Bool => "bool".to_string(),
+        InferType::Tuple(elems) => {
+            let mut s = String::from("(");
+            let mut i = 0;
+            while i < elems.len() {
+                if i > 0 {
+                    s.push_str(", ");
+                }
+                s.push_str(&infer_to_string(&elems[i]));
+                i += 1;
+            }
+            if elems.len() == 1 {
+                s.push(',');
+            }
+            s.push(')');
+            s
+        }
+        InferType::Enum { path, type_args, .. } => {
+            if type_args.is_empty() {
+                place_to_string(path)
+            } else {
+                let mut s = place_to_string(path);
+                s.push('<');
+                let mut i = 0;
+                while i < type_args.len() {
+                    if i > 0 {
+                        s.push_str(", ");
+                    }
+                    s.push_str(&infer_to_string(&type_args[i]));
+                    i += 1;
+                }
+                s.push('>');
+                s
+            }
+        }
+    }
+}
+
+pub(crate) struct Subst {
+    bindings: Vec<Option<InferType>>,
+    // Per-var "literal" flag. A var allocated from an integer literal
+    // carries this flag; on unification it must resolve to a type that
+    // implements `std::Num`. Today that admits every `Int(_)` kind
+    // (stdlib provides `impl Num for u8/i8/.../isize`), every user type
+    // with `impl Num for ...`, and every `Param(T)` whose bound list
+    // includes `Num`. If still unconstrained at body-end, defaults to
+    // `i32` (preserving today's literal behavior).
+    is_num_lit: Vec<bool>,
+}
+
+impl Subst {
+    pub(crate) fn fresh_int(&mut self) -> u32 {
+        let id = self.bindings.len() as u32;
+        self.bindings.push(None);
+        self.is_num_lit.push(true);
+        id
+    }
+
+    pub(crate) fn fresh_var(&mut self) -> u32 {
+        let id = self.bindings.len() as u32;
+        self.bindings.push(None);
+        self.is_num_lit.push(false);
+        id
+    }
+
+    pub(crate) fn substitute(&self, ty: &InferType) -> InferType {
+        match ty {
+            InferType::Var(v) => match &self.bindings[*v as usize] {
+                Some(t) => self.substitute(t),
+                None => InferType::Var(*v),
+            },
+            InferType::Int(k) => InferType::Int(*k),
+            InferType::Struct { path, type_args, lifetime_args } => {
+                let mut subst_args: Vec<InferType> = Vec::new();
+                let mut i = 0;
+                while i < type_args.len() {
+                    subst_args.push(self.substitute(&type_args[i]));
+                    i += 1;
+                }
+                InferType::Struct {
+                    path: path.clone(),
+                    type_args: subst_args,
+                    lifetime_args: lifetime_args.clone(),
+                }
+            }
+            InferType::Ref { inner, mutable, lifetime } => InferType::Ref {
+                inner: Box::new(self.substitute(inner)),
+                mutable: *mutable,
+                lifetime: lifetime.clone(),
+            },
+            InferType::RawPtr { inner, mutable } => InferType::RawPtr {
+                inner: Box::new(self.substitute(inner)),
+                mutable: *mutable,
+            },
+            InferType::Param(n) => InferType::Param(n.clone()),
+            InferType::Bool => InferType::Bool,
+            InferType::Tuple(elems) => {
+                let mut out: Vec<InferType> = Vec::new();
+                let mut i = 0;
+                while i < elems.len() {
+                    out.push(self.substitute(&elems[i]));
+                    i += 1;
+                }
+                InferType::Tuple(out)
+            }
+            InferType::Enum { path, type_args, lifetime_args } => {
+                let mut subst_args: Vec<InferType> = Vec::new();
+                let mut i = 0;
+                while i < type_args.len() {
+                    subst_args.push(self.substitute(&type_args[i]));
+                    i += 1;
+                }
+                InferType::Enum {
+                    path: path.clone(),
+                    type_args: subst_args,
+                    lifetime_args: lifetime_args.clone(),
+                }
+            }
+        }
+    }
+
+    fn bind_var(
+        &mut self,
+        v: u32,
+        other: InferType,
+        traits: &TraitTable,
+        type_params: &Vec<String>,
+        type_param_bounds: &Vec<Vec<Vec<String>>>,
+        span: &Span,
+        file: &str,
+    ) -> Result<(), Error> {
+        if self.is_num_lit[v as usize] {
+            // Var carries the literal-Num bound — verify the candidate
+            // satisfies Num. Var-to-Var propagates the flag.
+            if let InferType::Var(other_v) = &other {
+                self.is_num_lit[*other_v as usize] = true;
+            } else if !satisfies_num(&other, traits, type_params, type_param_bounds) {
+                return Err(Error {
+                    file: file.to_string(),
+                    message: format!(
+                        "type mismatch: expected `{}`, got integer",
+                        infer_to_string(&other)
+                    ),
+                    span: span.copy(),
+                });
+            }
+        }
+        self.bindings[v as usize] = Some(other);
+        Ok(())
+    }
+
+
+    pub(crate) fn unify(
+        &mut self,
+        a: &InferType,
+        b: &InferType,
+        traits: &TraitTable,
+        type_params: &Vec<String>,
+        type_param_bounds: &Vec<Vec<Vec<String>>>,
+        span: &Span,
+        file: &str,
+    ) -> Result<(), Error> {
+        let a = self.substitute(a);
+        let b = self.substitute(b);
+        match (a, b) {
+            (InferType::Var(va), InferType::Var(vb)) => {
+                if va == vb {
+                    Ok(())
+                } else {
+                    self.bind_var(
+                        va,
+                        InferType::Var(vb),
+                        traits,
+                        type_params,
+                        type_param_bounds,
+                        span,
+                        file,
+                    )
+                }
+            }
+            (InferType::Var(v), other) => self.bind_var(
+                v,
+                other,
+                traits,
+                type_params,
+                type_param_bounds,
+                span,
+                file,
+            ),
+            (other, InferType::Var(v)) => self.bind_var(
+                v,
+                other,
+                traits,
+                type_params,
+                type_param_bounds,
+                span,
+                file,
+            ),
+            (InferType::Int(ka), InferType::Int(kb)) => {
+                if ka == kb {
+                    Ok(())
+                } else {
+                    Err(Error {
+                        file: file.to_string(),
+                        message: format!(
+                            "type mismatch: expected `{}`, got `{}`",
+                            int_kind_name(&kb),
+                            int_kind_name(&ka)
+                        ),
+                        span: span.copy(),
+                    })
+                }
+            }
+            (
+                InferType::Struct {
+                    path: pa,
+                    type_args: aa,
+                    ..
+                },
+                InferType::Struct {
+                    path: pb,
+                    type_args: ab,
+                    ..
+                },
+            ) => {
+                if pa != pb {
+                    return Err(Error {
+                        file: file.to_string(),
+                        message: format!(
+                            "type mismatch: expected `{}`, got `{}`",
+                            place_to_string(&pb),
+                            place_to_string(&pa)
+                        ),
+                        span: span.copy(),
+                    });
+                }
+                if aa.len() != ab.len() {
+                    return Err(Error {
+                        file: file.to_string(),
+                        message: format!(
+                            "type mismatch: `{}` has {} type arguments, expected {}",
+                            place_to_string(&pa),
+                            aa.len(),
+                            ab.len()
+                        ),
+                        span: span.copy(),
+                    });
+                }
+                let mut i = 0;
+                while i < aa.len() {
+                    self.unify(&aa[i], &ab[i], traits, type_params, type_param_bounds, span, file)?;
+                    i += 1;
+                }
+                Ok(())
+            }
+            (
+                InferType::Ref {
+                    inner: ia,
+                    mutable: ma,
+                    ..
+                },
+                InferType::Ref {
+                    inner: ib,
+                    mutable: mb,
+                    ..
+                },
+            ) => {
+                if ma != mb {
+                    return Err(Error {
+                        file: file.to_string(),
+                        message: format!(
+                            "type mismatch: expected `{}`, got `{}`",
+                            if mb {
+                                format!("&mut {}", infer_to_string(&ib))
+                            } else {
+                                format!("&{}", infer_to_string(&ib))
+                            },
+                            if ma {
+                                format!("&mut {}", infer_to_string(&ia))
+                            } else {
+                                format!("&{}", infer_to_string(&ia))
+                            }
+                        ),
+                        span: span.copy(),
+                    });
+                }
+                self.unify(&ia, &ib, traits, type_params, type_param_bounds, span, file)
+            }
+            (
+                InferType::RawPtr {
+                    inner: ia,
+                    mutable: ma,
+                },
+                InferType::RawPtr {
+                    inner: ib,
+                    mutable: mb,
+                },
+            ) => {
+                if ma != mb {
+                    return Err(Error {
+                        file: file.to_string(),
+                        message: format!(
+                            "type mismatch: expected `{}`, got `{}`",
+                            if mb {
+                                format!("*mut {}", infer_to_string(&ib))
+                            } else {
+                                format!("*const {}", infer_to_string(&ib))
+                            },
+                            if ma {
+                                format!("*mut {}", infer_to_string(&ia))
+                            } else {
+                                format!("*const {}", infer_to_string(&ia))
+                            }
+                        ),
+                        span: span.copy(),
+                    });
+                }
+                self.unify(&ia, &ib, traits, type_params, type_param_bounds, span, file)
+            }
+            (InferType::Param(a), InferType::Param(b)) => {
+                if a == b {
+                    Ok(())
+                } else {
+                    Err(Error {
+                        file: file.to_string(),
+                        message: format!(
+                            "type mismatch: expected `{}`, got `{}`",
+                            b, a
+                        ),
+                        span: span.copy(),
+                    })
+                }
+            }
+            (InferType::Bool, InferType::Bool) => Ok(()),
+            (InferType::Tuple(ea), InferType::Tuple(eb)) => {
+                if ea.len() != eb.len() {
+                    return Err(Error {
+                        file: file.to_string(),
+                        message: format!(
+                            "tuple arity mismatch: expected {}-tuple, got {}-tuple",
+                            eb.len(),
+                            ea.len()
+                        ),
+                        span: span.copy(),
+                    });
+                }
+                let mut i = 0;
+                while i < ea.len() {
+                    self.unify(
+                        &ea[i],
+                        &eb[i],
+                        traits,
+                        type_params,
+                        type_param_bounds,
+                        span,
+                        file,
+                    )?;
+                    i += 1;
+                }
+                Ok(())
+            }
+            (
+                InferType::Enum {
+                    path: pa,
+                    type_args: aa,
+                    ..
+                },
+                InferType::Enum {
+                    path: pb,
+                    type_args: ab,
+                    ..
+                },
+            ) => {
+                if pa != pb {
+                    return Err(Error {
+                        file: file.to_string(),
+                        message: format!(
+                            "type mismatch: expected `{}`, got `{}`",
+                            place_to_string(&pb),
+                            place_to_string(&pa)
+                        ),
+                        span: span.copy(),
+                    });
+                }
+                if aa.len() != ab.len() {
+                    return Err(Error {
+                        file: file.to_string(),
+                        message: format!(
+                            "type mismatch: `{}` has {} type arguments, expected {}",
+                            place_to_string(&pa),
+                            aa.len(),
+                            ab.len()
+                        ),
+                        span: span.copy(),
+                    });
+                }
+                let mut i = 0;
+                while i < aa.len() {
+                    self.unify(&aa[i], &ab[i], traits, type_params, type_param_bounds, span, file)?;
+                    i += 1;
+                }
+                Ok(())
+            }
+            (a, b) => Err(Error {
+                file: file.to_string(),
+                message: format!(
+                    "type mismatch: expected `{}`, got `{}`",
+                    infer_to_string(&b),
+                    infer_to_string(&a)
+                ),
+                span: span.copy(),
+            }),
+        }
+    }
+
+    fn finalize(&self, ty: &InferType) -> RType {
+        match self.substitute(ty) {
+            InferType::Var(_) => RType::Int(IntKind::I32),
+            InferType::Int(k) => RType::Int(k),
+            InferType::Struct { path, type_args, lifetime_args } => {
+                let mut concrete: Vec<RType> = Vec::new();
+                let mut i = 0;
+                while i < type_args.len() {
+                    concrete.push(self.finalize(&type_args[i]));
+                    i += 1;
+                }
+                RType::Struct {
+                    path,
+                    type_args: concrete,
+                    lifetime_args,
+                }
+            }
+            InferType::Param(n) => RType::Param(n),
+            InferType::Ref { inner, mutable, lifetime } => RType::Ref {
+                inner: Box::new(self.finalize(&inner)),
+                mutable,
+                lifetime,
+            },
+            InferType::RawPtr { inner, mutable } => RType::RawPtr {
+                inner: Box::new(self.finalize(&inner)),
+                mutable,
+            },
+            InferType::Bool => RType::Bool,
+            InferType::Tuple(elems) => {
+                let mut out: Vec<RType> = Vec::new();
+                let mut i = 0;
+                while i < elems.len() {
+                    out.push(self.finalize(&elems[i]));
+                    i += 1;
+                }
+                RType::Tuple(out)
+            }
+            InferType::Enum { path, type_args, lifetime_args } => {
+                let mut concrete: Vec<RType> = Vec::new();
+                let mut i = 0;
+                while i < type_args.len() {
+                    concrete.push(self.finalize(&type_args[i]));
+                    i += 1;
+                }
+                RType::Enum {
+                    path,
+                    type_args: concrete,
+                    lifetime_args,
+                }
+            }
+        }
+    }
+}
+
+pub(crate) struct LitConstraint {
+    var: u32,
+    value: u64,
+    span: Span,
+}
+
+pub(crate) struct LocalEntry {
+    name: String,
+    ty: InferType,
+    mutable: bool,
+}
+
+pub(crate) struct CheckCtx<'a> {
+    pub(crate) locals: Vec<LocalEntry>,
+    // Per-NodeId InferType (sized to func.node_count). After body check,
+    // each entry is finalized into the FnSymbol/GenericTemplate's expr_types.
+    pub(crate) expr_infer_types: Vec<Option<InferType>>,
+    pub(crate) lit_constraints: Vec<LitConstraint>,
+    // Pending per-MethodCall and per-Call resolutions, indexed by Expr.id.
+    pub(crate) method_resolutions: Vec<Option<PendingMethodCall>>,
+    pub(crate) call_resolutions: Vec<Option<PendingCall>>,
+    pub(crate) subst: Subst,
+    pub(crate) current_module: &'a Vec<String>,
+    pub(crate) current_file: &'a str,
+    pub(crate) structs: &'a StructTable,
+    pub(crate) enums: &'a EnumTable,
+    pub(crate) traits: &'a TraitTable,
+    pub(crate) funcs: &'a FuncTable,
+    pub(crate) self_target: Option<&'a RType>,
+    pub(crate) type_params: &'a Vec<String>,
+    pub(crate) reexports: &'a ReExportTable,
+    // Active use entries, ordered with the outermost (module-level)
+    // entries first and innermost-block entries appended at the end.
+    // Path resolution iterates this in reverse so the innermost scope
+    // shadows outer ones. Block walks save `use_scope.len()` before
+    // entering and truncate back on exit.
+    pub(crate) use_scope: Vec<UseEntry>,
+    // Per-type-param trait bounds (resolved trait paths) for the
+    // currently-checked function. Same shape as
+    // `GenericTemplate.type_param_bounds` — `[i]` lists the bound traits
+    // on `type_params[i]`. Empty for non-generic functions.
+    pub(crate) type_param_bounds: &'a Vec<Vec<Vec<String>>>,
+}
+
+fn check_module(
+    module: &Module,
+    path: &mut Vec<String>,
+    current_file: &mut String,
+    structs: &StructTable,
+    enums: &EnumTable,
+    traits: &TraitTable,
+    funcs: &mut FuncTable,
+    reexports: &ReExportTable,
+) -> Result<(), Error> {
+    let saved = current_file.clone();
+    *current_file = module.source_file.clone();
+    let crate_root: &str = if path.is_empty() { "" } else { &path[0] };
+    let use_scope = module_use_entries(module, crate_root);
+    let mut i = 0;
+    while i < module.items.len() {
+        match &module.items[i] {
+            Item::Function(f) => {
+                check_function(f, path, path, None, current_file, structs, enums, traits, funcs, reexports, &use_scope)?
+            }
+            Item::Module(m) => {
+                path.push(m.name.clone());
+                check_module(m, path, current_file, structs, enums, traits, funcs, reexports)?;
+                path.pop();
+            }
+            Item::Struct(_) => {}
+            Item::Enum(_) => {}
+            Item::Impl(ib) => {
+                let target_rt = resolve_impl_target(ib, path, structs, enums, &use_scope, reexports, current_file)?;
+                // T2.6: mirror the prefix collect_funcs used. For Path
+                // targets, that's the first AST segment. For non-Path
+                // trait impls, it's a synthetic `__trait_impl_<idx>`
+                // matching the registration order of `traits.impls`.
+                let mut method_prefix = path.clone();
+                match &ib.target.kind {
+                    crate::ast::TypeKind::Path(p) if !p.segments.is_empty() => {
+                        method_prefix.push(p.segments[0].name.clone());
+                    }
+                    _ => {
+                        match find_trait_impl_idx(ib, &target_rt, path, traits, &use_scope, reexports, current_file) {
+                            Some(idx) => {
+                                method_prefix.push(format!("__trait_impl_{}", idx));
+                            }
+                            None => {
+                                // Inherent impl with non-path target —
+                                // already rejected in collect_funcs.
+                                i += 1;
+                                continue;
+                            }
+                        }
+                    }
+                }
+                let mut k = 0;
+                while k < ib.methods.len() {
+                    check_function(
+                        &ib.methods[k],
+                        path,
+                        &method_prefix,
+                        Some(&target_rt),
+                        current_file,
+                        structs,
+                        enums,
+                        traits,
+                        funcs,
+                        reexports,
+                        &use_scope,
+                    )?;
+                    k += 1;
+                }
+            }
+            Item::Trait(_) => {}
+            Item::Use(_) => {}
+        }
+        i += 1;
+    }
+    *current_file = saved;
+    Ok(())
+}
+
+fn check_function(
+    func: &Function,
+    current_module: &Vec<String>,
+    path_prefix: &Vec<String>,
+    self_target: Option<&RType>,
+    current_file: &str,
+    structs: &StructTable,
+    enums: &EnumTable,
+    traits: &TraitTable,
+    funcs: &mut FuncTable,
+    reexports: &ReExportTable,
+    module_use_scope: &Vec<UseEntry>,
+) -> Result<(), Error> {
+    // Look up the registered template to derive the full type-param list
+    // (impl's params + method's own params, for generic impl methods).
+    let lookup_path = {
+        let mut p = path_prefix.clone();
+        p.push(func.name.clone());
+        p
+    };
+    let (type_param_names, type_param_bounds): (Vec<String>, Vec<Vec<Vec<String>>>) =
+        match template_lookup(funcs, &lookup_path) {
+            Some((_, t)) => {
+                let mut bounds_clone: Vec<Vec<Vec<String>>> = Vec::new();
+                let mut i = 0;
+                while i < t.type_param_bounds.len() {
+                    let mut row: Vec<Vec<String>> = Vec::new();
+                    let mut j = 0;
+                    while j < t.type_param_bounds[i].len() {
+                        row.push(t.type_param_bounds[i][j].clone());
+                        j += 1;
+                    }
+                    bounds_clone.push(row);
+                    i += 1;
+                }
+                (t.type_params.clone(), bounds_clone)
+            }
+            None => (Vec::new(), Vec::new()),
+        };
+    // Build initial locals from params (params are immutable bindings in our subset).
+    let mut locals: Vec<LocalEntry> = Vec::new();
+    let mut k = 0;
+    while k < func.params.len() {
+        let rt = resolve_type(
+            &func.params[k].ty,
+            current_module,
+            structs,
+            enums,
+            self_target,
+            &type_param_names,
+            module_use_scope,
+            reexports,
+            current_file,
+        )?;
+        locals.push(LocalEntry {
+            name: func.params[k].name.clone(),
+            ty: rtype_to_infer(&rt),
+            mutable: false,
+        });
+        k += 1;
+    }
+    let return_rt: Option<RType> = match &func.return_type {
+        Some(ty) => Some(resolve_type(
+            ty,
+            current_module,
+            structs,
+            enums,
+            self_target,
+            &type_param_names,
+            module_use_scope,
+            reexports,
+            current_file,
+        )?),
+        None => None,
+    };
+
+    let node_count = func.node_count as usize;
+    let (expr_infer_types, lit_constraints, method_resolutions, call_resolutions, subst) = {
+        let mut method_res: Vec<Option<PendingMethodCall>> = Vec::with_capacity(node_count);
+        let mut call_res: Vec<Option<PendingCall>> = Vec::with_capacity(node_count);
+        let mut expr_infer: Vec<Option<InferType>> = Vec::with_capacity(node_count);
+        let mut i = 0;
+        while i < node_count {
+            method_res.push(None);
+            call_res.push(None);
+            expr_infer.push(None);
+            i += 1;
+        }
+        // Initialize the use scope with the module's flattened entries.
+        // Inner blocks push their own `Stmt::Use` entries on top during
+        // body traversal; the scope is restored on block exit.
+        let mut initial_use_scope: Vec<UseEntry> = Vec::new();
+        let mut k = 0;
+        while k < module_use_scope.len() {
+            initial_use_scope.push(module_use_scope[k].clone());
+            k += 1;
+        }
+        let mut ctx = CheckCtx {
+            locals,
+            expr_infer_types: expr_infer,
+            lit_constraints: Vec::new(),
+            method_resolutions: method_res,
+            call_resolutions: call_res,
+            subst: Subst {
+                bindings: Vec::new(),
+                is_num_lit: Vec::new(),
+            },
+            current_module,
+            current_file,
+            structs,
+            enums,
+            traits,
+            funcs: &*funcs,
+            self_target,
+            type_params: &type_param_names,
+            type_param_bounds: &type_param_bounds,
+            reexports,
+            use_scope: initial_use_scope,
+        };
+        check_block(&mut ctx, &func.body, &return_rt)?;
+        (
+            ctx.expr_infer_types,
+            ctx.lit_constraints,
+            ctx.method_resolutions,
+            ctx.call_resolutions,
+            ctx.subst,
+        )
+    };
+
+    // Range-check each integer literal against its (now resolved) type.
+    // T5.5: a literal may resolve to a non-`Int` type (a user `impl Num
+    // for Foo`, or a generic `Param(T)` with `T: Num`); range-checking
+    // doesn't apply there — the user's `from_i64` decides the i64 →
+    // user-type semantics.
+    let mut i = 0;
+    while i < lit_constraints.len() {
+        let lc = &lit_constraints[i];
+        let resolved = subst.substitute(&InferType::Var(lc.var));
+        let kind = match resolved {
+            InferType::Var(_) => IntKind::I32,
+            InferType::Int(k) => k,
+            _ => {
+                // Non-Int target (Struct/Param/etc.) — skip range check.
+                i += 1;
+                continue;
+            }
+        };
+        if (lc.value as u128) > int_kind_max(&kind) {
+            return Err(Error {
+                file: current_file.to_string(),
+                message: format!(
+                    "integer literal `{}` does not fit in `{}`",
+                    lc.value,
+                    int_kind_name(&kind)
+                ),
+                span: lc.span.copy(),
+            });
+        }
+        i += 1;
+    }
+
+    // Finalize per-NodeId expr types.
+    let mut expr_types: Vec<Option<RType>> = Vec::with_capacity(node_count);
+    let mut i = 0;
+    while i < expr_infer_types.len() {
+        match &expr_infer_types[i] {
+            Some(t) => expr_types.push(Some(subst.finalize(t))),
+            None => expr_types.push(None),
+        }
+        i += 1;
+    }
+    // Finalize method resolutions (per-NodeId).
+    let mut method_resolutions_final: Vec<Option<MethodResolution>> =
+        Vec::with_capacity(node_count);
+    let mut i = 0;
+    while i < method_resolutions.len() {
+        match &method_resolutions[i] {
+            Some(p) => {
+                let mut type_args: Vec<RType> = Vec::new();
+                let mut j = 0;
+                while j < p.type_arg_infers.len() {
+                    type_args.push(subst.finalize(&p.type_arg_infers[j]));
+                    j += 1;
+                }
+                let trait_dispatch = match &p.trait_dispatch {
+                    Some(td) => Some(TraitDispatch {
+                        trait_path: td.trait_path.clone(),
+                        method_name: td.method_name.clone(),
+                        recv_type: subst.finalize(&td.recv_type_infer),
+                    }),
+                    None => None,
+                };
+                method_resolutions_final.push(Some(MethodResolution {
+                    callee_idx: p.callee_idx,
+                    callee_path: p.callee_path.clone(),
+                    recv_adjust: p.recv_adjust,
+                    ret_borrows_receiver: p.ret_borrows_receiver,
+                    template_idx: p.template_idx,
+                    type_args,
+                    trait_dispatch,
+                }));
+            }
+            None => method_resolutions_final.push(None),
+        }
+        i += 1;
+    }
+    let method_resolutions = method_resolutions_final;
+    // Finalize call resolutions (per-NodeId).
+    let mut call_resolutions_final: Vec<Option<CallResolution>> =
+        Vec::with_capacity(node_count);
+    let mut i = 0;
+    while i < call_resolutions.len() {
+        match &call_resolutions[i] {
+            Some(PendingCall::Direct(idx)) => {
+                call_resolutions_final.push(Some(CallResolution::Direct(*idx)))
+            }
+            Some(PendingCall::Generic { template_idx, type_var_ids }) => {
+                let mut concrete: Vec<RType> = Vec::new();
+                let mut j = 0;
+                while j < type_var_ids.len() {
+                    concrete.push(subst.finalize(&InferType::Var(type_var_ids[j])));
+                    j += 1;
+                }
+                call_resolutions_final.push(Some(CallResolution::Generic {
+                    template_idx: *template_idx,
+                    type_args: concrete,
+                }));
+            }
+            Some(PendingCall::Variant { enum_path, disc, type_var_ids }) => {
+                let mut concrete: Vec<RType> = Vec::new();
+                let mut j = 0;
+                while j < type_var_ids.len() {
+                    concrete.push(subst.finalize(&InferType::Var(type_var_ids[j])));
+                    j += 1;
+                }
+                call_resolutions_final.push(Some(CallResolution::Variant {
+                    enum_path: enum_path.clone(),
+                    disc: *disc,
+                    type_args: concrete,
+                }));
+            }
+            None => call_resolutions_final.push(None),
+        }
+        i += 1;
+    }
+    let call_resolutions = call_resolutions_final;
+
+    // Store on the FnSymbol or GenericTemplate.
+    let mut full = path_prefix.clone();
+    full.push(func.name.clone());
+    let mut entry_idx: Option<usize> = None;
+    let mut e = 0;
+    while e < funcs.entries.len() {
+        if funcs.entries[e].path == full {
+            entry_idx = Some(e);
+            break;
+        }
+        e += 1;
+    }
+    if let Some(e) = entry_idx {
+        funcs.entries[e].expr_types = expr_types;
+        funcs.entries[e].method_resolutions = method_resolutions;
+        funcs.entries[e].call_resolutions = call_resolutions;
+    } else {
+        let mut t = 0;
+        while t < funcs.templates.len() {
+            if funcs.templates[t].path == full {
+                funcs.templates[t].expr_types = expr_types;
+                funcs.templates[t].method_resolutions = method_resolutions;
+                funcs.templates[t].call_resolutions = call_resolutions;
+                break;
+            }
+            t += 1;
+        }
+    }
+    Ok(())
+}
+
+// Per-call recording during body check; resolved at end-of-fn into `CallResolution`.
+pub(crate) enum PendingCall {
+    Direct(usize),
+    Generic { template_idx: usize, type_var_ids: Vec<u32> },
+    Variant {
+        enum_path: Vec<String>,
+        disc: u32,
+        // One InferType per enum's type-param, allocated as a fresh
+        // var per construction site (or set to a concrete value if
+        // the user wrote turbofish). Finalized at end-of-fn.
+        type_var_ids: Vec<u32>,
+    },
+}
+
+// Like `MethodResolution`, but records type-arg InferTypes instead of
+// finalized RTypes. End-of-fn finalizes via `subst.finalize`.
+pub(crate) struct PendingMethodCall {
+    callee_idx: u32,
+    callee_path: Vec<String>,
+    recv_adjust: ReceiverAdjust,
+    ret_borrows_receiver: bool,
+    template_idx: Option<usize>,
+    // For template methods: one InferType per template type_param. Order:
+    // impl's params first (bound to receiver type_args), then method's own
+    // params (fresh inference vars, possibly unified by turbofish/inference).
+    type_arg_infers: Vec<InferType>,
+    // T2: when the call is dispatched symbolically through a trait
+    // bound (recv is `Param(T)` with `T: Trait`), record the trait path,
+    // method name, and the receiver's InferType so codegen can re-resolve
+    // the impl after monomorphization. None for direct dispatch.
+    trait_dispatch: Option<PendingTraitDispatch>,
+}
+
+struct PendingTraitDispatch {
+    trait_path: Vec<String>,
+    method_name: String,
+    recv_type_infer: InferType,
+}
+
+fn check_block(
+    ctx: &mut CheckCtx,
+    block: &Block,
+    return_type: &Option<RType>,
+) -> Result<(), Error> {
+    let actual = check_block_inner(ctx, block)?;
+    // No declared return type ⇒ function returns `()` (the unit tuple).
+    let expected: RType = match return_type {
+        Some(rt) => rt.clone(),
+        None => RType::Tuple(Vec::new()),
+    };
+    let expected_infer = rtype_to_infer(&expected);
+    ctx.subst.unify(
+        &actual,
+        &expected_infer,
+        ctx.traits,
+        ctx.type_params,
+        ctx.type_param_bounds,
+        &tail_span_or_block(block),
+        ctx.current_file,
+    )?;
+    Ok(())
+}
+
+// A block always has a type. With a tail expression, it's the tail's
+// type; without one, it's `()` (the empty tuple).
+fn check_block_inner(ctx: &mut CheckCtx, block: &Block) -> Result<InferType, Error> {
+    let mut i = 0;
+    while i < block.stmts.len() {
+        match &block.stmts[i] {
+            Stmt::Let(let_stmt) => check_let_stmt(ctx, let_stmt)?,
+            Stmt::Assign(assign) => check_assign_stmt(ctx, assign)?,
+            Stmt::Expr(expr) => check_expr_stmt(ctx, expr)?,
+            Stmt::Use(decl) => {
+                let crate_root: &str = if ctx.current_module.is_empty() {
+                    ""
+                } else {
+                    &ctx.current_module[0]
+                };
+                flatten_use_tree(&Vec::new(), &decl.tree, crate_root, decl.is_pub, &mut ctx.use_scope);
+            }
+        }
+        i += 1;
+    }
+    match &block.tail {
+        Some(expr) => Ok(check_expr(ctx, expr)?),
+        None => Ok(InferType::Tuple(Vec::new())),
+    }
+}
+
+// `expr;` — type-check the expression, then discard its value (any
+// type is fine in stmt position). Any expression may sit here now that
+// we have a unit type.
+fn check_expr_stmt(ctx: &mut CheckCtx, expr: &Expr) -> Result<(), Error> {
+    let _ = check_expr(ctx, expr)?;
+    Ok(())
+}
+
+fn check_block_expr(ctx: &mut CheckCtx, block: &Block) -> Result<InferType, Error> {
+    let mark = ctx.locals.len();
+    let use_mark = ctx.use_scope.len();
+    let ty = check_block_inner(ctx, block)?;
+    ctx.locals.truncate(mark);
+    ctx.use_scope.truncate(use_mark);
+    Ok(ty)
+}
+
+fn tail_span_or_block(block: &Block) -> Span {
+    match &block.tail {
+        Some(expr) => expr.span.copy(),
+        None => block.span.copy(),
+    }
+}
+
+fn check_let_stmt(ctx: &mut CheckCtx, let_stmt: &LetStmt) -> Result<(), Error> {
+    let value_ty = check_expr(ctx, &let_stmt.value)?;
+    let final_ty = match &let_stmt.ty {
+        Some(annotation) => {
+            let annot_rt = resolve_type(
+                annotation,
+                ctx.current_module,
+                ctx.structs,
+                ctx.enums,
+                ctx.self_target,
+                ctx.type_params,
+                &ctx.use_scope,
+                ctx.reexports,
+                ctx.current_file,
+            )?;
+            let annot_infer = rtype_to_infer(&annot_rt);
+            ctx.subst.unify(
+                &value_ty,
+                &annot_infer,
+                ctx.traits,
+                ctx.type_params,
+                ctx.type_param_bounds,
+                &let_stmt.value.span,
+                ctx.current_file,
+            )?;
+            annot_infer
+        }
+        None => value_ty,
+    };
+    // Overwrite the recorded type at the value expr's id with the final type
+    // (in case an annotation pinned it down). Codegen reads expr_types[value.id]
+    // to size the binding's storage.
+    ctx.expr_infer_types[let_stmt.value.id as usize] = Some(final_ty.clone());
+    ctx.locals.push(LocalEntry {
+        name: let_stmt.name.clone(),
+        ty: final_ty,
+        mutable: let_stmt.mutable,
+    });
+    Ok(())
+}
+
+fn check_assign_stmt(ctx: &mut CheckCtx, assign: &AssignStmt) -> Result<(), Error> {
+    // Two flavors of LHS:
+    //   1. Var-rooted chain: `x` or `x.f.g.h`.
+    //   2. Deref-rooted chain: `*p` or `(*p).f.g.h`.
+    if let Some((root_expr, fields)) = extract_deref_rooted_chain(&assign.lhs) {
+        return check_deref_rooted_assign(ctx, root_expr, &fields, assign);
+    }
+    // LHS must be a place expression (Var or Var-rooted FieldAccess chain).
+    let chain = match extract_place_for_assign(&assign.lhs) {
+        Some(c) => c,
+        None => {
+            return Err(Error {
+                file: ctx.current_file.to_string(),
+                message: "left-hand side of assignment must be a place expression".to_string(),
+                span: assign.lhs.span.copy(),
+            });
+        }
+    };
+    // Find root binding (search reverse for innermost shadow).
+    let mut found_idx: Option<usize> = None;
+    let mut i = ctx.locals.len();
+    while i > 0 {
+        i -= 1;
+        if ctx.locals[i].name == chain[0] {
+            found_idx = Some(i);
+            break;
+        }
+    }
+    let idx = match found_idx {
+        Some(i) => i,
+        None => {
+            return Err(Error {
+                file: ctx.current_file.to_string(),
+                message: format!("unknown variable: `{}`", chain[0]),
+                span: assign.lhs.span.copy(),
+            });
+        }
+    };
+    let root_resolved = ctx.subst.substitute(&ctx.locals[idx].ty);
+    let root_is_mut_ref = matches!(root_resolved, InferType::Ref { mutable: true, .. });
+    let root_is_shared_ref = matches!(root_resolved, InferType::Ref { mutable: false, .. });
+    if chain.len() == 1 {
+        if !ctx.locals[idx].mutable {
+            return Err(Error {
+                file: ctx.current_file.to_string(),
+                message: format!(
+                    "cannot assign to `{}`: not declared as `mut`",
+                    chain[0]
+                ),
+                span: assign.lhs.span.copy(),
+            });
+        }
+    } else if root_is_shared_ref {
+        return Err(Error {
+            file: ctx.current_file.to_string(),
+            message: format!(
+                "cannot assign through `{}`: shared reference is not mutable",
+                chain[0]
+            ),
+            span: assign.lhs.span.copy(),
+        });
+    } else if !root_is_mut_ref && !ctx.locals[idx].mutable {
+        return Err(Error {
+            file: ctx.current_file.to_string(),
+            message: format!(
+                "cannot assign to field of `{}`: not declared as `mut`",
+                chain[0]
+            ),
+            span: assign.lhs.span.copy(),
+        });
+    }
+    // Walk the chain to determine the LHS type.
+    let lhs_ty = walk_chain_type(
+        &ctx.locals[idx].ty,
+        &chain,
+        ctx.structs,
+        ctx.enums,
+        ctx.current_file,
+        &assign.lhs.span,
+    )?;
+    let rhs_ty = check_expr(ctx, &assign.rhs)?;
+    ctx.subst.unify(
+        &rhs_ty,
+        &lhs_ty,
+        ctx.traits,
+        ctx.type_params,
+        ctx.type_param_bounds,
+        &assign.rhs.span,
+        ctx.current_file,
+    )?;
+    Ok(())
+}
+
+// Returns (deref_target, field_chain) if the LHS is `*expr` or
+// `(*expr).field…`. The deref_target is the expression being dereferenced
+// (typically a Var bound to a `&mut T` / `*mut T`); the field_chain is the
+// list of fields walked after the deref.
+fn extract_deref_rooted_chain<'a>(expr: &'a Expr) -> Option<(&'a Expr, Vec<String>)> {
+    let mut fields: Vec<String> = Vec::new();
+    let mut current = expr;
+    loop {
+        match &current.kind {
+            ExprKind::Deref(inner) => {
+                let mut reversed: Vec<String> = Vec::new();
+                let mut i = fields.len();
+                while i > 0 {
+                    i -= 1;
+                    reversed.push(fields[i].clone());
+                }
+                return Some((inner.as_ref(), reversed));
+            }
+            ExprKind::FieldAccess(fa) => {
+                fields.push(fa.field.clone());
+                current = &fa.base;
+            }
+            _ => return None,
+        }
+    }
+}
+
+fn check_deref_rooted_assign(
+    ctx: &mut CheckCtx,
+    root_expr: &Expr,
+    fields: &Vec<String>,
+    assign: &AssignStmt,
+) -> Result<(), Error> {
+    // The root must type as `&mut T` or `*mut T` — otherwise the deref isn't
+    // assignable. (We don't allow whole-place assignment through `*const T`
+    // or `&T`, matching Rust.)
+    let root_infer = check_expr(ctx, root_expr)?;
+    let resolved = ctx.subst.substitute(&root_infer);
+    let inner_infer = match resolved {
+        InferType::Ref { inner, mutable: true, .. } => *inner,
+        InferType::RawPtr { inner, mutable: true } => *inner,
+        InferType::Ref { mutable: false, .. } => {
+            return Err(Error {
+                file: ctx.current_file.to_string(),
+                message: "cannot assign through a shared reference".to_string(),
+                span: assign.lhs.span.copy(),
+            });
+        }
+        InferType::RawPtr { mutable: false, .. } => {
+            return Err(Error {
+                file: ctx.current_file.to_string(),
+                message: "cannot assign through a `*const T` raw pointer".to_string(),
+                span: assign.lhs.span.copy(),
+            });
+        }
+        other => {
+            return Err(Error {
+                file: ctx.current_file.to_string(),
+                message: format!(
+                    "cannot dereference `{}` for assignment",
+                    infer_to_string(&other)
+                ),
+                span: assign.lhs.span.copy(),
+            });
+        }
+    };
+    // Walk fields starting from the pointed-at type to find the LHS type.
+    let mut current = inner_infer;
+    let mut i = 0;
+    while i < fields.len() {
+        let (struct_path, type_args) = match &current {
+            InferType::Struct { path, type_args, .. } => (path.clone(), type_args.clone()),
+            _ => {
+                return Err(Error {
+                    file: ctx.current_file.to_string(),
+                    message: "field assignment on non-struct value".to_string(),
+                    span: assign.lhs.span.copy(),
+                });
+            }
+        };
+        let entry = struct_lookup(ctx.structs, &struct_path).expect("resolved struct");
+        let mut found = false;
+        let mut k = 0;
+        while k < entry.fields.len() {
+            if entry.fields[k].name == fields[i] {
+                let field_infer = rtype_to_infer(&entry.fields[k].ty);
+                let env = build_infer_env(&entry.type_params, &type_args);
+                current = infer_substitute(&field_infer, &env);
+                found = true;
+                break;
+            }
+            k += 1;
+        }
+        if !found {
+            return Err(Error {
+                file: ctx.current_file.to_string(),
+                message: format!(
+                    "no field `{}` on `{}`",
+                    fields[i],
+                    place_to_string(&struct_path)
+                ),
+                span: assign.lhs.span.copy(),
+            });
+        }
+        i += 1;
+    }
+    let rhs_ty = check_expr(ctx, &assign.rhs)?;
+    ctx.subst.unify(
+        &rhs_ty,
+        &current,
+        ctx.traits,
+        ctx.type_params,
+        ctx.type_param_bounds,
+        &assign.rhs.span,
+        ctx.current_file,
+    )?;
+    Ok(())
+}
+
+fn extract_place_for_assign(expr: &Expr) -> Option<Vec<String>> {
+    let mut chain: Vec<String> = Vec::new();
+    let mut current = expr;
+    loop {
+        match &current.kind {
+            ExprKind::Var(name) => {
+                chain.push(name.clone());
+                let mut reversed: Vec<String> = Vec::new();
+                let mut i = chain.len();
+                while i > 0 {
+                    i -= 1;
+                    reversed.push(chain[i].clone());
+                }
+                return Some(reversed);
+            }
+            ExprKind::FieldAccess(fa) => {
+                chain.push(fa.field.clone());
+                current = &fa.base;
+            }
+            ExprKind::TupleIndex { base, index, .. } => {
+                chain.push(format!("{}", index));
+                current = base;
+            }
+            _ => return None,
+        }
+    }
+}
+
+fn walk_chain_type(
+    start: &InferType,
+    chain: &Vec<String>,
+    structs: &StructTable,
+    enums: &EnumTable,
+    file: &str,
+    span: &Span,
+) -> Result<InferType, Error> {
+    let mut current = start.clone();
+    let mut i = 1;
+    while i < chain.len() {
+        // Tuple-index chain segment: digit-only string. The type
+        // of the segment is the corresponding tuple element. This
+        // takes precedence over struct-field lookup so a struct
+        // with a `0` field would still resolve there only if the
+        // current type is actually a struct.
+        let is_tuple_seg = !chain[i].is_empty() && chain[i].bytes().all(|b| b.is_ascii_digit());
+        if is_tuple_seg {
+            let elems: Vec<InferType> = match &current {
+                InferType::Tuple(es) => es.clone(),
+                InferType::Ref { inner, .. } => match inner.as_ref() {
+                    InferType::Tuple(es) => es.clone(),
+                    _ => {
+                        return Err(Error {
+                            file: file.to_string(),
+                            message: "tuple-index assignment on non-tuple value".to_string(),
+                            span: span.copy(),
+                        });
+                    }
+                },
+                _ => {
+                    return Err(Error {
+                        file: file.to_string(),
+                        message: "tuple-index assignment on non-tuple value".to_string(),
+                        span: span.copy(),
+                    });
+                }
+            };
+            let idx: usize = chain[i].parse().expect("digit-only segment");
+            if idx >= elems.len() {
+                return Err(Error {
+                    file: file.to_string(),
+                    message: format!(
+                        "tuple index {} out of range (length {})",
+                        idx,
+                        elems.len()
+                    ),
+                    span: span.copy(),
+                });
+            }
+            current = elems[idx].clone();
+            i += 1;
+            continue;
+        }
+        let (struct_path, type_args) = match &current {
+            InferType::Struct { path, type_args, .. } => (path.clone(), type_args.clone()),
+            InferType::Ref { inner, .. } => match inner.as_ref() {
+                InferType::Struct { path, type_args, .. } => {
+                    (path.clone(), type_args.clone())
+                }
+                _ => {
+                    return Err(Error {
+                        file: file.to_string(),
+                        message: "field assignment on non-struct value".to_string(),
+                        span: span.copy(),
+                    });
+                }
+            },
+            _ => {
+                return Err(Error {
+                    file: file.to_string(),
+                    message: "field assignment on non-struct value".to_string(),
+                    span: span.copy(),
+                });
+            }
+        };
+        let entry = struct_lookup(structs, &struct_path).expect("resolved struct");
+        let mut found = false;
+        let mut k = 0;
+        while k < entry.fields.len() {
+            if entry.fields[k].name == chain[i] {
+                let field_infer = rtype_to_infer(&entry.fields[k].ty);
+                let env = build_infer_env(&entry.type_params, &type_args);
+                current = infer_substitute(&field_infer, &env);
+                found = true;
+                break;
+            }
+            k += 1;
+        }
+        if !found {
+            return Err(Error {
+                file: file.to_string(),
+                message: format!(
+                    "no field `{}` on `{}`",
+                    chain[i],
+                    place_to_string(&struct_path)
+                ),
+                span: span.copy(),
+            });
+        }
+        i += 1;
+    }
+    Ok(current)
+}
+
+pub(crate) fn check_expr(ctx: &mut CheckCtx, expr: &Expr) -> Result<InferType, Error> {
+    let ty = check_expr_inner(ctx, expr)?;
+    // Record the resolved InferType under this Expr's NodeId. Finalized to
+    // RType at end-of-fn into FnSymbol/Template.expr_types.
+    ctx.expr_infer_types[expr.id as usize] = Some(ty.clone());
+    Ok(ty)
+}
+
+fn check_expr_inner(ctx: &mut CheckCtx, expr: &Expr) -> Result<InferType, Error> {
+    match &expr.kind {
+        ExprKind::IntLit(n) => {
+            let v = ctx.subst.fresh_int();
+            ctx.lit_constraints.push(LitConstraint {
+                var: v,
+                value: *n,
+                span: expr.span.copy(),
+            });
+            Ok(InferType::Var(v))
+        }
+        ExprKind::Var(name) => {
+            let mut i = ctx.locals.len();
+            while i > 0 {
+                i -= 1;
+                if ctx.locals[i].name == *name {
+                    return Ok(ctx.locals[i].ty.clone());
+                }
+            }
+            Err(Error {
+                file: ctx.current_file.to_string(),
+                message: format!("unknown variable: `{}`", name),
+                span: expr.span.copy(),
+            })
+        }
+        ExprKind::Call(call) => check_call(ctx, call, expr),
+        ExprKind::StructLit(lit) => check_struct_lit(ctx, lit, expr),
+        ExprKind::FieldAccess(fa) => check_field_access(ctx, fa, expr),
+        ExprKind::Borrow { inner, mutable } => {
+            // Walk the inner as a place expression — borrowing a non-Copy
+            // place doesn't move out, so the "Copy through ref" check that
+            // applies to value-position field access doesn't fire here.
+            let inner_ty = check_place_expr(ctx, inner)?;
+            // Phase B: borrow expressions get an `Inferred(0)` placeholder
+            // lifetime; refining this into per-borrow fresh lifetimes is
+            // Phase C's job.
+            Ok(InferType::Ref {
+                inner: Box::new(inner_ty),
+                mutable: *mutable,
+                lifetime: LifetimeRepr::Inferred(0),
+            })
+        }
+        ExprKind::Cast { inner, ty } => check_cast(ctx, inner, ty, expr),
+        ExprKind::Deref(inner) => check_deref(ctx, inner, expr),
+        ExprKind::Unsafe(block) => check_block_expr(ctx, block.as_ref()),
+        ExprKind::Block(block) => check_block_expr(ctx, block.as_ref()),
+        ExprKind::MethodCall(mc) => check_method_call(ctx, mc, expr),
+        ExprKind::BoolLit(_) => Ok(InferType::Bool),
+        ExprKind::If(if_expr) => check_if_expr(ctx, if_expr, expr),
+        ExprKind::Builtin { name, name_span, args } => {
+            check_builtin(ctx, name, name_span, args, expr)
+        }
+        ExprKind::Tuple(elems) => {
+            let mut tys: Vec<InferType> = Vec::new();
+            let mut i = 0;
+            while i < elems.len() {
+                tys.push(check_expr(ctx, &elems[i])?);
+                i += 1;
+            }
+            Ok(InferType::Tuple(tys))
+        }
+        ExprKind::TupleIndex { base, index, index_span } => {
+            let base_ty = check_expr(ctx, base)?;
+            // Auto-deref through any number of references — `r.0` on
+            // `&(u32, u32)` reads element 0. (Tuple elements that are
+            // non-Copy through a ref will still be rejected by the
+            // borrow-aware path, but for now we only have integer/bool
+            // tuples in tests.)
+            let mut cur = ctx.subst.substitute(&base_ty);
+            while let InferType::Ref { inner, .. } = cur {
+                cur = ctx.subst.substitute(&inner);
+            }
+            match cur {
+                InferType::Tuple(elems) => {
+                    let n = elems.len();
+                    if (*index as usize) >= n {
+                        return Err(Error {
+                            file: ctx.current_file.to_string(),
+                            message: format!(
+                                "tuple index {} out of range (length {})",
+                                index, n
+                            ),
+                            span: index_span.copy(),
+                        });
+                    }
+                    Ok(elems[*index as usize].clone())
+                }
+                other => Err(Error {
+                    file: ctx.current_file.to_string(),
+                    message: format!(
+                        "tuple index `.{}` on non-tuple type `{}`",
+                        index,
+                        infer_to_string(&other)
+                    ),
+                    span: expr.span.copy(),
+                }),
+            }
+        }
+        ExprKind::Match(m) => check_match_expr(ctx, m, expr),
+        ExprKind::IfLet(il) => check_if_let_expr(ctx, il, expr),
+    }
+}
+
+// `if cond { … } else { … }` — cond must be `bool`, the two arms'
+// tail types unify, and the if-expression takes that type. A
+// tail-less arm yields `()`, so a both-tail-less if is unit-typed.
+fn check_if_expr(
+    ctx: &mut CheckCtx,
+    if_expr: &crate::ast::IfExpr,
+    outer: &Expr,
+) -> Result<InferType, Error> {
+    // `check_expr` (not `check_expr_inner`) so the cond's type is
+    // recorded under its NodeId — codegen for some sub-exprs (e.g.
+    // `Builtin`) reads its own result type back out.
+    let cond_ty = check_expr(ctx, &if_expr.cond)?;
+    ctx.subst.unify(
+        &cond_ty,
+        &InferType::Bool,
+        ctx.traits,
+        &ctx.type_params,
+        &ctx.type_param_bounds,
+        &if_expr.cond.span,
+        ctx.current_file,
+    )?;
+    let then_ty = check_block_expr(ctx, if_expr.then_block.as_ref())?;
+    let else_ty = check_block_expr(ctx, if_expr.else_block.as_ref())?;
+    ctx.subst.unify(
+        &then_ty,
+        &else_ty,
+        ctx.traits,
+        &ctx.type_params,
+        &ctx.type_param_bounds,
+        &outer.span,
+        ctx.current_file,
+    )?;
+    Ok(then_ty)
+}
+
+// `match scrut { pat1 => arm1, pat2 if guard => arm2, _ => arm3 }`.
+// All arms unify to the same type. Patterns introduce bindings that
+// scope to the arm's body. Guards are not yet supported. Exhaustiveness
+// is checked structurally per scrutinee type.
+fn check_match_expr(
+    ctx: &mut CheckCtx,
+    m: &crate::ast::MatchExpr,
+    outer: &Expr,
+) -> Result<InferType, Error> {
+    let scrutinee_ty = check_expr(ctx, &m.scrutinee)?;
+    if m.arms.is_empty() {
+        return Err(Error {
+            file: ctx.current_file.to_string(),
+            message: "match expression must have at least one arm".to_string(),
+            span: m.span.copy(),
+        });
+    }
+    let mut arm_ty: Option<InferType> = None;
+    let mut i = 0;
+    let mut any_guard = false;
+    while i < m.arms.len() {
+        let arm = &m.arms[i];
+        if arm.guard.is_some() {
+            any_guard = true;
+        }
+        // Type-check the pattern against the scrutinee type and collect
+        // the bindings it introduces. Push them as locals for the arm
+        // body (and guard, if any), then truncate when the arm is done.
+        let mark = ctx.locals.len();
+        let mut bindings: Vec<(String, InferType, Span, bool)> = Vec::new();
+        check_pattern(ctx, &arm.pattern, &scrutinee_ty, &mut bindings)?;
+        let mut k = 0;
+        while k < bindings.len() {
+            ctx.locals.push(LocalEntry {
+                name: bindings[k].0.clone(),
+                ty: bindings[k].1.clone(),
+                mutable: bindings[k].3,
+            });
+            k += 1;
+        }
+        // Guard: a `bool`-typed expression that runs after the pattern
+        // matches but before the body. Bindings are in scope.
+        if let Some(g) = &arm.guard {
+            let g_ty = check_expr(ctx, g)?;
+            ctx.subst.unify(
+                &g_ty,
+                &InferType::Bool,
+                ctx.traits,
+                ctx.type_params,
+                ctx.type_param_bounds,
+                &g.span,
+                ctx.current_file,
+            )?;
+        }
+        let body_ty = check_expr(ctx, &arm.body)?;
+        ctx.locals.truncate(mark);
+        match &arm_ty {
+            Some(prev) => {
+                let prev_clone = prev.clone();
+                ctx.subst.unify(
+                    &body_ty,
+                    &prev_clone,
+                    ctx.traits,
+                    ctx.type_params,
+                    ctx.type_param_bounds,
+                    &arm.body.span,
+                    ctx.current_file,
+                )?;
+            }
+            None => arm_ty = Some(body_ty),
+        }
+        i += 1;
+    }
+    // Exhaustiveness: every value of the scrutinee's type must be
+    // matched by at least one arm. Substitute the scrutinee type so
+    // we have its concrete shape.
+    let scrutinee_concrete = ctx.subst.substitute(&scrutinee_ty);
+    check_match_exhaustive(
+        ctx,
+        &scrutinee_concrete,
+        &m.arms,
+        &outer.span,
+    )?;
+    Ok(arm_ty.expect("match has at least one arm"))
+}
+
+// `if let Pat = scrut { then } else { else }`. Like a single-arm
+// match plus an `else` fallback, with the pattern bindings scoped to
+// the then-block. `else` is optional in source — the parser already
+// substitutes an empty unit-typed block when no `else` was written.
+// Both arms unify to the same type, like a regular `if`. No
+// exhaustiveness check (the `else` covers non-matches).
+fn check_if_let_expr(
+    ctx: &mut CheckCtx,
+    il: &crate::ast::IfLetExpr,
+    outer: &Expr,
+) -> Result<InferType, Error> {
+    let scrutinee_ty = check_expr(ctx, &il.scrutinee)?;
+    let mark = ctx.locals.len();
+    let mut bindings: Vec<(String, InferType, Span, bool)> = Vec::new();
+    check_pattern(ctx, &il.pattern, &scrutinee_ty, &mut bindings)?;
+    let mut k = 0;
+    while k < bindings.len() {
+        ctx.locals.push(LocalEntry {
+            name: bindings[k].0.clone(),
+            ty: bindings[k].1.clone(),
+            mutable: bindings[k].3,
+        });
+        k += 1;
+    }
+    let then_ty = check_block_expr(ctx, il.then_block.as_ref())?;
+    ctx.locals.truncate(mark);
+    let else_ty = check_block_expr(ctx, il.else_block.as_ref())?;
+    ctx.subst.unify(
+        &then_ty,
+        &else_ty,
+        ctx.traits,
+        ctx.type_params,
+        ctx.type_param_bounds,
+        &outer.span,
+        ctx.current_file,
+    )?;
+    Ok(then_ty)
+}
+
+
+// Builtin intrinsic check. The name encodes (type, op) — e.g.
+// `u32_add`, `i64_eq`, `bool_and`, `bool_not`. Looks up the
+// signature, verifies arg arity + types, returns the result type.
+//
+// Operation kinds:
+//   - Arithmetic on int types (add, sub, mul, div, rem): (T, T) -> T.
+//   - Comparison on int types (eq, ne, lt, le, gt, ge): (T, T) -> bool.
+//   - Bool: and/or (bool, bool) -> bool; not (bool) -> bool;
+//     eq/ne (bool, bool) -> bool.
+fn check_builtin(
+    ctx: &mut CheckCtx,
+    name: &str,
+    name_span: &Span,
+    args: &Vec<Expr>,
+    expr: &Expr,
+) -> Result<InferType, Error> {
+    let sig = match builtin_signature(name) {
+        Some(s) => s,
+        None => {
+            return Err(Error {
+                file: ctx.current_file.to_string(),
+                message: format!("unknown builtin `¤{}`", name),
+                span: name_span.copy(),
+            });
+        }
+    };
+    if args.len() != sig.params.len() {
+        return Err(Error {
+            file: ctx.current_file.to_string(),
+            message: format!(
+                "builtin `¤{}` takes {} argument(s), got {}",
+                name,
+                sig.params.len(),
+                args.len()
+            ),
+            span: expr.span.copy(),
+        });
+    }
+    let mut k = 0;
+    while k < args.len() {
+        let arg_ty = check_expr(ctx, &args[k])?;
+        let expected = rtype_to_infer(&sig.params[k]);
+        ctx.subst.unify(
+            &arg_ty,
+            &expected,
+            ctx.traits,
+            ctx.type_params,
+            ctx.type_param_bounds,
+            &args[k].span,
+            ctx.current_file,
+        )?;
+        k += 1;
+    }
+    Ok(rtype_to_infer(&sig.result))
+}
+
+mod builtins;
+pub use builtins::{BuiltinSig, builtin_signature};
+
+mod patterns;
+use patterns::{check_match_exhaustive, check_pattern};
+
+mod methods;
+use methods::check_method_call;
+
+mod setup;
+use setup::{
+    collect_enum_names, collect_funcs, collect_struct_names, collect_trait_names,
+    find_trait_impl_idx, push_root_name, register_function, resolve_enum_variants,
+    resolve_impl_target, resolve_struct_fields, resolve_trait_methods, resolve_trait_path,
+    validate_supertrait_obligations,
+};
+
+// `recv.method(args)` resolution. Type-check the receiver, peel one layer of
+// ref to find the underlying struct, look up `[StructPath, method_name]` in
+// FuncTable, derive a `ReceiverAdjust` from the recv type vs the method's
+// receiver type, type-check remaining args, and record the resolution for
+// borrowck/codegen consumption.
+// Symbolic method dispatch via a type-param's trait bounds. Used when
+// `recv: T` (or `&T`/`&mut T`) and `T: Trait` is in scope. Verifies the
+// trait declares the method, type-checks args against the trait method's
+// signature, and stamps a `TraitDispatch` resolution for codegen to
+// re-resolve at monomorphization.
+
+// A receiver is a "mutable place" if it's a Var bound to a `mut` local, or a
+// FieldAccess chain rooted at one — same rule as for `&mut place` borrows.
+pub(crate) fn is_mutable_place(ctx: &CheckCtx, expr: &Expr) -> bool {
+    let chain = match extract_place_for_assign(expr) {
+        Some(c) => c,
+        None => return false,
+    };
+    let mut i = ctx.locals.len();
+    while i > 0 {
+        i -= 1;
+        if ctx.locals[i].name == chain[0] {
+            // Owned `mut` binding, or a `&mut T` binding.
+            if ctx.locals[i].mutable {
+                return true;
+            }
+            let resolved = ctx.subst.substitute(&ctx.locals[i].ty);
+            return matches!(resolved, InferType::Ref { mutable: true, .. });
+        }
+    }
+    false
+}
+
+// `*p` reads the pointed-to value. Result type = inner of the ref/raw-ptr.
+// We don't enforce Copy here — that check kicks in only when the deref is
+// USED as a value (the caller can decide). `(*p).field` access still applies
+// the Copy rule via `check_field_access`'s "through reference" branch.
+// Walk an expression as a place (memory location). Used for the inner of
+// `&...` / `&mut...` so the "Copy through ref" rule on intermediate field
+// accesses doesn't fire — borrowing a non-Copy place is fine; only reading
+// a place into a value moves out. Place expressions are: `Var`, `FieldAccess`
+// on a place, `Deref` on a value (the value side is a ref/raw-ptr). For any
+// other shape (e.g., `&call()`), falls back to `check_expr` (treats the inner
+// as a value — borrowck won't track such borrows).
+fn check_place_expr(ctx: &mut CheckCtx, expr: &Expr) -> Result<InferType, Error> {
+    match &expr.kind {
+        ExprKind::Var(_)
+        | ExprKind::FieldAccess(_)
+        | ExprKind::Deref(_)
+        | ExprKind::TupleIndex { .. } => {
+            let ty = check_place_inner(ctx, expr)?;
+            ctx.expr_infer_types[expr.id as usize] = Some(ty.clone());
+            Ok(ty)
+        }
+        _ => check_expr(ctx, expr),
+    }
+}
+
+fn check_place_inner(ctx: &mut CheckCtx, expr: &Expr) -> Result<InferType, Error> {
+    match &expr.kind {
+        ExprKind::Var(name) => {
+            let mut i = ctx.locals.len();
+            while i > 0 {
+                i -= 1;
+                if ctx.locals[i].name == *name {
+                    return Ok(ctx.locals[i].ty.clone());
+                }
+            }
+            Err(Error {
+                file: ctx.current_file.to_string(),
+                message: format!("unknown variable: `{}`", name),
+                span: expr.span.copy(),
+            })
+        }
+        ExprKind::FieldAccess(fa) => {
+            let base_ty = check_place_expr(ctx, &fa.base)?;
+            let resolved = ctx.subst.substitute(&base_ty);
+            // Auto-deref one level through `&T` / `&mut T` (matches the
+            // value-position field-access behavior).
+            let (struct_path, struct_type_args) = match resolved {
+                InferType::Struct { path, type_args, .. } => (path, type_args),
+                InferType::Ref { inner, .. } => match *inner {
+                    InferType::Struct { path, type_args, .. } => (path, type_args),
+                    _ => {
+                        return Err(Error {
+                            file: ctx.current_file.to_string(),
+                            message: "field access on non-struct value".to_string(),
+                            span: fa.base.span.copy(),
+                        });
+                    }
+                },
+                _ => {
+                    return Err(Error {
+                        file: ctx.current_file.to_string(),
+                        message: "field access on non-struct value".to_string(),
+                        span: fa.base.span.copy(),
+                    });
+                }
+            };
+            let entry = struct_lookup(ctx.structs, &struct_path).expect("resolved struct");
+            let mut i = 0;
+            while i < entry.fields.len() {
+                if entry.fields[i].name == fa.field {
+                    let env = build_infer_env(&entry.type_params, &struct_type_args);
+                    let field_raw = rtype_to_infer(&entry.fields[i].ty);
+                    return Ok(infer_substitute(&field_raw, &env));
+                }
+                i += 1;
+            }
+            Err(Error {
+                file: ctx.current_file.to_string(),
+                message: format!(
+                    "no field `{}` on `{}`",
+                    fa.field,
+                    place_to_string(&struct_path)
+                ),
+                span: fa.field_span.copy(),
+            })
+        }
+        ExprKind::Deref(inner) => {
+            // The inner of a Deref is a value (a ref or raw-ptr that holds
+            // the place's address). Use check_expr to type-check the value.
+            let inner_ty = check_expr(ctx, inner)?;
+            let resolved = ctx.subst.substitute(&inner_ty);
+            match resolved {
+                InferType::Ref { inner, .. } => Ok(*inner),
+                InferType::RawPtr { inner, .. } => Ok(*inner),
+                other => Err(Error {
+                    file: ctx.current_file.to_string(),
+                    message: format!(
+                        "cannot dereference `{}` — only references and raw pointers can be dereferenced",
+                        infer_to_string(&other)
+                    ),
+                    span: expr.span.copy(),
+                }),
+            }
+        }
+        ExprKind::TupleIndex { base, index, index_span } => {
+            let base_ty = check_place_expr(ctx, base)?;
+            let mut resolved = ctx.subst.substitute(&base_ty);
+            // Auto-deref through `&T` / `&mut T` (matches value-position
+            // tuple-index behavior).
+            while let InferType::Ref { inner, .. } = resolved {
+                resolved = ctx.subst.substitute(&inner);
+            }
+            match resolved {
+                InferType::Tuple(elems) => {
+                    let n = elems.len();
+                    if (*index as usize) >= n {
+                        return Err(Error {
+                            file: ctx.current_file.to_string(),
+                            message: format!(
+                                "tuple index {} out of range (length {})",
+                                index, n
+                            ),
+                            span: index_span.copy(),
+                        });
+                    }
+                    Ok(elems[*index as usize].clone())
+                }
+                other => Err(Error {
+                    file: ctx.current_file.to_string(),
+                    message: format!(
+                        "tuple index `.{}` on non-tuple type `{}`",
+                        index,
+                        infer_to_string(&other)
+                    ),
+                    span: expr.span.copy(),
+                }),
+            }
+        }
+        _ => unreachable!("check_place_inner only dispatches Var/FieldAccess/Deref/TupleIndex"),
+    }
+}
+
+fn check_deref(ctx: &mut CheckCtx, inner: &Expr, deref_expr: &Expr) -> Result<InferType, Error> {
+    let inner_ty = check_expr(ctx, inner)?;
+    let resolved = ctx.subst.substitute(&inner_ty);
+    match resolved {
+        InferType::Ref { inner, .. } => Ok(*inner),
+        InferType::RawPtr { inner, .. } => Ok(*inner),
+        other => Err(Error {
+            file: ctx.current_file.to_string(),
+            message: format!(
+                "cannot dereference `{}` — only references and raw pointers can be dereferenced",
+                infer_to_string(&other)
+            ),
+            span: deref_expr.span.copy(),
+        }),
+    }
+}
+
+// Casts in our subset: any of {integer, &T, &mut T, *const T, *mut T} can be
+// cast to any of {*const T, *mut T}. Integer-class type vars get pinned to
+// usize at the cast site (matches Rust's "integers cast to ptr-sized") so the
+// underlying ABI is i32. Everything else is a type-level reinterpret.
+fn check_cast(
+    ctx: &mut CheckCtx,
+    inner: &Expr,
+    ty: &Type,
+    cast_expr: &Expr,
+) -> Result<InferType, Error> {
+    let target = resolve_type(
+        ty,
+        ctx.current_module,
+        ctx.structs,
+        ctx.enums,
+        ctx.self_target,
+        ctx.type_params,
+        &ctx.use_scope,
+        ctx.reexports,
+        ctx.current_file,
+    )?;
+    let target_is_ptr = is_raw_ptr(&target);
+    let target_is_int = matches!(&target, RType::Int(_));
+    if !target_is_ptr && !target_is_int {
+        return Err(Error {
+            file: ctx.current_file.to_string(),
+            message: format!(
+                "casts are only allowed to raw pointer or integer types, got `{}`",
+                rtype_to_string(&target)
+            ),
+            span: ty.span.copy(),
+        });
+    }
+    let src_ty = check_expr(ctx, inner)?;
+    let resolved_src = ctx.subst.substitute(&src_ty);
+    let src_ok = if target_is_ptr {
+        matches!(
+            &resolved_src,
+            InferType::Ref { .. }
+                | InferType::RawPtr { .. }
+                | InferType::Int(_)
+                | InferType::Var(_)
+        )
+    } else {
+        // Int target: source must be an integer (or unbound integer var).
+        matches!(&resolved_src, InferType::Int(_) | InferType::Var(_))
+    };
+    if !src_ok {
+        return Err(Error {
+            file: ctx.current_file.to_string(),
+            message: format!(
+                "cannot cast `{}` to `{}`",
+                infer_to_string(&resolved_src),
+                rtype_to_string(&target)
+            ),
+            span: cast_expr.span.copy(),
+        });
+    }
+    if let InferType::Var(v) = &resolved_src {
+        if ctx.subst.is_num_lit[*v as usize] {
+            // Pin an unresolved integer literal: to `usize` for ptr casts
+            // (matches "integers cast to ptr-sized"), to `i32` otherwise.
+            let pin_kind = if target_is_ptr {
+                IntKind::Usize
+            } else {
+                IntKind::I32
+            };
+            ctx.subst.unify(
+                &InferType::Var(*v),
+                &InferType::Int(pin_kind),
+                ctx.traits,
+                ctx.type_params,
+                ctx.type_param_bounds,
+                &cast_expr.span,
+                ctx.current_file,
+            )?;
+        }
+    }
+    Ok(rtype_to_infer(&target))
+}
+
+fn check_call(ctx: &mut CheckCtx, call: &Call, call_expr: &Expr) -> Result<InferType, Error> {
+    // Use-table resolution first: an explicit import or matching glob
+    // takes precedence over module-relative path lookup, so
+    // `use std::dummy::id; id(7)` resolves to `["std","dummy","id"]`
+    // rather than `[<current-module>, "id"]`.
+    let raw_segs: Vec<String> =
+        call.callee.segments.iter().map(|s| s.name.clone()).collect();
+    // Try enum-variant construction first: `Path::Variant(args)`. The
+    // path's prefix names an enum and the last segment matches a variant.
+    if let Some((enum_path, disc)) = lookup_variant_path(
+        ctx.enums,
+        ctx.reexports,
+        &ctx.use_scope,
+        ctx.current_module,
+        &raw_segs,
+    ) {
+        return check_variant_call(ctx, call, call_expr, enum_path, disc);
+    }
+    let raw_full =
+        resolve_via_use_scopes(&raw_segs, &ctx.use_scope, |cand| {
+            func_path_resolved(ctx.funcs, ctx.reexports, cand).is_some()
+        })
+        .unwrap_or_else(|| {
+            resolve_full_path(ctx.current_module, ctx.self_target, &call.callee.segments)
+        });
+    // Follow re-exports to the canonical path so the FuncTable lookups
+    // below find the entry/template.
+    let full = func_path_resolved(ctx.funcs, ctx.reexports, &raw_full).unwrap_or(raw_full);
+    // Generic args attach to the last segment of the callee path.
+    let last_seg_args = if call.callee.segments.is_empty() {
+        Vec::new()
+    } else {
+        let last = &call.callee.segments[call.callee.segments.len() - 1];
+        let mut v: Vec<crate::ast::Type> = Vec::new();
+        let mut i = 0;
+        while i < last.args.len() {
+            v.push(last.args[i].clone());
+            i += 1;
+        }
+        v
+    };
+    // Try non-generic first.
+    if let Some(entry_idx) = funcs_entry_index(ctx.funcs, &full) {
+        let entry = &ctx.funcs.entries[entry_idx];
+        let is_method = entry.impl_target.is_some();
+        let def_mod = fn_defining_module(&entry.path, is_method);
+        if !is_visible_from(&def_mod, entry.is_pub, ctx.current_module) {
+            return Err(Error {
+                file: ctx.current_file.to_string(),
+                message: format!(
+                    "function `{}` is private",
+                    place_to_string(&entry.path)
+                ),
+                span: call_expr.span.copy(),
+            });
+        }
+        if !last_seg_args.is_empty() {
+            return Err(Error {
+                file: ctx.current_file.to_string(),
+                message: format!(
+                    "`{}` is not a generic function — turbofish is not allowed",
+                    segments_to_string(&call.callee.segments)
+                ),
+                span: call_expr.span.copy(),
+            });
+        }
+        if call.args.len() != entry.param_types.len() {
+            return Err(Error {
+                file: ctx.current_file.to_string(),
+                message: format!(
+                    "wrong number of arguments to `{}`: expected {}, got {}",
+                    segments_to_string(&call.callee.segments),
+                    entry.param_types.len(),
+                    call.args.len()
+                ),
+                span: call_expr.span.copy(),
+            });
+        }
+        let mut param_infer: Vec<InferType> = Vec::new();
+        let mut k = 0;
+        while k < entry.param_types.len() {
+            param_infer.push(rtype_to_infer(&entry.param_types[k]));
+            k += 1;
+        }
+        let return_infer: InferType = match &entry.return_type {
+            Some(rt) => rtype_to_infer(rt),
+            None => InferType::Tuple(Vec::new()),
+        };
+        ctx.call_resolutions[call_expr.id as usize] = Some(PendingCall::Direct(entry_idx));
+        let mut i = 0;
+        while i < call.args.len() {
+            let arg_ty = check_expr(ctx, &call.args[i])?;
+            ctx.subst.unify(
+                &arg_ty,
+                &param_infer[i],
+                ctx.traits,
+                ctx.type_params,
+                ctx.type_param_bounds,
+                &call.args[i].span,
+                ctx.current_file,
+            )?;
+            i += 1;
+        }
+        return Ok(return_infer);
+    }
+    // Try a generic template.
+    if let Some((template_idx, _)) = template_lookup(ctx.funcs, &full) {
+        let tmpl_is_pub = ctx.funcs.templates[template_idx].is_pub;
+        let tmpl_path = ctx.funcs.templates[template_idx].path.clone();
+        let tmpl_is_method = ctx.funcs.templates[template_idx].impl_target.is_some();
+        let def_mod = fn_defining_module(&tmpl_path, tmpl_is_method);
+        if !is_visible_from(&def_mod, tmpl_is_pub, ctx.current_module) {
+            return Err(Error {
+                file: ctx.current_file.to_string(),
+                message: format!(
+                    "function `{}` is private",
+                    place_to_string(&tmpl_path)
+                ),
+                span: call_expr.span.copy(),
+            });
+        }
+        // Snapshot the template's data we need (clone vectors so we don't keep
+        // a borrow into ctx.funcs across the upcoming ctx.subst mutations).
+        let tmpl_type_params: Vec<String> = ctx.funcs.templates[template_idx].type_params.clone();
+        let tmpl_param_types: Vec<RType> = {
+            let mut v: Vec<RType> = Vec::new();
+            let mut k = 0;
+            while k < ctx.funcs.templates[template_idx].param_types.len() {
+                v.push(ctx.funcs.templates[template_idx].param_types[k].clone());
+                k += 1;
+            }
+            v
+        };
+        let tmpl_return_type: Option<RType> = ctx.funcs.templates[template_idx]
+            .return_type
+            .clone();
+        if !last_seg_args.is_empty() && last_seg_args.len() != tmpl_type_params.len() {
+            return Err(Error {
+                file: ctx.current_file.to_string(),
+                message: format!(
+                    "wrong number of type arguments to `{}`: expected {}, got {}",
+                    segments_to_string(&call.callee.segments),
+                    tmpl_type_params.len(),
+                    last_seg_args.len()
+                ),
+                span: call_expr.span.copy(),
+            });
+        }
+        if call.args.len() != tmpl_param_types.len() {
+            return Err(Error {
+                file: ctx.current_file.to_string(),
+                message: format!(
+                    "wrong number of arguments to `{}`: expected {}, got {}",
+                    segments_to_string(&call.callee.segments),
+                    tmpl_param_types.len(),
+                    call.args.len()
+                ),
+                span: call_expr.span.copy(),
+            });
+        }
+        let mut env: Vec<(String, InferType)> = Vec::new();
+        let mut var_ids: Vec<u32> = Vec::new();
+        let mut k = 0;
+        while k < tmpl_type_params.len() {
+            let v = ctx.subst.fresh_var();
+            var_ids.push(v);
+            env.push((tmpl_type_params[k].clone(), InferType::Var(v)));
+            k += 1;
+        }
+        // Apply explicit turbofish args by unifying.
+        let mut k = 0;
+        while k < last_seg_args.len() {
+            let user_rt = resolve_type(
+                &last_seg_args[k],
+                ctx.current_module,
+                ctx.structs,
+                ctx.enums,
+                ctx.self_target,
+                ctx.type_params,
+                &ctx.use_scope,
+                ctx.reexports,
+                ctx.current_file,
+            )?;
+            let user_infer = rtype_to_infer(&user_rt);
+            ctx.subst.unify(
+                &InferType::Var(var_ids[k]),
+                &user_infer,
+                ctx.traits,
+                ctx.type_params,
+                ctx.type_param_bounds,
+                &last_seg_args[k].span,
+                ctx.current_file,
+            )?;
+            k += 1;
+        }
+        let mut param_infer: Vec<InferType> = Vec::new();
+        let mut k = 0;
+        while k < tmpl_param_types.len() {
+            param_infer.push(infer_substitute(&rtype_to_infer(&tmpl_param_types[k]), &env));
+            k += 1;
+        }
+        let return_infer: InferType = match &tmpl_return_type {
+            Some(rt) => infer_substitute(&rtype_to_infer(rt), &env),
+            None => InferType::Tuple(Vec::new()),
+        };
+        ctx.call_resolutions[call_expr.id as usize] = Some(PendingCall::Generic {
+            template_idx,
+            type_var_ids: var_ids,
+        });
+        let mut i = 0;
+        while i < call.args.len() {
+            let arg_ty = check_expr(ctx, &call.args[i])?;
+            ctx.subst.unify(
+                &arg_ty,
+                &param_infer[i],
+                ctx.traits,
+                ctx.type_params,
+                ctx.type_param_bounds,
+                &call.args[i].span,
+                ctx.current_file,
+            )?;
+            i += 1;
+        }
+        return Ok(return_infer);
+    }
+    Err(Error {
+        file: ctx.current_file.to_string(),
+        message: format!(
+            "unresolved function: {}",
+            segments_to_string(&call.callee.segments)
+        ),
+        span: call.callee.span.copy(),
+    })
+}
+
+// Struct-shaped variant: `E::Variant { f: e, g: e }`. Mirrors
+// `check_variant_call` but matches the named-field shape.
+fn check_variant_struct_lit(
+    ctx: &mut CheckCtx,
+    lit: &StructLit,
+    lit_expr: &Expr,
+    enum_path: Vec<String>,
+    disc: usize,
+) -> Result<InferType, Error> {
+    let entry = enum_lookup(ctx.enums, &enum_path).expect("variant lookup returned a real enum");
+    if !is_visible_from(
+        &type_defining_module(&entry.path),
+        entry.is_pub,
+        ctx.current_module,
+    ) {
+        return Err(Error {
+            file: ctx.current_file.to_string(),
+            message: format!("enum `{}` is private", place_to_string(&entry.path)),
+            span: lit.path.span.copy(),
+        });
+    }
+    let variant = &entry.variants[disc];
+    let field_defs: Vec<RTypedField> = match &variant.payload {
+        VariantPayloadResolved::Struct(fields) => {
+            let mut out: Vec<RTypedField> = Vec::new();
+            let mut k = 0;
+            while k < fields.len() {
+                out.push(RTypedField {
+                    name: fields[k].name.clone(),
+                    name_span: fields[k].name_span.copy(),
+                    ty: fields[k].ty.clone(),
+                    is_pub: fields[k].is_pub,
+                });
+                k += 1;
+            }
+            out
+        }
+        VariantPayloadResolved::Tuple(_) => {
+            return Err(Error {
+                file: ctx.current_file.to_string(),
+                message: format!(
+                    "variant `{}::{}` is a tuple-shaped variant; use `{}::{}( … )`",
+                    place_to_string(&entry.path),
+                    variant.name,
+                    place_to_string(&entry.path),
+                    variant.name
+                ),
+                span: lit.path.span.copy(),
+            });
+        }
+        VariantPayloadResolved::Unit => {
+            return Err(Error {
+                file: ctx.current_file.to_string(),
+                message: format!(
+                    "variant `{}::{}` is a unit variant; use `{}::{}` (no braces)",
+                    place_to_string(&entry.path),
+                    variant.name,
+                    place_to_string(&entry.path),
+                    variant.name
+                ),
+                span: lit.path.span.copy(),
+            });
+        }
+    };
+    // Type args from the enum's prefix segment (e.g. `Option::<u32>::Some { … }`).
+    let last = &lit.path.segments[lit.path.segments.len() - 1];
+    let mut explicit_type_args: Vec<crate::ast::Type> = last.args.clone();
+    if explicit_type_args.is_empty() && lit.path.segments.len() >= 2 {
+        let prev = &lit.path.segments[lit.path.segments.len() - 2];
+        explicit_type_args = prev.args.clone();
+    }
+    if !explicit_type_args.is_empty() && explicit_type_args.len() != entry.type_params.len() {
+        return Err(Error {
+            file: ctx.current_file.to_string(),
+            message: format!(
+                "wrong number of type arguments for `{}`: expected {}, got {}",
+                place_to_string(&entry.path),
+                entry.type_params.len(),
+                explicit_type_args.len()
+            ),
+            span: lit.path.span.copy(),
+        });
+    }
+    let mut type_var_ids: Vec<u32> = Vec::with_capacity(entry.type_params.len());
+    let mut env: Vec<(String, InferType)> = Vec::new();
+    let mut k = 0;
+    while k < entry.type_params.len() {
+        let v = ctx.subst.fresh_var();
+        type_var_ids.push(v);
+        env.push((entry.type_params[k].clone(), InferType::Var(v)));
+        k += 1;
+    }
+    if !explicit_type_args.is_empty() {
+        let mut k = 0;
+        while k < explicit_type_args.len() {
+            let rt = resolve_type(
+                &explicit_type_args[k],
+                ctx.current_module,
+                ctx.structs,
+                ctx.enums,
+                ctx.self_target,
+                ctx.type_params,
+                &ctx.use_scope,
+                ctx.reexports,
+                ctx.current_file,
+            )?;
+            ctx.subst.unify(
+                &InferType::Var(type_var_ids[k]),
+                &rtype_to_infer(&rt),
+                ctx.traits,
+                ctx.type_params,
+                ctx.type_param_bounds,
+                &lit.path.span,
+                ctx.current_file,
+            )?;
+            k += 1;
+        }
+    }
+    // Validate field set: every declared field present, no extras, no
+    // duplicates. Check each initializer's type against the substituted
+    // declared type.
+    let enum_path_clone = entry.path.clone();
+    let variant_name = variant.name.clone();
+    let mut seen: Vec<bool> = vec![false; field_defs.len()];
+    let mut i = 0;
+    while i < lit.fields.len() {
+        let init = &lit.fields[i];
+        let mut found: Option<usize> = None;
+        let mut k = 0;
+        while k < field_defs.len() {
+            if field_defs[k].name == init.name {
+                found = Some(k);
+                break;
+            }
+            k += 1;
+        }
+        let idx = match found {
+            Some(idx) => idx,
+            None => {
+                return Err(Error {
+                    file: ctx.current_file.to_string(),
+                    message: format!(
+                        "unknown field `{}` on variant `{}::{}`",
+                        init.name,
+                        place_to_string(&enum_path_clone),
+                        variant_name
+                    ),
+                    span: init.name_span.copy(),
+                });
+            }
+        };
+        if seen[idx] {
+            return Err(Error {
+                file: ctx.current_file.to_string(),
+                message: format!("duplicate field `{}` in variant literal", init.name),
+                span: init.name_span.copy(),
+            });
+        }
+        seen[idx] = true;
+        let value_ty = check_expr(ctx, &init.value)?;
+        let expected = infer_substitute(&rtype_to_infer(&field_defs[idx].ty), &env);
+        ctx.subst.unify(
+            &value_ty,
+            &expected,
+            ctx.traits,
+            ctx.type_params,
+            ctx.type_param_bounds,
+            &init.value.span,
+            ctx.current_file,
+        )?;
+        i += 1;
+    }
+    let mut k = 0;
+    while k < field_defs.len() {
+        if !seen[k] {
+            return Err(Error {
+                file: ctx.current_file.to_string(),
+                message: format!(
+                    "missing field `{}` in variant `{}::{}`",
+                    field_defs[k].name,
+                    place_to_string(&enum_path_clone),
+                    variant_name
+                ),
+                span: lit.path.span.copy(),
+            });
+        }
+        k += 1;
+    }
+    let disc_u32 = disc as u32;
+    ctx.call_resolutions[lit_expr.id as usize] = Some(PendingCall::Variant {
+        enum_path: enum_path_clone.clone(),
+        disc: disc_u32,
+        type_var_ids: type_var_ids.clone(),
+    });
+    let mut type_args_infer: Vec<InferType> = Vec::new();
+    let mut k = 0;
+    while k < type_var_ids.len() {
+        type_args_infer.push(InferType::Var(type_var_ids[k]));
+        k += 1;
+    }
+    Ok(InferType::Enum {
+        path: enum_path_clone,
+        type_args: type_args_infer,
+        lifetime_args: Vec::new(),
+    })
+}
+
+fn funcs_entry_index(funcs: &FuncTable, path: &Vec<String>) -> Option<usize> {
+    let mut i = 0;
+    while i < funcs.entries.len() {
+        if &funcs.entries[i].path == path {
+            return Some(i);
+        }
+        i += 1;
+    }
+    None
+}
+
+// `E::Variant(args)` — enum variant construction with positional payload
+// (or no payload, in which case args must be empty). Resolves the variant,
+// allocates fresh inference vars for the enum's type-params, type-checks
+// the args against the variant's payload types substituted with those
+// vars, and returns `InferType::Enum`. Records a `PendingCall::Variant`
+// at this Call's NodeId so codegen can lower construction.
+fn check_variant_call(
+    ctx: &mut CheckCtx,
+    call: &Call,
+    call_expr: &Expr,
+    enum_path: Vec<String>,
+    disc: usize,
+) -> Result<InferType, Error> {
+    let entry = enum_lookup(ctx.enums, &enum_path).expect("variant lookup returned a real enum");
+    if !is_visible_from(
+        &type_defining_module(&entry.path),
+        entry.is_pub,
+        ctx.current_module,
+    ) {
+        return Err(Error {
+            file: ctx.current_file.to_string(),
+            message: format!("enum `{}` is private", place_to_string(&entry.path)),
+            span: call_expr.span.copy(),
+        });
+    }
+    let variant = &entry.variants[disc];
+    // Resolve the type-args slot: turbofish on the last seg goes to the
+    // variant, but Rust convention is `E::<T>::Variant(args)` so type-
+    // args attach to the enum-prefix segment. We accept either: pull
+    // type args off whichever segment carries them.
+    let last = &call.callee.segments[call.callee.segments.len() - 1];
+    let mut explicit_type_args: Vec<crate::ast::Type> = last.args.clone();
+    if explicit_type_args.is_empty() && call.callee.segments.len() >= 2 {
+        let prev = &call.callee.segments[call.callee.segments.len() - 2];
+        explicit_type_args = prev.args.clone();
+    }
+    if !explicit_type_args.is_empty() && explicit_type_args.len() != entry.type_params.len() {
+        return Err(Error {
+            file: ctx.current_file.to_string(),
+            message: format!(
+                "wrong number of type arguments for `{}`: expected {}, got {}",
+                place_to_string(&entry.path),
+                entry.type_params.len(),
+                explicit_type_args.len()
+            ),
+            span: call_expr.span.copy(),
+        });
+    }
+    // Allocate fresh inference vars for each enum type-param. If the user
+    // provided turbofish args, immediately bind each var to the explicit
+    // type. Otherwise inference will close them via arg-type unification.
+    let mut type_var_ids: Vec<u32> = Vec::with_capacity(entry.type_params.len());
+    let mut env: Vec<(String, InferType)> = Vec::new();
+    let mut k = 0;
+    while k < entry.type_params.len() {
+        let v = ctx.subst.fresh_var();
+        type_var_ids.push(v);
+        env.push((entry.type_params[k].clone(), InferType::Var(v)));
+        k += 1;
+    }
+    if !explicit_type_args.is_empty() {
+        let mut k = 0;
+        while k < explicit_type_args.len() {
+            let rt = resolve_type(
+                &explicit_type_args[k],
+                ctx.current_module,
+                ctx.structs,
+                ctx.enums,
+                ctx.self_target,
+                ctx.type_params,
+                &ctx.use_scope,
+                ctx.reexports,
+                ctx.current_file,
+            )?;
+            let infer = rtype_to_infer(&rt);
+            let var_infer = InferType::Var(type_var_ids[k]);
+            ctx.subst.unify(
+                &var_infer,
+                &infer,
+                ctx.traits,
+                ctx.type_params,
+                ctx.type_param_bounds,
+                &call_expr.span,
+                ctx.current_file,
+            )?;
+            k += 1;
+        }
+    }
+    // Validate payload shape and check arg types.
+    let payload_types: Vec<RType> = match &variant.payload {
+        VariantPayloadResolved::Unit => Vec::new(),
+        VariantPayloadResolved::Tuple(types) => types.clone(),
+        VariantPayloadResolved::Struct(_) => {
+            return Err(Error {
+                file: ctx.current_file.to_string(),
+                message: format!(
+                    "variant `{}::{}` is a struct-shaped variant; use `{}::{} {{ … }}`",
+                    place_to_string(&entry.path),
+                    variant.name,
+                    place_to_string(&entry.path),
+                    variant.name
+                ),
+                span: call_expr.span.copy(),
+            });
+        }
+    };
+    if call.args.len() != payload_types.len() {
+        return Err(Error {
+            file: ctx.current_file.to_string(),
+            message: format!(
+                "wrong number of arguments to `{}::{}`: expected {}, got {}",
+                place_to_string(&entry.path),
+                variant.name,
+                payload_types.len(),
+                call.args.len()
+            ),
+            span: call_expr.span.copy(),
+        });
+    }
+    let disc_u32 = disc as u32;
+    ctx.call_resolutions[call_expr.id as usize] = Some(PendingCall::Variant {
+        enum_path: entry.path.clone(),
+        disc: disc_u32,
+        type_var_ids: type_var_ids.clone(),
+    });
+    let mut i = 0;
+    while i < payload_types.len() {
+        let arg_ty = check_expr(ctx, &call.args[i])?;
+        let expected = infer_substitute(&rtype_to_infer(&payload_types[i]), &env);
+        ctx.subst.unify(
+            &arg_ty,
+            &expected,
+            ctx.traits,
+            ctx.type_params,
+            ctx.type_param_bounds,
+            &call.args[i].span,
+            ctx.current_file,
+        )?;
+        i += 1;
+    }
+    // Build the result type: the enum, instantiated with the
+    // inference vars (which the literal/arg unification above has
+    // pinned where possible).
+    let mut type_args_infer: Vec<InferType> = Vec::new();
+    let mut k = 0;
+    while k < type_var_ids.len() {
+        type_args_infer.push(InferType::Var(type_var_ids[k]));
+        k += 1;
+    }
+    Ok(InferType::Enum {
+        path: entry.path.clone(),
+        type_args: type_args_infer,
+        lifetime_args: Vec::new(),
+    })
+}
+
+fn check_struct_lit(
+    ctx: &mut CheckCtx,
+    lit: &StructLit,
+    lit_expr: &Expr,
+) -> Result<InferType, Error> {
+    let raw_segs: Vec<String> = lit.path.segments.iter().map(|s| s.name.clone()).collect();
+    // Try enum struct-variant construction first. If the path's
+    // prefix names an enum and the last segment is a struct-shaped
+    // variant, route to the variant-construction path.
+    if let Some((enum_path, disc)) = lookup_variant_path(
+        ctx.enums,
+        ctx.reexports,
+        &ctx.use_scope,
+        ctx.current_module,
+        &raw_segs,
+    ) {
+        return check_variant_struct_lit(ctx, lit, lit_expr, enum_path, disc);
+    }
+    let raw_full =
+        resolve_via_use_scopes(&raw_segs, &ctx.use_scope, |cand| {
+            struct_lookup_resolved(ctx.structs, ctx.reexports, cand).is_some()
+        })
+        .unwrap_or_else(|| {
+            resolve_full_path(ctx.current_module, ctx.self_target, &lit.path.segments)
+        });
+    // Follow re-exports to the struct's canonical path.
+    let full = struct_lookup_resolved(ctx.structs, ctx.reexports, &raw_full)
+        .map(|e| e.path.clone())
+        .unwrap_or(raw_full);
+
+    let entry = match struct_lookup(ctx.structs, &full) {
+        Some(e) => e,
+        None => {
+            return Err(Error {
+                file: ctx.current_file.to_string(),
+                message: format!(
+                    "unknown struct: {}",
+                    segments_to_string(&lit.path.segments)
+                ),
+                span: lit.path.span.copy(),
+            });
+        }
+    };
+    if !is_visible_from(&type_defining_module(&entry.path), entry.is_pub, ctx.current_module) {
+        return Err(Error {
+            file: ctx.current_file.to_string(),
+            message: format!("struct `{}` is private", place_to_string(&entry.path)),
+            span: lit.path.span.copy(),
+        });
+    }
+    let struct_type_params: Vec<String> = entry.type_params.clone();
+    let mut def_field_names: Vec<String> = Vec::new();
+    let mut def_field_types: Vec<RType> = Vec::new();
+    let mut def_field_pubs: Vec<bool> = Vec::new();
+    let mut k = 0;
+    while k < entry.fields.len() {
+        def_field_names.push(entry.fields[k].name.clone());
+        def_field_types.push(entry.fields[k].ty.clone());
+        def_field_pubs.push(entry.fields[k].is_pub);
+        k += 1;
+    }
+    // Field-level visibility: constructing a struct from outside its
+    // defining module requires every field to be `pub`. Inside the
+    // module, all fields are reachable regardless.
+    let struct_def_module = type_defining_module(&entry.path);
+    let inside_def_module: bool =
+        is_visible_from(&struct_def_module, false, ctx.current_module);
+    // Allocate fresh type-arg vars for this struct's params. If the path's
+    // last segment carried turbofish args, unify them.
+    let last_seg = &lit.path.segments[lit.path.segments.len() - 1];
+    if !last_seg.args.is_empty() && last_seg.args.len() != struct_type_params.len() {
+        return Err(Error {
+            file: ctx.current_file.to_string(),
+            message: format!(
+                "wrong number of type arguments for `{}`: expected {}, got {}",
+                place_to_string(&full),
+                struct_type_params.len(),
+                last_seg.args.len()
+            ),
+            span: lit.path.span.copy(),
+        });
+    }
+    let mut env: Vec<(String, InferType)> = Vec::new();
+    let mut type_arg_infers: Vec<InferType> = Vec::new();
+    let mut i = 0;
+    while i < struct_type_params.len() {
+        let v = ctx.subst.fresh_var();
+        type_arg_infers.push(InferType::Var(v));
+        env.push((struct_type_params[i].clone(), InferType::Var(v)));
+        i += 1;
+    }
+    let mut k = 0;
+    while k < last_seg.args.len() {
+        let user_rt = resolve_type(
+            &last_seg.args[k],
+            ctx.current_module,
+            ctx.structs,
+            ctx.enums,
+            ctx.self_target,
+            ctx.type_params,
+            &ctx.use_scope,
+            ctx.reexports,
+            ctx.current_file,
+        )?;
+        let user_infer = rtype_to_infer(&user_rt);
+        ctx.subst.unify(
+            &type_arg_infers[k],
+            &user_infer,
+            ctx.traits,
+            ctx.type_params,
+            ctx.type_param_bounds,
+            &last_seg.args[k].span,
+            ctx.current_file,
+        )?;
+        k += 1;
+    }
+    // (The wrapping `check_expr` will store our return value at this Expr's
+    // NodeId — that gives codegen the concrete type_args for layout.)
+
+    // Validate field shape.
+    let mut i = 0;
+    while i < lit.fields.len() {
+        let mut found_idx: Option<usize> = None;
+        let mut j = 0;
+        while j < def_field_names.len() {
+            if lit.fields[i].name == def_field_names[j] {
+                found_idx = Some(j);
+                break;
+            }
+            j += 1;
+        }
+        let found_idx = match found_idx {
+            Some(j) => j,
+            None => {
+                return Err(Error {
+                    file: ctx.current_file.to_string(),
+                    message: format!(
+                        "struct `{}` has no field `{}`",
+                        segments_to_string(&lit.path.segments),
+                        lit.fields[i].name
+                    ),
+                    span: lit.fields[i].name_span.copy(),
+                });
+            }
+        };
+        if !inside_def_module && !def_field_pubs[found_idx] {
+            return Err(Error {
+                file: ctx.current_file.to_string(),
+                message: format!(
+                    "field `{}` of `{}` is private",
+                    lit.fields[i].name,
+                    place_to_string(&full)
+                ),
+                span: lit.fields[i].name_span.copy(),
+            });
+        }
+        let mut k = i + 1;
+        while k < lit.fields.len() {
+            if lit.fields[k].name == lit.fields[i].name {
+                return Err(Error {
+                    file: ctx.current_file.to_string(),
+                    message: format!("field `{}` is initialized twice", lit.fields[i].name),
+                    span: lit.fields[k].name_span.copy(),
+                });
+            }
+            k += 1;
+        }
+        i += 1;
+    }
+    let mut i = 0;
+    while i < def_field_names.len() {
+        let mut present = false;
+        let mut j = 0;
+        while j < lit.fields.len() {
+            if lit.fields[j].name == def_field_names[i] {
+                present = true;
+                break;
+            }
+            j += 1;
+        }
+        if !present {
+            return Err(Error {
+                file: ctx.current_file.to_string(),
+                message: format!("missing field `{}`", def_field_names[i]),
+                span: lit_expr.span.copy(),
+            });
+        }
+        i += 1;
+    }
+
+    // Type-check inits in source order. Each declared field type is
+    // substituted via the struct's type-arg env so Param("T") in field types
+    // unifies with whatever the type-arg var resolves to.
+    let mut i = 0;
+    while i < lit.fields.len() {
+        let init = &lit.fields[i];
+        let init_ty = check_expr(ctx, &init.value)?;
+        let mut k = 0;
+        while k < def_field_names.len() {
+            if def_field_names[k] == init.name {
+                let expected_raw = rtype_to_infer(&def_field_types[k]);
+                let expected = infer_substitute(&expected_raw, &env);
+                ctx.subst.unify(
+                    &init_ty,
+                    &expected,
+                    ctx.traits,
+                    ctx.type_params,
+                    ctx.type_param_bounds,
+                    &init.value.span,
+                    ctx.current_file,
+                )?;
+                break;
+            }
+            k += 1;
+        }
+        i += 1;
+    }
+
+    // Struct literals allocate fresh `Inferred(0)` placeholders for their
+    // lifetime args — Phase D doesn't unify struct lifetimes (carry-only),
+    // and borrowck reads field borrows directly from the holder's per-slot
+    // data rather than from these placeholders.
+    let mut lit_lifetime_args: Vec<LifetimeRepr> = Vec::new();
+    let mut i = 0;
+    while i < entry.lifetime_params.len() {
+        lit_lifetime_args.push(LifetimeRepr::Inferred(0));
+        i += 1;
+    }
+    Ok(InferType::Struct {
+        path: full,
+        type_args: type_arg_infers,
+        lifetime_args: lit_lifetime_args,
+    })
+}
+
+fn check_field_access(
+    ctx: &mut CheckCtx,
+    fa: &FieldAccess,
+    _fa_expr: &Expr,
+) -> Result<InferType, Error> {
+    // Field access through a deref expression — `(*p).field` — applies the
+    // same "Copy fields only" rule as auto-deref `r.field` does. Detect it
+    // syntactically before walking the base.
+    let through_explicit_deref = matches!(&fa.base.kind, ExprKind::Deref(_));
+    let base_ty = check_expr(ctx, &fa.base)?;
+    let resolved = ctx.subst.substitute(&base_ty);
+    let (struct_path, struct_type_args, through_ref) = match resolved {
+        InferType::Struct { path, type_args, .. } => (path, type_args, through_explicit_deref),
+        InferType::Ref { inner, .. } => match *inner {
+            InferType::Struct { path, type_args, .. } => (path, type_args, true),
+            _ => {
+                return Err(Error {
+                    file: ctx.current_file.to_string(),
+                    message: "field access on non-struct value".to_string(),
+                    span: fa.base.span.copy(),
+                });
+            }
+        },
+        _ => {
+            return Err(Error {
+                file: ctx.current_file.to_string(),
+                message: "field access on non-struct value".to_string(),
+                span: fa.base.span.copy(),
+            });
+        }
+    };
+    let entry = struct_lookup(ctx.structs, &struct_path).expect("resolved struct");
+    let mut i = 0;
+    while i < entry.fields.len() {
+        if entry.fields[i].name == fa.field {
+            // Field-level visibility: a non-pub field is only readable
+            // from inside the struct's defining module (or descendants).
+            if !field_visible_from(&struct_path, entry.fields[i].is_pub, ctx.current_module) {
+                return Err(Error {
+                    file: ctx.current_file.to_string(),
+                    message: format!(
+                        "field `{}` of `{}` is private",
+                        fa.field,
+                        place_to_string(&struct_path)
+                    ),
+                    span: fa.field_span.copy(),
+                });
+            }
+            // Substitute the field's declared type with the struct's type args
+            // (e.g., `pair.first` where pair: Pair<u32, u64> and field declared
+            // as T → resolves to u32).
+            let env = build_infer_env(&entry.type_params, &struct_type_args);
+            let field_ty_raw = entry.fields[i].ty.clone();
+            let field_infer_raw = rtype_to_infer(&field_ty_raw);
+            let field_infer = infer_substitute(&field_infer_raw, &env);
+            // Copy check: a non-Copy field accessed through a ref is a move
+            // out of borrow. Place borrows (`&...`) walk through
+            // `check_place_expr` and skip this branch entirely; only
+            // value-position field access reaches here.
+            if through_ref
+                && !is_copy_with_bounds(
+                    &field_ty_raw,
+                    ctx.traits,
+                    ctx.type_params,
+                    ctx.type_param_bounds,
+                )
+            {
+                return Err(Error {
+                    file: ctx.current_file.to_string(),
+                    message: format!(
+                        "cannot move out of borrow: field `{}` of `{}` has non-Copy type `{}`",
+                        fa.field,
+                        place_to_string(&struct_path),
+                        rtype_to_string(&field_ty_raw)
+                    ),
+                    span: fa.field_span.copy(),
+                });
+            }
+            return Ok(field_infer);
+        }
+        i += 1;
+    }
+    Err(Error {
+        file: ctx.current_file.to_string(),
+        message: format!(
+            "no field `{}` on `{}`",
+            fa.field,
+            place_to_string(&struct_path)
+        ),
+        span: fa.field_span.copy(),
+    })
+}
