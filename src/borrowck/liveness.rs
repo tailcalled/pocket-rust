@@ -14,7 +14,7 @@
 // more precise (e.g., `x.f` live without `x.g`) but per-local is
 // enough for borrow regions and matches what NLL needs in practice.
 
-use crate::cfg::{
+use super::cfg::{
     BasicBlock, BlockId, Cfg, CfgStmt, CfgStmtKind, LocalId, Operand, OperandKind, Place, Rvalue,
     Terminator,
 };
@@ -216,7 +216,7 @@ fn mark_rvalue_uses(rv: &Rvalue, state: &mut LiveSet) {
             }
         }
         Rvalue::Variant { fields, .. } => {
-            use crate::cfg::VariantFields;
+            use super::cfg::VariantFields;
             match fields {
                 VariantFields::Unit => {}
                 VariantFields::Tuple(ops) => {

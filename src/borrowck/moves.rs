@@ -13,7 +13,7 @@
 // 3), drop-flag synthesis (phase 5). Those run on top of this pass's
 // output (per-block in/out move states).
 
-use crate::cfg::{
+use super::cfg::{
     BasicBlock, BlockId, Cfg, CfgStmt, CfgStmtKind, LocalId, Operand, OperandKind, Place, Rvalue,
     Terminator,
 };
@@ -397,7 +397,7 @@ fn apply_rvalue_state_only(rv: &Rvalue, state: &mut MoveSet) {
             }
         }
         Rvalue::Variant { fields, .. } => {
-            use crate::cfg::VariantFields;
+            use super::cfg::VariantFields;
             match fields {
                 VariantFields::Unit => {}
                 VariantFields::Tuple(ops) => {
@@ -505,7 +505,7 @@ fn apply_rvalue(
             }
         }
         Rvalue::Variant { fields, .. } => {
-            use crate::cfg::VariantFields;
+            use super::cfg::VariantFields;
             match fields {
                 VariantFields::Unit => {}
                 VariantFields::Tuple(ops) => {

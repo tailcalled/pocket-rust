@@ -1,3 +1,23 @@
+// CFG-based borrow checker.
+//
+// `mod.rs` is the per-function driver: builds a CFG, runs three
+// dataflow analyses, surfaces their errors as user-facing borrowck
+// errors, and writes the move snapshot back onto FuncTable for
+// codegen's drop-flag synthesis. The actual borrow-checking lives in
+// the submodules:
+//
+// - `cfg`      — CFG data types (Place/Projection/Operand/BasicBlock/...)
+// - `build`    — AST → CFG lowering
+// - `moves`    — forward dataflow on per-place move state
+// - `liveness` — backward dataflow on per-LocalId live ranges
+// - `borrows`  — forward NLL active-borrow tracking + conflict checks
+
+mod build;
+mod cfg;
+mod borrows;
+mod liveness;
+mod moves;
+
 use crate::ast::{Function, Item, Module};
 use crate::span::Error;
 use crate::typeck::{
@@ -186,7 +206,7 @@ fn check_function(
                 })
                 .unwrap(),
         };
-        let cfg_ctx = crate::cfg_build::CfgBuildCtx {
+        let cfg_ctx = build::CfgBuildCtx {
             structs,
             enums,
             traits,
@@ -199,20 +219,20 @@ fn check_function(
             param_types,
             return_type: &return_ty,
         };
-        let cfg = crate::cfg_build::build(func, &cfg_ctx);
-        let move_analysis = crate::cfg_moves::analyze(&cfg, traits, current_file);
+        let cfg = build::build(func, &cfg_ctx);
+        let move_analysis = moves::analyze(&cfg, traits, current_file);
         if let Some(e) = move_analysis.errors.into_iter().next() {
             return Err(e);
         }
-        let liveness = crate::cfg_liveness::analyze(&cfg);
-        let borrow_check = crate::cfg_borrows::analyze(&cfg, &liveness, current_file);
+        let liveness = liveness::analyze(&cfg);
+        let borrow_check = borrows::analyze(&cfg, &liveness, current_file);
         if let Some(e) = borrow_check.errors.into_iter().next() {
             return Err(e);
         }
         // Re-run move analysis to recover its data (consumed-by-value
         // above when we drained errors). It's deterministic, so the
         // second run produces identical output.
-        let move_analysis = crate::cfg_moves::analyze(&cfg, traits, current_file);
+        let move_analysis = moves::analyze(&cfg, traits, current_file);
         cfg_moved = build_moved_places(&cfg, &move_analysis);
         cfg_move_sites = move_analysis.move_sites;
     }
@@ -243,8 +263,8 @@ fn check_function(
 // for drop-flag synthesis. Each MovedLocal becomes a single-segment
 // place keyed by the local's name.
 fn build_moved_places(
-    cfg: &crate::cfg::Cfg,
-    move_analysis: &crate::cfg_moves::MoveAnalysis,
+    cfg: &cfg::Cfg,
+    move_analysis: &moves::MoveAnalysis,
 ) -> Vec<MovedPlace> {
     let mut out: Vec<MovedPlace> = Vec::new();
     let mut i = 0;
@@ -252,8 +272,8 @@ fn build_moved_places(
         let m = &move_analysis.moved_locals[i];
         if let Some(name) = &cfg.locals[m.local as usize].name {
             let status = match m.status {
-                crate::cfg_moves::MoveStatus::Moved => crate::typeck::MoveStatus::Moved,
-                crate::cfg_moves::MoveStatus::MaybeMoved => {
+                moves::MoveStatus::Moved => crate::typeck::MoveStatus::Moved,
+                moves::MoveStatus::MaybeMoved => {
                     crate::typeck::MoveStatus::MaybeMoved
                 }
             };

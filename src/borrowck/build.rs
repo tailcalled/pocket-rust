@@ -9,7 +9,7 @@ use crate::ast::{
     self, AssignStmt, Block, Call, Expr, ExprKind, FieldAccess, Function, IfLetExpr, LetStmt,
     MatchExpr, MethodCall, Pattern, PatternKind, Stmt, StructLit,
 };
-use crate::cfg::{
+use super::cfg::{
     BasicBlock, BlockId, CallTarget, Cfg, CfgStmt, CfgStmtKind, LocalDecl, LocalId, Operand,
     OperandKind, Place, Projection, RegionId, Rvalue, Terminator, VariantFields,
 };

@@ -20,11 +20,11 @@
 // if either is a prefix of the other. So `&x` blocks `&mut x.f`, and
 // `&x.f` blocks `&mut x`.
 
-use crate::cfg::{
+use super::cfg::{
     BasicBlock, BlockId, Cfg, CfgStmt, CfgStmtKind, LocalId, Operand, OperandKind, Place,
     RegionId, Rvalue, Terminator,
 };
-use crate::cfg_liveness::LivenessAnalysis;
+use super::liveness::LivenessAnalysis;
 use crate::span::{Error, Span};
 
 // One active borrow tracked through the dataflow.
@@ -182,7 +182,7 @@ fn apply_block(
 // i+1..N.
 fn compute_live_after_per_stmt(
     block: &BasicBlock,
-    live_out: &crate::cfg_liveness::LiveSet,
+    live_out: &super::liveness::LiveSet,
 ) -> Vec<Vec<LocalId>> {
     // Start from live_out (state after the last stmt + terminator).
     // We need state after each stmt — i.e., before the next stmt.
@@ -265,7 +265,7 @@ fn mark_rvalue_uses(rv: &Rvalue, state: &mut Vec<LocalId>) {
             }
         }
         Rvalue::Variant { fields, .. } => {
-            use crate::cfg::VariantFields;
+            use super::cfg::VariantFields;
             match fields {
                 VariantFields::Unit => {}
                 VariantFields::Tuple(ops) => {
@@ -440,7 +440,7 @@ fn collect_rvalue_source_locals(rv: &Rvalue, out: &mut Vec<LocalId>) {
             }
         }
         Rvalue::Variant { fields, .. } => {
-            use crate::cfg::VariantFields;
+            use super::cfg::VariantFields;
             match fields {
                 VariantFields::Unit => {}
                 VariantFields::Tuple(ops) => {
@@ -509,7 +509,7 @@ fn apply_rvalue(
             }
         }
         Rvalue::Variant { fields, .. } => {
-            use crate::cfg::VariantFields;
+            use super::cfg::VariantFields;
             match fields {
                 VariantFields::Unit => {}
                 VariantFields::Tuple(ops) => {
