@@ -1436,6 +1436,12 @@ fn emit_function_concrete(
 
         // Copy each spilled param from its incoming WASM-local slot into memory.
         // Scan locals[] in declaration order — params are first, in order.
+        // For enum-typed params the incoming wasm value is the enum's
+        // address (caller's frame); we memcpy the disc + payload bytes
+        // into the slot so the local owns its own copy. This matches
+        // `store_flat_to_memory`'s inline representation for spilled
+        // let-bindings — `load_flat_from_memory` for an enum then
+        // produces the slot's own address regardless of source.
         let mut p = 0;
         let mut wasm_local_cursor: u32 = 0;
         while p < func.params.len() {
@@ -1445,16 +1451,37 @@ fn emit_function_concrete(
             let flat_size = vts.len() as u32;
             match &param_offsets[p] {
                 Some(off) => {
-                    let mut leaves: Vec<MemLeaf> = Vec::new();
-                    collect_leaves(&pty, structs, enums, 0, &mut leaves);
-                    let mut k = 0;
-                    while k < leaves.len() {
-                        ctx.instructions
-                            .push(wasm::Instruction::GlobalGet(SP_GLOBAL));
-                        ctx.instructions
-                            .push(wasm::Instruction::LocalGet(wasm_local_cursor + k as u32));
-                        ctx.instructions.push(store_instr(&leaves[k], *off));
-                        k += 1;
+                    if matches!(&pty, RType::Enum { .. }) {
+                        // memcpy from incoming-address (a single i32 in
+                        // wasm_local_cursor) to frame[off]. flat_size
+                        // is 1 for enums; the wasm local at cursor
+                        // holds the source address.
+                        let src_local = wasm_local_cursor;
+                        let dst_local = ctx.next_wasm_local;
+                        ctx.extra_locals.push(wasm::ValType::I32);
+                        ctx.next_wasm_local += 1;
+                        let fb = ctx.frame_base_local;
+                        ctx.instructions.push(wasm::Instruction::LocalGet(fb));
+                        if *off != 0 {
+                            ctx.instructions
+                                .push(wasm::Instruction::I32Const(*off as i32));
+                            ctx.instructions.push(wasm::Instruction::I32Add);
+                        }
+                        ctx.instructions.push(wasm::Instruction::LocalSet(dst_local));
+                        let bytes = byte_size_of(&pty, structs, enums);
+                        emit_memcpy(&mut ctx, dst_local, src_local, bytes);
+                    } else {
+                        let mut leaves: Vec<MemLeaf> = Vec::new();
+                        collect_leaves(&pty, structs, enums, 0, &mut leaves);
+                        let mut k = 0;
+                        while k < leaves.len() {
+                            ctx.instructions
+                                .push(wasm::Instruction::GlobalGet(SP_GLOBAL));
+                            ctx.instructions
+                                .push(wasm::Instruction::LocalGet(wasm_local_cursor + k as u32));
+                            ctx.instructions.push(store_instr(&leaves[k], *off));
+                            k += 1;
+                        }
                     }
                 }
                 None => {}
@@ -4004,6 +4031,19 @@ fn codegen_method_call(
         };
         (callee_idx, return_rt)
     };
+    // Enum-returning callees use sret: leading i32 is a caller-
+    // allocated destination slot, written by the callee before return
+    // and surfaced as the call's wasm result. Allocate it from the
+    // caller's shadow stack before pushing the receiver/args.
+    let returns_enum = matches!(&return_rt, RType::Enum { .. });
+    if returns_enum {
+        let bytes = byte_size_of(&return_rt, ctx.structs, ctx.enums);
+        ctx.instructions.push(wasm::Instruction::GlobalGet(SP_GLOBAL));
+        ctx.instructions.push(wasm::Instruction::I32Const(bytes as i32));
+        ctx.instructions.push(wasm::Instruction::I32Sub);
+        ctx.instructions.push(wasm::Instruction::GlobalSet(SP_GLOBAL));
+        ctx.instructions.push(wasm::Instruction::GlobalGet(SP_GLOBAL));
+    }
     // Codegen receiver.
     match recv_adjust_local {
         RecvAdjustLocal::Move => {
@@ -4130,6 +4170,18 @@ fn codegen_trait_method_call(
             (idx, return_rt)
         }
     };
+    // Sret handling for enum-returning trait methods: same convention
+    // as `codegen_call` / `codegen_method_call` — caller allocates the
+    // dest slot and pushes its address as the leading param.
+    let returns_enum = matches!(&return_rt, RType::Enum { .. });
+    if returns_enum {
+        let bytes = byte_size_of(&return_rt, ctx.structs, ctx.enums);
+        ctx.instructions.push(wasm::Instruction::GlobalGet(SP_GLOBAL));
+        ctx.instructions.push(wasm::Instruction::I32Const(bytes as i32));
+        ctx.instructions.push(wasm::Instruction::I32Sub);
+        ctx.instructions.push(wasm::Instruction::GlobalSet(SP_GLOBAL));
+        ctx.instructions.push(wasm::Instruction::GlobalGet(SP_GLOBAL));
+    }
     // Codegen receiver per the recorded recv_adjust (derived from the
     // trait method's declared receiver shape during typeck).
     let recv_adjust = ctx.method_resolutions[res_idx]
@@ -5382,6 +5434,21 @@ fn store_flat_to_memory(ctx: &mut FnCtx, ty: &RType, base: BaseAddr, base_offset
 
 // Push flat scalars onto the WASM stack, loading them from base+offset+leaf_offset.
 fn load_flat_from_memory(ctx: &mut FnCtx, ty: &RType, base: BaseAddr, base_offset: u32) {
+    if matches!(ty, RType::Enum { .. }) {
+        // The enum lives inline at [base + base_offset] (because
+        // `store_flat_to_memory` for enums memcpys the disc + payload
+        // into the slot rather than storing just the i32 address).
+        // The "value" of the enum binding is its address — i.e., the
+        // slot's address — so push that, not a load from offset 0
+        // (which would yield the disc).
+        emit_base(ctx, base);
+        if base_offset != 0 {
+            ctx.instructions
+                .push(wasm::Instruction::I32Const(base_offset as i32));
+            ctx.instructions.push(wasm::Instruction::I32Add);
+        }
+        return;
+    }
     let mut leaves: Vec<MemLeaf> = Vec::new();
     collect_leaves(ty, ctx.structs, ctx.enums, 0, &mut leaves);
     let mut k = 0;

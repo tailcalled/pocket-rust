@@ -372,6 +372,62 @@ pub fn tokenize(file: &str, source: &str) -> Result<Vec<Token>, Error> {
         } else if b == b'+' {
             push_single(&mut tokens, TokenKind::Plus, line, &mut col);
             byte_pos += 1;
+        } else if b == b'/'
+            && (byte_pos + 1) < bytes.len()
+            && bytes[byte_pos + 1] == b'/'
+        {
+            // Line comment: skip from `//` through end-of-line. The
+            // newline itself is left for the outer whitespace handler
+            // so line/col tracking stays uniform.
+            byte_pos += 2;
+            col += 2;
+            while byte_pos < bytes.len() && bytes[byte_pos] != b'\n' {
+                byte_pos += 1;
+                col += 1;
+            }
+        } else if b == b'/'
+            && (byte_pos + 1) < bytes.len()
+            && bytes[byte_pos + 1] == b'*'
+        {
+            // Block comment: skip until matching `*/`. Nested `/* */`
+            // pairs are honored — `cargo` lexes Rust the same way.
+            byte_pos += 2;
+            col += 2;
+            let mut depth: u32 = 1;
+            while byte_pos < bytes.len() && depth > 0 {
+                if (byte_pos + 1) < bytes.len()
+                    && bytes[byte_pos] == b'/'
+                    && bytes[byte_pos + 1] == b'*'
+                {
+                    depth += 1;
+                    byte_pos += 2;
+                    col += 2;
+                } else if (byte_pos + 1) < bytes.len()
+                    && bytes[byte_pos] == b'*'
+                    && bytes[byte_pos + 1] == b'/'
+                {
+                    depth -= 1;
+                    byte_pos += 2;
+                    col += 2;
+                } else if bytes[byte_pos] == b'\n' {
+                    line += 1;
+                    col = 1;
+                    byte_pos += 1;
+                } else {
+                    byte_pos += 1;
+                    col += 1;
+                }
+            }
+            if depth > 0 {
+                return Err(Error {
+                    file: file.to_string(),
+                    message: "unterminated block comment".to_string(),
+                    span: Span::new(
+                        Pos::new(line, col),
+                        Pos::new(line, col),
+                    ),
+                });
+            }
         } else if b == b'/' {
             push_single(&mut tokens, TokenKind::Slash, line, &mut col);
             byte_pos += 1;

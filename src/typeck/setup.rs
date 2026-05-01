@@ -1241,13 +1241,15 @@ pub(super) fn resolve_impl_target(
         file,
     )?;
     if ib.trait_path.is_none() {
-        // Inherent: must be a struct.
+        // Inherent: must be a nominal user type (struct or enum). Refs,
+        // raw pointers, primitives, and tuples can't carry inherent
+        // methods — those go through trait impls.
         match &resolved {
-            RType::Struct { .. } => {}
+            RType::Struct { .. } | RType::Enum { .. } => {}
             _ => {
                 return Err(Error {
                     file: file.to_string(),
-                    message: "inherent impl target must be a struct".to_string(),
+                    message: "inherent impl target must be a struct or enum".to_string(),
                     span: ib.target.span.copy(),
                 });
             }
