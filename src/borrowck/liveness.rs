@@ -183,7 +183,7 @@ fn mark_operand_uses(op: &Operand, state: &mut LiveSet) {
         OperandKind::Move(p) | OperandKind::Copy(p) => {
             state.insert(p.root);
         }
-        OperandKind::ConstInt(_) | OperandKind::ConstBool(_) | OperandKind::ConstUnit => {}
+        OperandKind::ConstInt(_) | OperandKind::ConstBool(_) | OperandKind::ConstUnit | OperandKind::ConstStr(_) => {}
     }
 }
 

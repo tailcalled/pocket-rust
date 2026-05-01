@@ -234,7 +234,7 @@ fn transfer_terminator_backward(term: &Terminator, state: &mut Vec<LocalId>) {
 fn mark_operand_uses(op: &Operand, state: &mut Vec<LocalId>) {
     match &op.kind {
         OperandKind::Move(p) | OperandKind::Copy(p) => insert_local(state, p.root),
-        OperandKind::ConstInt(_) | OperandKind::ConstBool(_) | OperandKind::ConstUnit => {}
+        OperandKind::ConstInt(_) | OperandKind::ConstBool(_) | OperandKind::ConstUnit | OperandKind::ConstStr(_) => {}
     }
 }
 
@@ -399,6 +399,10 @@ fn rtype_contains_ref(t: &crate::typeck::RType) -> bool {
             lifetime_args,
             ..
         } => !lifetime_args.is_empty() || type_args.iter().any(rtype_contains_ref),
+        // `[T]` / `str` are unsized; they're only ever observed behind a
+        // Ref, which is handled by the Ref arm above. A bare Slice/Str in
+        // a value position shouldn't reach here.
+        RType::Slice(_) | RType::Str => true,
     }
 }
 
@@ -413,7 +417,7 @@ fn collect_rvalue_source_locals(rv: &Rvalue, out: &mut Vec<LocalId>) {
                 out.push(p.root);
             }
         }
-        OperandKind::ConstInt(_) | OperandKind::ConstBool(_) | OperandKind::ConstUnit => {}
+        OperandKind::ConstInt(_) | OperandKind::ConstBool(_) | OperandKind::ConstUnit | OperandKind::ConstStr(_) => {}
     };
     match rv {
         Rvalue::Use(op) => push_op(op, out),
@@ -546,7 +550,7 @@ fn apply_operand_read(op: &Operand, cfg: &Cfg, state: &mut BorrowSet, errors: &m
     match &op.kind {
         OperandKind::Move(p) => check_move(p, state, &op.span, errors, cfg, file),
         OperandKind::Copy(p) => check_read_shared(p, state, &op.span, errors, cfg, file),
-        OperandKind::ConstInt(_) | OperandKind::ConstBool(_) | OperandKind::ConstUnit => {}
+        OperandKind::ConstInt(_) | OperandKind::ConstBool(_) | OperandKind::ConstUnit | OperandKind::ConstStr(_) => {}
     }
 }
 

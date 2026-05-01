@@ -24,6 +24,21 @@ struct MonoState {
     map_args: Vec<Vec<RType>>,
     map_idx: Vec<u32>,
     next_idx: u32,
+    // Per-crate string-literal pool. Each entry is a deduped UTF-8
+    // payload; offsets are relative to the start of *this crate's*
+    // contribution. `str_pool_base_offset` is the absolute byte
+    // offset within the wasm data segment where this crate's
+    // contribution starts (i.e. cumulative size of earlier crates'
+    // pool contributions). `intern_str` returns absolute memory
+    // addresses for codegen.
+    str_pool_bytes: Vec<u8>,
+    str_pool_entries: Vec<StrPoolEntry>,
+    str_pool_base_offset: u32,
+}
+
+struct StrPoolEntry {
+    payload: String,
+    relative_offset: u32,
 }
 
 struct MonoWork {
@@ -33,14 +48,47 @@ struct MonoWork {
 }
 
 impl MonoState {
-    fn new(start_idx: u32) -> Self {
+    fn new(start_idx: u32, str_pool_base_offset: u32) -> Self {
         Self {
             queue: Vec::new(),
             map_template: Vec::new(),
             map_args: Vec::new(),
             map_idx: Vec::new(),
             next_idx: start_idx,
+            str_pool_bytes: Vec::new(),
+            str_pool_entries: Vec::new(),
+            str_pool_base_offset,
         }
+    }
+
+    // Intern a string literal into this crate's pool. Returns the
+    // **absolute memory address** of the entry plus its byte length —
+    // i.e. `STR_POOL_BASE + cumulative-prior-pool-size + relative`.
+    // Dedupes against earlier entries with the same payload so
+    // repeated `"hello"` literals in this crate share a single slot.
+    fn intern_str(&mut self, payload: &str) -> (u32, u32) {
+        let mut i = 0;
+        while i < self.str_pool_entries.len() {
+            if self.str_pool_entries[i].payload == payload {
+                let rel = self.str_pool_entries[i].relative_offset;
+                let absolute = STR_POOL_BASE + self.str_pool_base_offset + rel;
+                return (absolute, payload.as_bytes().len() as u32);
+            }
+            i += 1;
+        }
+        let bytes = payload.as_bytes();
+        let relative = self.str_pool_bytes.len() as u32;
+        let mut k = 0;
+        while k < bytes.len() {
+            self.str_pool_bytes.push(bytes[k]);
+            k += 1;
+        }
+        self.str_pool_entries.push(StrPoolEntry {
+            payload: payload.to_string(),
+            relative_offset: relative,
+        });
+        let absolute = STR_POOL_BASE + self.str_pool_base_offset + relative;
+        (absolute, bytes.len() as u32)
     }
 
     fn lookup(&self, template_idx: usize, type_args: &Vec<RType>) -> Option<u32> {
@@ -103,6 +151,12 @@ fn make_struct_env(type_params: &Vec<String>, type_args: &Vec<RType>) -> Vec<(St
     env
 }
 
+// Address at which the module's string-literal data segment starts.
+// Sits in low memory just past the null-territory bytes (offset 0..7).
+// The heap (`__heap_top`) is bumped past the pool at end-of-emit so
+// it doesn't collide with the baked-in string data.
+pub const STR_POOL_BASE: u32 = 8;
+
 pub fn emit(
     wasm_mod: &mut wasm::Module,
     root: &Module,
@@ -115,11 +169,64 @@ pub fn emit(
     push_root_name(&mut module_path, root);
     // Monomorphic instantiations get wasm idxs starting after the non-generic
     // entries' idxs (which typeck assigned 0..entries.len()).
-    let mut mono = MonoState::new(funcs.entries.len() as u32);
+    //
+    // The string-literal pool's per-crate base offset is the
+    // cumulative size of any earlier crates' contributions to the
+    // single segment at STR_POOL_BASE — read from the wasm module's
+    // existing data segments.
+    let str_pool_base_offset: u32 = {
+        let mut total: u32 = 0;
+        let mut i = 0;
+        while i < wasm_mod.datas.len() {
+            if wasm_mod.datas[i].offset == STR_POOL_BASE {
+                total = wasm_mod.datas[i].bytes.len() as u32;
+                break;
+            }
+            i += 1;
+        }
+        total
+    };
+    let mut mono = MonoState::new(funcs.entries.len() as u32, str_pool_base_offset);
     emit_module(wasm_mod, root, &mut module_path, structs, enums, traits, funcs, &mut mono)?;
     while !mono.queue.is_empty() {
         let work = mono.queue.remove(0);
         emit_monomorphic(wasm_mod, work, structs, enums, traits, funcs, &mut mono)?;
+    }
+    // Flush this crate's pool contribution into the single segment at
+    // STR_POOL_BASE — appending if a prior crate already created it,
+    // creating fresh if not — and bump `__heap_top`'s init past the
+    // new total.
+    if !mono.str_pool_bytes.is_empty() {
+        let mut found: Option<usize> = None;
+        let mut i = 0;
+        while i < wasm_mod.datas.len() {
+            if wasm_mod.datas[i].offset == STR_POOL_BASE {
+                found = Some(i);
+                break;
+            }
+            i += 1;
+        }
+        let new_total = match found {
+            Some(idx) => {
+                let mut k = 0;
+                while k < mono.str_pool_bytes.len() {
+                    wasm_mod.datas[idx].bytes.push(mono.str_pool_bytes[k]);
+                    k += 1;
+                }
+                wasm_mod.datas[idx].bytes.len() as u32
+            }
+            None => {
+                let segment_bytes = mono.str_pool_bytes.clone();
+                let total = segment_bytes.len() as u32;
+                wasm_mod.datas.push(wasm::Data {
+                    offset: STR_POOL_BASE,
+                    bytes: segment_bytes,
+                });
+                total
+            }
+        };
+        wasm_mod.globals[1].init =
+            wasm::Instruction::I32Const((STR_POOL_BASE as i32) + (new_total as i32));
     }
     Ok(())
 }
@@ -336,12 +443,36 @@ fn collect_leaves(
                 });
             }
         }
-        RType::Ref { .. } | RType::RawPtr { .. } => out.push(MemLeaf {
+        RType::Ref { inner, .. } => match inner.as_ref() {
+            // Fat ref to a DST slice or str: two i32 leaves (data ptr, length).
+            RType::Slice(_) | RType::Str => {
+                out.push(MemLeaf {
+                    byte_offset: base_offset,
+                    byte_size: 4,
+                    signed: false,
+                    valtype: wasm::ValType::I32,
+                });
+                out.push(MemLeaf {
+                    byte_offset: base_offset + 4,
+                    byte_size: 4,
+                    signed: false,
+                    valtype: wasm::ValType::I32,
+                });
+            }
+            _ => out.push(MemLeaf {
+                byte_offset: base_offset,
+                byte_size: 4,
+                signed: false,
+                valtype: wasm::ValType::I32,
+            }),
+        },
+        RType::RawPtr { .. } => out.push(MemLeaf {
             byte_offset: base_offset,
             byte_size: 4,
             signed: false,
             valtype: wasm::ValType::I32,
         }),
+        RType::Slice(_) | RType::Str => unreachable!("`[T]` / `str` is unsized — only valid behind a reference"),
         RType::Struct { path, type_args, .. } => {
             let entry = struct_lookup(structs, path).expect("resolved struct");
             let env = make_struct_env(&entry.type_params, type_args);
@@ -542,7 +673,7 @@ fn walk_expr_drop_marks(
         ExprKind::Cast { inner, .. } => {
             walk_expr_drop_marks(inner, expr_types, traits, info);
         }
-        ExprKind::IntLit(_) | ExprKind::NegIntLit(_) | ExprKind::BoolLit(_) | ExprKind::Var(_) => {}
+        ExprKind::IntLit(_) | ExprKind::NegIntLit(_) | ExprKind::StrLit(_) | ExprKind::BoolLit(_) | ExprKind::Var(_) => {}
         ExprKind::If(if_expr) => {
             walk_expr_drop_marks(&if_expr.cond, expr_types, traits, info);
             walk_block_drop_marks(if_expr.then_block.as_ref(), expr_types, traits, info);
@@ -671,7 +802,7 @@ fn walk_expr_addr(
     info: &mut AddressInfo,
 ) {
     match &expr.kind {
-        ExprKind::IntLit(_) | ExprKind::NegIntLit(_) | ExprKind::BoolLit(_) | ExprKind::Var(_) => {}
+        ExprKind::IntLit(_) | ExprKind::NegIntLit(_) | ExprKind::StrLit(_) | ExprKind::BoolLit(_) | ExprKind::Var(_) => {}
         ExprKind::If(if_expr) => {
             walk_expr_addr(&if_expr.cond, stack, info);
             walk_block_addr(if_expr.then_block.as_ref(), stack, info);
@@ -1160,7 +1291,7 @@ fn collect_let_value_ids(block: &Block, out: &mut Vec<u32>) {
 
 fn collect_lets_in_expr(expr: &Expr, out: &mut Vec<u32>) {
     match &expr.kind {
-        ExprKind::IntLit(_) | ExprKind::NegIntLit(_) | ExprKind::BoolLit(_) | ExprKind::Var(_) => {}
+        ExprKind::IntLit(_) | ExprKind::NegIntLit(_) | ExprKind::StrLit(_) | ExprKind::BoolLit(_) | ExprKind::Var(_) => {}
         ExprKind::If(if_expr) => {
             collect_lets_in_expr(&if_expr.cond, out);
             collect_let_value_ids(if_expr.then_block.as_ref(), out);
@@ -2420,6 +2551,20 @@ fn codegen_expr(ctx: &mut FnCtx, expr: &Expr) -> Result<RType, Error> {
             emit_int_lit(ctx, &ty, *n, true);
             Ok(ty)
         }
+        ExprKind::StrLit(s) => {
+            // Intern into the module-wide pool; emit `i32.const ptr;
+            // i32.const len` — the fat-ref representation of `&str`.
+            let (addr, len) = ctx.mono.intern_str(s);
+            ctx.instructions
+                .push(wasm::Instruction::I32Const(addr as i32));
+            ctx.instructions
+                .push(wasm::Instruction::I32Const(len as i32));
+            let ty = ctx.expr_types[expr.id as usize]
+                .as_ref()
+                .expect("typeck recorded this literal's type")
+                .clone();
+            Ok(ty)
+        }
         ExprKind::Var(name) => codegen_var(ctx, name, expr.id),
         ExprKind::Call(call) => codegen_call(ctx, call, expr.id),
         ExprKind::StructLit(lit) => codegen_struct_lit(ctx, lit, expr.id),
@@ -2604,6 +2749,20 @@ fn codegen_builtin(
         "free" => return codegen_builtin_free(ctx, args, node_id),
         "cast" => return codegen_builtin_cast(ctx, args, node_id),
         "size_of" => return codegen_builtin_size_of(ctx, node_id),
+        "make_slice" => return codegen_builtin_make_slice(ctx, args, node_id),
+        "slice_len" => return codegen_builtin_slice_len(ctx, args, node_id),
+        "slice_ptr" | "slice_mut_ptr" => {
+            return codegen_builtin_slice_ptr(ctx, args, node_id);
+        }
+        // str_len reuses slice_len (same fat-ref shape, same drop-ptr-keep-len).
+        "str_len" => return codegen_builtin_slice_len(ctx, args, node_id),
+        // str_as_bytes is a 1-arg pure pass-through: `&str` and `&[u8]`
+        // share the fat-ref representation, so codegenning the arg
+        // already leaves (ptr, len) on the stack — the result.
+        "str_as_bytes" => return codegen_builtin_passthrough_one(ctx, args, node_id),
+        // make_str(ptr, len) builds a fat ref, exactly like make_slice.
+        "make_str" => return codegen_builtin_make_slice(ctx, args, node_id),
+        "make_mut_slice" => return codegen_builtin_make_slice(ctx, args, node_id),
         "ptr_usize_add" => return codegen_builtin_ptr_arith(ctx, args, node_id, PtrArith::Add),
         "ptr_usize_sub" => return codegen_builtin_ptr_arith(ctx, args, node_id, PtrArith::Sub),
         "ptr_isize_offset" => {
@@ -2811,6 +2970,75 @@ fn codegen_builtin_cast(
     node_id: crate::ast::NodeId,
 ) -> Result<RType, Error> {
     codegen_expr(ctx, &args[0])?;
+    let ty = ctx.expr_types[node_id as usize]
+        .as_ref()
+        .expect("typeck recorded the builtin's result type")
+        .clone();
+    Ok(ty)
+}
+
+// `¤slice_ptr::<T>(s: &[T]) -> *const T` and the mut variant
+// `¤slice_mut_ptr::<T>(s: &mut [T]) -> *mut T`. The arg pushes
+// (data_ptr, len); we want `data_ptr` (below `len`) and discard
+// `len` (top). One `drop` does it.
+fn codegen_builtin_slice_ptr(
+    ctx: &mut FnCtx,
+    args: &Vec<Expr>,
+    node_id: crate::ast::NodeId,
+) -> Result<RType, Error> {
+    codegen_expr(ctx, &args[0])?;
+    ctx.instructions.push(wasm::Instruction::Drop);
+    let ty = ctx.expr_types[node_id as usize]
+        .as_ref()
+        .expect("typeck recorded the builtin's result type")
+        .clone();
+    Ok(ty)
+}
+
+// `¤slice_len::<T>(s: &[T]) -> usize`. The arg pushes (data_ptr, len)
+// onto the stack; we want `len` (top) and discard `data_ptr` (below).
+// Stash `len` to a temp local, drop the ptr, reload the temp.
+fn codegen_builtin_slice_len(
+    ctx: &mut FnCtx,
+    args: &Vec<Expr>,
+    _node_id: crate::ast::NodeId,
+) -> Result<RType, Error> {
+    codegen_expr(ctx, &args[0])?;
+    let len_local = ctx.next_wasm_local;
+    ctx.extra_locals.push(wasm::ValType::I32);
+    ctx.next_wasm_local += 1;
+    ctx.instructions.push(wasm::Instruction::LocalSet(len_local));
+    ctx.instructions.push(wasm::Instruction::Drop);
+    ctx.instructions.push(wasm::Instruction::LocalGet(len_local));
+    Ok(RType::Int(IntKind::Usize))
+}
+
+// 1-arg pass-through used by `¤str_as_bytes`: codegen the single arg
+// (which already flattens to the desired result shape) and use the
+// builtin's recorded result type.
+fn codegen_builtin_passthrough_one(
+    ctx: &mut FnCtx,
+    args: &Vec<Expr>,
+    node_id: crate::ast::NodeId,
+) -> Result<RType, Error> {
+    codegen_expr(ctx, &args[0])?;
+    let ty = ctx.expr_types[node_id as usize]
+        .as_ref()
+        .expect("typeck recorded the builtin's result type")
+        .clone();
+    Ok(ty)
+}
+
+// `¤make_slice::<T>(ptr, len) -> &[T]`. Pure no-op at codegen: both
+// args already flatten to one i32, leaving (ptr, len) on the wasm
+// stack — exactly the fat-ref representation of `&[T]`.
+fn codegen_builtin_make_slice(
+    ctx: &mut FnCtx,
+    args: &Vec<Expr>,
+    node_id: crate::ast::NodeId,
+) -> Result<RType, Error> {
+    codegen_expr(ctx, &args[0])?;
+    codegen_expr(ctx, &args[1])?;
     let ty = ctx.expr_types[node_id as usize]
         .as_ref()
         .expect("typeck recorded the builtin's result type")

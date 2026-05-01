@@ -5,6 +5,14 @@ pub struct Module {
     pub globals: Vec<Global>,
     pub exports: Vec<Export>,
     pub code: Vec<FuncBody>,
+    pub datas: Vec<Data>,
+}
+
+// Active-mode data segment for memory 0. `offset` is the absolute
+// byte address; `bytes` is the payload. Encoded as section id 11.
+pub struct Data {
+    pub offset: u32,
+    pub bytes: Vec<u8>,
 }
 
 pub struct Memory {
@@ -171,6 +179,7 @@ impl Module {
             globals: Vec::new(),
             exports: Vec::new(),
             code: Vec::new(),
+            datas: Vec::new(),
         }
     }
 
@@ -202,8 +211,34 @@ impl Module {
         if !self.code.is_empty() {
             encode_code_section(&mut bytes, &self.code);
         }
+        if !self.datas.is_empty() {
+            encode_data_section(&mut bytes, &self.datas);
+        }
         bytes
     }
+}
+
+fn encode_data_section(out: &mut Vec<u8>, datas: &Vec<Data>) {
+    let mut payload: Vec<u8> = Vec::new();
+    write_uleb128(&mut payload, datas.len() as u32);
+    let mut i = 0;
+    while i < datas.len() {
+        let d = &datas[i];
+        // Active-mode segment in memory 0: flag byte = 0x00, offset
+        // expression (i32.const N; end), then byte vector.
+        payload.push(0x00);
+        payload.push(0x41); // i32.const opcode
+        write_sleb128(&mut payload, d.offset as i32);
+        payload.push(0x0b); // end opcode
+        write_uleb128(&mut payload, d.bytes.len() as u32);
+        let mut k = 0;
+        while k < d.bytes.len() {
+            payload.push(d.bytes[k]);
+            k += 1;
+        }
+        i += 1;
+    }
+    encode_section(out, 11, payload);
 }
 
 fn encode_section(out: &mut Vec<u8>, id: u8, payload: Vec<u8>) {

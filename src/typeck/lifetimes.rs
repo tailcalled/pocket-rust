@@ -77,6 +77,8 @@ pub fn freshen_inferred_lifetimes(rt: &mut RType, next_id: &mut u32) {
                 i += 1;
             }
         }
+        RType::Slice(inner) => freshen_inferred_lifetimes(inner, next_id),
+        RType::Str => {}
     }
 }
 
@@ -150,6 +152,8 @@ pub fn require_no_inferred_lifetimes(
             }
             Ok(())
         }
+        RType::Slice(inner) => require_no_inferred_lifetimes(inner, span, file),
+        RType::Str => Ok(()),
     }
 }
 
@@ -205,6 +209,8 @@ pub fn validate_named_lifetimes(
             }
             Ok(())
         }
+        RType::Slice(inner) => validate_named_lifetimes(inner, lifetime_params, span, file),
+        RType::Str => Ok(()),
     }
 }
 
@@ -215,6 +221,13 @@ fn check_named_in_scope(
     file: &str,
 ) -> Result<(), Error> {
     if let LifetimeRepr::Named(name) = lt {
+        // `'static` is a built-in lifetime; always in scope without
+        // an enclosing `<'static, …>` declaration. (It carries
+        // structurally just like any other Named lifetime — Phase D
+        // doesn't enforce its "outlives everything" semantics.)
+        if name == "static" {
+            return Ok(());
+        }
         let mut found = false;
         let mut i = 0;
         while i < lifetime_params.len() {

@@ -7,17 +7,17 @@
 //   - Drop semantics on the outer Vec (+ inner Vec inside Option) at
 //     scope end: every Drop-typed binding fires its destructor.
 //   - **Inference all the way through**: neither `Vec::new()` site
-//     gets a type annotation. `inner`'s T is fixed by `inner.push(seed)`
-//     where `seed: u32`; `outer`'s T is fixed by `outer.push(inner)`
-//     where `inner: Vec<u32>` (a generic-substituted struct, not a
-//     primitive). The compiler must propagate the substituted struct
-//     type through method dispatch, not just bare params.
+//     gets a type annotation. `inner`'s T is fixed by `inner.push(42u32)`
+//     where the literal carries its own type via the `u32` suffix;
+//     `outer`'s T is fixed by `outer.push(inner)` where `inner:
+//     Vec<u32>` (a generic-substituted struct, not a primitive). The
+//     compiler must propagate the substituted struct type through
+//     method dispatch, not just bare params.
 
 fn answer() -> u32 {
-    // No annotation on `inner` — T inferred from push of a typed binding.
-    let seed: u32 = 42;
+    // No annotation on `inner` — T inferred from push of a typed literal.
     let mut inner = Vec::new();
-    inner.push(seed);
+    inner.push(42u32);
 
     // No annotation on `outer` either — T inferred from `inner: Vec<u32>`
     // being moved in. This forces the inference machinery to pick up

@@ -45,6 +45,8 @@ pub enum TokenKind {
     RParen,
     LBrace,
     RBrace,
+    LBracket,
+    RBracket,
     Arrow,
     Semi,
     Colon,
@@ -76,6 +78,13 @@ pub enum TokenKind {
     // `..=` — inclusive range, used in range patterns (`0..=9`).
     DotDotEq,
     IntLit(u64),
+    // `"..."` — UTF-8 string literal. The `String` carries the
+    // **decoded** content (escape sequences already resolved); since
+    // pocket-rust source is UTF-8 and `\xNN` is restricted to ASCII
+    // (per Rust), the result is always valid UTF-8. A future
+    // `b"..."` byte-literal would carry `Vec<u8>` to express that
+    // it can hold arbitrary bytes.
+    StrLit(String),
     FatArrow,
 }
 
@@ -113,6 +122,8 @@ pub fn token_kind_name(t: &TokenKind) -> &'static str {
         TokenKind::Lifetime(_) => "lifetime",
         TokenKind::LParen => "`(`",
         TokenKind::RParen => "`)`",
+        TokenKind::LBracket => "`[`",
+        TokenKind::RBracket => "`]`",
         TokenKind::LBrace => "`{`",
         TokenKind::RBrace => "`}`",
         TokenKind::Arrow => "`->`",
@@ -140,6 +151,7 @@ pub fn token_kind_name(t: &TokenKind) -> &'static str {
         TokenKind::DotDotEq => "`..=`",
         TokenKind::FatArrow => "`=>`",
         TokenKind::IntLit(_) => "integer literal",
+        TokenKind::StrLit(_) => "string literal",
     }
 }
 
@@ -306,6 +318,96 @@ pub fn tokenize(file: &str, source: &str) -> Result<Vec<Token>, Error> {
                     span,
                 });
             }
+        } else if b == b'"' {
+            // String literal `"..."`. Recognized escapes match the
+            // common subset of Rust's: `\n`, `\r`, `\t`, `\\`, `\"`,
+            // `\0`. Everything else is a lex error. Unterminated
+            // strings (EOF before closing `"`) are also rejected.
+            //
+            // We collect the decoded payload as raw bytes and convert
+            // to `String` at the end. This preserves any multi-byte
+            // UTF-8 sequence from the source file verbatim — casting
+            // each byte to `char` along the way would re-interpret
+            // them as codepoints, which is wrong for bytes ≥ 0x80.
+            // Since the source is UTF-8 and our escapes only emit
+            // ASCII-range bytes, the assembled buffer is always valid
+            // UTF-8 and `String::from_utf8` succeeds.
+            let start = Pos::new(line, col);
+            byte_pos += 1;
+            col += 1;
+            let mut decoded: Vec<u8> = Vec::new();
+            let mut closed = false;
+            while byte_pos < bytes.len() {
+                let c = bytes[byte_pos];
+                if c == b'"' {
+                    byte_pos += 1;
+                    col += 1;
+                    closed = true;
+                    break;
+                }
+                if c == b'\\' {
+                    if byte_pos + 1 >= bytes.len() {
+                        return Err(Error {
+                            file: file.to_string(),
+                            message: "unterminated string literal".to_string(),
+                            span: Span::new(start.copy(), Pos::new(line, col)),
+                        });
+                    }
+                    let esc = bytes[byte_pos + 1];
+                    let resolved: u8 = match esc {
+                        b'n' => b'\n',
+                        b'r' => b'\r',
+                        b't' => b'\t',
+                        b'\\' => b'\\',
+                        b'"' => b'"',
+                        b'0' => 0,
+                        _ => {
+                            let span = Span::new(
+                                Pos::new(line, col),
+                                Pos::new(line, col + 2),
+                            );
+                            return Err(Error {
+                                file: file.to_string(),
+                                message: format!(
+                                    "unknown escape sequence `\\{}`",
+                                    esc as char
+                                ),
+                                span,
+                            });
+                        }
+                    };
+                    decoded.push(resolved);
+                    byte_pos += 2;
+                    col += 2;
+                    continue;
+                }
+                if c == b'\n' {
+                    decoded.push(b'\n');
+                    byte_pos += 1;
+                    line += 1;
+                    col = 1;
+                    continue;
+                }
+                // Any other byte: copy through verbatim, preserving
+                // multi-byte UTF-8 sequences from the source.
+                decoded.push(c);
+                byte_pos += 1;
+                col += 1;
+            }
+            if !closed {
+                return Err(Error {
+                    file: file.to_string(),
+                    message: "unterminated string literal".to_string(),
+                    span: Span::new(start.copy(), Pos::new(line, col)),
+                });
+            }
+            let end = Pos::new(line, col);
+            let payload = String::from_utf8(decoded)
+                .expect("source is UTF-8 and escapes only emit ASCII bytes");
+            tokens.push(Token {
+                kind: TokenKind::StrLit(payload),
+                span: Span::new(start, end),
+            });
         } else if is_digit(b) {
             let start = Pos::new(line, col);
             let start_byte = byte_pos;
@@ -337,6 +439,12 @@ pub fn tokenize(file: &str, source: &str) -> Result<Vec<Token>, Error> {
             byte_pos += 1;
         } else if b == b'}' {
             push_single(&mut tokens, TokenKind::RBrace, line, &mut col);
+            byte_pos += 1;
+        } else if b == b'[' {
+            push_single(&mut tokens, TokenKind::LBracket, line, &mut col);
+            byte_pos += 1;
+        } else if b == b']' {
+            push_single(&mut tokens, TokenKind::RBracket, line, &mut col);
             byte_pos += 1;
         } else if b == b';' {
             push_single(&mut tokens, TokenKind::Semi, line, &mut col);

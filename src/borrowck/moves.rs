@@ -584,7 +584,8 @@ fn apply_operand(
         }
         OperandKind::ConstInt(_)
         | OperandKind::ConstBool(_)
-        | OperandKind::ConstUnit => {}
+        | OperandKind::ConstUnit
+        | OperandKind::ConstStr(_) => {}
     }
 }
 

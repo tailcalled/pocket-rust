@@ -219,6 +219,12 @@ pub enum TypeKind {
     RawPtr { inner: Box<Type>, mutable: bool },
     SelfType,
     Tuple(Vec<Type>),
+    // `[T]` — the dynamically-sized slice type. Only valid behind a
+    // reference (`&[T]` / `&mut [T]`). Bare `[T]` in a position where
+    // a sized type is required is rejected at type-resolution time.
+    Slice(Box<Type>),
+    // (`str` is a single-segment Path("str") at the AST level — the
+    // type-resolver maps it to `RType::Str`. No dedicated AST variant.)
 }
 
 #[derive(Clone)]
@@ -272,6 +278,11 @@ pub enum ExprKind {
     // minus (`-x`, `-(a + b)`, etc.) the parser desugars to a
     // `<T as VecSpace>::neg` method call instead.
     NegIntLit(u64),
+    // `"..."` — UTF-8 string literal. The decoded payload is stored
+    // directly on the AST node; codegen interns it into the module's
+    // data section and emits a fat ref pointing into that section.
+    // Type is always `&'static str`.
+    StrLit(String),
     BoolLit(bool),
     Call(Call),
     Var(String),

@@ -325,6 +325,7 @@ impl<'a> Builder<'a> {
             // a literal carries no move/borrow semantics, so we treat
             // `NegIntLit(n)` as just another constant operand.
             ExprKind::NegIntLit(n) => Operand { kind: OperandKind::ConstInt(*n), span, node_id: nid },
+            ExprKind::StrLit(s) => Operand { kind: OperandKind::ConstStr(s.clone()), span, node_id: nid },
             ExprKind::BoolLit(b) => Operand { kind: OperandKind::ConstBool(*b), span, node_id: nid },
             ExprKind::Tuple(elems) if elems.is_empty() => {
                 Operand { kind: OperandKind::ConstUnit, span, node_id: nid }
@@ -492,6 +493,11 @@ impl<'a> Builder<'a> {
             }),
             ExprKind::NegIntLit(n) => Rvalue::Use(Operand {
                 kind: OperandKind::ConstInt(*n),
+                span,
+                node_id: nid,
+            }),
+            ExprKind::StrLit(s) => Rvalue::Use(Operand {
+                kind: OperandKind::ConstStr(s.clone()),
                 span,
                 node_id: nid,
             }),

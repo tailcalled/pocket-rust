@@ -145,6 +145,16 @@ pub enum RType {
         type_args: Vec<RType>,
         lifetime_args: Vec<LifetimeRepr>,
     },
+    // `[T]` — the dynamically-sized slice type. Bare `Slice` is
+    // unsized: `byte_size_of` and `flatten_rtype` panic on it. Valid
+    // only as the inner of a `Ref { inner: Slice(_), .. }` — a fat
+    // pointer that flattens to `[I32, I32]` (data ptr + length).
+    Slice(Box<RType>),
+    // `str` — UTF-8 string DST. Layout-identical to `Slice(Box::new(Int(U8)))`
+    // (a fat ref over u8 bytes), but kept distinct from `Slice<u8>` at the
+    // type level so users get `&str` in error messages and so future UTF-8
+    // invariants can attach here. Same DST rules as `Slice`.
+    Str,
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -220,6 +230,8 @@ pub fn rtype_eq(a: &RType, b: &RType) -> bool {
             },
         ) => ma == mb && rtype_eq(ia, ib),
         (RType::Param(a), RType::Param(b)) => a == b,
+        (RType::Slice(a), RType::Slice(b)) => rtype_eq(a, b),
+        (RType::Str, RType::Str) => true,
         (RType::Tuple(a), RType::Tuple(b)) => rtype_vec_eq(a, b),
         (
             RType::Enum {
@@ -309,6 +321,8 @@ pub fn rtype_to_string(t: &RType) -> String {
                 s
             }
         }
+        RType::Slice(inner) => format!("[{}]", rtype_to_string(inner)),
+        RType::Str => "str".to_string(),
     }
 }
 
@@ -331,8 +345,14 @@ pub fn rtype_size(ty: &RType, structs: &StructTable) -> u32 {
             }
             s
         }
-        RType::Ref { .. } | RType::RawPtr { .. } => 1,
+        RType::Ref { inner, .. } => match inner.as_ref() {
+            // Fat ref to a slice: 2 wasm scalars (ptr + len).
+            RType::Slice(_) | RType::Str => 2,
+            _ => 1,
+        },
+        RType::RawPtr { .. } => 1,
         RType::Param(_) => unreachable!("rtype_size called on unresolved type parameter"),
+        RType::Slice(_) | RType::Str => unreachable!("`[T]` / `str` is unsized — only valid behind a reference"),
         RType::Tuple(elems) => {
             let mut s: u32 = 0;
             let mut i = 0;
@@ -389,8 +409,18 @@ pub fn flatten_rtype(ty: &RType, structs: &StructTable, out: &mut Vec<crate::was
                 i += 1;
             }
         }
-        RType::Ref { .. } | RType::RawPtr { .. } => out.push(crate::wasm::ValType::I32),
+        RType::Ref { inner, .. } => match inner.as_ref() {
+            // Fat ref to a DST slice or str: (data ptr, length) — both
+            // i32 on wasm32.
+            RType::Slice(_) | RType::Str => {
+                out.push(crate::wasm::ValType::I32);
+                out.push(crate::wasm::ValType::I32);
+            }
+            _ => out.push(crate::wasm::ValType::I32),
+        },
+        RType::RawPtr { .. } => out.push(crate::wasm::ValType::I32),
         RType::Param(_) => unreachable!("flatten_rtype called on unresolved type parameter"),
+        RType::Slice(_) | RType::Str => unreachable!("`[T]` / `str` is unsized — only valid behind a reference"),
         RType::Tuple(elems) => {
             let mut i = 0;
             while i < elems.len() {
@@ -415,7 +445,13 @@ pub fn byte_size_of(rt: &RType, structs: &StructTable, enums: &EnumTable) -> u32
             IntKind::U64 | IntKind::I64 => 8,
             IntKind::U128 | IntKind::I128 => 16,
         },
-        RType::Ref { .. } | RType::RawPtr { .. } => 4,
+        RType::Ref { inner, .. } => match inner.as_ref() {
+            // Fat ref: 8 bytes (4 ptr + 4 len) on wasm32.
+            RType::Slice(_) | RType::Str => 8,
+            _ => 4,
+        },
+        RType::RawPtr { .. } => 4,
+        RType::Slice(_) | RType::Str => unreachable!("`[T]` / `str` is unsized — only valid behind a reference"),
         RType::Struct { path, type_args, .. } => {
             let entry = struct_lookup(structs, path).expect("resolved struct");
             let env = struct_env(&entry.type_params, type_args);
@@ -554,6 +590,8 @@ pub fn substitute_rtype(rt: &RType, env: &Vec<(String, RType)>) -> RType {
                 lifetime_args: lifetime_args.clone(),
             }
         }
+        RType::Slice(inner) => RType::Slice(Box::new(substitute_rtype(inner, env))),
+        RType::Str => RType::Str,
     }
 }
 

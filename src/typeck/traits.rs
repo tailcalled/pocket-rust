@@ -450,6 +450,11 @@ pub(crate) fn try_match_against_infer(
             }
             _ => false,
         },
+        RType::Slice(ia) => match &resolved {
+            InferType::Slice(ib) => try_match_against_infer(ia, ib, subst, env, pending),
+            _ => false,
+        },
+        RType::Str => matches!(resolved, InferType::Str),
     }
 }
 pub fn find_trait_impl_idx_by_span(

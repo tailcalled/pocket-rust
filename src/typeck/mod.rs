@@ -38,7 +38,9 @@ fn satisfies_num(
         | InferType::RawPtr { .. }
         | InferType::Bool
         | InferType::Tuple(_)
-        | InferType::Enum { .. } => false,
+        | InferType::Enum { .. }
+        | InferType::Slice(_)
+        | InferType::Str => false,
     }
 }
 
@@ -97,6 +99,8 @@ pub(crate) fn infer_to_rtype_for_check(t: &InferType) -> RType {
                 lifetime_args: lifetime_args.clone(),
             }
         }
+        InferType::Slice(inner) => RType::Slice(Box::new(infer_to_rtype_for_check(inner))),
+        InferType::Str => RType::Str,
     }
 }
 
@@ -213,6 +217,10 @@ pub(crate) enum InferType {
         type_args: Vec<InferType>,
         lifetime_args: Vec<LifetimeRepr>,
     },
+    // `[T]` — DST. Only valid as the inner of `Ref { inner: Slice(_), .. }`.
+    Slice(Box<InferType>),
+    // `str` — UTF-8 string DST. Only valid as the inner of a Ref.
+    Str,
 }
 
 // Build a name → InferType env from a generic struct/template's type-param
@@ -282,6 +290,8 @@ pub(crate) fn rtype_to_infer(rt: &RType) -> InferType {
                 lifetime_args: lifetime_args.clone(),
             }
         }
+        RType::Slice(inner) => InferType::Slice(Box::new(rtype_to_infer(inner))),
+        RType::Str => InferType::Str,
     }
 }
 
@@ -347,6 +357,8 @@ pub(crate) fn infer_substitute(t: &InferType, env: &Vec<(String, InferType)>) ->
                 lifetime_args: lifetime_args.clone(),
             }
         }
+        InferType::Slice(inner) => InferType::Slice(Box::new(infer_substitute(inner, env))),
+        InferType::Str => InferType::Str,
     }
 }
 
@@ -422,6 +434,8 @@ pub(crate) fn infer_to_string(t: &InferType) -> String {
                 s
             }
         }
+        InferType::Slice(inner) => format!("[{}]", infer_to_string(inner)),
+        InferType::Str => "str".to_string(),
     }
 }
 
@@ -505,6 +519,8 @@ impl Subst {
                     lifetime_args: lifetime_args.clone(),
                 }
             }
+            InferType::Slice(inner) => InferType::Slice(Box::new(self.substitute(inner))),
+            InferType::Str => InferType::Str,
         }
     }
 
@@ -790,6 +806,10 @@ impl Subst {
                 }
                 Ok(())
             }
+            (InferType::Slice(ia), InferType::Slice(ib)) => {
+                self.unify(ia.as_ref(), ib.as_ref(), traits, type_params, type_param_bounds, span, file)
+            }
+            (InferType::Str, InferType::Str) => Ok(()),
             (a, b) => Err(Error {
                 file: file.to_string(),
                 message: format!(
@@ -852,6 +872,8 @@ impl Subst {
                     lifetime_args,
                 }
             }
+            InferType::Slice(inner) => RType::Slice(Box::new(self.finalize(&inner))),
+            InferType::Str => RType::Str,
         }
     }
 }
@@ -1835,6 +1857,16 @@ fn check_expr_inner(ctx: &mut CheckCtx, expr: &Expr) -> Result<InferType, Error>
             });
             Ok(InferType::Var(v))
         }
+        ExprKind::StrLit(_) => {
+            // String literal is `&'static str`. Lifetime is `'static`
+            // because the data lives in the module's data section
+            // for the lifetime of the program.
+            Ok(InferType::Ref {
+                inner: Box::new(InferType::Str),
+                mutable: false,
+                lifetime: LifetimeRepr::Named("static".to_string()),
+            })
+        }
         ExprKind::Var(name) => {
             let mut i = ctx.locals.len();
             while i > 0 {
@@ -2217,6 +2249,14 @@ fn check_builtin(
         "free" => return check_builtin_free(ctx, type_args, args, expr),
         "cast" => return check_builtin_cast(ctx, type_args, args, expr),
         "size_of" => return check_builtin_size_of(ctx, type_args, args, expr),
+        "make_slice" => return check_builtin_make_slice(ctx, type_args, args, expr, false),
+        "make_mut_slice" => return check_builtin_make_slice(ctx, type_args, args, expr, true),
+        "slice_len" => return check_builtin_slice_len(ctx, type_args, args, expr),
+        "slice_ptr" => return check_builtin_slice_ptr(ctx, type_args, args, expr, false),
+        "slice_mut_ptr" => return check_builtin_slice_ptr(ctx, type_args, args, expr, true),
+        "str_len" => return check_builtin_str_len(ctx, type_args, args, expr),
+        "str_as_bytes" => return check_builtin_str_as_bytes(ctx, type_args, args, expr),
+        "make_str" => return check_builtin_make_str(ctx, type_args, args, expr),
         "ptr_usize_add" | "ptr_usize_sub" => {
             return check_builtin_ptr_usize_offset(ctx, name, type_args, args, expr);
         }
@@ -2423,6 +2463,386 @@ fn check_builtin_cast(
         inner: Box::new(new_pointee),
         mutable,
     }))
+}
+
+// `¤str_len(s: &str) -> usize`. Pulls the length half out of the
+// fat ref. Same codegen as `¤slice_len` (drops ptr, keeps len) but
+// takes no type-arg since `str`'s element type is fixed.
+fn check_builtin_str_len(
+    ctx: &mut CheckCtx,
+    type_args: &Vec<crate::ast::Type>,
+    args: &Vec<Expr>,
+    expr: &Expr,
+) -> Result<InferType, Error> {
+    if !type_args.is_empty() {
+        return Err(Error {
+            file: ctx.current_file.to_string(),
+            message: "builtin `¤str_len` does not take type arguments".to_string(),
+            span: expr.span.copy(),
+        });
+    }
+    if args.len() != 1 {
+        return Err(Error {
+            file: ctx.current_file.to_string(),
+            message: format!(
+                "builtin `¤str_len` takes 1 argument (`&str`), got {}",
+                args.len()
+            ),
+            span: expr.span.copy(),
+        });
+    }
+    let arg_ty = check_expr(ctx, &args[0])?;
+    let expected = InferType::Ref {
+        inner: Box::new(InferType::Str),
+        mutable: false,
+        lifetime: LifetimeRepr::Inferred(0),
+    };
+    ctx.subst.unify(
+        &arg_ty,
+        &expected,
+        ctx.traits,
+        ctx.type_params,
+        ctx.type_param_bounds,
+        &args[0].span,
+        ctx.current_file,
+    )?;
+    Ok(rtype_to_infer(&RType::Int(IntKind::Usize)))
+}
+
+// `¤str_as_bytes(s: &str) -> &[u8]`. The fat-ref representation of
+// `&str` and `&[u8]` is bit-identical (both are (ptr, len) over u8
+// bytes), so codegen is a pure pass-through.
+fn check_builtin_str_as_bytes(
+    ctx: &mut CheckCtx,
+    type_args: &Vec<crate::ast::Type>,
+    args: &Vec<Expr>,
+    expr: &Expr,
+) -> Result<InferType, Error> {
+    if !type_args.is_empty() {
+        return Err(Error {
+            file: ctx.current_file.to_string(),
+            message: "builtin `¤str_as_bytes` does not take type arguments".to_string(),
+            span: expr.span.copy(),
+        });
+    }
+    if args.len() != 1 {
+        return Err(Error {
+            file: ctx.current_file.to_string(),
+            message: format!(
+                "builtin `¤str_as_bytes` takes 1 argument (`&str`), got {}",
+                args.len()
+            ),
+            span: expr.span.copy(),
+        });
+    }
+    let arg_ty = check_expr(ctx, &args[0])?;
+    let expected = InferType::Ref {
+        inner: Box::new(InferType::Str),
+        mutable: false,
+        lifetime: LifetimeRepr::Inferred(0),
+    };
+    ctx.subst.unify(
+        &arg_ty,
+        &expected,
+        ctx.traits,
+        ctx.type_params,
+        ctx.type_param_bounds,
+        &args[0].span,
+        ctx.current_file,
+    )?;
+    Ok(InferType::Ref {
+        inner: Box::new(InferType::Slice(Box::new(InferType::Int(IntKind::U8)))),
+        mutable: false,
+        lifetime: LifetimeRepr::Inferred(0),
+    })
+}
+
+// `¤make_str(ptr: *const u8, len: usize) -> &str`. Constructs a fat
+// `&str` from raw parts. The caller is responsible for the UTF-8
+// invariant (currently unenforced — a `make_str` call site is fully
+// trusted). Codegen is a pure no-op (args already form the fat ref).
+fn check_builtin_make_str(
+    ctx: &mut CheckCtx,
+    type_args: &Vec<crate::ast::Type>,
+    args: &Vec<Expr>,
+    expr: &Expr,
+) -> Result<InferType, Error> {
+    if !type_args.is_empty() {
+        return Err(Error {
+            file: ctx.current_file.to_string(),
+            message: "builtin `¤make_str` does not take type arguments".to_string(),
+            span: expr.span.copy(),
+        });
+    }
+    if args.len() != 2 {
+        return Err(Error {
+            file: ctx.current_file.to_string(),
+            message: format!(
+                "builtin `¤make_str` takes 2 arguments (ptr, len), got {}",
+                args.len()
+            ),
+            span: expr.span.copy(),
+        });
+    }
+    let arg0_ty = check_expr(ctx, &args[0])?;
+    let arg1_ty = check_expr(ctx, &args[1])?;
+    let expected0 = rtype_to_infer(&RType::RawPtr {
+        inner: Box::new(RType::Int(IntKind::U8)),
+        mutable: false,
+    });
+    ctx.subst.unify(
+        &arg0_ty,
+        &expected0,
+        ctx.traits,
+        ctx.type_params,
+        ctx.type_param_bounds,
+        &args[0].span,
+        ctx.current_file,
+    )?;
+    let expected1 = rtype_to_infer(&RType::Int(IntKind::Usize));
+    ctx.subst.unify(
+        &arg1_ty,
+        &expected1,
+        ctx.traits,
+        ctx.type_params,
+        ctx.type_param_bounds,
+        &args[1].span,
+        ctx.current_file,
+    )?;
+    Ok(InferType::Ref {
+        inner: Box::new(InferType::Str),
+        mutable: false,
+        lifetime: LifetimeRepr::Inferred(0),
+    })
+}
+
+// `¤slice_ptr::<T>(s: &[T]) -> *const T` and the mut variant
+// `¤slice_mut_ptr::<T>(s: &mut [T]) -> *mut T`. Pulls the data-ptr
+// half out of the fat ref. Codegen drops the length scalar (top of
+// stack) and keeps the ptr scalar (below it). The mutable variant
+// has the same wasm shape — only the typeck input/output differ.
+fn check_builtin_slice_ptr(
+    ctx: &mut CheckCtx,
+    type_args: &Vec<crate::ast::Type>,
+    args: &Vec<Expr>,
+    expr: &Expr,
+    mutable: bool,
+) -> Result<InferType, Error> {
+    let name = if mutable { "slice_mut_ptr" } else { "slice_ptr" };
+    if type_args.len() != 1 {
+        return Err(Error {
+            file: ctx.current_file.to_string(),
+            message: format!(
+                "builtin `¤{}` takes 1 type argument (`T`), got {}",
+                name,
+                type_args.len()
+            ),
+            span: expr.span.copy(),
+        });
+    }
+    if args.len() != 1 {
+        return Err(Error {
+            file: ctx.current_file.to_string(),
+            message: format!(
+                "builtin `¤{}` takes 1 argument, got {}",
+                name,
+                args.len()
+            ),
+            span: expr.span.copy(),
+        });
+    }
+    let t = resolve_type(
+        &type_args[0],
+        ctx.current_module,
+        ctx.structs,
+        ctx.enums,
+        ctx.self_target,
+        ctx.type_params,
+        &ctx.use_scope,
+        ctx.reexports,
+        ctx.current_file,
+    )?;
+    let arg_ty = check_expr(ctx, &args[0])?;
+    let expected = InferType::Ref {
+        inner: Box::new(InferType::Slice(Box::new(rtype_to_infer(&t)))),
+        mutable,
+        lifetime: LifetimeRepr::Inferred(0),
+    };
+    ctx.subst.unify(
+        &arg_ty,
+        &expected,
+        ctx.traits,
+        ctx.type_params,
+        ctx.type_param_bounds,
+        &args[0].span,
+        ctx.current_file,
+    )?;
+    Ok(InferType::RawPtr {
+        inner: Box::new(rtype_to_infer(&t)),
+        mutable,
+    })
+}
+
+// `¤slice_len::<T>(s: &[T]) -> usize`. Pulls the length half out of
+// the fat ref. Codegen drops the data ptr from the wasm stack and
+// keeps the length scalar.
+fn check_builtin_slice_len(
+    ctx: &mut CheckCtx,
+    type_args: &Vec<crate::ast::Type>,
+    args: &Vec<Expr>,
+    expr: &Expr,
+) -> Result<InferType, Error> {
+    if type_args.len() != 1 {
+        return Err(Error {
+            file: ctx.current_file.to_string(),
+            message: format!(
+                "builtin `¤slice_len` takes 1 type argument (`T`), got {}",
+                type_args.len()
+            ),
+            span: expr.span.copy(),
+        });
+    }
+    if args.len() != 1 {
+        return Err(Error {
+            file: ctx.current_file.to_string(),
+            message: format!(
+                "builtin `¤slice_len` takes 1 argument (`&[T]`), got {}",
+                args.len()
+            ),
+            span: expr.span.copy(),
+        });
+    }
+    let t = resolve_type(
+        &type_args[0],
+        ctx.current_module,
+        ctx.structs,
+        ctx.enums,
+        ctx.self_target,
+        ctx.type_params,
+        &ctx.use_scope,
+        ctx.reexports,
+        ctx.current_file,
+    )?;
+    let arg_ty = check_expr(ctx, &args[0])?;
+    // Accept either `&[T]` or `&mut [T]` — the length read is the
+    // same regardless of mutability, and `get_mut` needs to read len
+    // through `&mut self` without an extra intrinsic.
+    let resolved = ctx.subst.substitute(&arg_ty);
+    let inner_ok = match &resolved {
+        InferType::Ref { inner, .. } => match inner.as_ref() {
+            InferType::Slice(_) => true,
+            _ => false,
+        },
+        _ => false,
+    };
+    if !inner_ok {
+        return Err(Error {
+            file: ctx.current_file.to_string(),
+            message: format!(
+                "builtin `¤slice_len` first argument must be `&[T]` or `&mut [T]`, got `{}`",
+                infer_to_string(&resolved)
+            ),
+            span: args[0].span.copy(),
+        });
+    }
+    // Unify the inner element type with the supplied turbofish T —
+    // mutability is allowed to differ.
+    if let InferType::Ref { inner, mutable, .. } = &resolved {
+        if let InferType::Slice(element) = inner.as_ref() {
+            ctx.subst.unify(
+                element.as_ref(),
+                &rtype_to_infer(&t),
+                ctx.traits,
+                ctx.type_params,
+                ctx.type_param_bounds,
+                &args[0].span,
+                ctx.current_file,
+            )?;
+            let _ = mutable;
+        }
+    }
+    Ok(rtype_to_infer(&RType::Int(IntKind::Usize)))
+}
+
+// `¤make_slice::<T>(ptr: *const u8, len: usize) -> &[T]`. Constructs a
+// fat slice ref from an existing data pointer and a length. The
+// pointer is taken as `*const u8` so the same intrinsic call site
+// works regardless of T's size (the caller is expected to have already
+// computed bytes-worth offsets); `T` then determines only the slice's
+// element type. Used by `Vec<T>::as_slice` to surface the buffer.
+// Codegen is a pure no-op — both args are already i32s on the wasm
+// stack, which is exactly the fat-ref representation.
+fn check_builtin_make_slice(
+    ctx: &mut CheckCtx,
+    type_args: &Vec<crate::ast::Type>,
+    args: &Vec<Expr>,
+    expr: &Expr,
+    mutable: bool,
+) -> Result<InferType, Error> {
+    let name = if mutable { "make_mut_slice" } else { "make_slice" };
+    if type_args.len() != 1 {
+        return Err(Error {
+            file: ctx.current_file.to_string(),
+            message: format!(
+                "builtin `¤{}` takes 1 type argument (`T`), got {}",
+                name,
+                type_args.len()
+            ),
+            span: expr.span.copy(),
+        });
+    }
+    if args.len() != 2 {
+        return Err(Error {
+            file: ctx.current_file.to_string(),
+            message: format!(
+                "builtin `¤{}` takes 2 arguments (ptr, len), got {}",
+                name,
+                args.len()
+            ),
+            span: expr.span.copy(),
+        });
+    }
+    let t = resolve_type(
+        &type_args[0],
+        ctx.current_module,
+        ctx.structs,
+        ctx.enums,
+        ctx.self_target,
+        ctx.type_params,
+        &ctx.use_scope,
+        ctx.reexports,
+        ctx.current_file,
+    )?;
+    let arg0_ty = check_expr(ctx, &args[0])?;
+    let arg1_ty = check_expr(ctx, &args[1])?;
+    let expected0 = rtype_to_infer(&RType::RawPtr {
+        inner: Box::new(RType::Int(IntKind::U8)),
+        mutable,
+    });
+    ctx.subst.unify(
+        &arg0_ty,
+        &expected0,
+        ctx.traits,
+        ctx.type_params,
+        ctx.type_param_bounds,
+        &args[0].span,
+        ctx.current_file,
+    )?;
+    let expected1 = rtype_to_infer(&RType::Int(IntKind::Usize));
+    ctx.subst.unify(
+        &arg1_ty,
+        &expected1,
+        ctx.traits,
+        ctx.type_params,
+        ctx.type_param_bounds,
+        &args[1].span,
+        ctx.current_file,
+    )?;
+    Ok(InferType::Ref {
+        inner: Box::new(InferType::Slice(Box::new(rtype_to_infer(&t)))),
+        mutable,
+        lifetime: LifetimeRepr::Inferred(0),
+    })
 }
 
 // `¤size_of::<T>() -> usize`. Mandatory turbofish (no inference). The

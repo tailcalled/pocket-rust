@@ -3,3 +3,6 @@
 // own, just the impl blocks that give primitives their methods.
 
 pub mod pointer;
+pub mod slice;
+pub mod str;
+

@@ -49,6 +49,19 @@ impl<T> Vec<T> {
         self.cap
     }
 
+    // Borrow the initialized prefix as a `&[T]` slice. The returned
+    // fat ref carries (data ptr, length); both halves are read out of
+    // `self`. Lifetime-tied to `&self`.
+    pub fn as_slice(&self) -> &[T] {
+        unsafe { ¤make_slice::<T>(self.ptr.cast::<u8>() as *const u8, self.len) }
+    }
+
+    // Mutable counterpart of `as_slice`. Returns `&mut [T]` whose
+    // exclusive borrow is tied to `&mut self`.
+    pub fn as_mut_slice(&mut self) -> &mut [T] {
+        unsafe { ¤make_mut_slice::<T>(self.ptr.cast::<u8>(), self.len) }
+    }
+
     pub fn push(&mut self, value: T) {
         if self.len == self.cap {
             self.grow();
@@ -177,7 +190,7 @@ impl<T> Drop for Vec<T> {
 // a blocker lands, search this file for the relevant TODO.
 //
 // TODO: append(&mut self, other: &mut Vec<T>) — needs draining; expressible once the move-out-of-`*mut` story for `take`/`replace` is sound.
-// TODO: as_slice(&self) -> &[T] / as_mut_slice — needs `&[T]` slice types.
+// TODO: as_mut_slice(&mut self) -> &mut [T] — same shape as `as_slice`, but needs the codegen path for `&mut [T]` (mutable fat ref) to be wired through; the immutable case landed first.
 // TODO: contains(&self, x: &T) — needs the `PartialEq` constraint on element comparison; expressible today, just hadn't a use case.
 // TODO: dedup / dedup_by / dedup_by_key — needs PartialEq + closures.
 // TODO: drain(&mut self, range) — needs ranges as first-class values + iterator support.

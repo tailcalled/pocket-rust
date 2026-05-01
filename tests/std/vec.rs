@@ -55,3 +55,8 @@ fn vec_inference_challenge_returns_42() {
 fn vec_inference_nested_returns_42() {
     expect_answer("std/vec/inference_nested", 42u32);
 }
+
+#[test]
+fn vec_as_slice_len_returns_3() {
+    expect_answer("std/vec/as_slice_len", 3u32);
+}

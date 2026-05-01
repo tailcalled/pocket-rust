@@ -1100,6 +1100,17 @@ impl Parser {
                 span,
             });
         }
+        if self.peek_kind(&TokenKind::LBracket) {
+            // Slice type `[T]`. Bare slices are DSTs and only valid
+            // behind a reference; the type-resolver enforces that.
+            let lb = self.expect(&TokenKind::LBracket, "`[`")?;
+            let inner = self.parse_type()?;
+            let rb = self.expect(&TokenKind::RBracket, "`]`")?;
+            return Ok(Type {
+                kind: TypeKind::Slice(Box::new(inner)),
+                span: Span::new(lb.start, rb.end),
+            });
+        }
         if self.peek_kind(&TokenKind::Star) {
             let star_span = self.expect(&TokenKind::Star, "`*`")?;
             let mutable = if self.peek_kind(&TokenKind::Mut) {
@@ -1567,6 +1578,7 @@ impl Parser {
         }
         match &self.tokens[self.pos].kind {
             TokenKind::IntLit(_) => self.parse_int_lit(),
+            TokenKind::StrLit(_) => self.parse_str_lit(),
             TokenKind::True => {
                 let span = self.tokens[self.pos].span.copy();
                 self.pos += 1;
@@ -1946,8 +1958,76 @@ impl Parser {
                 let span = tok.span.copy();
                 self.pos += 1;
                 let id = self.alloc_node_id();
-                Ok(Expr {
+                let lit = Expr {
                     kind: ExprKind::IntLit(value),
+                    span: span.copy(),
+                    id,
+                };
+                // Optional type suffix: `42u32`, `100i64`, etc. The
+                // lexer reads digits then stops at any non-digit, so
+                // `42u32` arrives as `IntLit(42)` followed by `Ident("u32")`.
+                // If the next token is one of the recognized integer-
+                // kind names, desugar to `(lit as <kind>)` — the
+                // existing cast machinery pins the literal's type at
+                // typeck and emits no runtime work for same-class
+                // conversions.
+                if let Some(suffix) = self.peek_int_suffix() {
+                    let suffix_span = self.tokens[self.pos].span.copy();
+                    self.pos += 1;
+                    let cast_id = self.alloc_node_id();
+                    return Ok(Expr {
+                        kind: ExprKind::Cast {
+                            inner: Box::new(lit),
+                            ty: Type {
+                                kind: TypeKind::Path(Path {
+                                    segments: vec![PathSegment {
+                                        name: suffix,
+                                        args: Vec::new(),
+                                        lifetime_args: Vec::new(),
+                                        span: suffix_span.copy(),
+                                    }],
+                                    span: suffix_span.copy(),
+                                }),
+                                span: suffix_span.copy(),
+                            },
+                        },
+                        span: Span::new(span.start, suffix_span.end),
+                        id: cast_id,
+                    });
+                }
+                Ok(lit)
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    // Peek for a literal type-suffix ident (`u8`/`i8`/.../`usize`/`isize`/
+    // `u128`/`i128`). Returns the suffix name if present.
+    fn peek_int_suffix(&self) -> Option<String> {
+        if self.pos >= self.tokens.len() {
+            return None;
+        }
+        if let TokenKind::Ident(name) = &self.tokens[self.pos].kind {
+            match name.as_str() {
+                "u8" | "i8" | "u16" | "i16" | "u32" | "i32" | "u64" | "i64"
+                | "u128" | "i128" | "usize" | "isize" => Some(name.clone()),
+                _ => None,
+            }
+        } else {
+            None
+        }
+    }
+
+    fn parse_str_lit(&mut self) -> Result<Expr, Error> {
+        let tok = &self.tokens[self.pos];
+        match &tok.kind {
+            TokenKind::StrLit(s) => {
+                let payload = s.clone();
+                let span = tok.span.copy();
+                self.pos += 1;
+                let id = self.alloc_node_id();
+                Ok(Expr {
+                    kind: ExprKind::StrLit(payload),
                     span,
                     id,
                 })
@@ -2057,6 +2137,21 @@ impl Parser {
 
     fn parse_field_init(&mut self) -> Result<FieldInit, Error> {
         let (name, name_span) = self.expect_ident()?;
+        // Shorthand: `Foo { x }` desugars to `Foo { x: x }` when
+        // followed by `,` or `}`. The name lookup falls through to
+        // typeck via the synthetic `Var` expression.
+        if self.peek_kind(&TokenKind::Comma) || self.peek_kind(&TokenKind::RBrace) {
+            let value = Expr {
+                kind: ExprKind::Var(name.clone()),
+                span: name_span.copy(),
+                id: self.alloc_node_id(),
+            };
+            return Ok(FieldInit {
+                name,
+                name_span,
+                value,
+            });
+        }
         self.expect(&TokenKind::Colon, "`:`")?;
         let value = self.parse_expr()?;
         Ok(FieldInit {
@@ -2223,6 +2318,8 @@ impl Parser {
             (TokenKind::RParen, TokenKind::RParen) => true,
             (TokenKind::LBrace, TokenKind::LBrace) => true,
             (TokenKind::RBrace, TokenKind::RBrace) => true,
+            (TokenKind::LBracket, TokenKind::LBracket) => true,
+            (TokenKind::RBracket, TokenKind::RBracket) => true,
             (TokenKind::Arrow, TokenKind::Arrow) => true,
             (TokenKind::Semi, TokenKind::Semi) => true,
             (TokenKind::Colon, TokenKind::Colon) => true,

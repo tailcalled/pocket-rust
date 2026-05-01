@@ -76,6 +76,9 @@ pub fn resolve_type(
                 if path.segments[0].name == "bool" {
                     return Ok(RType::Bool);
                 }
+                if path.segments[0].name == "str" {
+                    return Ok(RType::Str);
+                }
                 if let Some(k) = int_kind_from_name(&path.segments[0].name) {
                     return Ok(RType::Int(k));
                 }
@@ -300,6 +303,20 @@ pub fn resolve_type(
                 i += 1;
             }
             Ok(RType::Tuple(out))
+        }
+        TypeKind::Slice(inner) => {
+            let inner_rt = resolve_type(
+                inner,
+                current_module,
+                structs,
+                enums,
+                self_target,
+                type_params,
+                use_scope,
+                reexports,
+                file,
+            )?;
+            Ok(RType::Slice(Box::new(inner_rt)))
         }
     }
 }

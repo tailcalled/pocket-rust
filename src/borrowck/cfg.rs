@@ -116,6 +116,11 @@ pub enum OperandKind {
     ConstInt(u64),
     ConstBool(bool),
     ConstUnit,
+    // String literal — payload is the decoded source bytes. Borrowck
+    // doesn't inspect the content; it's just an opaque constant whose
+    // resulting `&'static str` borrows nothing. Codegen interns the
+    // payload into the module's data section.
+    ConstStr(String),
 }
 
 // How to compute a value to assign to a place.

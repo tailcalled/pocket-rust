@@ -1244,17 +1244,22 @@ pub(super) fn resolve_impl_target(
         file,
     )?;
     if ib.trait_path.is_none() {
-        // Inherent: must be a struct, enum, or raw pointer (the
+        // Inherent: must be a struct, enum, raw pointer, or slice. The
         // primitive-pointer methods in `lib/std/primitive/pointer.rs`
-        // are inherent on `*const T` / `*mut T`, mirroring Rust's
-        // stdlib). Refs, primitives, and tuples can't carry inherent
-        // methods — those go through trait impls.
+        // are inherent on `*const T` / `*mut T`; slice methods (`len`,
+        // `get`, …) are inherent on `[T]`. Refs, primitives, and
+        // tuples can't carry inherent methods — those go through trait
+        // impls.
         match &resolved {
-            RType::Struct { .. } | RType::Enum { .. } | RType::RawPtr { .. } => {}
+            RType::Struct { .. }
+            | RType::Enum { .. }
+            | RType::RawPtr { .. }
+            | RType::Slice(_)
+            | RType::Str => {}
             _ => {
                 return Err(Error {
                     file: file.to_string(),
-                    message: "inherent impl target must be a struct, enum, or raw pointer"
+                    message: "inherent impl target must be a struct, enum, raw pointer, slice, or str"
                         .to_string(),
                     span: ib.target.span.copy(),
                 });
