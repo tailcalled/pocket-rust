@@ -141,6 +141,7 @@ where
     expect_export(dir, "answer", expected)
 }
 
+mod boxed;
 mod cmp;
 mod copy;
 mod drop;

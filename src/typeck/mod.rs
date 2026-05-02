@@ -2160,14 +2160,38 @@ fn check_deref_rooted_assign(
             });
         }
         other => {
-            return Err(Error {
-                file: ctx.current_file.to_string(),
-                message: format!(
-                    "cannot dereference `{}` for assignment",
-                    infer_to_string(&other)
-                ),
-                span: assign.lhs.span.copy(),
-            });
+            // Smart-pointer write via `DerefMut`. The LHS type is
+            // the impl's `Target` (declared on the supertrait
+            // `Deref`); codegen routes the write through
+            // `<X as DerefMut>::deref_mut(&mut x)` and stores into
+            // the returned `&mut Target`.
+            let inner_rt = infer_to_rtype_for_check(&other);
+            let deref_mut_path = vec![
+                "std".to_string(),
+                "ops".to_string(),
+                "DerefMut".to_string(),
+            ];
+            let deref_path = vec![
+                "std".to_string(),
+                "ops".to_string(),
+                "Deref".to_string(),
+            ];
+            let has_deref_mut =
+                traits::solve_impl(&deref_mut_path, &inner_rt, ctx.traits, 0).is_some();
+            let target_candidates =
+                traits::find_assoc_binding(ctx.traits, &inner_rt, &deref_path, "Target");
+            if has_deref_mut && target_candidates.len() == 1 {
+                rtype_to_infer(&target_candidates[0])
+            } else {
+                return Err(Error {
+                    file: ctx.current_file.to_string(),
+                    message: format!(
+                        "cannot dereference `{}` for assignment",
+                        infer_to_string(&other)
+                    ),
+                    span: assign.lhs.span.copy(),
+                });
+            }
         }
     };
     // Walk fields starting from the pointed-at type to find the LHS type.
@@ -3983,14 +4007,34 @@ fn check_place_inner(ctx: &mut CheckCtx, expr: &Expr) -> Result<InferType, Error
             match resolved {
                 InferType::Ref { inner, .. } => Ok(*inner),
                 InferType::RawPtr { inner, .. } => Ok(*inner),
-                other => Err(Error {
-                    file: ctx.current_file.to_string(),
-                    message: format!(
-                        "cannot dereference `{}` — only references and raw pointers can be dereferenced",
-                        infer_to_string(&other)
-                    ),
-                    span: expr.span.copy(),
-                }),
+                other => {
+                    // Smart-pointer place: route through `Deref` /
+                    // `DerefMut` (caller decides which). The place's
+                    // type is the impl's `Target`.
+                    let deref_path = vec![
+                        "std".to_string(),
+                        "ops".to_string(),
+                        "Deref".to_string(),
+                    ];
+                    let inner_rt = infer_to_rtype_for_check(&other);
+                    let candidates = traits::find_assoc_binding(
+                        ctx.traits,
+                        &inner_rt,
+                        &deref_path,
+                        "Target",
+                    );
+                    if candidates.len() == 1 {
+                        return Ok(rtype_to_infer(&candidates[0]));
+                    }
+                    Err(Error {
+                        file: ctx.current_file.to_string(),
+                        message: format!(
+                            "cannot dereference `{}` — type does not implement `Deref`",
+                            infer_to_string(&other)
+                        ),
+                        span: expr.span.copy(),
+                    })
+                }
             }
         }
         ExprKind::TupleIndex { base, index, index_span } => {
@@ -4037,14 +4081,36 @@ fn check_deref(ctx: &mut CheckCtx, inner: &Expr, deref_expr: &Expr) -> Result<In
     match resolved {
         InferType::Ref { inner, .. } => Ok(*inner),
         InferType::RawPtr { inner, .. } => Ok(*inner),
-        other => Err(Error {
-            file: ctx.current_file.to_string(),
-            message: format!(
-                "cannot dereference `{}` — only references and raw pointers can be dereferenced",
-                infer_to_string(&other)
-            ),
-            span: deref_expr.span.copy(),
-        }),
+        other => {
+            // Smart-pointer deref via `std::ops::Deref`. When the
+            // inner type isn't a built-in ref/raw-ptr, look up
+            // `<inner_ty as Deref>::Target` — if a single impl
+            // matches, use its Target type and let codegen route
+            // the deref through `Deref::deref`.
+            let deref_path = vec![
+                "std".to_string(),
+                "ops".to_string(),
+                "Deref".to_string(),
+            ];
+            let inner_rt = infer_to_rtype_for_check(&other);
+            let candidates = traits::find_assoc_binding(
+                ctx.traits,
+                &inner_rt,
+                &deref_path,
+                "Target",
+            );
+            if candidates.len() == 1 {
+                return Ok(rtype_to_infer(&candidates[0]));
+            }
+            Err(Error {
+                file: ctx.current_file.to_string(),
+                message: format!(
+                    "cannot dereference `{}` — type does not implement `Deref`",
+                    infer_to_string(&other)
+                ),
+                span: deref_expr.span.copy(),
+            })
+        }
     }
 }
 

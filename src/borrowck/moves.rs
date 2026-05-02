@@ -577,7 +577,20 @@ fn apply_operand(
                     }
                 }
             }
-            state.mark(place.clone(), MoveStatus::Moved);
+            // Don't track moves through raw-pointer derefs. Raw
+            // pointers don't carry compile-time ownership info, so
+            // `let v = unsafe { *raw };` followed by another use of
+            // `raw` (e.g. `raw.cast::<U>()`) is sound from the
+            // pointer's perspective — the unsoundness sits in the
+            // user's `unsafe` block, not the borrowck's place model.
+            // Without this skip, after the deref-move on `*raw` the
+            // `raw` ptr itself becomes "moved" via overlap, breaking
+            // legitimate raw-pointer manipulation patterns like
+            // `Box::into_inner` (which reads T off the heap and
+            // then frees the buffer).
+            if !is_through_raw_ptr_deref(place, cfg) {
+                state.mark(place.clone(), MoveStatus::Moved);
+            }
         }
         OperandKind::Copy(place) => {
             check_read(state, place, &op.span, errors, cfg, file);
@@ -607,6 +620,21 @@ fn apply_terminator_reads(
         }
         Terminator::Goto(_) | Terminator::Return | Terminator::Unreachable => {}
     }
+}
+
+// True iff `place` projects through a `Deref` and the projection's
+// root local has type `*const T` / `*mut T`. Used to suppress
+// move-tracking for raw-pointer derefs (raw pointers don't carry
+// ownership, so the user's `unsafe { *raw }` shouldn't poison `raw`
+// for downstream use).
+fn is_through_raw_ptr_deref(place: &super::cfg::Place, cfg: &Cfg) -> bool {
+    if !place.projections.iter().any(|p| matches!(p, super::cfg::Projection::Deref)) {
+        return false;
+    }
+    matches!(
+        cfg.locals[place.root as usize].ty,
+        crate::typeck::RType::RawPtr { .. }
+    )
 }
 
 fn check_read(

@@ -2982,10 +2982,71 @@ fn codegen_deref_assign(
     rhs: &Expr,
 ) -> Result<(), Error> {
     // Compute the address: codegen the deref-inner (pushes i32) and stash.
-    let inner_ty = codegen_expr(ctx, deref_inner)?;
-    let pointee = match &inner_ty {
-        RType::Ref { inner, .. } | RType::RawPtr { inner, .. } => (**inner).clone(),
-        _ => unreachable!("typeck verified deref target is a ref/raw-ptr"),
+    let inner_ty_static = ctx.expr_types[deref_inner.id as usize]
+        .as_ref()
+        .expect("typeck recorded inner type")
+        .clone();
+    let inner_ty_static = substitute_rtype(&inner_ty_static, &ctx.env);
+    let pointee = match &inner_ty_static {
+        RType::Ref { inner, .. } | RType::RawPtr { inner, .. } => {
+            // Built-in: codegen the inner to push the i32 address.
+            let _ = codegen_expr(ctx, deref_inner)?;
+            (**inner).clone()
+        }
+        _ => {
+            // Smart-pointer write via DerefMut. Resolve the impl's
+            // `deref_mut` method, push `&mut deref_inner` as recv,
+            // call it — the result is an i32 address of `Target`.
+            let trait_path = vec![
+                "std".to_string(),
+                "ops".to_string(),
+                "DerefMut".to_string(),
+            ];
+            let resolution =
+                crate::typeck::solve_impl(&trait_path, &inner_ty_static, ctx.traits, 0)
+                    .expect("typeck verified DerefMut impl exists");
+            let cand = crate::typeck::find_trait_impl_method(
+                ctx.funcs,
+                resolution.impl_idx,
+                "deref_mut",
+            )
+            .expect("DerefMut impl provides deref_mut");
+            let callee_idx = match cand {
+                crate::typeck::MethodCandidate::Direct(i) => ctx.funcs.entries[i].idx,
+                crate::typeck::MethodCandidate::Template(i) => {
+                    let tmpl = &ctx.funcs.templates[i];
+                    let mut concrete: Vec<RType> = Vec::new();
+                    let mut k = 0;
+                    while k < tmpl.type_params.len() {
+                        let name = &tmpl.type_params[k];
+                        let mut found: Option<RType> = None;
+                        let mut j = 0;
+                        while j < resolution.subst.len() {
+                            if resolution.subst[j].0 == *name {
+                                found = Some(resolution.subst[j].1.clone());
+                                break;
+                            }
+                            j += 1;
+                        }
+                        concrete.push(found.expect("impl param bound by subst"));
+                        k += 1;
+                    }
+                    ctx.mono.intern(i, concrete)
+                }
+            };
+            let target_rt = crate::typeck::find_assoc_binding(
+                ctx.traits,
+                &inner_ty_static,
+                &vec!["std".to_string(), "ops".to_string(), "Deref".to_string()],
+                "Target",
+            )
+            .into_iter()
+            .next()
+            .expect("typeck verified Target binding");
+            codegen_borrow(ctx, deref_inner, true)?;
+            ctx.instructions.push(wasm::Instruction::Call(callee_idx));
+            target_rt
+        }
     };
     let addr_local = ctx.next_wasm_local;
     ctx.extra_locals.push(wasm::ValType::I32);
@@ -6315,14 +6376,24 @@ fn ref_pointee_addr_local(ctx: &mut FnCtx, binding_idx: usize) -> u32 {
 }
 
 fn codegen_deref(ctx: &mut FnCtx, inner: &Expr) -> Result<RType, Error> {
-    // Inner produces an i32 address. Stash it, then load each leaf of the
-    // pointee type from address+leaf_offset.
+    // Compute the static type of `inner` (without evaluating it
+    // first, so we can dispatch on whether it's a built-in ref/ptr
+    // vs. a smart-pointer that goes through `Deref::deref`).
+    let inner_ty_static = ctx.expr_types[inner.id as usize]
+        .as_ref()
+        .expect("typeck recorded inner type")
+        .clone();
+    let inner_ty_static = substitute_rtype(&inner_ty_static, &ctx.env);
+    match &inner_ty_static {
+        RType::Ref { .. } | RType::RawPtr { .. } => {}
+        _ => return codegen_deref_via_trait(ctx, inner, &inner_ty_static, false),
+    }
+    // Built-in ref/ptr deref: inner produces an i32 address; stash and load.
     let inner_ty = codegen_expr(ctx, inner)?;
     let pointee = match &inner_ty {
         RType::Ref { inner, .. } | RType::RawPtr { inner, .. } => (**inner).clone(),
         _ => unreachable!("typeck rejects deref of non-reference"),
     };
-    // Stash the address in a fresh i32 local so we can reuse it across leaves.
     let addr_local = ctx.next_wasm_local;
     ctx.extra_locals.push(wasm::ValType::I32);
     ctx.next_wasm_local += 1;
@@ -6330,6 +6401,72 @@ fn codegen_deref(ctx: &mut FnCtx, inner: &Expr) -> Result<RType, Error> {
         .push(wasm::Instruction::LocalSet(addr_local));
     load_flat_from_memory(ctx, &pointee, BaseAddr::WasmLocal(addr_local), 0);
     Ok(pointee)
+}
+
+// Smart-pointer deref via `Deref::deref(&inner)` (or
+// `DerefMut::deref_mut(&mut inner)` when `mutable` is true). The
+// trait method returns `&Target` / `&mut Target` — an i32 address —
+// from which we then load the Target leaves.
+fn codegen_deref_via_trait(
+    ctx: &mut FnCtx,
+    inner: &Expr,
+    inner_ty_static: &RType,
+    mutable: bool,
+) -> Result<RType, Error> {
+    let trait_path: Vec<String> = if mutable {
+        vec!["std".to_string(), "ops".to_string(), "DerefMut".to_string()]
+    } else {
+        vec!["std".to_string(), "ops".to_string(), "Deref".to_string()]
+    };
+    let method_name = if mutable { "deref_mut" } else { "deref" };
+    let resolution = crate::typeck::solve_impl(&trait_path, inner_ty_static, ctx.traits, 0)
+        .expect("typeck verified Deref impl exists");
+    let cand = crate::typeck::find_trait_impl_method(ctx.funcs, resolution.impl_idx, method_name)
+        .expect("Deref impl provides the trait method");
+    let callee_idx = match cand {
+        crate::typeck::MethodCandidate::Direct(i) => ctx.funcs.entries[i].idx,
+        crate::typeck::MethodCandidate::Template(i) => {
+            let tmpl = &ctx.funcs.templates[i];
+            let mut concrete: Vec<RType> = Vec::new();
+            let mut k = 0;
+            while k < tmpl.type_params.len() {
+                let name = &tmpl.type_params[k];
+                let mut found: Option<RType> = None;
+                let mut j = 0;
+                while j < resolution.subst.len() {
+                    if resolution.subst[j].0 == *name {
+                        found = Some(resolution.subst[j].1.clone());
+                        break;
+                    }
+                    j += 1;
+                }
+                concrete.push(found.expect("impl param bound by subst"));
+                k += 1;
+            }
+            ctx.mono.intern(i, concrete)
+        }
+    };
+    // Resolve the Target type from the impl's binding.
+    let target_rt = crate::typeck::find_assoc_binding(
+        ctx.traits,
+        inner_ty_static,
+        &trait_path,
+        "Target",
+    )
+    .into_iter()
+    .next()
+    .expect("typeck verified Target binding");
+    // Push `&inner` (or `&mut inner`) as the recv, then call.
+    codegen_borrow(ctx, inner, mutable)?;
+    ctx.instructions.push(wasm::Instruction::Call(callee_idx));
+    // Stack: i32 address of Target. Stash and load.
+    let addr_local = ctx.next_wasm_local;
+    ctx.extra_locals.push(wasm::ValType::I32);
+    ctx.next_wasm_local += 1;
+    ctx.instructions
+        .push(wasm::Instruction::LocalSet(addr_local));
+    load_flat_from_memory(ctx, &target_rt, BaseAddr::WasmLocal(addr_local), 0);
+    Ok(target_rt)
 }
 
 // ============================================================================

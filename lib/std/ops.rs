@@ -24,6 +24,21 @@ pub trait IndexMut: Index {
     fn index_mut(&mut self, idx: usize) -> &mut Self::Output;
 }
 
+// Smart-pointer dereference. `*box` for a `box: Box<T>` desugars at
+// typeck/codegen to `*Deref::deref(&box)` (where the call returns
+// `&T` and the outer deref reads the T value out). `&*box` and
+// `&mut *box` similarly route through `Deref::deref` / `DerefMut::
+// deref_mut` to produce the inner ref directly. Auto-deref for
+// method dispatch (`box.method()` → `(*box).method()` automatically)
+// is a follow-up — for now use the explicit `*` form.
+pub trait Deref {
+    type Target;
+    fn deref(&self) -> &Self::Target;
+}
+pub trait DerefMut: Deref {
+    fn deref_mut(&mut self) -> &mut Self::Target;
+}
+
 // Rust-style operator-overloading traits. Each binary op is one trait
 // with a `Rhs = Self` default and an `Output` assoc type, so users
 // can write asymmetric operations (e.g. `Vec3 * f32`) without
