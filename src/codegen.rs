@@ -520,6 +520,9 @@ fn collect_leaves(
         RType::AssocProj { .. } => unreachable!(
             "collect_leaves on unresolved associated-type projection — typeck should have concretized"
         ),
+        // `!` has zero leaves — a value of type `!` never exists, so
+        // there's nothing to lay out in memory.
+        RType::Never => {}
     }
 }
 
@@ -1992,7 +1995,10 @@ fn codegen_break(ctx: &mut FnCtx, label: Option<&str>) -> Result<RType, Error> {
     // break_depth (cf depth at loop entry, just before the Block push).
     let br_idx = cur.saturating_sub(break_depth + 1);
     ctx.instructions.push(wasm::Instruction::Br(br_idx));
-    Ok(RType::Tuple(Vec::new()))
+    // `break` has type `!` — wasm validator treats post-Br code as
+    // polymorphic, so a `Br` standing in for any expected result type
+    // (the if/match's BlockType) is accepted.
+    Ok(RType::Never)
 }
 
 fn codegen_continue(ctx: &mut FnCtx, label: Option<&str>) -> Result<RType, Error> {
@@ -2003,7 +2009,7 @@ fn codegen_continue(ctx: &mut FnCtx, label: Option<&str>) -> Result<RType, Error
     let cur = current_cf_depth(ctx);
     let br_idx = cur.saturating_sub(continue_depth + 1);
     ctx.instructions.push(wasm::Instruction::Br(br_idx));
-    Ok(RType::Tuple(Vec::new()))
+    Ok(RType::Never)
 }
 
 fn find_loop_frame(ctx: &FnCtx, label: Option<&str>) -> Option<(usize, usize)> {

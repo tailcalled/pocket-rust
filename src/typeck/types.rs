@@ -155,6 +155,14 @@ pub enum RType {
     // type level so users get `&str` in error messages and so future UTF-8
     // invariants can attach here. Same DST rules as `Slice`.
     Str,
+    // `!` — the never type. Has no inhabitants. Coerces freely to any
+    // other type at unification time so `break`/`continue`/`return`
+    // (and calls to functions returning `!`) can sit as one arm of an
+    // `if`/`match` whose other arm yields a real value, with the
+    // construct typed as the real value's type. Codegen treats Never
+    // as zero-sized / no-flat-scalars (its expressions never produce
+    // a wasm value — they emit `br` / `unreachable` / etc.).
+    Never,
     // Associated-type projection: `Self::Item` or `T::Item` in source.
     // `base` is `Param("Self")` / `Param("T")` until substitution lands
     // a concrete type; `concretize_assoc_proj` then resolves to the
@@ -261,6 +269,7 @@ pub fn rtype_eq(a: &RType, b: &RType) -> bool {
             RType::AssocProj { base: ba, trait_path: ta, name: na },
             RType::AssocProj { base: bb, trait_path: tb, name: nb },
         ) => ta == tb && na == nb && rtype_eq(ba, bb),
+        (RType::Never, RType::Never) => true,
         _ => false,
     }
 }
@@ -342,6 +351,7 @@ pub fn rtype_to_string(t: &RType) -> String {
         RType::AssocProj { base, name, .. } => {
             format!("<{} as ?>::{}", rtype_to_string(base), name)
         }
+        RType::Never => "!".to_string(),
     }
 }
 
@@ -389,6 +399,12 @@ pub fn rtype_size(ty: &RType, structs: &StructTable) -> u32 {
         RType::AssocProj { .. } => unreachable!(
             "rtype_size called on unresolved associated-type projection"
         ),
+        // `!` has no inhabitants; a value of type `!` never exists at
+        // runtime. Treat as zero-sized for the rare case it appears in
+        // a layout (e.g. `(u32, !)` is theoretically size 4); in
+        // practice expressions of type `!` divert via br / unreachable
+        // before any storage layout matters.
+        RType::Never => 0,
     }
 }
 
@@ -457,6 +473,10 @@ pub fn flatten_rtype(ty: &RType, structs: &StructTable, out: &mut Vec<crate::was
         RType::AssocProj { .. } => unreachable!(
             "flatten_rtype called on unresolved associated-type projection"
         ),
+        // No flat scalars — `!` has no inhabitants, so a function that
+        // claims to return `!` produces no wasm result. Same shape as
+        // a 0-tuple from the wasm-ABI's perspective.
+        RType::Never => {}
     }
 }
 
@@ -520,6 +540,7 @@ pub fn byte_size_of(rt: &RType, structs: &StructTable, enums: &EnumTable) -> u32
         RType::AssocProj { .. } => unreachable!(
             "byte_size_of called on unresolved associated-type projection"
         ),
+        RType::Never => 0,
     }
 }
 
@@ -625,6 +646,7 @@ pub fn substitute_rtype(rt: &RType, env: &Vec<(String, RType)>) -> RType {
             trait_path: trait_path.clone(),
             name: name.clone(),
         },
+        RType::Never => RType::Never,
     }
 }
 
@@ -673,12 +695,79 @@ pub fn is_raw_ptr(t: &RType) -> bool {
     matches!(t, RType::RawPtr { .. })
 }
 
+// Whether `t` has no inhabitants — i.e. no value of type `t` can ever
+// exist. `!` is the canonical uninhabited type; a tuple/struct with
+// any uninhabited field is uninhabited (constructing it would require
+// a value of that field's type); an enum is uninhabited iff *every*
+// variant's payload is uninhabited (no variant can be constructed).
+// References and raw pointers are treated as inhabited regardless of
+// pointee — practically irrelevant for our use cases (`&!` doesn't
+// arise in valid programs). Used by match-exhaustiveness to skip
+// uninconstructable variants like `Err(!)` in `Result<T, !>`.
+pub fn is_uninhabited(
+    t: &RType,
+    structs: &StructTable,
+    enums: &EnumTable,
+) -> bool {
+    match t {
+        RType::Never => true,
+        RType::Tuple(elems) => elems.iter().any(|e| is_uninhabited(e, structs, enums)),
+        RType::Struct { path, type_args, .. } => {
+            let entry = match struct_lookup(structs, path) {
+                Some(e) => e,
+                None => return false,
+            };
+            let env = struct_env(&entry.type_params, type_args);
+            entry.fields.iter().any(|f| {
+                let fty = substitute_rtype(&f.ty, &env);
+                is_uninhabited(&fty, structs, enums)
+            })
+        }
+        RType::Enum { path, type_args, .. } => {
+            let entry = match enum_lookup(enums, path) {
+                Some(e) => e,
+                None => return false,
+            };
+            let env = struct_env(&entry.type_params, type_args);
+            // Enum is uninhabited iff every variant is unconstructable.
+            entry.variants.iter().all(|v| {
+                is_variant_payload_uninhabited(&v.payload, &env, structs, enums)
+            })
+        }
+        // Refs / raw pointers: nominally inhabited (pointer-to-? is
+        // an i32). Other leaf types: inhabited.
+        _ => false,
+    }
+}
+
+// A variant's payload is uninhabited if any field/element is
+// uninhabited. A `Unit` variant is *constructable* (no payload to
+// produce), so always inhabited.
+pub fn is_variant_payload_uninhabited(
+    payload: &VariantPayloadResolved,
+    env: &Vec<(String, RType)>,
+    structs: &StructTable,
+    enums: &EnumTable,
+) -> bool {
+    match payload {
+        VariantPayloadResolved::Unit => false,
+        VariantPayloadResolved::Tuple(types) => types.iter().any(|t| {
+            let ty = substitute_rtype(t, env);
+            is_uninhabited(&ty, structs, enums)
+        }),
+        VariantPayloadResolved::Struct(fields) => fields.iter().any(|f| {
+            let ty = substitute_rtype(&f.ty, env);
+            is_uninhabited(&ty, structs, enums)
+        }),
+    }
+}
+
 // Whether `t` is `Sized` — i.e. has a known compile-time size. The two
 // DSTs in pocket-rust are `str` and `[T]`; everything else is Sized
 // (refs/pointers to DSTs are Sized — a `&str` is two i32s). A `Param`
 // is conservatively treated as Sized: every type-param implicitly
 // carries a `T: Sized` bound, so a binding to a non-Sized type is
-// rejected at unification (see `bind_var`).
+// rejected at unification (see `bind_var`). `!` is Sized (zero-sized).
 pub fn is_sized(t: &RType) -> bool {
     !matches!(t, RType::Slice(_) | RType::Str)
 }

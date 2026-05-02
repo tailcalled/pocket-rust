@@ -73,6 +73,30 @@ impl<T, E> Result<T, E> {
     }
 }
 
+// `Result<T, !>::into_ok` — when the error type is `!` (uninhabited),
+// an `Err` variant can never be constructed. Calling `into_ok`
+// extracts the `Ok` payload without needing to handle errors.
+// Exhaustiveness sees the Err arm as uninhabited (its payload is `!`)
+// and accepts the match without it.
+impl<T> Result<T, !> {
+    pub fn into_ok(self) -> T {
+        match self {
+            Result::Ok(v) => v,
+        }
+    }
+}
+
+// `Result<!, E>::into_err` — symmetric: when the ok type is `!`, the
+// `Ok` variant can't be constructed, and the match needs only the Err
+// arm.
+impl<E> Result<!, E> {
+    pub fn into_err(self) -> E {
+        match self {
+            Result::Err(e) => e,
+        }
+    }
+}
+
 // `Result<Result<T, E>, E>::flatten` — `Ok(Ok(x))` → `Ok(x)`,
 // `Ok(Err(e))` / `Err(e)` → `Err(e)`. Same shape as
 // `Option<Option<T>>::flatten`. The inner and outer `Err` types must
@@ -114,7 +138,6 @@ impl<T, E> Result<Option<T>, E> {
 // TODO: expect(self, msg) / expect_err(self, msg) — need `&str` plumbing and a panic primitive (currently no `unreachable!` / `panic!` in pocket-rust).
 // TODO: inspect(self, f) / inspect_err(self, f) — need closures.
 // TODO: into_iter(self) / iter(&self) / iter_mut(&mut self) — need iterator traits.
-// TODO: into_ok(self) / into_err(self) — need the `!` (never) type so the conversion only typechecks when one side can't occur.
 // TODO: is_err_and(self, f) / is_ok_and(self, f) — need closures.
 // TODO: map(self, f: F) / map_err(self, f) — need closures (`F: FnOnce(T) -> U`).
 // TODO: map_or(self, default, f) / map_or_else(self, default_f, f) — need closures.

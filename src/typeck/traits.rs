@@ -464,6 +464,7 @@ fn try_match_rtype_ctx(
             },
         ) => ma == mb && try_match_rtype_ctx(ia, ib, subst, false),
         (RType::Bool, RType::Bool) => true,
+        (RType::Never, RType::Never) => true,
         (RType::Tuple(a), RType::Tuple(b)) => {
             if a.len() != b.len() {
                 return false;
@@ -660,6 +661,9 @@ fn try_match_against_infer_ctx(
         // projection resolved before reaching dispatch. Conservative
         // false — caller eagerly concretizes or rejects upstream.
         RType::AssocProj { .. } => false,
+        // An impl pattern of `!` only matches `!` (no inhabitants
+        // means there's nothing else `!` should be picked up by).
+        RType::Never => matches!(resolved, InferType::Never),
     }
 }
 pub fn find_trait_impl_idx_by_span(

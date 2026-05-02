@@ -407,6 +407,8 @@ fn rtype_contains_ref(t: &crate::typeck::RType) -> bool {
         // typeck either resolves them to a concrete type or rejects.
         // Conservative: treat as ref-bearing to avoid over-pruning.
         RType::AssocProj { .. } => true,
+        // `!` has no inhabitants — no borrows ever attach to it.
+        RType::Never => false,
     }
 }
 

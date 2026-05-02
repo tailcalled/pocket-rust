@@ -1122,6 +1122,15 @@ impl Parser {
             // a parenthesized `(T)`.
             return self.parse_tuple_type();
         }
+        if self.peek_kind(&TokenKind::Bang) {
+            // `!` — the never type. Bare bang in type position only.
+            let span = self.tokens[self.pos].span.copy();
+            self.pos += 1;
+            return Ok(Type {
+                kind: TypeKind::Never,
+                span,
+            });
+        }
         if self.peek_kind(&TokenKind::SelfUpper) {
             // Bare `Self` → SelfType. `Self::Name` → fall through to
             // path parsing (`parse_path_with_type_args` handles the

@@ -98,5 +98,5 @@ impl<T> Option<Option<T>> {
 // TODO: replace(&mut self, value) — needs `mem::replace`.
 // TODO: take(&mut self) — needs `mem::replace`.
 // TODO: transpose(self) — needs `Result<T, E>`.
-// TODO: unwrap(self) / unwrap_or_else(self, f) — `unwrap` needs a panic primitive (or `¤unreachable::<T>()` plus the never type to type the None arm); `_or_else` additionally needs closures.
+// TODO: unwrap(self) / unwrap_or_else(self, f) — `unwrap` needs a panic primitive (or a `¤unreachable::<T>()` builtin to type the None arm; the never type itself is now in place, what's missing is a user-callable intrinsic that emits the wasm `unreachable` instruction with a typed return); `_or_else` additionally needs closures.
 // TODO: unwrap_or_default(self) — needs the `Default` trait.

@@ -7,6 +7,7 @@ mod types;
 pub use types::{
     IntKind, LifetimeRepr, RType, byte_size_of, copy_trait_path, drop_trait_path, num_trait_path, flatten_rtype,
     int_kind_name, is_copy, is_copy_with_bounds, is_drop, is_raw_ptr, is_ref_mutable, is_sized,
+    is_uninhabited, is_variant_payload_uninhabited,
     outer_lifetime, rtype_eq, rtype_to_string, substitute_rtype,
 };
 use types::{int_kind_from_name, int_kind_max, int_kind_neg_magnitude, int_kind_signed, struct_env};
@@ -41,15 +42,16 @@ fn satisfies_num(
         | InferType::Enum { .. }
         | InferType::Slice(_)
         | InferType::Str
-        | InferType::AssocProj { .. } => false,
+        | InferType::AssocProj { .. }
+        | InferType::Never => false,
     }
 }
 
 // Whether `t` (an InferType, possibly partially resolved) is `Sized`.
 // `Slice(_)` and `Str` are unsized; everything else, including refs to
-// DSTs and unresolved Vars/Params, is treated as Sized. (A Var that
-// later resolves to a DST is unrealistic in practice — DSTs don't
-// arise from inference, only from explicit user-written types.)
+// DSTs, unresolved Vars/Params, and `!` (zero-sized), is treated as
+// Sized. (A Var that later resolves to a DST is unrealistic in
+// practice — DSTs don't arise from inference.)
 pub(crate) fn is_sized_infer(t: &InferType) -> bool {
     !matches!(t, InferType::Slice(_) | InferType::Str)
 }
@@ -242,6 +244,7 @@ pub(crate) fn infer_to_rtype_for_check(t: &InferType) -> RType {
             trait_path: trait_path.clone(),
             name: name.clone(),
         },
+        InferType::Never => RType::Never,
     }
 }
 
@@ -370,6 +373,11 @@ pub(crate) enum InferType {
         trait_path: Vec<String>,
         name: String,
     },
+    // `!` — InferType counterpart of `RType::Never`. Coerces freely:
+    // `unify(Never, _)` succeeds without binding so the other side's
+    // inference proceeds. Produced by `break`/`continue`/`return`
+    // typecheckers and by calls to functions with `!` return type.
+    Never,
 }
 
 // Build a name → InferType env from a generic struct/template's type-param
@@ -446,6 +454,7 @@ pub(crate) fn rtype_to_infer(rt: &RType) -> InferType {
             trait_path: trait_path.clone(),
             name: name.clone(),
         },
+        RType::Never => InferType::Never,
     }
 }
 
@@ -518,6 +527,7 @@ pub(crate) fn infer_substitute(t: &InferType, env: &Vec<(String, InferType)>) ->
             trait_path: trait_path.clone(),
             name: name.clone(),
         },
+        InferType::Never => InferType::Never,
     }
 }
 
@@ -598,6 +608,7 @@ pub(crate) fn infer_to_string(t: &InferType) -> String {
         InferType::AssocProj { base, name, .. } => {
             format!("<{} as ?>::{}", infer_to_string(base), name)
         }
+        InferType::Never => "!".to_string(),
     }
 }
 
@@ -688,6 +699,7 @@ impl Subst {
                 trait_path: trait_path.clone(),
                 name: name.clone(),
             },
+            InferType::Never => InferType::Never,
         }
     }
 
@@ -735,6 +747,16 @@ impl Subst {
         let a = self.substitute(a);
         let b = self.substitute(b);
         match (a, b) {
+            // `!` (Never) coerces to every type. Unifying with Never on
+            // either side succeeds without binding — the other side's
+            // inference proceeds unaffected. This must be checked
+            // *before* the (Var, _) / (_, Var) arms, otherwise binding
+            // a num-lit Var against Never goes through `bind_var`'s
+            // `satisfies_num(Never)` check and fails. Lets e.g.
+            // `if cond { break } else { 42 }` type as `i32`: the if's
+            // result var unifies first with the then-arm's `!` (no-op)
+            // then with the else-arm's i32 var (binds the result).
+            (InferType::Never, _) | (_, InferType::Never) => Ok(()),
             (InferType::Var(va), InferType::Var(vb)) => {
                 if va == vb {
                     Ok(())
@@ -1046,6 +1068,7 @@ impl Subst {
                 trait_path,
                 name,
             },
+            InferType::Never => RType::Never,
         }
     }
 }
@@ -2195,13 +2218,13 @@ fn check_expr_inner(ctx: &mut CheckCtx, expr: &Expr) -> Result<InferType, Error>
         ExprKind::While(w) => check_while_expr(ctx, w, expr),
         ExprKind::Break { label, label_span } => {
             check_loop_label(ctx, label, label_span, &expr.span)?;
-            // `break` evaluates to `()` in pocket-rust (no `!` type
-            // yet); the surrounding context typically discards it.
-            Ok(InferType::Tuple(Vec::new()))
+            // `break` diverges — type as `!` so it can sit as one arm
+            // of an `if`/`match` whose other arm yields a real value.
+            Ok(InferType::Never)
         }
         ExprKind::Continue { label, label_span } => {
             check_loop_label(ctx, label, label_span, &expr.span)?;
-            Ok(InferType::Tuple(Vec::new()))
+            Ok(InferType::Never)
         }
     }
 }

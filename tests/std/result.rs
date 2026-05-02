@@ -96,6 +96,55 @@ fn result_transpose_err_returns_42() {
     expect_answer("std/result/transpose_err", 42u32);
 }
 
+// `Result<T, !>::into_ok` — Err arm is uninhabited, exhaustiveness
+// skips it, the Ok arm extracts the value.
+#[test]
+fn result_into_ok_returns_42() {
+    expect_answer("std/result/into_ok", 42u32);
+}
+
+// `Result<!, E>::into_err` — symmetric: Ok arm is uninhabited.
+#[test]
+fn result_into_err_returns_42() {
+    expect_answer("std/result/into_err", 42u32);
+}
+
+// Negative: skipping Err in a regular `match` on `Result<u32, u32>`
+// (where E is *not* `!`) is still rejected — uninhabited-skipping
+// only fires when the variant's payload is uninhabited.
+#[test]
+fn result_match_missing_err_arm_inhabited_is_rejected() {
+    let err = compile_source(
+        "fn answer() -> u32 { \
+             let r: Result<u32, u32> = Result::Ok(42); \
+             match r { Result::Ok(v) => v, } \
+         }",
+    );
+    assert!(
+        err.contains("non-exhaustive match"),
+        "expected non-exhaustive-match error, got: {}",
+        err
+    );
+}
+
+// Negative: dispatch sanity — calling `into_ok` on a `Result<T, E>`
+// where E isn't `!` finds no matching impl (the `impl<T> Result<T, !>`
+// pattern requires E exactly `!`).
+#[test]
+fn result_into_ok_on_inhabited_err_is_rejected() {
+    let err = compile_source(
+        "fn answer() -> u32 { \
+             let r: Result<u32, u32> = Result::Ok(42); \
+             r.into_ok() \
+         }",
+    );
+    assert!(
+        err.contains("no method") && err.contains("into_ok"),
+        "expected no-method error, got: {}",
+        err
+    );
+}
+
 // Negative: `Result::flatten` is only defined on `Result<Result<T, E>, E>`
 // — calling it on a singly-nested `Result<T, E>` (where T isn't a
 // Result) hits the second-impl-block constraint and dispatch fails.

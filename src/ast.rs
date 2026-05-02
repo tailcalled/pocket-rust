@@ -257,6 +257,12 @@ pub enum TypeKind {
     // reference (`&[T]` / `&mut [T]`). Bare `[T]` in a position where
     // a sized type is required is rejected at type-resolution time.
     Slice(Box<Type>),
+    // `!` — the never type. Has no inhabitants; produced by `break`,
+    // `continue`, `return`, and calls to functions returning `!`.
+    // Coerces freely to any other type at unification time so that an
+    // arm of an `if`/`match` can `break` while the other arm yields a
+    // real value, with the construct typed as the real value's type.
+    Never,
     // (`str` is a single-segment Path("str") at the AST level — the
     // type-resolver maps it to `RType::Str`. No dedicated AST variant.)
 }

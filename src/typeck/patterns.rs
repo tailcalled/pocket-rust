@@ -883,6 +883,21 @@ fn exhausted(ctx: &CheckCtx, ty: &InferType, pats: &Vec<&Pattern>) -> bool {
             };
             let mut v = 0;
             while v < entry.variants.len() {
+                // Skip variants whose payload is uninhabited (e.g.
+                // `Err(!)` in `Result<T, !>`) — they can never be
+                // constructed, so the match doesn't need to cover
+                // them. This is what lets `impl<T> Result<T, !> { fn
+                // into_ok(self) -> T { match self { Ok(v) => v, } } }`
+                // typecheck without an Err arm.
+                if crate::typeck::is_variant_payload_uninhabited(
+                    &entry.variants[v].payload,
+                    &env,
+                    ctx.structs,
+                    ctx.enums,
+                ) {
+                    v += 1;
+                    continue;
+                }
                 let variant_name = &entry.variants[v].name;
                 if !variant_covered(
                     ctx,

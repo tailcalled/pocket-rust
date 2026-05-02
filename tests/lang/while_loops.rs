@@ -50,3 +50,38 @@ fn while_labeled_continue_returns_3() {
     // each = 3.
     expect_answer("lang/while_loops/while_labeled_continue", 3u32);
 }
+
+// `break` typed as `!` so it can sit in an `if` arm whose other arm
+// yields a real value. Without the never type this would fail to
+// type-check.
+#[test]
+fn while_break_in_if_arm_returns_42() {
+    expect_answer("lang/while_loops/while_break_in_if_arm", 42u32);
+}
+
+// Same shape with `continue` — diverges, allowing the if's type to
+// be the else arm's type.
+#[test]
+fn while_continue_in_if_arm_returns_42() {
+    expect_answer("lang/while_loops/while_continue_in_if_arm", 42u32);
+}
+
+// `break` in a `match` arm. Match's type is the other arm's u32.
+#[test]
+fn while_break_in_match_arm_returns_42() {
+    expect_answer("lang/while_loops/while_break_in_match_arm", 42u32);
+}
+
+// Negative: `break` outside any loop. Same rule as before — the
+// loop-target lookup fails — but pin it down explicitly.
+#[test]
+fn break_outside_loop_is_rejected() {
+    let err = compile_source(
+        "fn answer() -> u32 { let _x: u32 = if true { break } else { 42 }; 0 }",
+    );
+    assert!(
+        err.contains("break") && (err.contains("outside") || err.contains("not in")),
+        "expected break-outside-loop error, got: {}",
+        err
+    );
+}

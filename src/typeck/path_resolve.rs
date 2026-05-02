@@ -353,6 +353,7 @@ pub fn resolve_type(
             )?;
             Ok(RType::Slice(Box::new(inner_rt)))
         }
+        TypeKind::Never => Ok(RType::Never),
     }
 }
 

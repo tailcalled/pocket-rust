@@ -80,6 +80,7 @@ pub fn freshen_inferred_lifetimes(rt: &mut RType, next_id: &mut u32) {
         RType::Slice(inner) => freshen_inferred_lifetimes(inner, next_id),
         RType::Str => {}
         RType::AssocProj { base, .. } => freshen_inferred_lifetimes(base, next_id),
+        RType::Never => {}
     }
 }
 
@@ -156,6 +157,7 @@ pub fn require_no_inferred_lifetimes(
         RType::Slice(inner) => require_no_inferred_lifetimes(inner, span, file),
         RType::Str => Ok(()),
         RType::AssocProj { base, .. } => require_no_inferred_lifetimes(base, span, file),
+        RType::Never => Ok(()),
     }
 }
 
@@ -216,6 +218,7 @@ pub fn validate_named_lifetimes(
         RType::AssocProj { base, .. } => {
             validate_named_lifetimes(base, lifetime_params, span, file)
         }
+        RType::Never => Ok(()),
     }
 }
 
