@@ -106,4 +106,5 @@ mod drop;
 mod num;
 mod option;
 mod pointer;
+mod result;
 mod vec;
