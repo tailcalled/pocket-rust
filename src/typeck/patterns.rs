@@ -752,6 +752,19 @@ pub(super) fn check_match_exhaustive(
     }
 }
 
+// True iff `pat` is irrefutable against `ty` — i.e. it's guaranteed
+// to match every value of `ty`. Used by `let PAT = …;` (without
+// `else`) to forbid patterns that could fall through. Reuses the
+// match-exhaustiveness machinery: a single pattern is irrefutable
+// iff it alone exhausts the scrutinee type.
+pub(super) fn pattern_is_irrefutable(
+    ctx: &CheckCtx,
+    ty: &InferType,
+    pat: &Pattern,
+) -> bool {
+    exhausted(ctx, ty, &vec![pat])
+}
+
 // Returns true if the union of `pats` covers every value of `ty`.
 fn exhausted(ctx: &CheckCtx, ty: &InferType, pats: &Vec<&Pattern>) -> bool {
     

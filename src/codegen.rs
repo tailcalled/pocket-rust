@@ -655,6 +655,20 @@ fn walk_block_drop_marks(
                         info.let_addressed[id] = true;
                     }
                 }
+                // Pattern bindings interaction with Drop: if any leaf
+                // binding under the pattern is Drop-typed, the scope-end
+                // drop machinery needs an address for it. Tuple
+                // destructure (`let (a, b) = …;`) routes through the
+                // let_addressed path — frame-spilling the whole tuple
+                // and addressing each binding at a sub-offset. let-else
+                // routes through codegen_pattern, which honors
+                // pattern_addressed[leaf.id] per leaf.
+                if let_pattern_has_drop_leaf(&ls.pattern, expr_types, traits) {
+                    info.let_addressed[id] = true;
+                }
+                if ls.else_block.is_some() {
+                    auto_address_drop_pattern_bindings(&ls.pattern, expr_types, traits, info);
+                }
                 walk_expr_drop_marks(&ls.value, expr_types, traits, info);
             }
             Stmt::Assign(a) => {
@@ -668,6 +682,98 @@ fn walk_block_drop_marks(
     }
     if let Some(t) = &block.tail {
         walk_expr_drop_marks(t, expr_types, traits, info);
+    }
+}
+
+// True iff any leaf Binding under `pat` resolves to a Drop type.
+// Used by walk_block_drop_marks to decide whether a let-stmt's
+// value needs frame-spilling (so each destructured binding has an
+// address for scope-end Drop::drop calls).
+fn let_pattern_has_drop_leaf(
+    pat: &crate::ast::Pattern,
+    expr_types: &Vec<Option<RType>>,
+    traits: &crate::typeck::TraitTable,
+) -> bool {
+    use crate::ast::PatternKind;
+    match &pat.kind {
+        PatternKind::Binding { .. } | PatternKind::At { .. } => {
+            let id = pat.id as usize;
+            if let Some(rt) = expr_types.get(id).and_then(|o| o.as_ref()) {
+                return crate::typeck::is_drop(rt, traits);
+            }
+            false
+        }
+        PatternKind::Tuple(elems) | PatternKind::VariantTuple { elems, .. } => {
+            let mut i = 0;
+            while i < elems.len() {
+                if let_pattern_has_drop_leaf(&elems[i], expr_types, traits) {
+                    return true;
+                }
+                i += 1;
+            }
+            false
+        }
+        PatternKind::Ref { inner, .. } => let_pattern_has_drop_leaf(inner, expr_types, traits),
+        PatternKind::VariantStruct { fields, .. } => {
+            let mut i = 0;
+            while i < fields.len() {
+                if let_pattern_has_drop_leaf(&fields[i].pattern, expr_types, traits) {
+                    return true;
+                }
+                i += 1;
+            }
+            false
+        }
+        _ => false,
+    }
+}
+
+// Walk a let-else (or match-arm) pattern and mark each Drop-typed
+// leaf Binding as pattern_addressed so codegen_pattern allocates
+// a shadow-stack slot for it. Without this, the binding lives in
+// wasm locals and emit_drops_for_locals_range silently skips it.
+fn auto_address_drop_pattern_bindings(
+    pat: &crate::ast::Pattern,
+    expr_types: &Vec<Option<RType>>,
+    traits: &crate::typeck::TraitTable,
+    info: &mut AddressInfo,
+) {
+    use crate::ast::PatternKind;
+    let id = pat.id as usize;
+    match &pat.kind {
+        PatternKind::Binding { .. } => {
+            if let Some(rt) = expr_types.get(id).and_then(|o| o.as_ref()) {
+                if crate::typeck::is_drop(rt, traits) && id < info.pattern_addressed.len() {
+                    info.pattern_addressed[id] = true;
+                }
+            }
+        }
+        PatternKind::At { inner, .. } => {
+            if let Some(rt) = expr_types.get(id).and_then(|o| o.as_ref()) {
+                if crate::typeck::is_drop(rt, traits) && id < info.pattern_addressed.len() {
+                    info.pattern_addressed[id] = true;
+                }
+            }
+            auto_address_drop_pattern_bindings(inner, expr_types, traits, info);
+        }
+        PatternKind::Tuple(elems) | PatternKind::VariantTuple { elems, .. } => {
+            let mut i = 0;
+            while i < elems.len() {
+                auto_address_drop_pattern_bindings(&elems[i], expr_types, traits, info);
+                i += 1;
+            }
+        }
+        PatternKind::Ref { inner, .. } => {
+            auto_address_drop_pattern_bindings(inner, expr_types, traits, info);
+        }
+        PatternKind::VariantStruct { fields, .. } => {
+            let mut i = 0;
+            while i < fields.len() {
+                auto_address_drop_pattern_bindings(&fields[i].pattern, expr_types, traits, info);
+                i += 1;
+            }
+        }
+        _ => {}
     }
 }
 
@@ -828,6 +934,40 @@ fn binding_ref_name<'a>(b: &'a BindingRef) -> &'a str {
     }
 }
 
+// Walk a let-stmt's pattern and push each binding onto the addr-
+// analysis stack. For simple `let x = e;` and `let _ = e;` this is
+// one or zero pushes; for tuple destructure each element-binding
+// gets its own entry. All bindings share the same `value_id` so
+// `&binding…` uses inside the let's scope mark the value-side as
+// addressed (the let's value is the storage source).
+fn push_pattern_bindings_for_addr(
+    pat: &crate::ast::Pattern,
+    value_id: u32,
+    stack: &mut Vec<BindingRef>,
+) {
+    use crate::ast::PatternKind;
+    match &pat.kind {
+        PatternKind::Binding { name, .. } => {
+            stack.push(BindingRef::Let(value_id, name.clone()));
+        }
+        PatternKind::Wildcard => {}
+        PatternKind::Tuple(elems) => {
+            let mut i = 0;
+            while i < elems.len() {
+                push_pattern_bindings_for_addr(&elems[i], value_id, stack);
+                i += 1;
+            }
+        }
+        PatternKind::Ref { inner, .. } | PatternKind::At { inner, .. } => {
+            push_pattern_bindings_for_addr(inner, value_id, stack);
+        }
+        // Variant / lit / range patterns only appear in let-else,
+        // which the codegen address pass doesn't need to walk into
+        // (let-else's bindings are scoped after the test).
+        _ => {}
+    }
+}
+
 fn walk_block_addr(
     block: &Block,
     stack: &mut Vec<BindingRef>,
@@ -839,7 +979,10 @@ fn walk_block_addr(
         match &block.stmts[i] {
             Stmt::Let(let_stmt) => {
                 walk_expr_addr(&let_stmt.value, stack, info);
-                stack.push(BindingRef::Let(let_stmt.value.id, let_stmt.name.clone()));
+                // Push every binding the pattern introduces; for the
+                // common `let x = e;` shape this is one entry. Tuple
+                // destructure pushes one per element binding.
+                push_pattern_bindings_for_addr(&let_stmt.pattern, let_stmt.value.id, stack);
             }
             Stmt::Assign(assign) => {
                 walk_expr_addr(&assign.lhs, stack, info);
@@ -2843,9 +2986,15 @@ fn emit_drops_for_locals_range(ctx: &mut FnCtx, from: usize, to: usize) -> Resul
             continue;
         }
         // Drop requires `&mut binding` — only addressed bindings can be
-        // dropped this way. Drop params aren't yet auto-addressed so
-        // they're silently skipped here (a known limitation).
-        if !matches!(&ctx.locals[i].storage, Storage::Memory { .. }) {
+        // dropped this way. Both Storage::Memory (frame slot at known
+        // offset) and Storage::MemoryAt (shadow-stack slot whose addr
+        // lives in a wasm local) are addressable and supported below.
+        // Drop params aren't yet auto-addressed so they're silently
+        // skipped here (a known limitation).
+        if !matches!(
+            &ctx.locals[i].storage,
+            Storage::Memory { .. } | Storage::MemoryAt { .. }
+        ) {
             continue;
         }
         match binding_move_status(&ctx.moved_places, &ctx.locals[i].name) {
@@ -2931,51 +3080,245 @@ fn emit_drop_call_for_local(
             ctx.mono.intern(i, concrete)
         }
     };
-    // Push `&mut binding` — the binding's address in shadow-stack memory.
-    // Use `frame_base_local`, not live `__sp`: by the time scope-end
-    // drops fire, the body may have allocated literal-borrow temps,
-    // sret slots, or enum constructions that drifted `__sp` below the
-    // frame's true base. Spilled bindings sit at fixed offsets
-    // relative to the post-prologue base, captured into
-    // `frame_base_local`.
-    let frame_offset = match &ctx.locals[idx].storage {
-        Storage::Memory { frame_offset } => *frame_offset,
+    // Push `&mut binding` — the binding's address in shadow-stack
+    // memory. Two storage shapes carry an address:
+    //   Storage::Memory   — fixed frame_offset relative to
+    //                       frame_base_local. Use frame_base_local
+    //                       (not live __sp): by the time scope-end
+    //                       drops fire, body may have drifted __sp
+    //                       via literal-borrow temps, sret slots, or
+    //                       enum construction.
+    //   Storage::MemoryAt — addr stashed in a wasm local at the
+    //                       point of binding (used by codegen_pattern
+    //                       for addressed pattern bindings, including
+    //                       Drop bindings auto-addressed by
+    //                       auto_address_drop_pattern_bindings).
+    match &ctx.locals[idx].storage {
+        Storage::Memory { frame_offset } => {
+            let off = *frame_offset;
+            ctx.instructions
+                .push(wasm::Instruction::LocalGet(ctx.frame_base_local));
+            if off != 0 {
+                ctx.instructions.push(wasm::Instruction::I32Const(off as i32));
+                ctx.instructions.push(wasm::Instruction::I32Add);
+            }
+        }
+        Storage::MemoryAt { addr_local } => {
+            ctx.instructions.push(wasm::Instruction::LocalGet(*addr_local));
+        }
         _ => unreachable!("Drop binding must be address-marked"),
-    };
-    ctx.instructions
-        .push(wasm::Instruction::LocalGet(ctx.frame_base_local));
-    if frame_offset != 0 {
-        ctx.instructions
-            .push(wasm::Instruction::I32Const(frame_offset as i32));
-        ctx.instructions.push(wasm::Instruction::I32Add);
     }
     ctx.instructions.push(wasm::Instruction::Call(callee_idx));
     Ok(())
 }
 
 fn codegen_let_stmt(ctx: &mut FnCtx, let_stmt: &LetStmt) -> Result<(), Error> {
-    codegen_expr(ctx, &let_stmt.value)?;
     let value_id = let_stmt.value.id as usize;
     let value_ty = ctx.expr_types[value_id]
         .as_ref()
         .expect("typeck recorded the let's type")
         .clone();
-    let frame_offset_opt = ctx.let_offsets[value_id];
+    // let-else: codegen the value, run the pattern test (using the
+    // existing match/if-let infrastructure); on no-match run the
+    // else-block (which typeck verified diverges); on match the
+    // bindings are written into wasm locals and the function
+    // continues with them in scope.
+    if let Some(else_block) = &let_stmt.else_block {
+        return codegen_let_else(ctx, let_stmt, &value_ty, else_block.as_ref());
+    }
+    // Simple-binding fast path: `let x = e;` / `let mut x = e;`.
+    if let Some((name, _mutable, _name_span)) = crate::ast::let_simple_binding(let_stmt) {
+        return codegen_let_simple_binding(ctx, let_stmt, name, &value_ty);
+    }
+    // Wildcard `let _ = e;` — codegen the expression for its side
+    // effects, drop any flat scalars it produced.
+    if matches!(&let_stmt.pattern.kind, crate::ast::PatternKind::Wildcard) {
+        codegen_expr(ctx, &let_stmt.value)?;
+        let mut vts: Vec<wasm::ValType> = Vec::new();
+        flatten_rtype(&value_ty, ctx.structs, &mut vts);
+        let mut k = 0;
+        while k < vts.len() {
+            ctx.instructions.push(wasm::Instruction::Drop);
+            k += 1;
+        }
+        return Ok(());
+    }
+    // Tuple destructure `let (a, b, …) = e;`. Two paths:
+    //
+    //   (a) Frame-spilled — when escape analysis flagged the let
+    //       value addressed (a `&binding` chain rooted at one of the
+    //       destructured names) or auto-marked it as Drop-bearing
+    //       (any leaf binding's type implements Drop). The whole
+    //       tuple is stored at the let's frame_offset; each element
+    //       binding becomes Storage::Memory at base + sub-offset.
+    //       Drop's scope-end machinery and `&binding` borrows both
+    //       work because each binding has a real address.
+    //
+    //   (b) Wasm-locals fast path — none of the above. Pop the
+    //       value's flat scalars into per-element wasm-local groups
+    //       and register Storage::Local bindings.
+    if let crate::ast::PatternKind::Tuple(elems) = &let_stmt.pattern.kind {
+        let elem_tys = match &value_ty {
+            RType::Tuple(ts) => ts.clone(),
+            _ => unreachable!("typeck verified tuple pattern matches tuple type"),
+        };
+        if elems.len() != elem_tys.len() {
+            unreachable!("typeck verified tuple-pattern arity");
+        }
+        if let Some(base_offset) = ctx.let_offsets[value_id] {
+            codegen_expr(ctx, &let_stmt.value)?;
+            store_flat_to_memory(ctx, &value_ty, BaseAddr::StackPointer, base_offset);
+            let mut elem_offset: u32 = 0;
+            let mut idx = 0;
+            while idx < elems.len() {
+                let elem_size = byte_size_of(&elem_tys[idx], ctx.structs, ctx.enums);
+                match &elems[idx].kind {
+                    crate::ast::PatternKind::Wildcard => {}
+                    crate::ast::PatternKind::Binding { name, .. } => {
+                        ctx.locals.push(LocalBinding {
+                            name: name.clone(),
+                            rtype: elem_tys[idx].clone(),
+                            storage: Storage::Memory {
+                                frame_offset: base_offset + elem_offset,
+                            },
+                        });
+                    }
+                    _ => unimplemented!(
+                        "nested pattern in tuple destructure not yet supported in codegen"
+                    ),
+                }
+                elem_offset += elem_size;
+                idx += 1;
+            }
+            return Ok(());
+        }
+        codegen_expr(ctx, &let_stmt.value)?;
+        // Stack top is the last element's last leaf. Pop into temp
+        // locals in reverse so a "high address = high element"
+        // ordering is preserved.
+        let mut elem_temps: Vec<(u32, u32)> = Vec::new(); // (start, flat_count) per element
+        let mut i = elem_tys.len();
+        while i > 0 {
+            i -= 1;
+            let mut vts: Vec<wasm::ValType> = Vec::new();
+            flatten_rtype(&elem_tys[i], ctx.structs, &mut vts);
+            let start = ctx.next_wasm_local;
+            let mut k = 0;
+            while k < vts.len() {
+                ctx.extra_locals.push(vts[k].copy());
+                ctx.next_wasm_local += 1;
+                k += 1;
+            }
+            // Pop in REVERSE within this element (top = last leaf).
+            let mut j = vts.len();
+            while j > 0 {
+                j -= 1;
+                ctx.instructions.push(wasm::Instruction::LocalSet(start + j as u32));
+            }
+            elem_temps.push((start, vts.len() as u32));
+        }
+        elem_temps.reverse();
+        // For each element pattern, register the binding (or skip
+        // for `_`). Only single-binding / wildcard sub-patterns are
+        // supported at codegen; nested destructure inside tuple
+        // would need recursion (TODO).
+        let mut idx = 0;
+        while idx < elems.len() {
+            let (start, flat_size) = elem_temps[idx];
+            match &elems[idx].kind {
+                crate::ast::PatternKind::Wildcard => {}
+                crate::ast::PatternKind::Binding { name, .. } => {
+                    ctx.locals.push(LocalBinding {
+                        name: name.clone(),
+                        rtype: elem_tys[idx].clone(),
+                        storage: Storage::Local { wasm_start: start, flat_size },
+                    });
+                }
+                _ => unimplemented!(
+                    "nested pattern in tuple destructure not yet supported in codegen"
+                ),
+            }
+            idx += 1;
+        }
+        return Ok(());
+    }
+    unimplemented!(
+        "let-binding pattern not yet supported in codegen: only `let x`, \
+         `let _`, `let mut x`, and tuple destructure of simple bindings work today"
+    );
+}
 
+// `let PAT = EXPR else { … };` lowering. Mirrors `codegen_if_let_expr`
+// but with the polarity flipped (match falls through, no-match
+// runs the diverging else block):
+//
+//   <codegen value into a stashed scrutinee>
+//   block (Empty)            ; outer — control resumes here on match
+//     block (Empty)          ; inner — pattern-test br_if-out lands here
+//       <codegen_pattern>    ; on no-match, br 0 (out of inner)
+//       <bindings live>      ; pushed onto ctx.locals by codegen_pattern
+//       br 1                 ; matched — skip past the else block
+//     end                    ; no-match path lands here
+//     <codegen else block>   ; diverges (typeck-enforced)
+//   end                      ; resumes here only on match
+//
+// After the outer Block ends, ctx.locals carries the new bindings,
+// so the rest of the enclosing block sees them.
+fn codegen_let_else(
+    ctx: &mut FnCtx,
+    let_stmt: &LetStmt,
+    value_ty: &RType,
+    else_block: &Block,
+) -> Result<(), Error> {
+    let _ = codegen_expr(ctx, &let_stmt.value)?;
+    let is_enum_scrut = matches!(value_ty, RType::Enum { .. });
+    let needs_ref_spill = !is_enum_scrut && pattern_uses_ref_binding(&let_stmt.pattern);
+    let storage = if needs_ref_spill {
+        spill_match_scrutinee(ctx, value_ty)
+    } else {
+        stash_match_scrutinee(ctx, value_ty)
+    };
+    ctx.instructions
+        .push(wasm::Instruction::Block(wasm::BlockType::Empty));
+    ctx.instructions
+        .push(wasm::Instruction::Block(wasm::BlockType::Empty));
+    codegen_pattern(ctx, &let_stmt.pattern, value_ty, &storage, 0)?;
+    ctx.instructions.push(wasm::Instruction::Br(1));
+    ctx.instructions.push(wasm::Instruction::End);
+    let _ = codegen_unit_block_stmt(ctx, else_block)?;
+    // typeck enforces the else block diverges; emit `unreachable`
+    // as a safety net for the wasm validator (the End below would
+    // otherwise expect control to land at the outer Block's end
+    // with the right shape).
+    ctx.instructions.push(wasm::Instruction::Unreachable);
+    ctx.instructions.push(wasm::Instruction::End);
+    Ok(())
+}
+
+// The pre-pattern simple-binding lowering, factored out so the
+// pattern-driven `codegen_let_stmt` can call it without reading
+// `let_stmt.name` / `let_stmt.mutable` directly.
+fn codegen_let_simple_binding(
+    ctx: &mut FnCtx,
+    let_stmt: &LetStmt,
+    name: &str,
+    value_ty: &RType,
+) -> Result<(), Error> {
+    codegen_expr(ctx, &let_stmt.value)?;
+    let value_id = let_stmt.value.id as usize;
+    let frame_offset_opt = ctx.let_offsets[value_id];
     match frame_offset_opt {
         Some(frame_offset) => {
-            // Spilled — store flat scalars into memory at SP+frame_offset.
-            store_flat_to_memory(ctx, &value_ty, BaseAddr::StackPointer, frame_offset);
+            store_flat_to_memory(ctx, value_ty, BaseAddr::StackPointer, frame_offset);
             ctx.locals.push(LocalBinding {
-                name: let_stmt.name.clone(),
+                name: name.to_string(),
                 rtype: value_ty.clone(),
                 storage: Storage::Memory { frame_offset },
             });
         }
         None => {
-            // Non-spilled — pop flat scalars into freshly allocated WASM locals.
             let mut vts: Vec<wasm::ValType> = Vec::new();
-            flatten_rtype(&value_ty, ctx.structs, &mut vts);
+            flatten_rtype(value_ty, ctx.structs, &mut vts);
             let flat_size = vts.len() as u32;
             let start = ctx.next_wasm_local;
             let mut k = 0;
@@ -2991,22 +3334,17 @@ fn codegen_let_stmt(ctx: &mut FnCtx, let_stmt: &LetStmt) -> Result<(), Error> {
                 k += 1;
             }
             ctx.locals.push(LocalBinding {
-                name: let_stmt.name.clone(),
+                name: name.to_string(),
                 rtype: value_ty.clone(),
-                storage: Storage::Local {
-                    wasm_start: start,
-                    flat_size,
-                },
+                storage: Storage::Local { wasm_start: start, flat_size },
             });
         }
     }
-    // If this binding ends up MaybeMoved at scope-end, allocate its drop
-    // flag now and init to 1 (the value just landed in storage).
-    if needs_drop_flag(&ctx.moved_places, &let_stmt.name, &value_ty, ctx.traits) {
+    if needs_drop_flag(&ctx.moved_places, name, value_ty, ctx.traits) {
         let flag_idx = ctx.next_wasm_local;
         ctx.extra_locals.push(wasm::ValType::I32);
         ctx.next_wasm_local += 1;
-        ctx.drop_flags.push((let_stmt.name.clone(), flag_idx));
+        ctx.drop_flags.push((name.to_string(), flag_idx));
         ctx.instructions.push(wasm::Instruction::I32Const(1));
         ctx.instructions.push(wasm::Instruction::LocalSet(flag_idx));
     }

@@ -296,13 +296,35 @@ pub enum Stmt {
     Use(UseDecl),
 }
 
+// Helper for downstream passes that want fast access to the
+// "simple `let x` / `let mut x`" common case without walking the
+// pattern. Returns `Some((name, mutable, name_span))` when the
+// pattern is a bare `Binding` (no `ref`, no inner pattern); `None`
+// for wildcards, tuple destructure, etc.
+pub fn let_simple_binding<'a>(ls: &'a LetStmt) -> Option<(&'a str, bool, &'a Span)> {
+    if let PatternKind::Binding { name, name_span, by_ref: false, mutable } = &ls.pattern.kind {
+        Some((name.as_str(), *mutable, name_span))
+    } else {
+        None
+    }
+}
+
 #[derive(Clone)]
 pub struct LetStmt {
-    pub name: String,
-    pub name_span: Span,
-    pub mutable: bool,
+    // Patterns in let: bare-ident `let x = e;` is `Pattern::Binding`,
+    // `let _ = e;` is `Pattern::Wildcard`, `let (a, b) = e;` is
+    // `Pattern::Tuple`. Refutable patterns (variant constructors,
+    // literals, ranges) are only allowed when `else_block` is `Some`
+    // (i.e. let-else).
+    pub pattern: Pattern,
     pub ty: Option<Type>,
     pub value: Expr,
+    // `let PAT = EXPR else { … };` — when `Some`, the pattern may be
+    // refutable; if it doesn't match `EXPR`, the else block runs.
+    // The else block must diverge (`return`, `break`, `continue`,
+    // `panic!()`, …) so control flow can't fall through past a
+    // mismatched binding.
+    pub else_block: Option<Box<Block>>,
 }
 
 #[derive(Clone)]

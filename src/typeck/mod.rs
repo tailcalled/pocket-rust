@@ -1905,6 +1905,30 @@ fn check_block(
 
 // A block always has a type. With a tail expression, it's the tail's
 // type; without one, it's `()` (the empty tuple).
+// True iff `block` contains a statement-level expression that
+// diverges (its expression-type resolves to `!`). Used by let-else
+// to recognize the natural `else { return …; }` form as diverging
+// even though the block's tail-type is `()` — the diverging expr
+// carries a trailing `;`, becoming a Stmt::Expr whose inner
+// expression's recorded type is `!`. Type-driven so future
+// `!`-typed expressions (calls to `!`-returning functions, etc.)
+// are picked up automatically without enumerating ASTNode kinds.
+fn block_has_diverging_stmt(ctx: &CheckCtx, block: &Block) -> bool {
+    let mut i = 0;
+    while i < block.stmts.len() {
+        if let Stmt::Expr(e) = &block.stmts[i] {
+            let id = e.id as usize;
+            if let Some(t) = ctx.expr_infer_types.get(id).and_then(|o| o.as_ref()) {
+                if matches!(ctx.subst.substitute(t), InferType::Never) {
+                    return true;
+                }
+            }
+        }
+        i += 1;
+    }
+    false
+}
+
 fn check_block_inner(ctx: &mut CheckCtx, block: &Block) -> Result<InferType, Error> {
     let mut i = 0;
     while i < block.stmts.len() {
@@ -1982,17 +2006,63 @@ fn check_let_stmt(ctx: &mut CheckCtx, let_stmt: &LetStmt) -> Result<(), Error> {
         }
         None => value_ty,
     };
-    // Overwrite the recorded type at the value expr's id with the final type
-    // (in case an annotation pinned it down). Codegen reads expr_types[value.id]
-    // to size the binding's storage.
+    // Overwrite the recorded type at the value expr's id with the
+    // final type (in case an annotation pinned it down). Codegen
+    // reads expr_types[value.id] to size the binding's storage.
     ctx.expr_infer_types[let_stmt.value.id as usize] = Some(final_ty.clone());
-    ctx.locals.push(LocalEntry {
-        name: let_stmt.name.clone(),
-        ty: final_ty,
-        mutable: let_stmt.mutable,
-    });
+    // Type-check the pattern against the value's type and collect
+    // bindings into `ctx.locals` so subsequent statements can see
+    // them. Refutable patterns require `else` (let-else); the
+    // irrefutability check is shared with match-exhaustiveness — a
+    // single pattern is irrefutable iff it alone exhausts the
+    // scrutinee type, which `pattern_is_irrefutable` decides.
+    let mut bindings: Vec<(String, InferType, Span, bool)> = Vec::new();
+    check_pattern(ctx, &let_stmt.pattern, &final_ty, &mut bindings)?;
+    if let_stmt.else_block.is_none()
+        && !patterns::pattern_is_irrefutable(ctx, &final_ty, &let_stmt.pattern)
+    {
+        return Err(Error {
+            file: ctx.current_file.to_string(),
+            message: "refutable pattern in `let` binding (use `let … else { … }` if the pattern can fail)".to_string(),
+            span: let_stmt.pattern.span.copy(),
+        });
+    }
+    if let Some(else_block) = &let_stmt.else_block {
+        // The else block must diverge. Two cases count: the block's
+        // tail expression is `!`-typed (e.g. `return x` without
+        // trailing `;`), OR one of its statements is a diverging
+        // expression-statement (`return …;`, `break;`, `continue;`,
+        // `panic!(…);`). Without the second case the natural
+        // spelling `else { return 42; }` would be rejected because
+        // a stmt-with-`;` block has tail-type `()`.
+        // The pattern's bindings are NOT in scope inside else.
+        let else_ty = check_block_inner(ctx, else_block.as_ref())?;
+        let resolved = ctx.subst.substitute(&else_ty);
+        let diverges = matches!(resolved, InferType::Never)
+            || block_has_diverging_stmt(ctx, else_block.as_ref());
+        if !diverges {
+            return Err(Error {
+                file: ctx.current_file.to_string(),
+                message: format!(
+                    "`let-else` block must diverge (type `!`), found `{}`",
+                    infer_to_string(&resolved)
+                ),
+                span: else_block.span.copy(),
+            });
+        }
+    }
+    let mut k = 0;
+    while k < bindings.len() {
+        ctx.locals.push(LocalEntry {
+            name: bindings[k].0.clone(),
+            ty: bindings[k].1.clone(),
+            mutable: bindings[k].3,
+        });
+        k += 1;
+    }
     Ok(())
 }
+
 
 fn check_assign_stmt(ctx: &mut CheckCtx, assign: &AssignStmt) -> Result<(), Error> {
     // Two flavors of LHS:

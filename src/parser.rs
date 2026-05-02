@@ -1401,13 +1401,7 @@ impl Parser {
 
     fn parse_let_stmt(&mut self) -> Result<Stmt, Error> {
         self.expect(&TokenKind::Let, "`let`")?;
-        let mutable = if self.peek_kind(&TokenKind::Mut) {
-            self.pos += 1;
-            true
-        } else {
-            false
-        };
-        let (name, name_span) = self.expect_ident()?;
+        let pattern = self.parse_pattern()?;
         let ty = if self.peek_kind(&TokenKind::Colon) {
             self.pos += 1;
             Some(self.parse_type()?)
@@ -1416,13 +1410,22 @@ impl Parser {
         };
         self.expect(&TokenKind::Eq, "`=`")?;
         let value = self.parse_expr()?;
+        // `let PAT = EXPR else { … };` (let-else). The else block
+        // must diverge — that's enforced at typeck via the block's
+        // type unifying with `!`.
+        let else_block = if self.peek_kind(&TokenKind::Else) {
+            self.pos += 1;
+            let blk = self.parse_block()?;
+            Some(Box::new(blk))
+        } else {
+            None
+        };
         self.expect(&TokenKind::Semi, "`;`")?;
         Ok(Stmt::Let(LetStmt {
-            name,
-            name_span,
-            mutable,
+            pattern,
             ty,
             value,
+            else_block,
         }))
     }
 
@@ -2669,12 +2672,24 @@ impl Parser {
                 id,
             }
         };
+        // Synthetic `let mut __pr_vec_<id> = Vec::new();` —
+        // construct a `Pattern::Binding` with mutable=true.
+        let pat_id = self.alloc_node_id();
+        let pat = Pattern {
+            kind: PatternKind::Binding {
+                name: var_name.clone(),
+                name_span: span.copy(),
+                by_ref: false,
+                mutable: true,
+            },
+            span: span.copy(),
+            id: pat_id,
+        };
         let let_stmt = Stmt::Let(LetStmt {
-            name: var_name.clone(),
-            name_span: span.copy(),
-            mutable: true,
+            pattern: pat,
             ty: None,
             value: new_call,
+            else_block: None,
         });
         let mut stmts: Vec<Stmt> = vec![let_stmt];
         let mut i = 0;

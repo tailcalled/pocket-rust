@@ -242,17 +242,53 @@ impl<'a> Builder<'a> {
 
     fn lower_let(&mut self, ls: &LetStmt) {
         let ty = self.expr_type(ls.value.id);
-        let id = self.alloc_local(
-            Some(ls.name.clone()),
-            ty.clone(),
-            ls.name_span.copy(),
-            ls.mutable,
-            false,
-        );
-        self.push_stmt(CfgStmtKind::StorageLive(id), ls.name_span.copy());
-        let place = local_place(id);
-        self.lower_expr_into(&ls.value, place);
-        self.bind_name(&ls.name, id);
+        // Simple-binding fast path: `let x = e;` / `let mut x = e;`.
+        // Tuple/struct destructure and let-else go through the
+        // pattern-binding path below.
+        if let Some((name, mutable, name_span)) = crate::ast::let_simple_binding(ls) {
+            let id = self.alloc_local(
+                Some(name.to_string()),
+                ty.clone(),
+                name_span.copy(),
+                mutable,
+                false,
+            );
+            self.push_stmt(CfgStmtKind::StorageLive(id), name_span.copy());
+            let place = local_place(id);
+            self.lower_expr_into(&ls.value, place);
+            self.bind_name(name, id);
+            return;
+        }
+        // General pattern: lower the value into a temp, then walk
+        // the pattern to bind sub-places. (let-else, tuple destructure,
+        // wildcard `let _ = e;`, etc.) Note: we rely on typeck having
+        // rejected refutable patterns without a let-else.
+        let scrut = self.alloc_temp(ty.clone(), ls.value.span.copy());
+        self.push_stmt(CfgStmtKind::StorageLive(scrut), ls.value.span.copy());
+        self.lower_expr_into(&ls.value, local_place(scrut));
+        let scrut_place = local_place(scrut);
+        // For let-else: emit a pattern test; on no-match, lower the
+        // else-block (which must diverge per typeck) so we never fall
+        // through.
+        if let Some(else_block) = &ls.else_block {
+            let then_block = self.new_block();
+            let else_target = self.new_block();
+            self.lower_pattern_test(
+                &ls.pattern,
+                &scrut_place,
+                &ty,
+                then_block,
+                else_target,
+            );
+            self.current_block = else_target;
+            self.lower_block(else_block.as_ref(), None);
+            // Else block diverges (typeck-enforced) — but emit a
+            // safety terminator in case lowering didn't already.
+            self.set_terminator(super::cfg::Terminator::Unreachable);
+            self.current_block = then_block;
+        }
+        let bindings = self.collect_pattern_bindings(&ls.pattern, &scrut_place, &ty);
+        self.materialize_bindings(&bindings);
     }
 
     fn lower_assign(&mut self, a: &AssignStmt) {
