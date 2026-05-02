@@ -17,6 +17,7 @@ pub enum TokenKind {
     Impl,
     Trait,
     For,
+    In,
     SelfLower,
     SelfUpper,
     If,
@@ -137,6 +138,7 @@ pub fn token_kind_name(t: &TokenKind) -> &'static str {
         TokenKind::Return => "`return`",
         TokenKind::Question => "`?`",
         TokenKind::For => "`for`",
+        TokenKind::In => "`in`",
         TokenKind::SelfLower => "`self`",
         TokenKind::SelfUpper => "`Self`",
         TokenKind::If => "`if`",
@@ -289,6 +291,11 @@ pub fn tokenize(file: &str, source: &str) -> Result<Vec<Token>, Error> {
             } else if text == "for" {
                 tokens.push(Token {
                     kind: TokenKind::For,
+                    span,
+                });
+            } else if text == "in" {
+                tokens.push(Token {
+                    kind: TokenKind::In,
                     span,
                 });
             } else if text == "self" {

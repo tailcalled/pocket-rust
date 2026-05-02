@@ -7,6 +7,7 @@ pub mod result;
 pub mod primitive;
 pub mod vec;
 pub mod boxed;
+pub mod iter;
 pub mod dummy;
 
 pub use crate::marker::Copy;
@@ -35,3 +36,4 @@ pub use crate::option::Option;
 pub use crate::result::Result;
 pub use crate::vec::Vec;
 pub use crate::boxed::Box;
+pub use crate::iter::Iterator;

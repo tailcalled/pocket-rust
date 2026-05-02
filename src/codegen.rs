@@ -752,6 +752,10 @@ fn walk_expr_drop_marks(
             walk_expr_drop_marks(&w.cond, expr_types, traits, info);
             walk_block_drop_marks(w.body.as_ref(), expr_types, traits, info);
         }
+        ExprKind::For(f) => {
+            walk_expr_drop_marks(&f.iter, expr_types, traits, info);
+            walk_block_drop_marks(f.body.as_ref(), expr_types, traits, info);
+        }
         ExprKind::Break { .. } | ExprKind::Continue { .. } => {}
         ExprKind::Return { value } => {
             if let Some(v) = value {
@@ -981,6 +985,22 @@ fn walk_expr_addr(
         ExprKind::While(w) => {
             walk_expr_addr(&w.cond, stack, info);
             walk_block_addr(w.body.as_ref(), stack, info);
+        }
+        ExprKind::For(f) => {
+            walk_expr_addr(&f.iter, stack, info);
+            // Push the pattern's binding so `&binding…` chains in the
+            // body mark the binding as addressed (so codegen spills
+            // it to the shadow stack instead of wasm locals — needed
+            // for `for x in iter { … x.method() … }` where `x.method`
+            // takes `&x` for an `&self` call).
+            let mark = stack.len();
+            if let crate::ast::PatternKind::Binding { name, .. } = &f.pattern.kind {
+                stack.push(BindingRef::Pattern(f.pattern.id, name.clone()));
+            }
+            walk_block_addr(f.body.as_ref(), stack, info);
+            while stack.len() > mark {
+                stack.pop();
+            }
         }
         ExprKind::Break { .. } | ExprKind::Continue { .. } => {}
         ExprKind::Return { value } => {
@@ -1462,6 +1482,10 @@ fn collect_lets_in_expr(expr: &Expr, out: &mut Vec<u32>) {
         ExprKind::While(w) => {
             collect_lets_in_expr(&w.cond, out);
             collect_let_value_ids(w.body.as_ref(), out);
+        }
+        ExprKind::For(f) => {
+            collect_lets_in_expr(&f.iter, out);
+            collect_let_value_ids(f.body.as_ref(), out);
         }
         ExprKind::Break { .. } | ExprKind::Continue { .. } => {}
         ExprKind::Return { value } => {
@@ -2028,6 +2052,15 @@ fn codegen_unit_block_stmt(ctx: &mut FnCtx, block: &Block) -> Result<(), Error> 
         }
         i += 1;
     }
+    // Unit-typed blocks can still have a tail expression — happens
+    // when the last expression is one of the unit-block-like forms
+    // (`if`, `match`, `while`, `for`, …) used without a trailing `;`.
+    // Codegen the tail as if it were an expression statement: push
+    // its scalars on the wasm stack and drop them. Without this,
+    // a tail `for x in iter { … }` would silently never run.
+    if let Some(tail) = &block.tail {
+        codegen_expr_stmt(ctx, tail)?;
+    }
     // T4: drop in-scope Drop-typed bindings in reverse declaration order
     // before truncating the locals stack.
     emit_drops_for_locals_range(ctx, mark, ctx.locals.len())?;
@@ -2107,6 +2140,298 @@ fn codegen_while_expr(ctx: &mut FnCtx, w: &crate::ast::WhileExpr) -> Result<RTyp
 
     ctx.instructions.push(wasm::Instruction::End); // close Loop
     ctx.instructions.push(wasm::Instruction::End); // close Block
+
+    Ok(RType::Tuple(Vec::new()))
+}
+
+// `for pat in iter { body }` — emit equivalent of:
+//
+//   let mut __iter = iter;
+//   loop {
+//       let __opt: Option<Item> = Iterator::next(&mut __iter);
+//       match __opt {
+//           Some(pat) => body,
+//           None => break,
+//       }
+//   }
+//
+// The iter is moved into a shadow-stack slot so we can pass `&mut
+// __iter` (an i32 address) to `Iterator::next`. Each iteration
+// allocates a fresh `Option<Item>` sret slot below SP, calls
+// `next`, reads the discriminant; disc=0 (None — Option declares
+// None first) exits the loop, disc=1 (Some) loads the Item payload
+// from `addr+4` into the binding's wasm locals and runs the body.
+//
+// Scope limits (intentional MVP): the pattern must be a single
+// `Var(name)` (or `_`); destructuring patterns inside `for` are
+// rejected by borrowck's `materialize_for_loop_bindings`. The iter's
+// type and `Item` type can have any shape — `flatten_rtype` /
+// `store_flat_to_memory` / `load_flat_from_memory` handle multi-
+// scalar layouts uniformly.
+fn codegen_for_expr(ctx: &mut FnCtx, f: &crate::ast::ForLoop) -> Result<RType, Error> {
+    let iter_ty = ctx.expr_types[f.iter.id as usize]
+        .as_ref()
+        .expect("typeck recorded iter type")
+        .clone();
+    let iter_ty = substitute_rtype(&iter_ty, &ctx.env);
+    let iterator_path = vec![
+        "std".to_string(),
+        "iter".to_string(),
+        "Iterator".to_string(),
+    ];
+
+    // Resolve `<iter_ty as Iterator>::next` to a wasm fn idx.
+    let resolution =
+        crate::typeck::solve_impl(&iterator_path, &iter_ty, ctx.traits, 0)
+            .expect("typeck verified Iterator impl exists");
+    let next_cand =
+        crate::typeck::find_trait_impl_method(ctx.funcs, resolution.impl_idx, "next")
+            .expect("Iterator impl provides next");
+    let next_callee_idx = match next_cand {
+        crate::typeck::MethodCandidate::Direct(i) => ctx.funcs.entries[i].idx,
+        crate::typeck::MethodCandidate::Template(i) => {
+            let tmpl = &ctx.funcs.templates[i];
+            let mut concrete: Vec<RType> = Vec::new();
+            let mut k = 0;
+            while k < tmpl.type_params.len() {
+                let name = &tmpl.type_params[k];
+                let mut found: Option<RType> = None;
+                let mut j = 0;
+                while j < resolution.subst.len() {
+                    if resolution.subst[j].0 == *name {
+                        found = Some(resolution.subst[j].1.clone());
+                        break;
+                    }
+                    j += 1;
+                }
+                concrete.push(found.expect("impl param bound by subst"));
+                k += 1;
+            }
+            ctx.mono.intern(i, concrete)
+        }
+    };
+
+    // Resolve Item type from the impl's `type Item = …` binding.
+    let item_ty = crate::typeck::find_assoc_binding(
+        ctx.traits,
+        &iter_ty,
+        &iterator_path,
+        "Item",
+    )
+    .into_iter()
+    .next()
+    .expect("typeck verified Item binding");
+    let item_ty = substitute_rtype(&item_ty, &ctx.env);
+
+    let option_path = vec![
+        "std".to_string(),
+        "option".to_string(),
+        "Option".to_string(),
+    ];
+    let option_ty = RType::Enum {
+        path: option_path,
+        type_args: vec![item_ty.clone()],
+        lifetime_args: Vec::new(),
+    };
+    let option_size = byte_size_of(&option_ty, ctx.structs, ctx.enums);
+    let iter_size = byte_size_of(&iter_ty, ctx.structs, ctx.enums);
+
+    // Setup: allocate __iter on the shadow stack and store the iter
+    // expression's value into it.
+    ctx.instructions.push(wasm::Instruction::GlobalGet(SP_GLOBAL));
+    ctx.instructions.push(wasm::Instruction::I32Const(iter_size as i32));
+    ctx.instructions.push(wasm::Instruction::I32Sub);
+    ctx.instructions.push(wasm::Instruction::GlobalSet(SP_GLOBAL));
+    let iter_addr_local = ctx.next_wasm_local;
+    ctx.extra_locals.push(wasm::ValType::I32);
+    ctx.next_wasm_local += 1;
+    ctx.instructions.push(wasm::Instruction::GlobalGet(SP_GLOBAL));
+    ctx.instructions.push(wasm::Instruction::LocalSet(iter_addr_local));
+    let _ = codegen_expr(ctx, &f.iter)?;
+    store_flat_to_memory(
+        ctx,
+        &iter_ty,
+        BaseAddr::WasmLocal(iter_addr_local),
+        0,
+    );
+
+    // Pre-allocate the binding's storage. Pattern is constrained to
+    // `Var(name)` or `_` per `materialize_for_loop_bindings`. If
+    // escape analysis flagged the binding as addressed (e.g.
+    // `for x in iter { foo(&x); }` takes `&x`), the binding lives in
+    // a per-iteration shadow-stack slot so it's addressable; else it
+    // lives in fresh wasm locals.
+    let mut item_flat: Vec<wasm::ValType> = Vec::new();
+    flatten_rtype(&item_ty, ctx.structs, &mut item_flat);
+    let binding_name: Option<String> = match &f.pattern.kind {
+        crate::ast::PatternKind::Binding { name, .. } => Some(name.clone()),
+        crate::ast::PatternKind::Wildcard => None,
+        _ => unreachable!(
+            "for-loop pattern destructure rejected at borrowck — \
+             only `for x in iter` and `for _ in iter` are supported"
+        ),
+    };
+    let pattern_id = f.pattern.id as usize;
+    let binding_addressed = pattern_id < ctx.pattern_addressed.len()
+        && ctx.pattern_addressed[pattern_id];
+    let item_size = byte_size_of(&item_ty, ctx.structs, ctx.enums);
+    let binding_addr_local: Option<u32> = if binding_addressed && binding_name.is_some() {
+        // Allocate a stable shadow-stack slot for the binding ABOVE
+        // the iter slot (allocated once before the loop, reused
+        // across iterations — same address every time).
+        ctx.instructions.push(wasm::Instruction::GlobalGet(SP_GLOBAL));
+        ctx.instructions.push(wasm::Instruction::I32Const(item_size as i32));
+        ctx.instructions.push(wasm::Instruction::I32Sub);
+        ctx.instructions.push(wasm::Instruction::GlobalSet(SP_GLOBAL));
+        let addr = ctx.next_wasm_local;
+        ctx.extra_locals.push(wasm::ValType::I32);
+        ctx.next_wasm_local += 1;
+        ctx.instructions.push(wasm::Instruction::GlobalGet(SP_GLOBAL));
+        ctx.instructions.push(wasm::Instruction::LocalSet(addr));
+        Some(addr)
+    } else {
+        None
+    };
+    let binding_start = ctx.next_wasm_local;
+    if binding_addr_local.is_none() {
+        let mut k = 0;
+        while k < item_flat.len() {
+            ctx.extra_locals.push(item_flat[k].copy());
+            ctx.next_wasm_local += 1;
+            k += 1;
+        }
+    }
+    let binding_flat_size = item_flat.len() as u32;
+
+    // Outer wasm Block (break target) + inner Loop (continue/back-edge).
+    let outer_depth = current_cf_depth(ctx);
+    let locals_at_entry = ctx.locals.len();
+    ctx.instructions
+        .push(wasm::Instruction::Block(wasm::BlockType::Empty));
+    ctx.instructions
+        .push(wasm::Instruction::Loop(wasm::BlockType::Empty));
+
+    // Per-iteration: allocate Option<Item> sret slot below SP.
+    ctx.instructions.push(wasm::Instruction::GlobalGet(SP_GLOBAL));
+    ctx.instructions.push(wasm::Instruction::I32Const(option_size as i32));
+    ctx.instructions.push(wasm::Instruction::I32Sub);
+    ctx.instructions.push(wasm::Instruction::GlobalSet(SP_GLOBAL));
+    let opt_addr_local = ctx.next_wasm_local;
+    ctx.extra_locals.push(wasm::ValType::I32);
+    ctx.next_wasm_local += 1;
+    ctx.instructions.push(wasm::Instruction::GlobalGet(SP_GLOBAL));
+    ctx.instructions.push(wasm::Instruction::LocalSet(opt_addr_local));
+
+    // Call `<IterT as Iterator>::next(opt_sret_addr, &mut __iter)`.
+    // Arg order: sret addr first (enum-returning ABI), then recv.
+    ctx.instructions.push(wasm::Instruction::LocalGet(opt_addr_local));
+    ctx.instructions.push(wasm::Instruction::LocalGet(iter_addr_local));
+    ctx.instructions.push(wasm::Instruction::Call(next_callee_idx));
+    // The sret-returning fn pushes the dest addr again; drop it.
+    ctx.instructions.push(wasm::Instruction::Drop);
+
+    // Read disc at opt_addr+0. None = 0 → exit loop; Some = 1 → bind
+    // payload and run body. (Option declares None before Some.)
+    ctx.instructions.push(wasm::Instruction::LocalGet(opt_addr_local));
+    ctx.instructions.push(wasm::Instruction::I32Load { align: 2, offset: 0 });
+    ctx.instructions.push(wasm::Instruction::I32Eqz);
+    // Before exiting via BrIf, restore SP (free the option slot).
+    // Actually wasm BrIf doesn't allow a side effect on the cond
+    // path — we'd need to test, then conditionally restore. Simpler:
+    // restore the option slot at the END of the loop body (back-edge
+    // path), and ALSO at the after-loop continuation (exit path).
+    // The cond `disc == 0` exits via BrIf 1 (out of Block); we then
+    // run the after-loop continuation which frees the option slot.
+    ctx.instructions.push(wasm::Instruction::BrIf(1));
+
+    // Some path: load Item payload from opt_addr+4 into the binding's
+    // storage. For wasm-local bindings, load + LocalSet each leaf;
+    // for shadow-stack bindings, memcpy the payload to addr_local.
+    if binding_name.is_some() {
+        if let Some(addr) = binding_addr_local {
+            // memcpy item_size bytes from opt_addr+4 to addr.
+            // Use the existing emit_memcpy helper which expects two
+            // local indices for src/dst — we need a temp for the
+            // `opt_addr + 4` source.
+            let src_tmp = ctx.next_wasm_local;
+            ctx.extra_locals.push(wasm::ValType::I32);
+            ctx.next_wasm_local += 1;
+            ctx.instructions.push(wasm::Instruction::LocalGet(opt_addr_local));
+            ctx.instructions.push(wasm::Instruction::I32Const(4));
+            ctx.instructions.push(wasm::Instruction::I32Add);
+            ctx.instructions.push(wasm::Instruction::LocalSet(src_tmp));
+            emit_memcpy(ctx, addr, src_tmp, item_size);
+        } else {
+            load_flat_from_memory(
+                ctx,
+                &item_ty,
+                BaseAddr::WasmLocal(opt_addr_local),
+                4,
+            );
+            let mut k = binding_flat_size;
+            while k > 0 {
+                k -= 1;
+                ctx.instructions
+                    .push(wasm::Instruction::LocalSet(binding_start + k));
+            }
+        }
+    }
+
+    // Push the binding into ctx.locals so the body can resolve it.
+    if let Some(name) = &binding_name {
+        let storage = match binding_addr_local {
+            Some(addr) => Storage::MemoryAt { addr_local: addr },
+            None => Storage::Local {
+                wasm_start: binding_start,
+                flat_size: binding_flat_size,
+            },
+        };
+        ctx.locals.push(LocalBinding {
+            name: name.clone(),
+            rtype: item_ty.clone(),
+            storage,
+        });
+    }
+
+    // Loop frame so break/continue inside body can find this loop.
+    ctx.loops.push(LoopCgFrame {
+        label: f.label.clone(),
+        break_depth: outer_depth,
+        continue_depth: outer_depth + 1,
+        locals_len_at_entry: locals_at_entry + (if binding_name.is_some() { 1 } else { 0 }),
+    });
+    codegen_unit_block_stmt(ctx, f.body.as_ref())?;
+    ctx.loops.pop();
+    if binding_name.is_some() {
+        ctx.locals.pop();
+    }
+
+    // End-of-iteration: free the Option slot, back-edge to Loop start.
+    ctx.instructions.push(wasm::Instruction::GlobalGet(SP_GLOBAL));
+    ctx.instructions.push(wasm::Instruction::I32Const(option_size as i32));
+    ctx.instructions.push(wasm::Instruction::I32Add);
+    ctx.instructions.push(wasm::Instruction::GlobalSet(SP_GLOBAL));
+    ctx.instructions.push(wasm::Instruction::Br(0));
+    ctx.instructions.push(wasm::Instruction::End); // close Loop
+    ctx.instructions.push(wasm::Instruction::End); // close Block
+
+    // After loop (exit-via-None or exit-via-break): free the Option
+    // slot (still allocated when we BrIf'd out), the binding slot
+    // (if shadow-stack-allocated), and the __iter slot.
+    ctx.instructions.push(wasm::Instruction::GlobalGet(SP_GLOBAL));
+    ctx.instructions.push(wasm::Instruction::I32Const(option_size as i32));
+    ctx.instructions.push(wasm::Instruction::I32Add);
+    ctx.instructions.push(wasm::Instruction::GlobalSet(SP_GLOBAL));
+    if binding_addr_local.is_some() {
+        ctx.instructions.push(wasm::Instruction::GlobalGet(SP_GLOBAL));
+        ctx.instructions.push(wasm::Instruction::I32Const(item_size as i32));
+        ctx.instructions.push(wasm::Instruction::I32Add);
+        ctx.instructions.push(wasm::Instruction::GlobalSet(SP_GLOBAL));
+    }
+    ctx.instructions.push(wasm::Instruction::GlobalGet(SP_GLOBAL));
+    ctx.instructions.push(wasm::Instruction::I32Const(iter_size as i32));
+    ctx.instructions.push(wasm::Instruction::I32Add);
+    ctx.instructions.push(wasm::Instruction::GlobalSet(SP_GLOBAL));
 
     Ok(RType::Tuple(Vec::new()))
 }
@@ -3229,6 +3554,7 @@ fn codegen_expr(ctx: &mut FnCtx, expr: &Expr) -> Result<RType, Error> {
         ExprKind::Match(m) => codegen_match_expr(ctx, m, expr.id),
         ExprKind::IfLet(il) => codegen_if_let_expr(ctx, il, expr.id),
         ExprKind::While(w) => codegen_while_expr(ctx, w),
+        ExprKind::For(f) => codegen_for_expr(ctx, f),
         ExprKind::Break { label, .. } => codegen_break(ctx, label.as_deref()),
         ExprKind::Continue { label, .. } => codegen_continue(ctx, label.as_deref()),
         ExprKind::Return { value } => codegen_return(ctx, value.as_deref()),

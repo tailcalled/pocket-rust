@@ -2511,6 +2511,7 @@ fn check_expr_inner(ctx: &mut CheckCtx, expr: &Expr) -> Result<InferType, Error>
         ExprKind::Match(m) => check_match_expr(ctx, m, expr),
         ExprKind::IfLet(il) => check_if_let_expr(ctx, il, expr),
         ExprKind::While(w) => check_while_expr(ctx, w, expr),
+        ExprKind::For(f) => check_for_expr(ctx, f, expr),
         ExprKind::Break { label, label_span } => {
             check_loop_label(ctx, label, label_span, &expr.span)?;
             // `break` diverges — type as `!` so it can sit as one arm
@@ -2798,6 +2799,103 @@ fn check_while_expr(
         ctx.current_file,
     )?;
     ctx.loop_labels.pop();
+    let _ = expr;
+    Ok(InferType::Tuple(Vec::new()))
+}
+
+// `for pat in iter { body }`. The iter expression's resolved type
+// must implement `std::iter::Iterator`; the pattern is checked
+// against the impl's `Item` binding, the body must be `()`-typed,
+// and the loop expression itself yields `()`. The loop's label is
+// stacked just like `while` so `break`/`continue` (with optional
+// label) work inside the body.
+fn check_for_expr(
+    ctx: &mut CheckCtx,
+    f: &crate::ast::ForLoop,
+    expr: &Expr,
+) -> Result<InferType, Error> {
+    if let Some(name) = &f.label {
+        let mut i = ctx.loop_labels.len();
+        while i > 0 {
+            i -= 1;
+            if ctx.loop_labels[i].as_deref() == Some(name.as_str()) {
+                return Err(Error {
+                    file: ctx.current_file.to_string(),
+                    message: format!("duplicate loop label `'{}`", name),
+                    span: f
+                        .label_span
+                        .as_ref()
+                        .map(|s| s.copy())
+                        .unwrap_or_else(|| expr.span.copy()),
+                });
+            }
+        }
+    }
+    // Type-check the iter expression and resolve its type.
+    let iter_ty = check_expr(ctx, &f.iter)?;
+    let resolved_iter = ctx.subst.substitute(&iter_ty);
+    let iter_rt = infer_to_rtype_for_check(&resolved_iter);
+    let iterator_path = vec![
+        "std".to_string(),
+        "iter".to_string(),
+        "Iterator".to_string(),
+    ];
+    // Resolve `<iter_ty as Iterator>::Item`.
+    let item_candidates = traits::find_assoc_binding(
+        ctx.traits,
+        &iter_rt,
+        &iterator_path,
+        "Item",
+    );
+    if item_candidates.is_empty() {
+        return Err(Error {
+            file: ctx.current_file.to_string(),
+            message: format!(
+                "the trait `Iterator` is not implemented for `{}` (required by `for` loop)",
+                rtype_to_string(&iter_rt)
+            ),
+            span: f.iter.span.copy(),
+        });
+    }
+    if item_candidates.len() > 1 {
+        return Err(Error {
+            file: ctx.current_file.to_string(),
+            message: format!(
+                "multiple `Iterator` impls for `{}` — `for` loop is ambiguous",
+                rtype_to_string(&iter_rt)
+            ),
+            span: f.iter.span.copy(),
+        });
+    }
+    let item_ty = rtype_to_infer(&item_candidates[0]);
+    // Check the pattern against `Item` and collect bindings for the
+    // body's scope.
+    let mark = ctx.locals.len();
+    let mut bindings: Vec<(String, InferType, Span, bool)> = Vec::new();
+    check_pattern(ctx, &f.pattern, &item_ty, &mut bindings)?;
+    let mut k = 0;
+    while k < bindings.len() {
+        ctx.locals.push(LocalEntry {
+            name: bindings[k].0.clone(),
+            ty: bindings[k].1.clone(),
+            mutable: bindings[k].3,
+        });
+        k += 1;
+    }
+    ctx.loop_labels.push(f.label.clone());
+    let unit = InferType::Tuple(Vec::new());
+    let body_ty = check_block_inner(ctx, f.body.as_ref())?;
+    ctx.subst.unify(
+        &body_ty,
+        &unit,
+        ctx.traits,
+        ctx.type_params,
+        ctx.type_param_bounds,
+        &f.body.span,
+        ctx.current_file,
+    )?;
+    ctx.loop_labels.pop();
+    ctx.locals.truncate(mark);
     let _ = expr;
     Ok(InferType::Tuple(Vec::new()))
 }

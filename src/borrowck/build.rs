@@ -288,6 +288,20 @@ impl<'a> Builder<'a> {
                     expr.span.copy(),
                 );
             }
+            ExprKind::For(f) => {
+                self.lower_for(f, expr.span.copy());
+                self.push_stmt(
+                    CfgStmtKind::Assign {
+                        place: dest,
+                        rvalue: Rvalue::Use(Operand {
+                            kind: OperandKind::ConstUnit,
+                            span: expr.span.copy(),
+                            node_id: Some(expr.id),
+                        }),
+                    },
+                    expr.span.copy(),
+                );
+            }
             ExprKind::Break { label, label_span: _ } => {
                 self.lower_break(label, expr.span.copy());
             }
@@ -643,6 +657,14 @@ impl<'a> Builder<'a> {
                     node_id: Some(expr.id),
                 })
             }
+            ExprKind::For(f) => {
+                self.lower_for(f, expr.span.copy());
+                Rvalue::Use(Operand {
+                    kind: OperandKind::ConstUnit,
+                    span,
+                    node_id: Some(expr.id),
+                })
+            }
             ExprKind::Break { label, label_span: _ } => {
                 self.lower_break(label, expr.span.copy());
                 // Return value won't be reached at runtime; produce a
@@ -956,6 +978,137 @@ impl<'a> Builder<'a> {
         // Continuation.
         self.current_block = after_block;
         let _ = span;
+    }
+
+    // `for pat in iter { body }` lowers to a CFG that mirrors
+    //
+    //   let mut __iter = iter;
+    //   loop {
+    //       // (the actual `Iterator::next(&mut __iter)` call and its
+    //       // Some/None destructure happen at codegen time — borrowck
+    //       // doesn't model the iterator semantics; it just sees that
+    //       // __iter is alive for the whole loop and that the pattern
+    //       // bindings are introduced fresh each iteration.)
+    //       <pattern bindings>
+    //       <body>
+    //       continue
+    //   }
+    //
+    // The CFG cond_block uses a synthetic `ConstBool(true)` to keep
+    // both successors (body and after) reachable in dataflow —
+    // after_block then has incoming edges via that synthetic edge
+    // and via any `break` in the body.
+    //
+    // Pattern bindings are allocated as fresh locals with `StorageLive`
+    // but no `Assign`; pocket-rust's move analysis treats places
+    // not present in the moved set as init-by-default, so reads of
+    // the bindings in the body work without a synthetic source value.
+    fn lower_for(&mut self, f: &crate::ast::ForLoop, span: Span) {
+        // Move iter into __iter.
+        let iter_ty = self.expr_type(f.iter.id);
+        let iter_local = self.alloc_temp(iter_ty.clone(), span.copy());
+        self.push_stmt(CfgStmtKind::StorageLive(iter_local), span.copy());
+        self.lower_expr_into(&f.iter, local_place(iter_local));
+
+        let cond_block = self.new_block();
+        let body_block = self.new_block();
+        let after_block = self.new_block();
+        self.set_terminator(Terminator::Goto(cond_block));
+
+        // cond_block: synthetic branch. The actual exit-on-None lives
+        // in codegen; borrowck just needs both successors reachable.
+        self.current_block = cond_block;
+        self.set_terminator(Terminator::If {
+            cond: Operand {
+                kind: OperandKind::ConstBool(true),
+                span: span.copy(),
+                node_id: None,
+            },
+            then_block: body_block,
+            else_block: after_block,
+        });
+
+        // body_block: bind pattern (StorageLive only — init by
+        // default), lower body, back-edge.
+        self.loops.push(LoopFrame {
+            label: f.label.clone(),
+            continue_target: cond_block,
+            break_target: after_block,
+        });
+        self.current_block = body_block;
+        self.push_scope();
+        self.materialize_for_loop_bindings(&f.pattern, &iter_ty);
+        self.lower_block(f.body.as_ref(), None);
+        self.set_terminator(Terminator::Goto(cond_block));
+        self.pop_scope();
+        self.loops.pop();
+
+        self.current_block = after_block;
+        let _ = span;
+    }
+
+    // Walk the for-loop's pattern, allocating a local for each
+    // binding (with the binding's type derived from the iter's
+    // `Iterator::Item` assoc), pushing `StorageLive` for each. No
+    // `Assign` is emitted — the move analysis treats unmoved places
+    // as initialized, so reads of the bindings in the body work.
+    // For-loop pattern shapes are typeck-validated; complex
+    // destructure patterns (struct variants etc.) are left as TODO
+    // here since they need the same `Item`-source-place machinery
+    // that the `if let`/`match` paths use.
+    fn materialize_for_loop_bindings(&mut self, pat: &Pattern, iter_ty: &RType) {
+        // Resolve `<iter_ty as Iterator>::Item` — same lookup typeck did.
+        let iterator_path = vec![
+            "std".to_string(),
+            "iter".to_string(),
+            "Iterator".to_string(),
+        ];
+        let item_candidates = crate::typeck::find_assoc_binding(
+            self.ctx.traits,
+            iter_ty,
+            &iterator_path,
+            "Item",
+        );
+        let item_ty = item_candidates
+            .into_iter()
+            .next()
+            .expect("typeck verified Iterator impl + Item binding");
+        match &pat.kind {
+            crate::ast::PatternKind::Wildcard => {}
+            crate::ast::PatternKind::Binding { name, name_span, by_ref, mutable } => {
+                let local_ty = if *by_ref {
+                    RType::Ref {
+                        inner: Box::new(item_ty),
+                        mutable: *mutable,
+                        lifetime: LifetimeRepr::Inferred(0),
+                    }
+                } else {
+                    item_ty
+                };
+                let local = self.alloc_local(
+                    Some(name.clone()),
+                    local_ty,
+                    name_span.copy(),
+                    *mutable && !*by_ref,
+                    false,
+                );
+                self.push_stmt(CfgStmtKind::StorageLive(local), name_span.copy());
+                self.bind_name(name, local);
+            }
+            // TODO: variant / struct / tuple / ref / at-binding /
+            // or-patterns inside `for pat in iter` — needs a synthetic
+            // `Item`-typed source place that borrowck's existing
+            // `materialize_bindings` can destructure against. For now
+            // only the bare-binding form (`for x in iter`) and
+            // wildcard (`for _ in iter`) are supported by borrowck;
+            // typeck accepts any pattern, so destructuring patterns
+            // in for-loop position will land here as a borrowck-time
+            // panic until this is filled in.
+            _ => {
+                let _ = item_ty;
+                unimplemented!("for-loop pattern destructure not yet supported in borrowck — use `for x in iter` then destructure inside the body");
+            }
+        }
     }
 
     fn lower_break(&mut self, label: &Option<String>, span: Span) {

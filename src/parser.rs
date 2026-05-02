@@ -1895,6 +1895,7 @@ impl Parser {
             TokenKind::If => self.parse_if_expr(),
             TokenKind::Match => self.parse_match_expr(),
             TokenKind::While => self.parse_while_expr(None, None),
+            TokenKind::For => self.parse_for_expr(None, None),
             TokenKind::Break => self.parse_break_expr(),
             TokenKind::Continue => self.parse_continue_expr(),
             TokenKind::Return => self.parse_return_expr(),
@@ -2192,18 +2193,57 @@ impl Parser {
         })
     }
 
-    // `'label: <loop>` — currently only `while` is supported, but the
-    // syntax is shared so this is the entry point.
+    // `'label: <loop>` — supports `'label: while …` and
+    // `'label: for …`. The label is then targetable by `break 'label`
+    // / `continue 'label` from inside the body.
     fn parse_labeled_loop(&mut self) -> Result<Expr, Error> {
         let (name, label_span) = self.expect_lifetime()?;
         self.expect(&TokenKind::Colon, "`:`")?;
         if self.peek_kind(&TokenKind::While) {
             self.parse_while_expr(Some(name), Some(label_span))
+        } else if self.peek_kind(&TokenKind::For) {
+            self.parse_for_expr(Some(name), Some(label_span))
         } else {
             Err(self.error_at_current(
-                "expected `while` after label (only `'label: while ...` is supported)",
+                "expected `while` or `for` after label",
             ))
         }
+    }
+
+    // `for pat in iter { body }` — iterates `iter` (which must impl
+    // `Iterator`) by repeatedly calling `Iterator::next(&mut iter)`
+    // until `None`. The pattern binds the `Some` payload's value
+    // each iteration. Loop's expression-type is `()`.
+    fn parse_for_expr(
+        &mut self,
+        label: Option<String>,
+        label_span: Option<Span>,
+    ) -> Result<Expr, Error> {
+        let for_span = self.expect(&TokenKind::For, "`for`")?;
+        let pattern = self.parse_pattern()?;
+        self.expect(&TokenKind::In, "`in`")?;
+        let saved = self.no_struct_lit;
+        self.no_struct_lit = true;
+        let iter = self.parse_expr()?;
+        self.no_struct_lit = saved;
+        let body = self.parse_block()?;
+        let span_start = label_span
+            .as_ref()
+            .map(|s| s.start.copy())
+            .unwrap_or(for_span.start);
+        let span = Span::new(span_start, body.span.end.copy());
+        let id = self.alloc_node_id();
+        Ok(Expr {
+            kind: ExprKind::For(crate::ast::ForLoop {
+                label,
+                label_span,
+                pattern,
+                iter: Box::new(iter),
+                body: Box::new(body),
+            }),
+            span,
+            id,
+        })
     }
 
     fn parse_break_expr(&mut self) -> Result<Expr, Error> {
@@ -2908,6 +2948,7 @@ impl Parser {
             (TokenKind::Return, TokenKind::Return) => true,
             (TokenKind::Question, TokenKind::Question) => true,
             (TokenKind::For, TokenKind::For) => true,
+            (TokenKind::In, TokenKind::In) => true,
             (TokenKind::Plus, TokenKind::Plus) => true,
             (TokenKind::SelfLower, TokenKind::SelfLower) => true,
             (TokenKind::SelfUpper, TokenKind::SelfUpper) => true,
@@ -2989,6 +3030,7 @@ fn is_unit_block_like(expr: &Expr) -> bool {
         ExprKind::IfLet(_) => true,
         ExprKind::Match(_) => true,
         ExprKind::While(_) => true,
+        ExprKind::For(_) => true,
         _ => false,
     }
 }

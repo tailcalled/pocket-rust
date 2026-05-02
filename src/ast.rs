@@ -393,6 +393,10 @@ pub enum ExprKind {
     // can be targeted by `break 'label` / `continue 'label` from
     // nested loops.
     While(WhileExpr),
+    // `'label: for pat in iter { body }` / `for pat in iter { body }`.
+    // See `ForLoop` for the iter-trait expectation; the loop yields
+    // `()` regardless of body shape.
+    For(ForLoop),
     // `break;` / `break 'label;`. Type `!` (diverging). The optional
     // label names which enclosing loop to exit.
     Break {
@@ -545,6 +549,23 @@ pub struct WhileExpr {
     pub label: Option<String>,
     pub label_span: Option<Span>,
     pub cond: Box<Expr>,
+    pub body: Box<Block>,
+}
+
+// `'label: for pat in iter { body }` / `for pat in iter { body }`.
+// Stays as a first-class node through typeck (so error messages can
+// keep mentioning `for`), borrowck (lowered to a CFG that mirrors
+// `loop { match Iterator::next(&mut __iter) { Some(pat) => body,
+// None => break } }`), and codegen (same shape in wasm). The
+// `iter`'s type must implement `std::iter::Iterator` directly —
+// pocket-rust doesn't yet auto-call `IntoIterator::into_iter`, so
+// users write `vec.into_iter()` explicitly.
+#[derive(Clone)]
+pub struct ForLoop {
+    pub label: Option<String>,
+    pub label_span: Option<Span>,
+    pub pattern: Pattern,
+    pub iter: Box<Expr>,
     pub body: Box<Block>,
 }
 
