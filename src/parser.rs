@@ -2387,6 +2387,18 @@ impl Parser {
             && self.peek_two(&TokenKind::Bang, &TokenKind::LBracket);
         if macro_paren || macro_bracket {
             let bang_span = self.expect(&TokenKind::Bang, "`!`")?;
+            let _ = bang_span;
+            // `matches!(scrutinee, pattern)` and `matches!(scrutinee,
+            // pattern if guard)` — args don't fit the expression-list
+            // shape (the second arg is a *pattern*, not an expr), so
+            // parse them by hand and desugar at parse time to a
+            // 2-arm `match`. Only the parens form is supported (Rust
+            // accepts `[]` and `{}` too, but `matches!` is conventionally
+            // written with parens; deferring the bracket forms).
+            if path.segments[0].name == "matches" && macro_paren {
+                let span_start = path.span.start.copy();
+                return self.parse_matches_macro(span_start);
+            }
             let args = if macro_paren {
                 self.parse_call_args()?
             } else {
@@ -2394,7 +2406,6 @@ impl Parser {
             };
             let end = self.tokens[self.pos - 1].span.end.copy();
             let span = Span::new(path.span.start.copy(), end);
-            let _ = bang_span;
             // `vec![a, b, c]` desugars to a block expression at parse
             // time: `{ let mut __pr_vec_<id> = Vec::new(); __v.push(a);
             // __v.push(b); __v.push(c); __v }`. The block's value is
@@ -2474,6 +2485,82 @@ impl Parser {
         self.pos + 1 < self.tokens.len()
             && Self::kind_eq(&self.tokens[self.pos].kind, a)
             && Self::kind_eq(&self.tokens[self.pos + 1].kind, b)
+    }
+
+    // `matches!(scrutinee, pattern)` / `matches!(scrutinee, pattern
+    // if guard)` desugars to:
+    //
+    //   match scrutinee {
+    //       pattern (if guard)? => true,
+    //       _ => false,
+    //   }
+    //
+    // The second arg is a *pattern* (and optional guard), not an
+    // expression — so we can't reuse `parse_call_args`; this is a
+    // hand-rolled parser that calls `parse_pattern` for the pattern
+    // slot. Only the `(…)` delimiter form is wired up; `[…]`/`{…}`
+    // for `matches!` are deferred since the canonical Rust spelling
+    // is parens.
+    fn parse_matches_macro(&mut self, span_start: crate::span::Pos) -> Result<Expr, Error> {
+        self.expect(&TokenKind::LParen, "`(`")?;
+        let scrutinee = self.parse_expr()?;
+        self.expect(&TokenKind::Comma, "`,`")?;
+        let pattern = self.parse_pattern()?;
+        let pat_span = pattern.span.copy();
+        let guard = if self.peek_kind(&TokenKind::If) {
+            self.pos += 1;
+            let saved = self.no_struct_lit;
+            self.no_struct_lit = true;
+            let g = self.parse_expr()?;
+            self.no_struct_lit = saved;
+            Some(g)
+        } else {
+            None
+        };
+        let rparen = self.expect(&TokenKind::RParen, "`)`")?;
+        let span = Span::new(span_start, rparen.end.copy());
+        // Build the two arms: `pattern (if guard)? => true,` and
+        // `_ => false,`.
+        let true_id = self.alloc_node_id();
+        let false_id = self.alloc_node_id();
+        let true_expr = Expr {
+            kind: ExprKind::BoolLit(true),
+            span: span.copy(),
+            id: true_id,
+        };
+        let false_expr = Expr {
+            kind: ExprKind::BoolLit(false),
+            span: span.copy(),
+            id: false_id,
+        };
+        let body_span_a = pat_span.copy();
+        let arm_a = MatchArm {
+            pattern,
+            guard,
+            body: true_expr,
+            span: body_span_a,
+        };
+        let wildcard_pat = Pattern {
+            kind: crate::ast::PatternKind::Wildcard,
+            span: span.copy(),
+            id: self.alloc_node_id(),
+        };
+        let arm_b = MatchArm {
+            pattern: wildcard_pat,
+            guard: None,
+            body: false_expr,
+            span: span.copy(),
+        };
+        let id = self.alloc_node_id();
+        Ok(Expr {
+            kind: ExprKind::Match(MatchExpr {
+                scrutinee: Box::new(scrutinee),
+                arms: vec![arm_a, arm_b],
+                span: span.copy(),
+            }),
+            span,
+            id,
+        })
     }
 
     fn parse_macro_bracket_args(&mut self) -> Result<Vec<Expr>, Error> {

@@ -19,6 +19,43 @@ fn vec_empty_returns_42() {
     expect_answer("lang/macros/vec_empty", 42i32);
 }
 
+// `matches!(scrut, pattern)` — desugars to `match scrut { pattern
+// => true, _ => false }`. Exercises the basic pattern-match.
+#[test]
+fn matches_basic_returns_42() {
+    expect_answer("lang/macros/matches_basic", 42i32);
+}
+
+// `matches!(scrut, pattern if guard)` — the optional `if guard`
+// runs after the pattern matches; the pattern's bindings are in
+// scope inside the guard.
+#[test]
+fn matches_with_guard_returns_42() {
+    expect_answer("lang/macros/matches_with_guard", 42i32);
+}
+
+// `matches!` returns false when the scrutinee doesn't match the
+// pattern (the wildcard arm fires).
+#[test]
+fn matches_no_match_returns_42() {
+    expect_answer("lang/macros/matches_no_match", 42i32);
+}
+
+// Negative: `matches!` requires the args to be `(scrut, pattern)`
+// — using just `(scrut)` (one expression, no pattern) errors with
+// the parser's "`,`"-expected message at the parens close.
+#[test]
+fn matches_missing_pattern_is_rejected() {
+    let err = compile_source(
+        "fn answer() -> u32 { let x: u32 = 1; if matches!(x) { 0 } else { 42 } }",
+    );
+    assert!(
+        err.contains("`,`") || err.contains("expected"),
+        "expected parser error on missing pattern, got: {}",
+        err
+    );
+}
+
 // `&&T` in type position must split into `& &T` (the lexer emits
 // the `&&` as one `AndAnd` token; the type parser splits it). If
 // the split misfired we'd see a "expected type, got `&&`"-style
