@@ -5,7 +5,7 @@ use crate::span::{Error, Span};
 
 mod types;
 pub use types::{
-    IntKind, LifetimeRepr, RType, byte_size_of, copy_trait_path, drop_trait_path, numeric_lit_op_trait_paths, flatten_rtype,
+    IntKind, LifetimeRepr, RType, byte_size_of, copy_trait_path, drop_trait_path, numeric_lit_op_traits_for_method, flatten_rtype,
     int_kind_name, is_copy, is_copy_with_bounds, is_drop, is_raw_ptr, is_ref_mutable, is_sized,
     is_uninhabited, is_variant_payload_uninhabited,
     outer_lifetime, rtype_contains_param, rtype_eq, rtype_to_string, substitute_rtype,
@@ -30,46 +30,6 @@ use types::{int_kind_from_name, int_kind_max, int_kind_neg_magnitude, int_kind_s
 // even with `T: Add` bounds, since `T` doesn't carry a `from_i64`
 // constructor in the new operator scheme. To use a literal as a
 // custom type, write the cast explicitly: `let x = MyType::from(42);`.
-// True iff every registered impl of `trait_path` binds `name` to a
-// concrete type that `rtype_eq`s its target. Used to collapse
-// `<? as Add>::Output` to `?` for the standard arith traits whose
-// primitive impls all set `Output = Self` — without this the
-// AssocProj would block downstream dispatch on the result of `1 + 2`.
-fn assoc_always_equals_self(
-    traits: &TraitTable,
-    trait_path: &Vec<String>,
-    name: &str,
-) -> bool {
-    let mut found_any = false;
-    let mut i = 0;
-    while i < traits.impls.len() {
-        let row = &traits.impls[i];
-        if &row.trait_path != trait_path {
-            i += 1;
-            continue;
-        }
-        let mut k = 0;
-        let mut binding_eq_target = false;
-        while k < row.assoc_type_bindings.len() {
-            if row.assoc_type_bindings[k].0 == name {
-                if !rtype_contains_param(&row.assoc_type_bindings[k].1)
-                    && rtype_eq(&row.assoc_type_bindings[k].1, &row.target)
-                {
-                    binding_eq_target = true;
-                }
-                break;
-            }
-            k += 1;
-        }
-        if !binding_eq_target {
-            return false;
-        }
-        found_any = true;
-        i += 1;
-    }
-    found_any
-}
-
 fn satisfies_num(
     t: &InferType,
     _traits: &TraitTable,
@@ -125,20 +85,15 @@ pub(crate) fn infer_concretize_assoc_proj(
                     i += 1;
                 }
             }
-            // When the base is still an unresolved Var, see if every
-            // impl of `trait_path` binds `name` equal to its target.
-            // If so the projection collapses to the base regardless of
-            // which impl ultimately wins (e.g. `<? as Add>::Output`
-            // → `?` since every primitive `impl Add for T` has
-            // `Output = T`). Without this collapse `1 + 2 + 3`
-            // wouldn't dispatch the second `add` (recv is the AssocProj
-            // from the first add).
+            // When the base is still an unresolved Var, leave the
+            // projection wrapped (lazy projection). Method dispatch
+            // on AssocProj{Var, …} recv unwraps to the inner Var (in
+            // `check_method_call`) so chained operations like
+            // `1 + 2 + 3` work; AssocProj-vs-concrete unification
+            // (in `Subst::unify`) drives the eventual binding when
+            // the result reaches a context with a concrete expected
+            // type.
             if matches!(new_base, InferType::Var(_)) {
-                if !trait_path.is_empty()
-                    && assoc_always_equals_self(traits, trait_path, name)
-                {
-                    return new_base;
-                }
                 return InferType::AssocProj {
                     base: Box::new(new_base),
                     trait_path: trait_path.clone(),
@@ -658,8 +613,13 @@ pub(crate) fn infer_to_string(t: &InferType) -> String {
         }
         InferType::Slice(inner) => format!("[{}]", infer_to_string(inner)),
         InferType::Str => "str".to_string(),
-        InferType::AssocProj { base, name, .. } => {
-            format!("<{} as ?>::{}", infer_to_string(base), name)
+        InferType::AssocProj { base, trait_path, name } => {
+            let trait_disp = if trait_path.is_empty() {
+                "?".to_string()
+            } else {
+                place_to_string(trait_path)
+            };
+            format!("<{} as {}>::{}", infer_to_string(base), trait_disp, name)
         }
         InferType::Never => "!".to_string(),
         InferType::Char => "char".to_string(),
@@ -1076,11 +1036,28 @@ impl Subst {
                         span: span.copy(),
                     });
                 }
+                // If `base` is a num-lit Var, only consider
+                // Int-target impls — the Var can only resolve to an
+                // int kind, so unrelated user impls (e.g. `impl Add
+                // for Wrap { type Output = u32; }`) shouldn't compete
+                // with primitive impls. Without this filter, a single
+                // user impl breaks `30 + 12 → u32` by returning two
+                // candidates with target=u32 (the primitive) and
+                // target=Wrap (the user impl).
+                let base_is_num_lit_var = matches!(
+                    base.as_ref(),
+                    InferType::Var(v) if (*v as usize) < self.is_num_lit.len()
+                        && self.is_num_lit[*v as usize]
+                );
                 let mut matching_targets: Vec<RType> = Vec::new();
                 let mut i = 0;
                 while i < traits.impls.len() {
                     let row = &traits.impls[i];
                     if !trait_path.is_empty() && row.trait_path != trait_path {
+                        i += 1;
+                        continue;
+                    }
+                    if base_is_num_lit_var && !matches!(&row.target, RType::Int(_)) {
                         i += 1;
                         continue;
                     }
@@ -3849,26 +3826,67 @@ use setup::{
 // signature, and stamps a `TraitDispatch` resolution for codegen to
 // re-resolve at monomorphization.
 
-// A receiver is a "mutable place" if it's a Var bound to a `mut` local, or a
-// FieldAccess chain rooted at one — same rule as for `&mut place` borrows.
+// Whether `expr` is a place expression that supports mutation. Covers
+// the same shapes as `*p = …;` and `vec[i] = …;` assignments — Var
+// (mut binding or `&mut T`), Var-rooted field/tuple-index chains,
+// `*p` for `&mut T`/`*mut T`, and `e[i]` when `e` is a mutable place
+// and the recv's type implements `IndexMut` (so the dispatch can
+// route through the `&mut Self` autoref level for `e[i] OP= rhs;`).
 pub(crate) fn is_mutable_place(ctx: &CheckCtx, expr: &Expr) -> bool {
-    let chain = match extract_place_for_assign(expr) {
-        Some(c) => c,
-        None => return false,
-    };
-    let mut i = ctx.locals.len();
-    while i > 0 {
-        i -= 1;
-        if ctx.locals[i].name == chain[0] {
-            // Owned `mut` binding, or a `&mut T` binding.
-            if ctx.locals[i].mutable {
-                return true;
+    match &expr.kind {
+        ExprKind::Var(name) => {
+            let mut i = ctx.locals.len();
+            while i > 0 {
+                i -= 1;
+                if ctx.locals[i].name == *name {
+                    if ctx.locals[i].mutable {
+                        return true;
+                    }
+                    let resolved = ctx.subst.substitute(&ctx.locals[i].ty);
+                    return matches!(resolved, InferType::Ref { mutable: true, .. });
+                }
             }
-            let resolved = ctx.subst.substitute(&ctx.locals[i].ty);
-            return matches!(resolved, InferType::Ref { mutable: true, .. });
+            false
         }
+        ExprKind::FieldAccess(fa) => is_mutable_place(ctx, &fa.base),
+        ExprKind::TupleIndex { base, .. } => is_mutable_place(ctx, base),
+        ExprKind::Deref(inner) => {
+            // Look at the inner expression's recorded type. If it
+            // resolves to `&mut T` or `*mut T`, the deref is a
+            // mutable place. (Reading the type from `expr_infer_types`
+            // requires the inner expr to have been checked first;
+            // method dispatch's `is_mutable_place` runs after
+            // `check_expr(receiver)` for the call's recv.)
+            let inner_ty_opt = ctx.expr_infer_types
+                .get(inner.id as usize)
+                .cloned()
+                .flatten();
+            if let Some(ty) = inner_ty_opt {
+                let resolved = ctx.subst.substitute(&ty);
+                matches!(
+                    resolved,
+                    InferType::Ref { mutable: true, .. }
+                        | InferType::RawPtr { mutable: true, .. }
+                )
+            } else {
+                false
+            }
+        }
+        ExprKind::Index { base, .. } => {
+            // `base[idx]` is a mutable place if `base` itself is a
+            // mutable place (so we can take `&mut base`) and the
+            // base's type implements `IndexMut`. We don't run a full
+            // trait-resolution check here; the dispatch path's own
+            // candidate match for `index_mut` will handle the
+            // type-side test, and emitting the autoref-mut level is
+            // safe even if no IndexMut impl exists (the call simply
+            // won't dispatch). Keeping this conservative on
+            // base-mutability matches the assignment rule for
+            // `vec[i] = …;`.
+            is_mutable_place(ctx, base)
+        }
+        _ => false,
     }
-    false
 }
 
 // `*p` reads the pointed-to value. Result type = inner of the ref/raw-ptr.
@@ -4357,6 +4375,22 @@ fn check_call(ctx: &mut CheckCtx, call: &Call, call_expr: &Expr) -> Result<Infer
         let tmpl_bounds = ctx.funcs.templates[template_idx].type_param_bounds.clone();
         let tmpl_bound_assoc =
             ctx.funcs.templates[template_idx].type_param_bound_assoc.clone();
+        let tmpl_type_params = ctx.funcs.templates[template_idx].type_params.clone();
+        // Build a substitution env mapping each template type-param to
+        // its inferred RType so we can substitute the assoc-constraint's
+        // expected type before comparing it against the impl's actual
+        // binding. Without this, `fn double<T: Add<T, Output = T>>` at
+        // call site `double::<u32>(21)` compares the bound's `T`
+        // (unsubstituted) against the impl's `u32` and reports a bogus
+        // mismatch.
+        let mut subst_env: Vec<(String, RType)> = Vec::new();
+        let mut q = 0;
+        while q < var_ids.len() && q < tmpl_type_params.len() {
+            let inferred = ctx.subst.substitute(&InferType::Var(var_ids[q]));
+            let inferred_rt = infer_to_rtype_for_check(&inferred);
+            subst_env.push((tmpl_type_params[q].clone(), inferred_rt));
+            q += 1;
+        }
         let mut p = 0;
         while p < var_ids.len() {
             if p >= tmpl_bounds.len() {
@@ -4380,7 +4414,11 @@ fn check_call(ctx: &mut CheckCtx, call: &Call, call_expr: &Expr) -> Result<Infer
                 }
                 let mut c = 0;
                 while c < constraints.len() {
-                    let (cname, cty_expected) = &constraints[c];
+                    let (cname, cty_expected_raw) = &constraints[c];
+                    // Substitute under inferred type-args before
+                    // comparison — `Output = T` in the bound becomes
+                    // `Output = u32` when T is inferred to u32.
+                    let cty_expected = substitute_rtype(cty_expected_raw, &subst_env);
                     let actual_candidates = traits::find_assoc_binding(
                         ctx.traits,
                         &inferred_rt,
@@ -4395,13 +4433,13 @@ fn check_call(ctx: &mut CheckCtx, call: &Call, call_expr: &Expr) -> Result<Infer
                                 rtype_to_string(&inferred_rt),
                                 place_to_string(trait_path),
                                 cname,
-                                rtype_to_string(cty_expected),
+                                rtype_to_string(&cty_expected),
                             ),
                             span: call_expr.span.copy(),
                         });
                     }
                     if actual_candidates.len() > 1
-                        || !rtype_eq(&actual_candidates[0], cty_expected)
+                        || !rtype_eq(&actual_candidates[0], &cty_expected)
                     {
                         return Err(Error {
                             file: ctx.current_file.to_string(),
@@ -4409,7 +4447,7 @@ fn check_call(ctx: &mut CheckCtx, call: &Call, call_expr: &Expr) -> Result<Infer
                                 "type mismatch on associated type `{}::{}`: expected `{}`, got `{}` (from `impl {} for {}`)",
                                 place_to_string(trait_path),
                                 cname,
-                                rtype_to_string(cty_expected),
+                                rtype_to_string(&cty_expected),
                                 rtype_to_string(&actual_candidates[0]),
                                 place_to_string(trait_path),
                                 rtype_to_string(&inferred_rt),

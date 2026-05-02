@@ -175,3 +175,49 @@ impl PartialEq for bool {
     fn ne(&self, other: &bool) -> bool { ¤bool_ne(*self, *other) }
 }
 impl Eq for bool {}
+
+// `char` is a Unicode scalar value (0..=0x10FFFF excluding surrogates),
+// stored as a u32 — so the comparison ops route through the u32
+// builtins after an `as u32` cast on each side.
+impl PartialEq for char {
+    fn eq(&self, other: &char) -> bool { ¤u32_eq(*self as u32, *other as u32) }
+    fn ne(&self, other: &char) -> bool { ¤u32_ne(*self as u32, *other as u32) }
+}
+impl Eq for char {}
+impl PartialOrd for char {
+    fn lt(&self, other: &char) -> bool { ¤u32_lt(*self as u32, *other as u32) }
+    fn le(&self, other: &char) -> bool { ¤u32_le(*self as u32, *other as u32) }
+    fn gt(&self, other: &char) -> bool { ¤u32_gt(*self as u32, *other as u32) }
+    fn ge(&self, other: &char) -> bool { ¤u32_ge(*self as u32, *other as u32) }
+}
+impl Ord for char {}
+
+// `&str` equality. Implemented on `&str` directly so dispatch lands
+// at recv-autoref level 1 (where both recv and arg become `&&str`)
+// instead of the `impl PartialEq for str` shape, which would mismatch
+// on the arg side because the comparison desugar wraps rhs in `&`.
+// Walks the str fat-ref's bytes after a length-equality short-circuit.
+impl PartialEq for &str {
+    fn eq(&self, other: &&str) -> bool {
+        let a: &str = *self;
+        let b: &str = *other;
+        let n: usize = ¤str_len(a);
+        let m: usize = ¤str_len(b);
+        if ¤usize_ne(n, m) { return false; }
+        let pa: *const u8 = ¤slice_ptr::<u8>(¤str_as_bytes(a));
+        let pb: *const u8 = ¤slice_ptr::<u8>(¤str_as_bytes(b));
+        let mut i: usize = 0;
+        while ¤usize_lt(i, n) {
+            let ba: u8 = unsafe { *(pa.byte_add(i)) };
+            let bb: u8 = unsafe { *(pb.byte_add(i)) };
+            if ¤u8_ne(ba, bb) { return false; }
+            i = ¤usize_add(i, 1);
+        }
+        true
+    }
+    fn ne(&self, other: &&str) -> bool { ¤bool_not(self.eq(other)) }
+}
+impl Eq for &str {}
+
+// TODO: impl PartialOrd / Ord for &str — lexicographic byte compare;
+// needs a "first differing byte" walk before the length tiebreak.

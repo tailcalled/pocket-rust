@@ -164,6 +164,7 @@ pub fn emit(
     enums: &crate::typeck::EnumTable,
     traits: &crate::typeck::TraitTable,
     funcs: &FuncTable,
+    next_idx: &mut u32,
 ) -> Result<(), Error> {
     let mut module_path: Vec<String> = Vec::new();
     push_root_name(&mut module_path, root);
@@ -186,16 +187,20 @@ pub fn emit(
         }
         total
     };
-    // Imported functions occupy wasm idxs 0..imports.len(); typeck
-    // assigned non-generic entries idxs starting at imports.len(); so
-    // mono picks up after both.
-    let mono_start = wasm_mod.imports.len() as u32 + funcs.entries.len() as u32;
-    let mut mono = MonoState::new(mono_start, str_pool_base_offset);
+    // Mono idx allocation pulls from the shared `next_idx` so that
+    // monomorphizations in *this* crate's codegen don't collide with
+    // entries that the *next* crate's typeck will register at the
+    // same idx. (Concretely: stdlib codegen monomorphizing a generic
+    // helper claims an idx; without bumping `next_idx`, the user
+    // crate's typeck would later register `answer` at the same idx
+    // and the wasm export would point at the mono'd helper's body.)
+    let mut mono = MonoState::new(*next_idx, str_pool_base_offset);
     emit_module(wasm_mod, root, &mut module_path, structs, enums, traits, funcs, &mut mono)?;
     while !mono.queue.is_empty() {
         let work = mono.queue.remove(0);
         emit_monomorphic(wasm_mod, work, structs, enums, traits, funcs, &mut mono)?;
     }
+    *next_idx = mono.next_idx;
     // Flush this crate's pool contribution into the single segment at
     // STR_POOL_BASE — appending if a prior crate already created it,
     // creating fresh if not — and bump `__heap_top`'s init past the

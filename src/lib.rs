@@ -176,7 +176,7 @@ pub fn compile(
         if let Err(e) = safeck::check(&lib_root, &funcs) {
             return Err(span::format_error(&e));
         }
-        if let Err(e) = codegen::emit(&mut wasm_mod, &lib_root, &structs, &enums, &traits, &funcs) {
+        if let Err(e) = codegen::emit(&mut wasm_mod, &lib_root, &structs, &enums, &traits, &funcs, &mut next_idx) {
             return Err(span::format_error(&e));
         }
         i += 1;
@@ -199,7 +199,7 @@ pub fn compile(
     if let Err(e) = safeck::check(&user_root, &funcs) {
         return Err(span::format_error(&e));
     }
-    if let Err(e) = codegen::emit(&mut wasm_mod, &user_root, &structs, &enums, &traits, &funcs) {
+    if let Err(e) = codegen::emit(&mut wasm_mod, &user_root, &structs, &enums, &traits, &funcs, &mut next_idx) {
         return Err(span::format_error(&e));
     }
     Ok(wasm_mod)

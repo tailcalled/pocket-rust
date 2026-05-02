@@ -3,7 +3,7 @@ use super::{
     LifetimeRepr, MethodCandidate, PendingMethodCall, PendingTraitDispatch,
     RType, ReceiverAdjust, TraitTable,
     TraitReceiverShape, check_expr,
-    find_lifetime_source, find_method_candidates, infer_substitute, infer_to_string, is_mutable_place, numeric_lit_op_trait_paths, place_to_string, resolve_type,
+    find_lifetime_source, find_method_candidates, infer_substitute, infer_to_string, is_mutable_place, numeric_lit_op_traits_for_method, place_to_string, resolve_type,
     rtype_to_infer, supertrait_closure, trait_lookup, try_match_against_infer,
 };
 use crate::ast::Expr;
@@ -409,6 +409,51 @@ pub(super) fn check_method_call(
 ) -> Result<InferType, Error> {
     let recv_ty = check_expr(ctx, &mc.receiver)?;
     let resolved_recv = ctx.subst.substitute(&recv_ty);
+    // Lazy projection: when recv is `AssocProj{base, …}` (typically
+    // arising from a chained call like `(1 + 2).add(3)`), peel the
+    // projection. With no global collapse heuristic in effect, the
+    // result of the inner call stays wrapped as
+    // `<Var as Add>::Output`, and the outer `.add(3)` would otherwise
+    // hit the no-method path because dispatch can't match a method
+    // on AssocProj. Three sub-cases:
+    //   - Var base → unwrap and re-resolve (the inner Var is what
+    //     governs dispatch; for num-lit Vars, the num-lit branch
+    //     below picks the right trait).
+    //   - Param base with a `T: Trait<Name = X>` constraint → resolve
+    //     to X via `infer_concretize_assoc_proj` and continue.
+    //   - Concrete base → resolve via `find_assoc_binding` and
+    //     continue.
+    // Wrapped in a small loop so a chain of nested AssocProjs gets
+    // peeled in one pass.
+    let mut peeled = resolved_recv.clone();
+    loop {
+        match &peeled {
+            InferType::AssocProj { base, .. } => {
+                let resolved = crate::typeck::infer_concretize_assoc_proj(
+                    &peeled,
+                    ctx.traits,
+                    ctx.type_params,
+                    ctx.type_param_bound_assoc,
+                );
+                if matches!(resolved, InferType::AssocProj { .. }) {
+                    // `infer_concretize_assoc_proj` left it wrapped
+                    // (base is Var, or no unique binding). For Var
+                    // base, just unwrap to base — the num-lit branch
+                    // below will dispatch through the trait. For
+                    // anything else, leave it and let dispatch fail
+                    // with a real "no method" message.
+                    if matches!(base.as_ref(), InferType::Var(_)) {
+                        peeled = (**base).clone();
+                        break;
+                    }
+                    break;
+                }
+                peeled = resolved;
+            }
+            _ => break,
+        }
+    }
+    let resolved_recv = peeled;
     // T2: handle symbolic dispatch when recv is `Param(T)` — find the
     // method via T's trait bounds.
     if let InferType::Param(name) = &resolved_recv {
@@ -442,11 +487,7 @@ pub(super) fn check_method_call(
     // `solve_impl_with_args`.
     if let InferType::Var(v) = &resolved_recv {
         if ctx.subst.is_num_lit[*v as usize] {
-            let matching = collect_traits_declaring_method(
-                ctx.traits,
-                &numeric_lit_op_trait_paths(),
-                &mc.method,
-            );
+            let matching = numeric_lit_op_traits_for_method(ctx.traits, &mc.method);
             return dispatch_method_through_trait(
                 ctx,
                 mc,
@@ -461,11 +502,7 @@ pub(super) fn check_method_call(
     if let InferType::Ref { inner, mutable, .. } = &resolved_recv {
         if let InferType::Var(v) = inner.as_ref() {
             if ctx.subst.is_num_lit[*v as usize] {
-                let matching = collect_traits_declaring_method(
-                    ctx.traits,
-                    &numeric_lit_op_trait_paths(),
-                    &mc.method,
-                );
+                let matching = numeric_lit_op_traits_for_method(ctx.traits, &mc.method);
                 let shape = if *mutable {
                     SymRecvShape::MutRef
                 } else {

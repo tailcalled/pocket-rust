@@ -941,6 +941,101 @@ fn fill_assoc_trait_path_via_closure(
     }
 }
 
+// Resolve `<target as trait>::Name` projections against *this* impl's
+// own bindings. Used by impl-validation to turn a substituted trait
+// method signature like `<Foo as Mix>::Output` into the concrete
+// type the impl assigns to `Output` — without going through the
+// global impl table, which can return multiple matches when several
+// `impl Mix<X> for Foo` rows exist with different bindings (the
+// trait_args differ but the projection has no place to record them).
+fn resolve_self_assoc_via_impl(
+    rt: &RType,
+    trait_full: &Vec<String>,
+    target_rt: &RType,
+    impl_assoc_bindings_ast: &Vec<crate::ast::ImplAssocType>,
+    traits: &TraitTable,
+    ib: &crate::ast::ImplBlock,
+    file: &str,
+) -> Result<RType, Error> {
+    // Find this impl's row in the table to read its resolved
+    // assoc_type_bindings (already validated/resolved at registration).
+    let idx = match crate::typeck::find_trait_impl_idx_by_span(traits, file, &ib.span) {
+        Some(i) => i,
+        // Inherent impl or pre-registration; fall back to global.
+        None => {
+            let _ = impl_assoc_bindings_ast;
+            return Ok(crate::typeck::concretize_assoc_proj(rt, traits));
+        }
+    };
+    let bindings: Vec<(String, RType)> = traits.impls[idx].assoc_type_bindings.clone();
+    Ok(walk_resolve_self_proj(rt, trait_full, target_rt, &bindings, traits))
+}
+
+fn walk_resolve_self_proj(
+    rt: &RType,
+    trait_full: &Vec<String>,
+    target_rt: &RType,
+    bindings: &Vec<(String, RType)>,
+    traits: &TraitTable,
+) -> RType {
+    let recurse = |r: &RType| walk_resolve_self_proj(r, trait_full, target_rt, bindings, traits);
+    match rt {
+        RType::AssocProj { base, trait_path, name } => {
+            let new_base = recurse(base);
+            // Match `<target as this-impl-trait>::name` directly.
+            // For cross-trait projections (e.g. `Self::Output`
+            // pointing at a supertrait's assoc), fall through to
+            // the global `concretize_assoc_proj` which finds the
+            // *other* trait's impl row and reads its bindings.
+            // Multi-impl ambiguity only happens within a single
+            // trait's row set, so the global lookup is safe here.
+            let trait_match = trait_path.is_empty() || trait_path == trait_full;
+            if trait_match && rtype_eq(&new_base, target_rt) {
+                let mut k = 0;
+                while k < bindings.len() {
+                    if bindings[k].0 == *name {
+                        return recurse(&bindings[k].1);
+                    }
+                    k += 1;
+                }
+            }
+            // Cross-trait — defer to global lookup, which correctly
+            // disambiguates by the projection's own trait_path.
+            let projected = RType::AssocProj {
+                base: Box::new(new_base),
+                trait_path: trait_path.clone(),
+                name: name.clone(),
+            };
+            crate::typeck::concretize_assoc_proj(&projected, traits)
+        }
+        RType::Struct { path, type_args, lifetime_args } => {
+            let new_args: Vec<RType> = type_args.iter().map(|a| recurse(a)).collect();
+            RType::Struct { path: path.clone(), type_args: new_args, lifetime_args: lifetime_args.clone() }
+        }
+        RType::Enum { path, type_args, lifetime_args } => {
+            let new_args: Vec<RType> = type_args.iter().map(|a| recurse(a)).collect();
+            RType::Enum { path: path.clone(), type_args: new_args, lifetime_args: lifetime_args.clone() }
+        }
+        RType::Tuple(elems) => {
+            let new_elems: Vec<RType> = elems.iter().map(|e| recurse(e)).collect();
+            RType::Tuple(new_elems)
+        }
+        RType::Ref { inner, mutable, lifetime } => RType::Ref {
+            inner: Box::new(recurse(inner)),
+            mutable: *mutable,
+            lifetime: lifetime.clone(),
+        },
+        RType::RawPtr { inner, mutable } => RType::RawPtr {
+            inner: Box::new(recurse(inner)),
+            mutable: *mutable,
+        },
+        RType::Slice(inner) => RType::Slice(Box::new(recurse(inner))),
+        RType::Param(_) | RType::Int(_) | RType::Bool | RType::Str | RType::Never | RType::Char => {
+            rt.clone()
+        }
+    }
+}
+
 // Walk an `RType`, replacing every `AssocProj` whose `trait_path` is
 // empty with `default_trait_path`. Empty trait_paths are emitted by
 // `resolve_type` when it sees `Self::Name` / `T::Name` (the parser
@@ -1339,19 +1434,28 @@ fn validate_trait_impl_signatures(
         while p < trait_method.param_types.len() {
             let subst = substitute_rtype(&trait_method.param_types[p], &trait_env);
             // After Self gets substituted to the impl target, any
-            // `Self::Item` projection now points at a concrete type —
-            // resolve through the impl's bindings so the comparison
-            // against the impl method's signature lines up.
-            expected_param_types.push(crate::typeck::concretize_assoc_proj(&subst, traits));
+            // `Self::Item` projection now points at a concrete type
+            // — resolve through *this impl's own bindings*. We can't
+            // use the global `concretize_assoc_proj` here because it
+            // walks every impl row matching `(trait_path, base)`
+            // without filtering by `trait_args`, so two
+            // `impl Mix<X> for Foo` rows (with different `Output`
+            // bindings) make the lookup ambiguous and the validation
+            // fails with a misleading "wrong return type" message.
+            expected_param_types.push(resolve_self_assoc_via_impl(
+                &subst, trait_full, target_rt, &ib.assoc_type_bindings, traits, ib, file,
+            )?);
             p += 1;
         }
-        let expected_return_type: Option<RType> = trait_method
-            .return_type
-            .as_ref()
-            .map(|rt| {
+        let expected_return_type: Option<RType> = match trait_method.return_type.as_ref() {
+            Some(rt) => Some({
                 let subst = substitute_rtype(rt, &trait_env);
-                crate::typeck::concretize_assoc_proj(&subst, traits)
-            });
+                resolve_self_assoc_via_impl(
+                    &subst, trait_full, target_rt, &ib.assoc_type_bindings, traits, ib, file,
+                )?
+            }),
+            None => None,
+        };
         // Substitute the impl method's signature too, so its `<V>`
         // params land on the same placeholders as the trait's `<U>`.
         let mut impl_param_types_sub: Vec<RType> = Vec::new();
