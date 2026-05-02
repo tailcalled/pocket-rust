@@ -1125,9 +1125,20 @@ fn emit_module(
                 };
                 let mut method_prefix = path.clone();
                 let mut target_path = path.clone();
+                // Generic-trait impls on Path targets get an extra
+                // `__trait_impl_<idx>` segment so multiple
+                // `impl Trait<X> for Foo` rows have distinct paths.
+                let trait_is_generic = trait_impl_idx.map_or(false, |idx| {
+                    !traits.impls[idx].trait_args.is_empty()
+                });
                 let target_rt: RType = match &target_name {
                     Some(name) => {
                         method_prefix.push(name.clone());
+                        if trait_is_generic {
+                            if let Some(idx) = trait_impl_idx {
+                                method_prefix.push(format!("__trait_impl_{}", idx));
+                            }
+                        }
                         target_path.push(name.clone());
                         let mut impl_param_args: Vec<RType> = Vec::new();
                         let mut k = 0;
@@ -1302,6 +1313,7 @@ fn subst_opt_method_resolutions(
             if let Some(td) = &m.trait_dispatch {
                 cloned.trait_dispatch = Some(crate::typeck::TraitDispatch {
                     trait_path: td.trait_path.clone(),
+                    trait_args: subst_vec(&td.trait_args, env),
                     method_name: td.method_name.clone(),
                     recv_type: substitute_rtype(&td.recv_type, env),
                 });
@@ -5055,6 +5067,7 @@ fn codegen_trait_method_call(
         .as_ref()
         .map(|t| crate::typeck::TraitDispatch {
             trait_path: t.trait_path.clone(),
+            trait_args: t.trait_args.clone(),
             method_name: t.method_name.clone(),
             recv_type: t.recv_type.clone(),
         })
@@ -5065,12 +5078,12 @@ fn codegen_trait_method_call(
         RType::Ref { inner, .. } => (**inner).clone(),
         other => other.clone(),
     };
-    let resolution = match crate::typeck::solve_impl(&td.trait_path, &concrete_recv, ctx.traits, 0)
+    let resolution = match crate::typeck::solve_impl_with_args(&td.trait_path, &td.trait_args, &concrete_recv, ctx.traits, 0)
     {
         Some(r) => r,
         None => unreachable!(
             "no impl of `{}` for `{}` at mono time — typeck should have caught",
-            crate::typeck::rtype_to_string(&concrete_recv),
+            crate::typeck::place_to_string(&td.trait_path),
             crate::typeck::rtype_to_string(&concrete_recv)
         ),
     };
@@ -5292,60 +5305,42 @@ fn int_kind_signed(k: &IntKind) -> bool {
     )
 }
 
-// T5: every user-source integer literal is desugared to
-// `<T as Num>::from_i64(literal_i64)`. Codegen emits an `i64.const`
-// (the only place a primitive integer constant is emitted now) and
-// calls the appropriate impl method, monomorphizing when needed.
+// Numeric literal codegen. With literal overloading dropped, every
+// integer literal resolves to a built-in `Int(kind)`; emit the
+// appropriate `iN.const`. 64-bit kinds (u64/i64) take an `i64.const`;
+// 128-bit kinds need two `i64.const`s (low half then high half) per
+// the wide flatten convention. ≤32-bit kinds (incl. usize/isize on
+// our wasm32 target) use `i32.const`. `negative` flips the sign for
+// `NegIntLit(N)` source forms; the typeck range-check already
+// rejected unsigned/out-of-range signed targets.
 fn emit_int_lit(ctx: &mut FnCtx, ty: &RType, value: u64, negative: bool) {
-    // Solve `<ty as Num>::from_i64`.
-    let num_path = vec!["std".to_string(), "ops".to_string(), "Num".to_string()];
-    let resolution = crate::typeck::solve_impl(&num_path, ty, ctx.traits, 0)
-        .expect("Num impl exists for every primitive integer kind in stdlib");
-    let cand = crate::typeck::find_trait_impl_method(
-        ctx.funcs,
-        resolution.impl_idx,
-        "from_i64",
-    )
-    .expect("Num impl provides from_i64");
-    let callee_idx = match cand {
-        crate::typeck::MethodCandidate::Direct(i) => ctx.funcs.entries[i].idx,
-        crate::typeck::MethodCandidate::Template(i) => {
-            // Stdlib's Num impls aren't generic on themselves, so the
-            // template path shouldn't fire today — but support it for
-            // future user impls (e.g. `impl<T: Num> Num for Wrap<T>`).
-            let tmpl = &ctx.funcs.templates[i];
-            let mut concrete: Vec<RType> = Vec::new();
-            let mut k = 0;
-            while k < tmpl.type_params.len() {
-                let name = &tmpl.type_params[k];
-                let mut found: Option<RType> = None;
-                let mut j = 0;
-                while j < resolution.subst.len() {
-                    if resolution.subst[j].0 == *name {
-                        found = Some(resolution.subst[j].1.clone());
-                        break;
-                    }
-                    j += 1;
-                }
-                concrete.push(found.expect("impl-param not bound by subst"));
-                k += 1;
-            }
-            ctx.mono.intern(i, concrete)
-        }
+    let kind = match ty {
+        RType::Int(k) => k.clone(),
+        _ => unreachable!(
+            "literal target must be Int after typeck — got {}",
+            crate::typeck::rtype_to_string(ty)
+        ),
     };
-    // Push i64.const VALUE — the only direct integer-const emit; not
-    // recursively desugared because it's the argument to from_i64.
-    // For `NegIntLit(N)` we pass `-N` (two's-complement i64). The
-    // typeck range-check already rejected unsigned and out-of-range
-    // signed targets.
-    let signed = if negative {
+    let signed64 = if negative {
         (value as i64).wrapping_neg()
     } else {
         value as i64
     };
-    ctx.instructions
-        .push(wasm::Instruction::I64Const(signed));
-    ctx.instructions.push(wasm::Instruction::Call(callee_idx));
+    match int_kind_class(&kind) {
+        IntClass::Wide128 => {
+            // Two halves: low (signed64) then high (sign-extension or 0).
+            let high = if int_kind_signed(&kind) && negative { -1i64 } else { 0i64 };
+            ctx.instructions.push(wasm::Instruction::I64Const(signed64));
+            ctx.instructions.push(wasm::Instruction::I64Const(high));
+        }
+        IntClass::Wide64 => {
+            ctx.instructions.push(wasm::Instruction::I64Const(signed64));
+        }
+        IntClass::Narrow32 => {
+            ctx.instructions
+                .push(wasm::Instruction::I32Const(signed64 as i32));
+        }
+    }
 }
 
 fn codegen_block_expr(ctx: &mut FnCtx, block: &Block) -> Result<RType, Error> {

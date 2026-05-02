@@ -301,17 +301,19 @@ fn unknown_trait_in_impl_is_rejected() {
 
 #[test]
 fn impl_without_supertrait_impl_is_rejected() {
-    // `trait Sub: Super` requires `impl Super for T` to exist
-    // whenever `impl Sub for T` is registered.
+    // `trait Refined: Base` requires `impl Base for T` to exist
+    // whenever `impl Refined for T` is registered. (Test uses non-
+    // stdlib trait names — `Sub` would collide with `std::ops::Sub`
+    // imported by the prelude after the operator-trait refactor.)
     let err = compile_source(
-        "trait Super { fn s(&self) -> u32; }\n\
-         trait Sub: Super { fn x(&self) -> u32; }\n\
+        "trait Base { fn b(&self) -> u32; }\n\
+         trait Refined: Base { fn x(&self) -> u32; }\n\
          struct Foo { n: u32 }\n\
-         impl Sub for Foo { fn x(&self) -> u32 { self.n } }\n\
+         impl Refined for Foo { fn x(&self) -> u32 { self.n } }\n\
          fn f() -> u32 { 0 }",
     );
     assert!(
-        err.contains("trait bound") && err.contains("Super"),
+        err.contains("trait bound") && err.contains("Base"),
         "expected supertrait obligation error, got: {}",
         err
     );
@@ -410,4 +412,67 @@ fn dispatch_ambig_same_level_two_param_impls_is_rejected() {
 #[test]
 fn dispatch_blanket_through_str_uses_autoref_returns_7() {
     expect_answer("lang/traits/dispatch_blanket_through_str_uses_autoref", 7i32);
+}
+
+// Trait with positional type-param `Mix<Rhs>` — two impls on the
+// same target with different Rhs disambiguate via the new
+// trait_args match in solve_impl. Validates the end-to-end pipeline
+// for generic traits.
+#[test]
+fn generic_trait_basic_returns_42() {
+    expect_answer("lang/traits/generic_trait_basic", 42i32);
+}
+
+// Strategy (d) deferred dispatch: two `impl Mix<X> for Foo` rows; the
+// call's trait-arg can't be picked at the call site (recv is concrete,
+// arg is an inferring literal). The let-binding's `: u32` annotation
+// arrives one statement later and must drive impl selection.
+#[test]
+fn generic_trait_multi_impl_inferred_returns_42() {
+    expect_answer("lang/traits/generic_trait_multi_impl_inferred", 42i32);
+}
+
+// Default trait param: `trait Mix<Rhs = Self>` lets `impl Mix for
+// Foo` omit the arg and have Rhs default to Foo. Validates that
+// trait-arg defaulting substitutes `Self` correctly at the impl site.
+#[test]
+fn trait_param_default_returns_42() {
+    expect_answer("lang/traits/trait_param_default", 42i32);
+}
+
+// Negative: a trait param with no default left out at use site —
+// expected error mentions the missing parameter.
+#[test]
+fn trait_param_missing_arg_is_rejected() {
+    let err = compile_source(
+        "trait Mix<Rhs> { fn mix(self, other: Rhs) -> u32; }\n\
+         struct Foo {}\n\
+         impl Mix for Foo { fn mix(self, other: Foo) -> u32 { 0 } }\n\
+         fn answer() -> u32 { 0 }",
+    );
+    assert!(
+        err.contains("missing type argument"),
+        "expected missing-type-arg error, got: {}",
+        err
+    );
+}
+
+// Negative: multi-impl generic trait, but the call's trait-arg is
+// never pinned by surrounding usage. The trait-arg inference var
+// stays unresolved at body-end, leaving codegen no impl to pick.
+// Should error rather than panic or pick arbitrarily.
+#[test]
+fn generic_trait_multi_impl_unresolved_is_rejected() {
+    let err = compile_source(
+        "trait Mixer<Rhs> { fn mix(self, other: Rhs) -> Rhs; }\n\
+         struct Foo {}\n\
+         impl Mixer<u32> for Foo { fn mix(self, other: u32) -> u32 { other } }\n\
+         impl Mixer<i64> for Foo { fn mix(self, other: i64) -> i64 { other } }\n\
+         fn answer() -> u32 { Foo {}.mix(0); 0 }",
+    );
+    assert!(
+        err.contains("no impl of `Mixer<i32>` for `Foo`"),
+        "expected no-impl-for-defaulted-trait-arg error, got: {}",
+        err
+    );
 }

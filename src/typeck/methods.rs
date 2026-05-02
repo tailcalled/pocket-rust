@@ -3,7 +3,7 @@ use super::{
     LifetimeRepr, MethodCandidate, PendingMethodCall, PendingTraitDispatch,
     RType, ReceiverAdjust, TraitTable,
     TraitReceiverShape, check_expr,
-    find_lifetime_source, find_method_candidates, infer_substitute, infer_to_string, is_mutable_place, num_trait_path, place_to_string, resolve_type,
+    find_lifetime_source, find_method_candidates, infer_substitute, infer_to_string, is_mutable_place, numeric_lit_op_trait_paths, place_to_string, resolve_type,
     rtype_to_infer, supertrait_closure, trait_lookup, try_match_against_infer,
 };
 use crate::ast::Expr;
@@ -108,14 +108,19 @@ fn collect_traits_declaring_method(
     matching_traits
 }
 
-// Common dispatch logic for "method on a not-yet-pinned type": either
-// `Param(T)` with `T: Bound` (the explicit bounded-symbolic path) or
-// an unbound integer literal var with implicit `T: Num` (the num-lit
-// path).
+// Common dispatch logic for "method on a type whose impl can't be
+// picked here-and-now": either `Param(T)` with `T: Bound` (the
+// explicit bounded-symbolic path), an unbound integer literal var with
+// implicit `T: Num` (the num-lit path), or a concrete recv where
+// multiple impls of the same generic trait match (the deferred-dispatch
+// path for `Foo{}.mix(0)` with multiple `impl Mix<X> for Foo` rows).
+// In every case the trait_args are resolved later via inference, then
+// `solve_impl_with_args` picks the actual impl at codegen / mono time.
 //
 // `recv_self_infer`: the Self type to substitute in the trait method's
 //   signature — `Param(name)` for the bounded path, `Var(v)` for the
-//   num-lit path. Borrowck/codegen apply the appropriate adjust later.
+//   num-lit path, the concrete recv InferType for the deferred path.
+//   Borrowck/codegen apply the appropriate adjust later.
 // `display_name`: a name to mention in error messages (`"T"` for a
 //   user-typed param, `"integer"` for a num-lit var).
 fn dispatch_method_through_trait(
@@ -165,6 +170,11 @@ fn dispatch_method_through_trait(
     let trait_return_type = trait_method.return_type.clone();
     let trait_recv_shape = trait_method.receiver_shape;
     let trait_method_type_params: Vec<String> = trait_method.type_params.clone();
+    // Trait-level type-params (e.g. `Rhs` in `trait Mix<Rhs>`). Each gets
+    // a fresh inference var so usage-driven unification can pin them; the
+    // resolved values land on `PendingTraitDispatch.trait_arg_infers` and
+    // are converted to RType at body finalize.
+    let trait_type_params: Vec<String> = trait_entry.trait_type_params.clone();
     // Drop the borrow into traits before mutating ctx.
     drop(trait_entry);
     let expected_arg_count = if trait_param_types.is_empty() {
@@ -191,6 +201,17 @@ fn dispatch_method_through_trait(
         "Self".to_string(),
         recv_self_infer.clone(),
     )];
+    // Allocate fresh inference vars for trait-level type-params and
+    // record them on the dispatch (so codegen can call
+    // `solve_impl_with_args` with their finalized RTypes).
+    let mut trait_arg_infers: Vec<InferType> = Vec::new();
+    let mut tap = 0;
+    while tap < trait_type_params.len() {
+        let v = ctx.subst.fresh_var();
+        method_subst.push((trait_type_params[tap].clone(), InferType::Var(v)));
+        trait_arg_infers.push(InferType::Var(v));
+        tap += 1;
+    }
     let mut method_type_var_ids: Vec<u32> = Vec::new();
     let mut tp = 0;
     while tp < trait_method_type_params.len() {
@@ -356,8 +377,10 @@ fn dispatch_method_through_trait(
         type_arg_infers,
         trait_dispatch: Some(PendingTraitDispatch {
             trait_path: trait_full.clone(),
+            trait_arg_infers,
             method_name: mc.method.clone(),
             recv_type_infer: recv_for_storage,
+            dispatch_span: mc.method_span.copy(),
         }),
     });
     // Return type comes from the trait method's declared signature with
@@ -408,17 +431,20 @@ pub(super) fn check_method_call(
         }
     }
     // Method on an unbound integer literal var (e.g. `30 + 12` or
-    // `(-x).foo()` where the literal hasn't been pinned yet). Treat
-    // it as if it had an implicit `T: Num` bound and dispatch through
-    // the Num + supertrait closure (so `add`/`sub` find VecSpace,
-    // `mul`/`div` find Num, etc.). The recv stays as the var; codegen
-    // picks up the concrete type after body-end pinning.
+    // `(-x).foo()` where the literal hasn't been pinned yet). The var
+    // can only resolve to a built-in integer type (literal overloading
+    // is dropped), so we know exactly which traits are in play:
+    // Add/Sub/Mul/Div/Rem/Neg + PartialEq/PartialOrd. We dispatch
+    // symbolically through whichever of those declares the method; the
+    // method's own signature drives arg checking, and the trait_args
+    // (e.g. `Rhs` in `Add<Rhs>`) become fresh inference vars resolved
+    // by usage. Codegen picks the impl after body-end pinning via
+    // `solve_impl_with_args`.
     if let InferType::Var(v) = &resolved_recv {
         if ctx.subst.is_num_lit[*v as usize] {
-            let num_path = num_trait_path();
             let matching = collect_traits_declaring_method(
                 ctx.traits,
-                &vec![num_path],
+                &numeric_lit_op_trait_paths(),
                 &mc.method,
             );
             return dispatch_method_through_trait(
@@ -435,10 +461,9 @@ pub(super) fn check_method_call(
     if let InferType::Ref { inner, mutable, .. } = &resolved_recv {
         if let InferType::Var(v) = inner.as_ref() {
             if ctx.subst.is_num_lit[*v as usize] {
-                let num_path = num_trait_path();
                 let matching = collect_traits_declaring_method(
                     ctx.traits,
-                    &vec![num_path],
+                    &numeric_lit_op_trait_paths(),
                     &mc.method,
                 );
                 let shape = if *mutable {
@@ -631,6 +656,66 @@ pub(super) fn check_method_call(
             continue;
         }
         if matches_at_level.len() > 1 {
+            // Strategy (d): if every match is a method on a trait impl,
+            // and they all come from impls of the same trait (with
+            // differing trait_args), defer impl selection. We dispatch
+            // through the trait method's signature with fresh inference
+            // vars for each trait-arg slot; usage downstream pins them
+            // and codegen runs `solve_impl_with_args` to pick the row.
+            // This is what handles `Foo{}.mix(0)` for two
+            // `impl Mix<X> for Foo` rows.
+            let mut trait_paths: Vec<Vec<String>> = Vec::new();
+            let mut all_have_trait = true;
+            let mut ci = 0;
+            while ci < matches_at_level.len() {
+                let trait_idx = match &matches_at_level[ci].0 {
+                    MethodCandidate::Direct(i) => ctx.funcs.entries[*i].trait_impl_idx,
+                    MethodCandidate::Template(i) => ctx.funcs.templates[*i].trait_impl_idx,
+                };
+                match trait_idx {
+                    Some(idx) => {
+                        let path = ctx.traits.impls[idx].trait_path.clone();
+                        if !trait_paths.iter().any(|p| *p == path) {
+                            trait_paths.push(path);
+                        }
+                    }
+                    None => {
+                        all_have_trait = false;
+                        break;
+                    }
+                }
+                ci += 1;
+            }
+            if all_have_trait && trait_paths.len() == 1 {
+                let trait_full = trait_paths.into_iter().next().unwrap();
+                // Only defer when the trait carries type-params:
+                // without them there's nothing for inference to pin
+                // (e.g. `impl Trait for u32` + `impl<T> Trait for T`,
+                // or two overlapping parametric patterns), and the
+                // call-site truly is ambiguous. Generic-trait impls
+                // (`impl Mix<u32> for Foo` + `impl Mix<i64> for Foo`)
+                // do have a slot to thread through usage.
+                let trait_has_params = trait_lookup(ctx.traits, &trait_full)
+                    .map(|t| !t.trait_type_params.is_empty())
+                    .unwrap_or(false);
+                if trait_has_params {
+                    let recv_shape = match &recv_full {
+                        InferType::Ref { mutable: true, .. } => SymRecvShape::MutRef,
+                        InferType::Ref { mutable: false, .. } => SymRecvShape::SharedRef,
+                        _ => SymRecvShape::Owned,
+                    };
+                    let display = infer_to_string(&recv_full);
+                    return dispatch_method_through_trait(
+                        ctx,
+                        mc,
+                        call_expr,
+                        recv_full.clone(),
+                        vec![trait_full],
+                        recv_shape,
+                        display,
+                    );
+                }
+            }
             return Err(Error {
                 file: ctx.current_file.to_string(),
                 message: format!(

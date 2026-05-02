@@ -119,6 +119,18 @@ pub struct TraitEntry {
     // `type Name;` declarations inside the trait body. Each impl of
     // this trait must bind exactly these names (no missing, no extras).
     pub assoc_types: Vec<String>,
+    // Trait-level type parameter names (`trait Add<Rhs> { ... }`).
+    // Each `impl Add<X> for T { ... }` row supplies one RType per name
+    // here in declaration order; downstream dispatch reads
+    // `TraitImplEntry.trait_args` to disambiguate which row applies.
+    pub trait_type_params: Vec<String>,
+    // Per trait-level type-param, the resolved default type (`Rhs =
+    // Self` → `Some(Param("Self"))`); `None` if no default. Same length
+    // and order as `trait_type_params`. Trait-arg lists shorter than
+    // `trait_type_params.len()` are completed by appending defaults
+    // (with `Self` substituted by the impl target / bound holder).
+    // A param with no default is required at use sites.
+    pub trait_type_param_defaults: Vec<Option<RType>>,
 }
 
 pub struct TraitMethodEntry {
@@ -155,6 +167,11 @@ pub enum TraitReceiverShape {
 // records the impl's own type-params (not the trait's).
 pub struct TraitImplEntry {
     pub trait_path: Vec<String>,
+    // Resolved positional type-args for the trait (the `<U>` in
+    // `impl Add<U> for T`). Length matches the trait's
+    // `trait_type_params`. May contain `Param(name)` slots referring
+    // to this impl's own type-params (e.g. `impl<X> Add<X> for X`).
+    pub trait_args: Vec<RType>,
     pub target: RType,
     pub impl_type_params: Vec<String>,
     pub impl_lifetime_params: Vec<String>,
@@ -342,6 +359,10 @@ pub struct MethodResolution {
 #[derive(Clone)]
 pub struct TraitDispatch {
     pub trait_path: Vec<String>,
+    // Resolved positional trait-args (for `Mix<u32>`-style traits). Empty
+    // for non-generic traits; `solve_impl_with_args` uses them alongside
+    // `recv_type` to pick the right impl row at codegen / mono time.
+    pub trait_args: Vec<RType>,
     pub method_name: String,
     pub recv_type: RType,
 }

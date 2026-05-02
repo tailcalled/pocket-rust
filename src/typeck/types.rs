@@ -282,6 +282,25 @@ pub fn rtype_eq(a: &RType, b: &RType) -> bool {
     }
 }
 
+// True iff `t` (or any nested element) is `Param(_)`. Used at typeck
+// finalize to skip impl-resolution validation when a trait_dispatch
+// still depends on an outer generic that won't be pinned until
+// monomorphization.
+pub fn rtype_contains_param(t: &RType) -> bool {
+    match t {
+        RType::Param(_) => true,
+        RType::Struct { type_args, .. } | RType::Enum { type_args, .. } => {
+            type_args.iter().any(rtype_contains_param)
+        }
+        RType::Tuple(elems) => elems.iter().any(rtype_contains_param),
+        RType::Ref { inner, .. } | RType::RawPtr { inner, .. } | RType::Slice(inner) => {
+            rtype_contains_param(inner)
+        }
+        RType::AssocProj { base, .. } => rtype_contains_param(base),
+        RType::Bool | RType::Int(_) | RType::Str | RType::Never | RType::Char => false,
+    }
+}
+
 pub fn rtype_to_string(t: &RType) -> String {
     match t {
         RType::Bool => "bool".to_string(),
@@ -694,8 +713,31 @@ pub fn drop_trait_path() -> Vec<String> {
     vec!["std".to_string(), "ops".to_string(), "Drop".to_string()]
 }
 
-pub fn num_trait_path() -> Vec<String> {
-    vec!["std".to_string(), "ops".to_string(), "Num".to_string()]
+// The set of trait paths that an unbound integer-literal var is
+// implicitly considered to satisfy for method dispatch (Add/Sub/Mul/
+// Div/Rem/Neg in `std::ops`, plus PartialEq/PartialOrd in `std::cmp`).
+// Used by the num-lit symbolic dispatch path to find the right trait
+// for `1.add(2)` / `1.eq(&2)` / `(-x).foo()` etc., before the var is
+// pinned to a concrete int kind.
+pub fn numeric_lit_op_trait_paths() -> Vec<Vec<String>> {
+    let std = "std".to_string();
+    let ops = "ops".to_string();
+    let cmp = "cmp".to_string();
+    vec![
+        vec![std.clone(), ops.clone(), "Add".to_string()],
+        vec![std.clone(), ops.clone(), "Sub".to_string()],
+        vec![std.clone(), ops.clone(), "Mul".to_string()],
+        vec![std.clone(), ops.clone(), "Div".to_string()],
+        vec![std.clone(), ops.clone(), "Rem".to_string()],
+        vec![std.clone(), ops.clone(), "Neg".to_string()],
+        vec![std.clone(), ops.clone(), "AddAssign".to_string()],
+        vec![std.clone(), ops.clone(), "SubAssign".to_string()],
+        vec![std.clone(), ops.clone(), "MulAssign".to_string()],
+        vec![std.clone(), ops.clone(), "DivAssign".to_string()],
+        vec![std.clone(), ops, "RemAssign".to_string()],
+        vec![std.clone(), cmp.clone(), "PartialEq".to_string()],
+        vec![std, cmp, "PartialOrd".to_string()],
+    ]
 }
 
 // Whether `t` implements `std::Drop`. Used by codegen to decide whether

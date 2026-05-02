@@ -87,6 +87,20 @@ fn check_module(
                 };
                 let mut method_prefix = current_module.clone();
                 method_prefix.push(target_name.clone());
+                // For generic-trait impls (`impl Add<u32> for Foo`),
+                // append the per-impl-row `__trait_impl_<idx>` suffix
+                // to mirror the path scheme typeck/codegen use.
+                if ib.trait_path.is_some() {
+                    if let Some(idx) = crate::typeck::find_trait_impl_idx_by_span(
+                        traits,
+                        current_file,
+                        &ib.span,
+                    ) {
+                        if !traits.impls[idx].trait_args.is_empty() {
+                            method_prefix.push(format!("__trait_impl_{}", idx));
+                        }
+                    }
+                }
                 let mut target_full = current_module.clone();
                 target_full.push(target_name);
                 let mut impl_param_args: Vec<RType> = Vec::new();

@@ -301,6 +301,14 @@ impl Parser {
     fn parse_trait_def_with_vis(&mut self, is_pub: bool) -> Result<TraitDef, Error> {
         let trait_kw = self.expect(&TokenKind::Trait, "`trait`")?;
         let (name, name_span) = self.expect_ident()?;
+        // Optional `<T1, T2, ...>` trait-level type parameters.
+        // Lifetime params on traits aren't supported yet.
+        let type_params = if self.peek_kind(&TokenKind::LAngle) {
+            let (_lifetime_params, type_params) = self.parse_generic_params()?;
+            type_params
+        } else {
+            Vec::new()
+        };
         let mut supertraits: Vec<TraitBound> = Vec::new();
         if self.peek_kind(&TokenKind::Colon) {
             self.pos += 1;
@@ -335,6 +343,7 @@ impl Parser {
         Ok(TraitDef {
             name,
             name_span,
+            type_params,
             supertraits,
             methods,
             assoc_types,
@@ -992,30 +1001,47 @@ impl Parser {
                 bounds.push(self.parse_trait_bound()?);
             }
         }
-        Ok(TypeParam { name, name_span, bounds })
+        let default = if self.peek_kind(&TokenKind::Eq) {
+            self.pos += 1;
+            Some(self.parse_type()?)
+        } else {
+            None
+        };
+        Ok(TypeParam { name, name_span, bounds, default })
     }
 
     fn parse_trait_bound(&mut self) -> Result<TraitBound, Error> {
-        // A bound is either `Path` (plain) or `Path<Name = Type, …>`
-        // (associated-type constraints). The bound's path itself doesn't
-        // carry generic type args today — `Trait<…>` brackets parse only
-        // as `Name = Type` pairs. (Plain trait generic args like
-        // `Foo<i32>` aren't supported on bounds yet — would need
-        // disambiguation against the assoc-constraint syntax.)
-        let path = self.parse_path()?;
+        // A bound is `Path<Args, Name = Type, …>`. Args (positional
+        // type-args for the trait's `<T1, T2, …>` declaration) come
+        // first; assoc-type constraints (`Name = Type`) follow. Each
+        // entry is disambiguated by peeking: an `IDENT =` pair is an
+        // assoc constraint; anything else is a type-arg expression.
+        let mut path = self.parse_path()?;
+        let mut trait_type_args: Vec<Type> = Vec::new();
         let mut assoc_constraints: Vec<AssocConstraint> = Vec::new();
         if self.peek_kind(&TokenKind::LAngle) {
             self.pos += 1;
-            // Empty `<>` is allowed but pointless; loop until `>`.
             while !self.peek_kind(&TokenKind::RAngle) {
-                let (cname, cname_span) = self.expect_ident()?;
-                self.expect(&TokenKind::Eq, "`=` (associated-type constraint)")?;
-                let cty = self.parse_type()?;
-                assoc_constraints.push(AssocConstraint {
-                    name: cname,
-                    name_span: cname_span,
-                    ty: cty,
-                });
+                let is_assoc = matches!(
+                    (
+                        self.tokens.get(self.pos).map(|t| &t.kind),
+                        self.tokens.get(self.pos + 1).map(|t| &t.kind),
+                    ),
+                    (Some(TokenKind::Ident(_)), Some(TokenKind::Eq))
+                );
+                if is_assoc {
+                    let (cname, cname_span) = self.expect_ident()?;
+                    self.expect(&TokenKind::Eq, "`=`")?;
+                    let cty = self.parse_type()?;
+                    assoc_constraints.push(AssocConstraint {
+                        name: cname,
+                        name_span: cname_span,
+                        ty: cty,
+                    });
+                } else {
+                    let ty = self.parse_type()?;
+                    trait_type_args.push(ty);
+                }
                 if self.peek_kind(&TokenKind::Comma) {
                     self.pos += 1;
                 } else {
@@ -1023,6 +1049,13 @@ impl Parser {
                 }
             }
             self.expect(&TokenKind::RAngle, "`>`")?;
+        }
+        // Stash the positional type-args on the path's last segment
+        // so downstream resolution sees them like any other typed
+        // path. (This mirrors how struct paths carry their `<…>`.)
+        if !trait_type_args.is_empty() {
+            let last = path.segments.len() - 1;
+            path.segments[last].args = trait_type_args;
         }
         Ok(TraitBound { path, assoc_constraints })
     }
@@ -1280,6 +1313,46 @@ impl Parser {
                     rhs,
                     span,
                 }));
+                continue;
+            }
+            // Compound-assignment desugar: `a OP= b;` → `Stmt::Expr(
+            // MethodCall { receiver: a, method: "<op>_assign", args:
+            // [b] })`. Method dispatch autorefs the receiver to
+            // `&mut a` (the trait method takes `&mut self`), so `a`
+            // must be a mutable place — exactly the same constraint
+            // as `a = a OP b;` would have.
+            let op_assign_method: Option<&str> = if self.peek_kind(&TokenKind::PlusEq) {
+                Some("add_assign")
+            } else if self.peek_kind(&TokenKind::MinusEq) {
+                Some("sub_assign")
+            } else if self.peek_kind(&TokenKind::StarEq) {
+                Some("mul_assign")
+            } else if self.peek_kind(&TokenKind::SlashEq) {
+                Some("div_assign")
+            } else if self.peek_kind(&TokenKind::PercentEq) {
+                Some("rem_assign")
+            } else {
+                None
+            };
+            if let Some(method) = op_assign_method {
+                let op_span = self.tokens[self.pos].span.copy();
+                self.pos += 1;
+                let rhs = self.parse_expr()?;
+                let semi = self.expect(&TokenKind::Semi, "`;`")?;
+                let span = Span::new(expr.span.start.copy(), semi.end);
+                let id = self.alloc_node_id();
+                let call = Expr {
+                    kind: ExprKind::MethodCall(MethodCall {
+                        receiver: Box::new(expr),
+                        method: method.to_string(),
+                        method_span: op_span,
+                        turbofish_args: Vec::new(),
+                        args: vec![rhs],
+                    }),
+                    span,
+                    id,
+                };
+                stmts.push(Stmt::Expr(call));
                 continue;
             }
             if self.peek_kind(&TokenKind::Semi) {
@@ -2538,6 +2611,11 @@ impl Parser {
             (TokenKind::Percent, TokenKind::Percent) => true,
             (TokenKind::Bang, TokenKind::Bang) => true,
             (TokenKind::EqEq, TokenKind::EqEq) => true,
+            (TokenKind::PlusEq, TokenKind::PlusEq) => true,
+            (TokenKind::MinusEq, TokenKind::MinusEq) => true,
+            (TokenKind::StarEq, TokenKind::StarEq) => true,
+            (TokenKind::SlashEq, TokenKind::SlashEq) => true,
+            (TokenKind::PercentEq, TokenKind::PercentEq) => true,
             (TokenKind::NotEq, TokenKind::NotEq) => true,
             (TokenKind::LtEq, TokenKind::LtEq) => true,
             (TokenKind::GtEq, TokenKind::GtEq) => true,

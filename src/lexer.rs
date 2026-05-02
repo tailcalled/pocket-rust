@@ -76,6 +76,16 @@ pub enum TokenKind {
     LtEq,
     GtEq,
     Eq,
+    // Compound-assignment operators. Each is a single token; the
+    // parser desugars `a OP= b` to `a.op_assign(b)` (autoref'd
+    // `&mut self`) for the matching `OpAssign<Rhs = Self>` trait
+    // (`std::ops::AddAssign` / `SubAssign` / `MulAssign` /
+    // `DivAssign` / `RemAssign`).
+    PlusEq,
+    MinusEq,
+    StarEq,
+    SlashEq,
+    PercentEq,
     // `_` — wildcard / placeholder. Used by patterns (matches anything,
     // binds nothing) and `let _ = …;`. Lexed as a standalone token, not
     // an identifier — pure-`_` ident isn't a binding name.
@@ -161,6 +171,11 @@ pub fn token_kind_name(t: &TokenKind) -> &'static str {
         TokenKind::Percent => "`%`",
         TokenKind::Bang => "`!`",
         TokenKind::EqEq => "`==`",
+        TokenKind::PlusEq => "`+=`",
+        TokenKind::MinusEq => "`-=`",
+        TokenKind::StarEq => "`*=`",
+        TokenKind::SlashEq => "`/=`",
+        TokenKind::PercentEq => "`%=`",
         TokenKind::NotEq => "`!=`",
         TokenKind::LtEq => "`<=`",
         TokenKind::GtEq => "`>=`",
@@ -506,9 +521,21 @@ pub fn tokenize(file: &str, source: &str) -> Result<Vec<Token>, Error> {
         } else if b == b'&' {
             push_single(&mut tokens, TokenKind::Amp, line, &mut col);
             byte_pos += 1;
+        } else if b == b'*' && (byte_pos + 1) < bytes.len() && bytes[byte_pos + 1] == b'=' {
+            let start = Pos::new(line, col);
+            col += 2;
+            let end = Pos::new(line, col);
+            tokens.push(Token { kind: TokenKind::StarEq, span: Span::new(start, end) });
+            byte_pos += 2;
         } else if b == b'*' {
             push_single(&mut tokens, TokenKind::Star, line, &mut col);
             byte_pos += 1;
+        } else if b == b'+' && (byte_pos + 1) < bytes.len() && bytes[byte_pos + 1] == b'=' {
+            let start = Pos::new(line, col);
+            col += 2;
+            let end = Pos::new(line, col);
+            tokens.push(Token { kind: TokenKind::PlusEq, span: Span::new(start, end) });
+            byte_pos += 2;
         } else if b == b'+' {
             push_single(&mut tokens, TokenKind::Plus, line, &mut col);
             byte_pos += 1;
@@ -568,9 +595,21 @@ pub fn tokenize(file: &str, source: &str) -> Result<Vec<Token>, Error> {
                     ),
                 });
             }
+        } else if b == b'/' && (byte_pos + 1) < bytes.len() && bytes[byte_pos + 1] == b'=' {
+            let start = Pos::new(line, col);
+            col += 2;
+            let end = Pos::new(line, col);
+            tokens.push(Token { kind: TokenKind::SlashEq, span: Span::new(start, end) });
+            byte_pos += 2;
         } else if b == b'/' {
             push_single(&mut tokens, TokenKind::Slash, line, &mut col);
             byte_pos += 1;
+        } else if b == b'%' && (byte_pos + 1) < bytes.len() && bytes[byte_pos + 1] == b'=' {
+            let start = Pos::new(line, col);
+            col += 2;
+            let end = Pos::new(line, col);
+            tokens.push(Token { kind: TokenKind::PercentEq, span: Span::new(start, end) });
+            byte_pos += 2;
         } else if b == b'%' {
             push_single(&mut tokens, TokenKind::Percent, line, &mut col);
             byte_pos += 1;
@@ -826,6 +865,12 @@ pub fn tokenize(file: &str, source: &str) -> Result<Vec<Token>, Error> {
                 kind: TokenKind::Arrow,
                 span: Span::new(start, end),
             });
+            byte_pos += 2;
+        } else if b == b'-' && (byte_pos + 1) < bytes.len() && bytes[byte_pos + 1] == b'=' {
+            let start = Pos::new(line, col);
+            col += 2;
+            let end = Pos::new(line, col);
+            tokens.push(Token { kind: TokenKind::MinusEq, span: Span::new(start, end) });
             byte_pos += 2;
         } else if b == b'-' {
             push_single(&mut tokens, TokenKind::Minus, line, &mut col);

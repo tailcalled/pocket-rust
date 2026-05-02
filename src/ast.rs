@@ -93,6 +93,10 @@ pub struct ImplAssocType {
 pub struct TraitDef {
     pub name: String,
     pub name_span: Span,
+    // Trait-level type parameters (`trait Add<Rhs> { ... }`). Available
+    // inside the trait body's method signatures and assoc-type defaults.
+    // Each bound site that names this trait supplies values for these.
+    pub type_params: Vec<TypeParam>,
     pub supertraits: Vec<TraitBound>,
     pub methods: Vec<TraitMethodSig>,
     // `type Name;` declarations inside the trait body. Each impl of
@@ -213,6 +217,13 @@ pub struct TypeParam {
     // Trait bounds attached to this type param (e.g. `<T: Show + Eq>`).
     // Empty when no bounds were written.
     pub bounds: Vec<TraitBound>,
+    // Default type for this param (e.g. `Rhs = Self` in `trait Add<Rhs
+    // = Self>`). Currently only meaningful on trait declarations —
+    // function/struct/impl type-params parse `default` but it's
+    // semantically rejected at typeck setup. `Self` in a default
+    // refers to the implementing type at use sites (substituted by
+    // the trait-arg defaulter).
+    pub default: Option<Type>,
 }
 
 #[derive(Clone)]

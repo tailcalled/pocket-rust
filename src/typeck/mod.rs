@@ -5,10 +5,10 @@ use crate::span::{Error, Span};
 
 mod types;
 pub use types::{
-    IntKind, LifetimeRepr, RType, byte_size_of, copy_trait_path, drop_trait_path, num_trait_path, flatten_rtype,
+    IntKind, LifetimeRepr, RType, byte_size_of, copy_trait_path, drop_trait_path, numeric_lit_op_trait_paths, flatten_rtype,
     int_kind_name, is_copy, is_copy_with_bounds, is_drop, is_raw_ptr, is_ref_mutable, is_sized,
     is_uninhabited, is_variant_payload_uninhabited,
-    outer_lifetime, rtype_eq, rtype_to_string, substitute_rtype,
+    outer_lifetime, rtype_contains_param, rtype_eq, rtype_to_string, substitute_rtype,
 };
 use types::{int_kind_from_name, int_kind_max, int_kind_neg_magnitude, int_kind_signed, struct_env};
 
@@ -22,30 +22,61 @@ use types::{int_kind_from_name, int_kind_max, int_kind_neg_magnitude, int_kind_s
 // - `Struct{...}`: fully concrete enough for `solve_impl(Num, _, …)`
 //   to find an impl — might not succeed if inner Vars are unresolved.
 // Refs and raw pointers don't satisfy.
+// What an integer-literal type-var is allowed to bind to. After
+// dropping numeric literal overloading, literals only resolve to the
+// built-in integer types — never to user types via a Num impl. (The
+// old behavior allowed `let x: UserType = 42;` when `impl Num for
+// UserType` existed; that's now an error.) Param `T` is rejected
+// even with `T: Add` bounds, since `T` doesn't carry a `from_i64`
+// constructor in the new operator scheme. To use a literal as a
+// custom type, write the cast explicitly: `let x = MyType::from(42);`.
+// True iff every registered impl of `trait_path` binds `name` to a
+// concrete type that `rtype_eq`s its target. Used to collapse
+// `<? as Add>::Output` to `?` for the standard arith traits whose
+// primitive impls all set `Output = Self` — without this the
+// AssocProj would block downstream dispatch on the result of `1 + 2`.
+fn assoc_always_equals_self(
+    traits: &TraitTable,
+    trait_path: &Vec<String>,
+    name: &str,
+) -> bool {
+    let mut found_any = false;
+    let mut i = 0;
+    while i < traits.impls.len() {
+        let row = &traits.impls[i];
+        if &row.trait_path != trait_path {
+            i += 1;
+            continue;
+        }
+        let mut k = 0;
+        let mut binding_eq_target = false;
+        while k < row.assoc_type_bindings.len() {
+            if row.assoc_type_bindings[k].0 == name {
+                if !rtype_contains_param(&row.assoc_type_bindings[k].1)
+                    && rtype_eq(&row.assoc_type_bindings[k].1, &row.target)
+                {
+                    binding_eq_target = true;
+                }
+                break;
+            }
+            k += 1;
+        }
+        if !binding_eq_target {
+            return false;
+        }
+        found_any = true;
+        i += 1;
+    }
+    found_any
+}
+
 fn satisfies_num(
     t: &InferType,
-    traits: &TraitTable,
-    type_params: &Vec<String>,
-    type_param_bounds: &Vec<Vec<Vec<String>>>,
+    _traits: &TraitTable,
+    _type_params: &Vec<String>,
+    _type_param_bounds: &Vec<Vec<Vec<String>>>,
 ) -> bool {
-    let num_path = vec!["std".to_string(), "ops".to_string(), "Num".to_string()];
-    match t {
-        InferType::Int(_) | InferType::Var(_) => true,
-        InferType::Param(_) | InferType::Struct { .. } => {
-            let rt = infer_to_rtype_for_check(t);
-            solve_impl_in_ctx(&num_path, &rt, traits, type_params, type_param_bounds, 0).is_some()
-        }
-        InferType::Ref { .. }
-        | InferType::RawPtr { .. }
-        | InferType::Bool
-        | InferType::Tuple(_)
-        | InferType::Enum { .. }
-        | InferType::Slice(_)
-        | InferType::Str
-        | InferType::AssocProj { .. }
-        | InferType::Never
-        | InferType::Char => false,
-    }
+    matches!(t, InferType::Int(_) | InferType::Var(_))
 }
 
 // Whether `t` (an InferType, possibly partially resolved) is `Sized`.
@@ -94,10 +125,26 @@ pub(crate) fn infer_concretize_assoc_proj(
                     i += 1;
                 }
             }
-            // Otherwise: try traits-table lookup on the base if it's a
-            // concrete RType-equivalent (Struct / Enum / etc.). For
-            // simplicity convert base to RType via best-effort and run
-            // `find_assoc_binding`; if it returns exactly one, use it.
+            // When the base is still an unresolved Var, see if every
+            // impl of `trait_path` binds `name` equal to its target.
+            // If so the projection collapses to the base regardless of
+            // which impl ultimately wins (e.g. `<? as Add>::Output`
+            // → `?` since every primitive `impl Add for T` has
+            // `Output = T`). Without this collapse `1 + 2 + 3`
+            // wouldn't dispatch the second `add` (recv is the AssocProj
+            // from the first add).
+            if matches!(new_base, InferType::Var(_)) {
+                if !trait_path.is_empty()
+                    && assoc_always_equals_self(traits, trait_path, name)
+                {
+                    return new_base;
+                }
+                return InferType::AssocProj {
+                    base: Box::new(new_base),
+                    trait_path: trait_path.clone(),
+                    name: name.clone(),
+                };
+            }
             let base_rt = infer_to_rtype_for_check(&new_base);
             let candidates = traits::find_assoc_binding(traits, &base_rt, trait_path, name);
             if candidates.len() == 1 {
@@ -1009,6 +1056,75 @@ impl Subst {
                 self.unify(ia.as_ref(), ib.as_ref(), traits, type_params, type_param_bounds, span, file)
             }
             (InferType::Str, InferType::Str) => Ok(()),
+            // AssocProj on either side: try to back-propagate. If
+            // exactly one impl of `trait_path` has its binding for
+            // `name` equal (as an RType) to the other side, unify the
+            // projection's base with that impl's target. Handles
+            // `<Self as Add>::Output = u32` → bind Self to u32 (since
+            // every primitive `impl Add for T` has `Output = T`).
+            (InferType::AssocProj { base, trait_path, name }, other)
+            | (other, InferType::AssocProj { base, trait_path, name }) => {
+                let other_rt = infer_to_rtype_for_check(&other);
+                if matches!(other_rt, RType::Param(ref n) if n == "?unknown") {
+                    return Err(Error {
+                        file: file.to_string(),
+                        message: format!(
+                            "type mismatch: expected `{}`, got `{}`",
+                            infer_to_string(&other),
+                            infer_to_string(&InferType::AssocProj { base: base.clone(), trait_path: trait_path.clone(), name: name.clone() })
+                        ),
+                        span: span.copy(),
+                    });
+                }
+                let mut matching_targets: Vec<RType> = Vec::new();
+                let mut i = 0;
+                while i < traits.impls.len() {
+                    let row = &traits.impls[i];
+                    if !trait_path.is_empty() && row.trait_path != trait_path {
+                        i += 1;
+                        continue;
+                    }
+                    let mut k = 0;
+                    while k < row.assoc_type_bindings.len() {
+                        if row.assoc_type_bindings[k].0 == name {
+                            // `assoc_type_bindings[k].1` may contain
+                            // `Param(impl_param)` slots; we only
+                            // accept impls whose binding is fully
+                            // concrete (no Param) and `rtype_eq` to
+                            // other_rt — that matches the
+                            // `Output = T` (with T = the impl's
+                            // concrete target) primitive case.
+                            if !rtype_contains_param(&row.assoc_type_bindings[k].1)
+                                && rtype_eq(&row.assoc_type_bindings[k].1, &other_rt)
+                            {
+                                if !matching_targets
+                                    .iter()
+                                    .any(|t| rtype_eq(t, &row.target))
+                                {
+                                    matching_targets.push(row.target.clone());
+                                }
+                            }
+                            break;
+                        }
+                        k += 1;
+                    }
+                    i += 1;
+                }
+                if matching_targets.len() == 1 {
+                    let target_infer = rtype_to_infer(&matching_targets[0]);
+                    self.unify(base.as_ref(), &target_infer, traits, type_params, type_param_bounds, span, file)
+                } else {
+                    Err(Error {
+                        file: file.to_string(),
+                        message: format!(
+                            "type mismatch: expected `{}`, got `{}`",
+                            infer_to_string(&other),
+                            infer_to_string(&InferType::AssocProj { base, trait_path, name })
+                        ),
+                        span: span.copy(),
+                    })
+                }
+            }
             (a, b) => Err(Error {
                 file: file.to_string(),
                 message: format!(
@@ -1180,18 +1296,40 @@ fn check_module(
             Item::Enum(_) => {}
             Item::Impl(ib) => {
                 let target_rt = resolve_impl_target(ib, path, structs, enums, &use_scope, reexports, current_file)?;
-                // T2.6: mirror the prefix collect_funcs used. For Path
-                // targets, that's the first AST segment. For non-Path
-                // trait impls, it's a synthetic `__trait_impl_<idx>`
-                // matching the registration order of `traits.impls`.
+                // Mirror collect_funcs's prefix scheme. Path targets
+                // use the struct name; non-Path trait impls use
+                // `__trait_impl_<idx>`; inherent non-Path impls use
+                // `__inherent_synth_<idx>`. Generic-trait impls
+                // (trait declares `<T1, …>`) on Path targets append
+                // an extra `__trait_impl_<idx>` segment so multiple
+                // `impl Trait<X> for Foo` rows don't collide on
+                // shared method names.
                 let mut method_prefix = path.clone();
+                // Span-based lookup is the only one that disambiguates
+                // multiple `impl Trait<X> for Foo` rows (path+target
+                // matches them all — trait_args differ but aren't keyed
+                // here). Setup, borrowck, and codegen all use the
+                // span-based variant; typeck mirrors that.
+                let trait_impl_idx_opt = if ib.trait_path.is_some() {
+                    find_trait_impl_idx_by_span(traits, current_file, &ib.span)
+                } else {
+                    None
+                };
+                let trait_is_generic = trait_impl_idx_opt.map_or(false, |idx| {
+                    !traits.impls[idx].trait_args.is_empty()
+                });
                 match &ib.target.kind {
                     crate::ast::TypeKind::Path(p) if !p.segments.is_empty() => {
                         method_prefix.push(p.segments[0].name.clone());
+                        if trait_is_generic {
+                            if let Some(idx) = trait_impl_idx_opt {
+                                method_prefix.push(format!("__trait_impl_{}", idx));
+                            }
+                        }
                     }
                     _ => {
                         if ib.trait_path.is_some() {
-                            match find_trait_impl_idx(ib, &target_rt, path, traits, &use_scope, reexports, current_file) {
+                            match trait_impl_idx_opt {
                                 Some(idx) => {
                                     method_prefix.push(format!("__trait_impl_{}", idx));
                                 }
@@ -1200,11 +1338,7 @@ fn check_module(
                                 ),
                             }
                         } else {
-                            // Inherent impl on a non-Path target
-                            // (`impl<T> *const T { … }`). Setup recorded
-                            // a synth idx keyed by `(file, span)`; we
-                            // recover it here so the methods get the
-                            // same `__inherent_synth_<idx>` prefix.
+                            // Inherent impl on a non-Path target.
                             let idx = tables::find_inherent_synth_idx(funcs, current_file, &ib.span)
                                 .expect("setup recorded an inherent-synth idx for this impl");
                             method_prefix.push(format!("__inherent_synth_{}", idx));
@@ -1510,11 +1644,128 @@ fn check_function(
                     j += 1;
                 }
                 let trait_dispatch = match &p.trait_dispatch {
-                    Some(td) => Some(TraitDispatch {
-                        trait_path: td.trait_path.clone(),
-                        method_name: td.method_name.clone(),
-                        recv_type: subst.finalize(&td.recv_type_infer),
-                    }),
+                    Some(td) => {
+                        let mut trait_args: Vec<RType> = Vec::new();
+                        let mut q = 0;
+                        while q < td.trait_arg_infers.len() {
+                            trait_args.push(subst.finalize(&td.trait_arg_infers[q]));
+                            q += 1;
+                        }
+                        let recv_type = subst.finalize(&td.recv_type_infer);
+                        // If recv_type is concrete and any trait_arg
+                        // defaulted (still bound to a Var that
+                        // finalize defaulted to i32) without being
+                        // unified with a real constraint, prefer the
+                        // unique impl for `(trait_path, recv)` —
+                        // that's how `1 + 2` against return type u32
+                        // works: recv pins to u32 via Output back-prop,
+                        // but Rhs's Var only got unified with arg 12's
+                        // Var, neither of which got pinned. The impl
+                        // table has `impl Add for u32` (Rhs=u32), so
+                        // we adopt those trait_args.
+                        let recv_for_solve = match &recv_type {
+                            RType::Ref { inner, .. } => (**inner).clone(),
+                            other => other.clone(),
+                        };
+                        if !rtype_contains_param(&recv_for_solve)
+                            && !trait_args.is_empty()
+                        {
+                            let mut matches: Vec<Vec<RType>> = Vec::new();
+                            let mut r = 0;
+                            while r < traits.impls.len() {
+                                let row = &traits.impls[r];
+                                if row.trait_path != td.trait_path {
+                                    r += 1;
+                                    continue;
+                                }
+                                let mut env: Vec<(String, RType)> = Vec::new();
+                                if traits::try_match_rtype(&row.target, &recv_for_solve, &mut env) {
+                                    let mut concrete_args: Vec<RType> = Vec::new();
+                                    let mut a = 0;
+                                    while a < row.trait_args.len() {
+                                        concrete_args.push(substitute_rtype(&row.trait_args[a], &env));
+                                        a += 1;
+                                    }
+                                    if !concrete_args.iter().any(rtype_contains_param) {
+                                        let already = matches.iter().any(|m| {
+                                            m.len() == concrete_args.len()
+                                                && m.iter().zip(concrete_args.iter()).all(|(x, y)| rtype_eq(x, y))
+                                        });
+                                        if !already {
+                                            matches.push(concrete_args);
+                                        }
+                                    }
+                                }
+                                r += 1;
+                            }
+                            if matches.len() == 1 {
+                                trait_args = matches.into_iter().next().unwrap();
+                            }
+                        }
+                        // For trait dispatches that fully concretized
+                        // (no `Param` left in recv_type or trait_args),
+                        // verify an impl exists. This catches cases
+                        // where a trait-arg inference var defaulted to
+                        // i32 but no `impl Trait<i32> for Recv` exists,
+                        // turning what would otherwise be a codegen-time
+                        // unreachable! into a proper user-facing error.
+                        let mut needs_validation =
+                            !rtype_contains_param(&recv_type);
+                        let mut q = 0;
+                        while q < trait_args.len() {
+                            if rtype_contains_param(&trait_args[q]) {
+                                needs_validation = false;
+                                break;
+                            }
+                            q += 1;
+                        }
+                        if needs_validation {
+                            let recv_for_solve = match &recv_type {
+                                RType::Ref { inner, .. } => (**inner).clone(),
+                                other => other.clone(),
+                            };
+                            if traits::solve_impl_with_args(
+                                &td.trait_path,
+                                &trait_args,
+                                &recv_for_solve,
+                                traits,
+                                0,
+                            )
+                            .is_none()
+                            {
+                                let mut args_str = String::new();
+                                if !trait_args.is_empty() {
+                                    args_str.push('<');
+                                    let mut q = 0;
+                                    while q < trait_args.len() {
+                                        if q > 0 {
+                                            args_str.push_str(", ");
+                                        }
+                                        args_str.push_str(&rtype_to_string(&trait_args[q]));
+                                        q += 1;
+                                    }
+                                    args_str.push('>');
+                                }
+                                return Err(Error {
+                                    file: current_file.to_string(),
+                                    message: format!(
+                                        "no impl of `{}{}` for `{}` (cannot pick method `{}`)",
+                                        place_to_string(&td.trait_path),
+                                        args_str,
+                                        rtype_to_string(&recv_for_solve),
+                                        td.method_name
+                                    ),
+                                    span: td.dispatch_span.copy(),
+                                });
+                            }
+                        }
+                        Some(TraitDispatch {
+                            trait_path: td.trait_path.clone(),
+                            trait_args,
+                            method_name: td.method_name.clone(),
+                            recv_type,
+                        })
+                    }
                     None => None,
                 };
                 method_resolutions_final.push(Some(MethodResolution {
@@ -1638,10 +1889,17 @@ pub(crate) struct PendingMethodCall {
     trait_dispatch: Option<PendingTraitDispatch>,
 }
 
-struct PendingTraitDispatch {
-    trait_path: Vec<String>,
-    method_name: String,
-    recv_type_infer: InferType,
+pub(crate) struct PendingTraitDispatch {
+    pub(crate) trait_path: Vec<String>,
+    // Positional trait-args as InferTypes (may include fresh vars
+    // pending unification). Empty for non-generic-trait dispatches.
+    pub(crate) trait_arg_infers: Vec<InferType>,
+    pub(crate) method_name: String,
+    pub(crate) recv_type_infer: InferType,
+    // Call site span — used to attribute the post-finalize "no impl
+    // matches the resolved trait_args" error when an unresolved/
+    // wrong-defaulted trait-arg leaves codegen no impl to pick.
+    pub(crate) dispatch_span: Span,
 }
 
 fn check_block(
@@ -3568,7 +3826,7 @@ pub use traits::{
     ImplResolution, MethodCandidate, concretize_assoc_proj,
     concretize_assoc_proj_with_bounds, find_assoc_binding, find_method_candidates,
     find_trait_impl_idx_by_span, find_trait_impl_method, solve_impl, solve_impl_in_ctx,
-    supertrait_closure,
+    solve_impl_with_args, supertrait_closure,
 };
 pub(crate) use traits::try_match_against_infer;
 

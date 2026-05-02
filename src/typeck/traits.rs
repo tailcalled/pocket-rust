@@ -22,7 +22,29 @@ pub fn solve_impl(
     traits: &TraitTable,
     depth: u32,
 ) -> Option<ImplResolution> {
-    solve_impl_in_ctx(trait_path, concrete, traits, &Vec::new(), &Vec::new(), depth)
+    solve_impl_with_args(trait_path, &Vec::new(), concrete, traits, depth)
+}
+
+// Like `solve_impl` but matches a trait with positional type-args
+// (`Add<u32>` vs `Add<u64>`). Each impl row's `trait_args` must
+// `try_match_rtype` against the requested args (with the impl's
+// type-params bound by the resulting subst).
+pub fn solve_impl_with_args(
+    trait_path: &Vec<String>,
+    trait_args: &Vec<RType>,
+    concrete: &RType,
+    traits: &TraitTable,
+    depth: u32,
+) -> Option<ImplResolution> {
+    solve_impl_in_ctx_with_args(
+        trait_path,
+        trait_args,
+        concrete,
+        traits,
+        &Vec::new(),
+        &Vec::new(),
+        depth,
+    )
 }
 
 // Like `solve_impl`, but also recognizes a `Param(name)` concrete as
@@ -35,6 +57,26 @@ pub fn solve_impl(
 // outer context.
 pub fn solve_impl_in_ctx(
     trait_path: &Vec<String>,
+    concrete: &RType,
+    traits: &TraitTable,
+    type_params: &Vec<String>,
+    type_param_bounds: &Vec<Vec<Vec<String>>>,
+    depth: u32,
+) -> Option<ImplResolution> {
+    solve_impl_in_ctx_with_args(
+        trait_path,
+        &Vec::new(),
+        concrete,
+        traits,
+        type_params,
+        type_param_bounds,
+        depth,
+    )
+}
+
+pub fn solve_impl_in_ctx_with_args(
+    trait_path: &Vec<String>,
+    trait_args: &Vec<RType>,
     concrete: &RType,
     traits: &TraitTable,
     type_params: &Vec<String>,
@@ -76,7 +118,28 @@ pub fn solve_impl_in_ctx(
             i += 1;
             continue;
         }
+        // Trait-args arity must match (every impl of trait `T` has
+        // exactly trait.trait_type_params.len() args; the requested
+        // args must too — typeck ensures this at use sites).
+        if row.trait_args.len() != trait_args.len() {
+            i += 1;
+            continue;
+        }
         let mut subst: Vec<(String, RType)> = Vec::new();
+        // Match each trait arg (impl-side may be `Param(impl_T)`).
+        let mut args_ok = true;
+        let mut a = 0;
+        while a < trait_args.len() {
+            if !try_match_rtype(&row.trait_args[a], &trait_args[a], &mut subst) {
+                args_ok = false;
+                break;
+            }
+            a += 1;
+        }
+        if !args_ok {
+            i += 1;
+            continue;
+        }
         if !try_match_rtype(&row.target, concrete, &mut subst) {
             i += 1;
             continue;
@@ -141,6 +204,21 @@ pub fn find_assoc_binding(
     trait_path: &Vec<String>,
     name: &str,
 ) -> Vec<RType> {
+    find_assoc_binding_with_args(traits, base, trait_path, &None, name)
+}
+
+// Like `find_assoc_binding` but optionally pins the trait's
+// positional type-args. `trait_args = Some(args)` requires each
+// candidate impl row's `trait_args` to `try_match_rtype` against
+// `args`; `None` means "any args" (used by AssocProj resolution
+// where the caller hasn't yet inferred a specific instantiation).
+pub fn find_assoc_binding_with_args(
+    traits: &TraitTable,
+    base: &RType,
+    trait_path: &Vec<String>,
+    trait_args: &Option<Vec<RType>>,
+    name: &str,
+) -> Vec<RType> {
     let mut results: Vec<RType> = Vec::new();
     let mut i = 0;
     while i < traits.impls.len() {
@@ -161,6 +239,25 @@ pub fn find_assoc_binding(
             continue;
         }
         let mut subst: Vec<(String, RType)> = Vec::new();
+        if let Some(args) = trait_args {
+            if args.len() != row.trait_args.len() {
+                i += 1;
+                continue;
+            }
+            let mut args_ok = true;
+            let mut a = 0;
+            while a < args.len() {
+                if !try_match_rtype(&row.trait_args[a], &args[a], &mut subst) {
+                    args_ok = false;
+                    break;
+                }
+                a += 1;
+            }
+            if !args_ok {
+                i += 1;
+                continue;
+            }
+        }
         if !try_match_rtype(&row.target, base, &mut subst) {
             i += 1;
             continue;

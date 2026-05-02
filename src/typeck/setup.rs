@@ -5,7 +5,7 @@ use super::{
     find_elision_source, freshen_inferred_lifetimes, func_lookup,
     is_copy_with_bounds, is_visible_from, module_use_entries, outer_lifetime, place_to_string,
     require_no_inferred_lifetimes, resolve_type, resolve_via_use_scopes,
-    rtype_eq, rtype_to_string, segments_to_string, solve_impl_in_ctx, struct_env, struct_lookup, substitute_rtype, template_lookup, trait_lookup,
+    rtype_eq, rtype_to_string, segments_to_string, solve_impl_in_ctx, struct_env, struct_lookup, substitute_rtype, supertrait_closure, template_lookup, trait_lookup,
     trait_lookup_resolved, type_defining_module, validate_named_lifetimes,
 };
 use crate::ast::{Function, Item, Module};
@@ -52,6 +52,19 @@ pub(super) fn collect_trait_names(module: &Module, path: &mut Vec<String>, table
                     assoc_type_names.push(td.assoc_types[at_i].name.clone());
                     at_i += 1;
                 }
+                let trait_type_params: Vec<String> =
+                    td.type_params.iter().map(|p| p.name.clone()).collect();
+                // Defaults are resolved later in resolve_trait_methods
+                // (where the `Self` placeholder is in scope and other
+                // user types are visible). At collection time we just
+                // remember which slots have a default written.
+                let mut trait_type_param_defaults: Vec<Option<RType>> =
+                    Vec::with_capacity(td.type_params.len());
+                let mut tp = 0;
+                while tp < td.type_params.len() {
+                    trait_type_param_defaults.push(None);
+                    tp += 1;
+                }
                 table.entries.push(TraitEntry {
                     path: full,
                     name_span: td.name_span.copy(),
@@ -60,6 +73,8 @@ pub(super) fn collect_trait_names(module: &Module, path: &mut Vec<String>, table
                     is_pub: td.is_pub,
                     supertraits: Vec::new(),
                     assoc_types: assoc_type_names,
+                    trait_type_params,
+                    trait_type_param_defaults,
                 });
             }
             Item::Module(m) => {
@@ -112,6 +127,11 @@ pub(super) fn resolve_trait_methods(
                     e += 1;
                 }
                 let entry_idx = entry_idx.expect("trait registered above");
+                // Supertrait paths are resolved here to canonical
+                // paths only; trait-arg matching for supertraits
+                // (e.g. `trait Eq: PartialEq<Rhs = Self>`) is a
+                // follow-up — `td.supertraits[s].assoc_constraints`
+                // and trait_args are not yet propagated through.
                 let mut supertraits: Vec<Vec<String>> = Vec::new();
                 let mut s = 0;
                 while s < td.supertraits.len() {
@@ -127,11 +147,50 @@ pub(super) fn resolve_trait_methods(
                     s += 1;
                 }
                 traits.entries[entry_idx].supertraits = supertraits;
+                // Resolve trait-level type-param defaults (`Rhs = Self`).
+                // `Self` is in scope (= self_target = `Param("Self")`),
+                // and earlier trait-params are also visible so a later
+                // default can reference an earlier one.
+                let trait_type_params_names: Vec<String> = td
+                    .type_params
+                    .iter()
+                    .map(|p| p.name.clone())
+                    .collect();
+                let mut tp = 0;
+                while tp < td.type_params.len() {
+                    if let Some(default_ty) = &td.type_params[tp].default {
+                        let rt = resolve_type(
+                            default_ty,
+                            path,
+                            structs,
+                            enums,
+                            Some(&self_target),
+                            &trait_type_params_names,
+                            &use_scope,
+                            reexports,
+                            &module.source_file,
+                        )?;
+                        traits.entries[entry_idx].trait_type_param_defaults[tp] = Some(rt);
+                    }
+                    tp += 1;
+                }
                 let mut k = 0;
                 while k < td.methods.len() {
                     let m = &td.methods[k];
-                    let type_params: Vec<String> =
-                        m.type_params.iter().map(|p| p.name.clone()).collect();
+                    // In-scope type-params for resolving the method
+                    // signature: trait's `<Rhs, ...>` first, then
+                    // method's own `<U, ...>`. `Self` is the implicit
+                    // self_target.
+                    let mut type_params: Vec<String> = td
+                        .type_params
+                        .iter()
+                        .map(|p| p.name.clone())
+                        .collect();
+                    let mut tp_i = 0;
+                    while tp_i < m.type_params.len() {
+                        type_params.push(m.type_params[tp_i].name.clone());
+                        tp_i += 1;
+                    }
                     let mut param_types: Vec<RType> = Vec::new();
                     let mut p = 0;
                     while p < m.params.len() {
@@ -168,8 +227,26 @@ pub(super) fn resolve_trait_methods(
                     } else {
                         None
                     };
-                    traits.entries[entry_idx].methods[k].param_types = param_types;
-                    traits.entries[entry_idx].methods[k].return_type = return_type;
+                    // `Self::Output` (and similar) parsed with empty
+                    // trait_path — fill in the supertrait-closure
+                    // member that actually declares the assoc, so
+                    // downstream `find_assoc_binding` disambiguates
+                    // when multiple traits share the same assoc name
+                    // (e.g. Add/Sub/Mul/... all declare `Output` for
+                    // u8). For inherited assocs (`IndexMut` method
+                    // returning `Self::Output` where Output lives on
+                    // Index), the closure walk picks `Index`.
+                    let mut filled_params: Vec<RType> = Vec::new();
+                    let mut p2 = 0;
+                    while p2 < param_types.len() {
+                        filled_params.push(fill_assoc_trait_path_via_closure(&param_types[p2], &full, traits));
+                        p2 += 1;
+                    }
+                    let filled_return = return_type
+                        .as_ref()
+                        .map(|rt| fill_assoc_trait_path_via_closure(rt, &full, traits));
+                    traits.entries[entry_idx].methods[k].param_types = filled_params;
+                    traits.entries[entry_idx].methods[k].return_type = filled_return;
                     traits.entries[entry_idx].methods[k].receiver_shape = receiver_shape;
                     k += 1;
                 }
@@ -568,9 +645,13 @@ pub(super) fn collect_funcs(
                 }
                 let trait_impl_idx_for_methods: Option<usize> =
                     if let Some(trait_path_node) = &ib.trait_path {
-                        let trait_full = resolve_trait_path(
+                        let (trait_full, trait_args) = resolve_trait_ref(
                             trait_path_node,
                             path,
+                            structs,
+                            enums,
+                            Some(&target_rt),
+                            &impl_type_params,
                             traits,
                             &use_scope,
                             reexports,
@@ -602,6 +683,7 @@ pub(super) fn collect_funcs(
                         register_trait_impl(
                             ib,
                             &trait_full,
+                            trait_args,
                             target_rt.clone(),
                             &impl_type_params,
                             &impl_lifetime_params,
@@ -650,9 +732,25 @@ pub(super) fn collect_funcs(
                     }
                     _ => None,
                 };
+                // Whether this trait impl needs per-row disambiguation:
+                // a trait with positional type-params can have
+                // multiple impls on the same target (`impl Add<u32>
+                // for Foo` + `impl Add<u64> for Foo`), and their
+                // methods would collide at `[…, Foo, add]`. When the
+                // trait declares trait-level type-params, append the
+                // impl row idx to the prefix.
+                let trait_is_generic = ib.trait_path.is_some()
+                    && trait_impl_idx_for_methods.map_or(false, |idx| {
+                        !traits.impls[idx].trait_args.is_empty()
+                    });
                 let mut method_prefix = path.clone();
                 if let Some(name) = &target_name_for_prefix {
                     method_prefix.push(name.clone());
+                    if trait_is_generic {
+                        if let Some(idx) = trait_impl_idx_for_methods {
+                            method_prefix.push(format!("__trait_impl_{}", idx));
+                        }
+                    }
                 } else if let Some(idx) = trait_impl_idx_for_methods {
                     method_prefix.push(format!("__trait_impl_{}", idx));
                 } else {
@@ -686,9 +784,13 @@ pub(super) fn collect_funcs(
                 // T2.5: validate impl method signatures against the trait
                 // declaration (for trait impls only).
                 if let Some(trait_path_node) = &ib.trait_path {
-                    let trait_full = resolve_trait_path(
+                    let (trait_full, trait_args) = resolve_trait_ref(
                         trait_path_node,
                         path,
+                        structs,
+                        enums,
+                        Some(&target_rt),
+                        &impl_type_params,
                         traits,
                         &use_scope,
                         reexports,
@@ -697,6 +799,7 @@ pub(super) fn collect_funcs(
                     validate_trait_impl_signatures(
                         ib,
                         &trait_full,
+                        &trait_args,
                         &target_rt,
                         &method_prefix,
                         funcs,
@@ -749,6 +852,253 @@ pub(super) fn find_trait_impl_idx(
 // 3. If the user wrote a single segment `T`, search for any registered
 //    trait whose path ends with that segment — approximates a prelude
 //    so `Copy` resolves to `std::Copy`. Multiple matches → ambiguity.
+// Resolve a trait path *with* its positional type-args. The path's
+// last segment carries the args (per `PathSegment.args` convention,
+// shared with struct/enum/turbofish). Returns the canonical trait
+// path plus the resolved RType for each arg. Validates arity against
+// the trait's declared `trait_type_params`.
+// Walk an `RType`, replacing every `AssocProj` whose `trait_path`
+// is empty with the trait in `current_trait`'s supertrait closure
+// that actually declares `name`. Falls back to `current_trait` if no
+// member of the closure declares `name` (typeck will then surface a
+// proper "no such assoc" error downstream rather than silently
+// resolving to a wrong trait).
+fn fill_assoc_trait_path_via_closure(
+    rt: &RType,
+    current_trait: &Vec<String>,
+    traits: &TraitTable,
+) -> RType {
+    let recurse = |inner: &RType| fill_assoc_trait_path_via_closure(inner, current_trait, traits);
+    match rt {
+        RType::AssocProj { base, trait_path, name } => {
+            let new_base = recurse(base);
+            let resolved_tp = if trait_path.is_empty() {
+                let closure = supertrait_closure(current_trait, traits);
+                let mut found: Option<Vec<String>> = None;
+                let mut i = 0;
+                while i < closure.len() {
+                    if let Some(t) = trait_lookup(traits, &closure[i]) {
+                        if t.assoc_types.iter().any(|a| a == name) {
+                            found = Some(closure[i].clone());
+                            break;
+                        }
+                    }
+                    i += 1;
+                }
+                found.unwrap_or_else(|| current_trait.clone())
+            } else {
+                trait_path.clone()
+            };
+            RType::AssocProj {
+                base: Box::new(new_base),
+                trait_path: resolved_tp,
+                name: name.clone(),
+            }
+        }
+        RType::Struct { path, type_args, lifetime_args } => {
+            let mut new_args: Vec<RType> = Vec::new();
+            let mut i = 0;
+            while i < type_args.len() {
+                new_args.push(recurse(&type_args[i]));
+                i += 1;
+            }
+            RType::Struct { path: path.clone(), type_args: new_args, lifetime_args: lifetime_args.clone() }
+        }
+        RType::Enum { path, type_args, lifetime_args } => {
+            let mut new_args: Vec<RType> = Vec::new();
+            let mut i = 0;
+            while i < type_args.len() {
+                new_args.push(recurse(&type_args[i]));
+                i += 1;
+            }
+            RType::Enum { path: path.clone(), type_args: new_args, lifetime_args: lifetime_args.clone() }
+        }
+        RType::Tuple(elems) => {
+            let mut new_elems: Vec<RType> = Vec::new();
+            let mut i = 0;
+            while i < elems.len() {
+                new_elems.push(recurse(&elems[i]));
+                i += 1;
+            }
+            RType::Tuple(new_elems)
+        }
+        RType::Ref { inner, mutable, lifetime } => RType::Ref {
+            inner: Box::new(recurse(inner)),
+            mutable: *mutable,
+            lifetime: lifetime.clone(),
+        },
+        RType::RawPtr { inner, mutable } => RType::RawPtr {
+            inner: Box::new(recurse(inner)),
+            mutable: *mutable,
+        },
+        RType::Slice(inner) => RType::Slice(Box::new(recurse(inner))),
+        RType::Param(_)
+        | RType::Int(_)
+        | RType::Bool
+        | RType::Str
+        | RType::Never
+        | RType::Char => rt.clone(),
+    }
+}
+
+// Walk an `RType`, replacing every `AssocProj` whose `trait_path` is
+// empty with `default_trait_path`. Empty trait_paths are emitted by
+// `resolve_type` when it sees `Self::Name` / `T::Name` (the parser
+// can't tell which trait the assoc belongs to). Trait method
+// signatures fill them with the trait being declared; impl method
+// signatures fill them with the impl's trait.
+fn fill_assoc_trait_path(rt: &RType, default_trait_path: &Vec<String>) -> RType {
+    match rt {
+        RType::AssocProj { base, trait_path, name } => {
+            let new_base = fill_assoc_trait_path(base, default_trait_path);
+            let tp = if trait_path.is_empty() {
+                default_trait_path.clone()
+            } else {
+                trait_path.clone()
+            };
+            RType::AssocProj {
+                base: Box::new(new_base),
+                trait_path: tp,
+                name: name.clone(),
+            }
+        }
+        RType::Struct { path, type_args, lifetime_args } => {
+            let mut new_args: Vec<RType> = Vec::new();
+            let mut i = 0;
+            while i < type_args.len() {
+                new_args.push(fill_assoc_trait_path(&type_args[i], default_trait_path));
+                i += 1;
+            }
+            RType::Struct { path: path.clone(), type_args: new_args, lifetime_args: lifetime_args.clone() }
+        }
+        RType::Enum { path, type_args, lifetime_args } => {
+            let mut new_args: Vec<RType> = Vec::new();
+            let mut i = 0;
+            while i < type_args.len() {
+                new_args.push(fill_assoc_trait_path(&type_args[i], default_trait_path));
+                i += 1;
+            }
+            RType::Enum { path: path.clone(), type_args: new_args, lifetime_args: lifetime_args.clone() }
+        }
+        RType::Tuple(elems) => {
+            let mut new_elems: Vec<RType> = Vec::new();
+            let mut i = 0;
+            while i < elems.len() {
+                new_elems.push(fill_assoc_trait_path(&elems[i], default_trait_path));
+                i += 1;
+            }
+            RType::Tuple(new_elems)
+        }
+        RType::Ref { inner, mutable, lifetime } => RType::Ref {
+            inner: Box::new(fill_assoc_trait_path(inner, default_trait_path)),
+            mutable: *mutable,
+            lifetime: lifetime.clone(),
+        },
+        RType::RawPtr { inner, mutable } => RType::RawPtr {
+            inner: Box::new(fill_assoc_trait_path(inner, default_trait_path)),
+            mutable: *mutable,
+        },
+        RType::Slice(inner) => {
+            RType::Slice(Box::new(fill_assoc_trait_path(inner, default_trait_path)))
+        }
+        RType::Param(_)
+        | RType::Int(_)
+        | RType::Bool
+        | RType::Str
+        | RType::Never
+        | RType::Char => rt.clone(),
+    }
+}
+
+pub(super) fn resolve_trait_ref(
+    p: &crate::ast::Path,
+    current_module: &Vec<String>,
+    structs: &StructTable,
+    enums: &EnumTable,
+    self_target: Option<&RType>,
+    type_params: &Vec<String>,
+    traits: &TraitTable,
+    use_scope: &Vec<UseEntry>,
+    reexports: &ReExportTable,
+    file: &str,
+) -> Result<(Vec<String>, Vec<RType>), Error> {
+    let trait_path = resolve_trait_path(p, current_module, traits, use_scope, reexports, file)?;
+    let entry = trait_lookup(traits, &trait_path).expect("just resolved");
+    let last = &p.segments[p.segments.len() - 1];
+    let total_params = entry.trait_type_params.len();
+    let provided = last.args.len();
+    // Each trailing slot the user omitted must have a default; otherwise
+    // it's an error.
+    if provided > total_params {
+        return Err(Error {
+            file: file.to_string(),
+            message: format!(
+                "too many type arguments for trait `{}`: expected at most {}, got {}",
+                place_to_string(&trait_path),
+                total_params,
+                provided
+            ),
+            span: p.span.copy(),
+        });
+    }
+    let mut k = provided;
+    while k < total_params {
+        if entry.trait_type_param_defaults[k].is_none() {
+            return Err(Error {
+                file: file.to_string(),
+                message: format!(
+                    "missing type argument for trait `{}`: parameter `{}` has no default",
+                    place_to_string(&trait_path),
+                    entry.trait_type_params[k]
+                ),
+                span: p.span.copy(),
+            });
+        }
+        k += 1;
+    }
+    let mut trait_args: Vec<RType> = Vec::new();
+    let mut i = 0;
+    while i < provided {
+        trait_args.push(resolve_type(
+            &last.args[i],
+            current_module,
+            structs,
+            enums,
+            self_target,
+            type_params,
+            use_scope,
+            reexports,
+            file,
+        )?);
+        i += 1;
+    }
+    // Fill defaults. Each default may reference earlier trait-args
+    // (via `Param(name)` of an earlier slot) or `Self` (substituted by
+    // the in-scope `self_target`, which is the implementing type at
+    // an `impl Trait for Foo` site or the bound holder at `T: Trait`).
+    // Build a substitution env from earlier slots' resolved args plus
+    // a `Self` binding when self_target is provided.
+    let mut k = provided;
+    while k < total_params {
+        let default_rt = entry.trait_type_param_defaults[k]
+            .as_ref()
+            .expect("checked above");
+        let mut env: Vec<(String, RType)> = Vec::new();
+        let mut j = 0;
+        while j < trait_args.len() {
+            env.push((entry.trait_type_params[j].clone(), trait_args[j].clone()));
+            j += 1;
+        }
+        if let Some(st) = self_target {
+            env.push(("Self".to_string(), st.clone()));
+        }
+        let resolved = substitute_rtype(default_rt, &env);
+        trait_args.push(resolved);
+        k += 1;
+    }
+    Ok((trait_path, trait_args))
+}
+
 pub(super) fn resolve_trait_path(
     p: &crate::ast::Path,
     current_module: &Vec<String>,
@@ -887,6 +1237,7 @@ fn validate_trait_impl(
 fn validate_trait_impl_signatures(
     ib: &crate::ast::ImplBlock,
     trait_full: &Vec<String>,
+    trait_args: &Vec<RType>,
     target_rt: &RType,
     method_prefix: &Vec<String>,
     funcs: &FuncTable,
@@ -956,8 +1307,19 @@ fn validate_trait_impl_signatures(
         // Impl side: each `V_i → Param("__trait_method_<i>")`. The
         // shared placeholder makes the two signatures comparable via
         // plain `rtype_eq` once both are substituted.
+        // Trait env: Self → impl_target, plus each trait-level
+        // type-param (`Add<Rhs>`) → the impl's corresponding
+        // trait_args slot.
         let mut trait_env: Vec<(String, RType)> =
             vec![("Self".to_string(), target_rt.clone())];
+        let mut tta = 0;
+        while tta < trait_entry.trait_type_params.len() && tta < trait_args.len() {
+            trait_env.push((
+                trait_entry.trait_type_params[tta].clone(),
+                trait_args[tta].clone(),
+            ));
+            tta += 1;
+        }
         let mut impl_env: Vec<(String, RType)> = Vec::new();
         let mut tp = 0;
         while tp < trait_method.type_params.len() {
@@ -1127,6 +1489,7 @@ fn validate_copy_impl(
 fn register_trait_impl(
     ib: &crate::ast::ImplBlock,
     trait_full: &Vec<String>,
+    trait_args: Vec<RType>,
     target: RType,
     impl_type_params: &Vec<String>,
     impl_lifetime_params: &Vec<String>,
@@ -1138,6 +1501,8 @@ fn register_trait_impl(
     let mut i = 0;
     while i < traits.impls.len() {
         if &traits.impls[i].trait_path == trait_full
+            && trait_args.len() == traits.impls[i].trait_args.len()
+            && trait_args.iter().zip(traits.impls[i].trait_args.iter()).all(|(a, b)| rtype_eq(a, b))
             && rtype_eq(&traits.impls[i].target, &target)
         {
             return Err(Error {
@@ -1197,6 +1562,7 @@ fn register_trait_impl(
     }
     traits.impls.push(TraitImplEntry {
         trait_path: trait_full.clone(),
+        trait_args,
         target,
         impl_type_params: impl_type_params.clone(),
         impl_lifetime_params: impl_lifetime_params.clone(),

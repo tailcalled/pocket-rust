@@ -482,18 +482,37 @@ impl<'a> Builder<'a> {
                 p
             }
             ExprKind::Deref(inner) => {
-                // For a place of the form `*expr`, we need `expr` itself
-                // to become an addressable place. Lower `expr` to an
-                // operand (a temp holding the ref), then attach a Deref
-                // projection on a place rooted at that temp.
-                let op = self.lower_expr_operand(inner);
-                match op.kind {
-                    OperandKind::Move(p) | OperandKind::Copy(p) => {
-                        let mut p = p;
-                        p.projections.push(Projection::Deref);
-                        p
+                // For `*expr`, we need `expr` to become an addressable
+                // place but we shouldn't move it — the ref is just
+                // being used to compute the deref address. Treat as
+                // an implicit reborrow: when `inner` is itself a place
+                // expression (Var/FieldAccess/Deref/etc.) we read its
+                // place directly and append `Projection::Deref`,
+                // without recording any move on the ref. This is what
+                // lets `*self = ¤u8_add(*self, other);` typecheck —
+                // both `*self` reads use `self` without consuming it.
+                // Non-place inners (e.g. `*foo()`) still go through
+                // operand materialization.
+                if matches!(
+                    inner.kind,
+                    ExprKind::Var(_)
+                        | ExprKind::FieldAccess(_)
+                        | ExprKind::TupleIndex { .. }
+                        | ExprKind::Deref(_)
+                ) {
+                    let mut p = self.lower_expr_place(inner);
+                    p.projections.push(Projection::Deref);
+                    p
+                } else {
+                    let op = self.lower_expr_operand(inner);
+                    match op.kind {
+                        OperandKind::Move(p) | OperandKind::Copy(p) => {
+                            let mut p = p;
+                            p.projections.push(Projection::Deref);
+                            p
+                        }
+                        _ => unreachable!("typeck rejects deref of constant"),
                     }
-                    _ => unreachable!("typeck rejects deref of constant"),
                 }
             }
             // Non-place expression appearing where a place is needed
