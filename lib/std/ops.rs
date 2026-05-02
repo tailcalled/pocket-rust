@@ -2,6 +2,28 @@ pub trait Drop {
     fn drop(&mut self);
 }
 
+// Indexing read: `arr[idx]` desugars at typeck/codegen to
+// `*Index::index(&arr, idx)`. The associated `Output` lets each impl
+// pick what it returns (typically the element type).
+//
+// Pocket-rust currently hardcodes the index type to `usize` (no
+// generic-trait support yet — `trait Index<Idx>` requires generic
+// trait parameters which the parser doesn't accept). When generic
+// traits land, the canonical signature is `trait Index<Idx> { type
+// Output; fn index(&self, idx: Idx) -> &Self::Output; }` and impls
+// are restated with `usize`.
+pub trait Index {
+    type Output;
+    fn index(&self, idx: usize) -> &Self::Output;
+}
+
+// Indexing write: `arr[idx] = …` and `&mut arr[idx]` desugar to
+// `IndexMut::index_mut(&mut arr, idx)`. `IndexMut: Index` so the
+// shared-ref `index` is always available too.
+pub trait IndexMut: Index {
+    fn index_mut(&mut self, idx: usize) -> &mut Self::Output;
+}
+
 // Additive structure (Haskell-style algebraic decomposition): a type
 // with a `zero`, addition/subtraction, and negation. The unary-minus
 // operator `-x` desugars to `x.neg()`, dispatched through `VecSpace`.

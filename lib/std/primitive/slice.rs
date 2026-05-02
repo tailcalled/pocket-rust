@@ -8,6 +8,8 @@
 
 use crate::mem;
 use crate::option::Option;
+use crate::ops::Index;
+use crate::ops::IndexMut;
 
 impl<T> [T] {
     // The number of elements in the slice. Reads the length half of
@@ -65,6 +67,39 @@ impl<T> [T] {
                 let elt: *mut T = base.cast::<u8>().byte_add(offset).cast::<T>();
                 Option::Some(&mut *elt)
             }
+        }
+    }
+}
+
+// `arr[idx]` desugar — Index/IndexMut for `[T]` with `Idx = usize`.
+// Bounds-checked: on out-of-range index, calls `panic!` which
+// invokes the host-imported `env.panic`. Returns `&T` / `&mut T` to
+// the element in place.
+impl<T> Index for [T] {
+    type Output = T;
+    fn index(&self, idx: usize) -> &T {
+        if idx >= ¤slice_len::<T>(self) {
+            panic!("slice index out of bounds")
+        }
+        let offset: usize = idx * mem::size_of::<T>();
+        unsafe {
+            let base: *const T = ¤slice_ptr::<T>(self);
+            let elt: *const T = base.cast::<u8>().byte_add(offset).cast::<T>();
+            &*elt
+        }
+    }
+}
+
+impl<T> IndexMut for [T] {
+    fn index_mut(&mut self, idx: usize) -> &mut T {
+        if idx >= ¤slice_len::<T>(self) {
+            panic!("slice index out of bounds")
+        }
+        let offset: usize = idx * mem::size_of::<T>();
+        unsafe {
+            let base: *mut T = ¤slice_mut_ptr::<T>(self);
+            let elt: *mut T = base.cast::<u8>().byte_add(offset).cast::<T>();
+            &mut *elt
         }
     }
 }

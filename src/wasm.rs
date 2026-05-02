@@ -1,11 +1,26 @@
 pub struct Module {
     pub types: Vec<FuncType>,
+    // Imported functions, in declaration order. Imported functions
+    // occupy wasm function indices `0..imports.len()`; module-defined
+    // functions follow at `imports.len()..imports.len() + functions.len()`.
+    // Callers (codegen) account for this offset when emitting `Call`
+    // instructions and when assigning `Export.index`.
+    pub imports: Vec<Import>,
     pub functions: Vec<u32>,
     pub memories: Vec<Memory>,
     pub globals: Vec<Global>,
     pub exports: Vec<Export>,
     pub code: Vec<FuncBody>,
     pub datas: Vec<Data>,
+}
+
+// One imported function. `module` and `name` are the two-string key
+// the host uses to look it up; `type_idx` references a `FuncType` in
+// `Module.types`.
+pub struct Import {
+    pub module: String,
+    pub name: String,
+    pub type_idx: u32,
 }
 
 // Active-mode data segment for memory 0. `offset` is the absolute
@@ -62,6 +77,7 @@ pub struct Export {
 
 pub enum ExportKind {
     Func,
+    Memory,
 }
 
 pub struct FuncBody {
@@ -178,6 +194,7 @@ impl Module {
     pub fn new() -> Module {
         Module {
             types: Vec::new(),
+            imports: Vec::new(),
             functions: Vec::new(),
             memories: Vec::new(),
             globals: Vec::new(),
@@ -199,6 +216,9 @@ impl Module {
         bytes.push(0x00);
         if !self.types.is_empty() {
             encode_type_section(&mut bytes, &self.types);
+        }
+        if !self.imports.is_empty() {
+            encode_import_section(&mut bytes, &self.imports);
         }
         if !self.functions.is_empty() {
             encode_function_section(&mut bytes, &self.functions);
@@ -285,6 +305,39 @@ fn val_type_byte(t: &ValType) -> u8 {
     }
 }
 
+// Section id 2. One entry per import: module name, item name, and a
+// `desc` byte naming the item's kind followed by a kind-specific
+// payload. We only emit function imports (desc 0x00, type idx).
+fn encode_import_section(out: &mut Vec<u8>, imports: &Vec<Import>) {
+    let mut payload: Vec<u8> = Vec::new();
+    write_uleb128(&mut payload, imports.len() as u32);
+    let mut i = 0;
+    while i < imports.len() {
+        let imp = &imports[i];
+        // module name
+        write_uleb128(&mut payload, imp.module.len() as u32);
+        let mb = imp.module.as_bytes();
+        let mut k = 0;
+        while k < mb.len() {
+            payload.push(mb[k]);
+            k += 1;
+        }
+        // item name
+        write_uleb128(&mut payload, imp.name.len() as u32);
+        let nb = imp.name.as_bytes();
+        let mut k = 0;
+        while k < nb.len() {
+            payload.push(nb[k]);
+            k += 1;
+        }
+        // desc: 0x00 = function import, followed by type index.
+        payload.push(0x00);
+        write_uleb128(&mut payload, imp.type_idx);
+        i += 1;
+    }
+    encode_section(out, 2, payload);
+}
+
 fn encode_function_section(out: &mut Vec<u8>, funcs: &Vec<u32>) {
     let mut payload: Vec<u8> = Vec::new();
     write_uleb128(&mut payload, funcs.len() as u32);
@@ -357,6 +410,7 @@ fn encode_export(out: &mut Vec<u8>, exp: &Export) {
 fn export_kind_byte(k: &ExportKind) -> u8 {
     match k {
         ExportKind::Func => 0x00,
+        ExportKind::Memory => 0x02,
     }
 }
 

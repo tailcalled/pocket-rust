@@ -503,6 +503,11 @@ fn try_match_rtype_ctx(
             }
             true
         }
+        (RType::Slice(ia), RType::Slice(ib)) => {
+            // `[T]`'s element type must be Sized (Rust's slice rule).
+            try_match_rtype_ctx(ia, ib, subst, true)
+        }
+        (RType::Str, RType::Str) => true,
         _ => false,
     }
 }

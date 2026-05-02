@@ -10,6 +10,8 @@ pub mod dummy;
 
 pub use crate::marker::Copy;
 pub use crate::ops::Drop;
+pub use crate::ops::Index;
+pub use crate::ops::IndexMut;
 pub use crate::ops::VecSpace;
 pub use crate::ops::Num;
 pub use crate::cmp::PartialEq;

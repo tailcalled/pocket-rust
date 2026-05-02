@@ -93,13 +93,38 @@ pub fn compile(
         templates: Vec::new(),
         inherent_synth_specs: Vec::new(),
     };
-    let mut next_idx: u32 = 0;
     let mut wasm_mod = wasm::Module::new();
+    // Reserve a host-imported `env.panic(ptr: i32, len: i32)`
+    // function at wasm function index 0. `panic!(msg)` lowers to a
+    // call to this slot followed by `unreachable`. Hosts that
+    // instantiate the module must provide the import (the test
+    // harness registers a wasmi-trap stub; production hosts can
+    // print and abort).
+    wasm_mod.types.push(wasm::FuncType {
+        params: vec![wasm::ValType::I32, wasm::ValType::I32],
+        results: Vec::new(),
+    });
+    wasm_mod.imports.push(wasm::Import {
+        module: "env".to_string(),
+        name: "panic".to_string(),
+        type_idx: 0,
+    });
+    // Module-defined functions are assigned wasm indices starting
+    // after the imports — keep `next_idx` aligned with that.
+    let mut next_idx: u32 = wasm_mod.imports.len() as u32;
     // One linear memory, fixed at 1 page (64 KiB). Stack pointer global lives
     // at index 0, initialized to the top of the page; shadow stack grows down.
     wasm_mod.memories.push(wasm::Memory {
         min_pages: 1,
         max_pages: Some(1),
+    });
+    // Export the memory as `"memory"` so hosts can read panic messages
+    // (and inspect arbitrary wasm-side data). This matches the
+    // standard wasm convention.
+    wasm_mod.exports.push(wasm::Export {
+        name: "memory".to_string(),
+        kind: wasm::ExportKind::Memory,
+        index: 0,
     });
     // Global 0: shadow-stack pointer (`__sp`). Initialized to the top
     // of the page (65536); shadow stack grows down for spilled

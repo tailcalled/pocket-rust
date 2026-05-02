@@ -656,6 +656,36 @@ impl<'a> Builder<'a> {
                 // the Ok/Err split — typeck has verified the shapes.
                 self.lower_expr_rvalue(inner)
             }
+            ExprKind::Index { base, index, .. } => {
+                // Model `arr[idx]` as `Index::index(&arr, idx)` for
+                // borrowck purposes — base is *borrowed*, not moved,
+                // so subsequent uses of base remain valid.
+                let _recv = self.synth_borrow(base, false);
+                let _ = self.lower_expr_operand(index);
+                Rvalue::Use(Operand {
+                    kind: OperandKind::ConstUnit,
+                    span,
+                    node_id: Some(expr.id),
+                })
+            }
+            ExprKind::MacroCall { args, .. } => {
+                // panic!(msg) — read the message arg; the call
+                // diverges, so subsequent code in the same block is
+                // unreachable for borrowck.
+                let mut i = 0;
+                while i < args.len() {
+                    let _ = self.lower_expr_operand(&args[i]);
+                    i += 1;
+                }
+                self.set_terminator(Terminator::Unreachable);
+                let unreachable = self.new_block();
+                self.current_block = unreachable;
+                Rvalue::Use(Operand {
+                    kind: OperandKind::ConstUnit,
+                    span,
+                    node_id: Some(expr.id),
+                })
+            }
         }
     }
 

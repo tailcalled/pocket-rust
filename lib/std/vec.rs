@@ -18,6 +18,8 @@
 use crate::mem;
 use crate::option::Option;
 use crate::ops::Drop;
+use crate::ops::Index;
+use crate::ops::IndexMut;
 
 pub struct Vec<T> {
     ptr: *mut T,
@@ -181,6 +183,39 @@ impl<T> Drop for Vec<T> {
         }
         unsafe {
             ¤free(self.ptr.cast::<u8>());
+        }
+    }
+}
+
+// `arr[idx]` desugar — Index/IndexMut for `Vec<T>` with `Idx = usize`.
+// Bounds-checked: on out-of-range index, calls `panic!` to invoke
+// the host. `Vec::get` / `get_mut` provide the safe Option-returning
+// variants.
+impl<T> Index for Vec<T> {
+    type Output = T;
+    fn index(&self, idx: usize) -> &T {
+        if idx >= self.len {
+            panic!("Vec index out of bounds")
+        }
+        let offset: usize = idx * mem::size_of::<T>();
+        unsafe {
+            let buf_u8: *mut u8 = self.ptr.cast::<u8>();
+            let elt: *const T = buf_u8.byte_add(offset).cast::<T>() as *const T;
+            &*elt
+        }
+    }
+}
+
+impl<T> IndexMut for Vec<T> {
+    fn index_mut(&mut self, idx: usize) -> &mut T {
+        if idx >= self.len {
+            panic!("Vec index out of bounds")
+        }
+        let offset: usize = idx * mem::size_of::<T>();
+        unsafe {
+            let buf_u8: *mut u8 = self.ptr.cast::<u8>();
+            let elt: *mut T = buf_u8.byte_add(offset).cast::<T>();
+            &mut *elt
         }
     }
 }

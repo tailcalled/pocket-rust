@@ -413,6 +413,30 @@ pub enum ExprKind {
         // Span of the `?` token itself, used for diagnostics.
         question_span: Span,
     },
+    // `arr[idx]` — indexing. Always typechecks as a read via the
+    // `Index` trait (returns the trait's `Output` type). Codegen
+    // branches on the *enclosing* context:
+    //   - value position → emit `*arr.index(idx)`.
+    //   - `&arr[idx]` → `arr.index(idx)`.
+    //   - `&mut arr[idx]` / LHS of `=` → `arr.index_mut(idx)`.
+    // Kept as a first-class node (not desugared early) so error
+    // diagnostics point at the `[` / `]` and the typeck failure
+    // surfaces as "no `Index` impl for X".
+    Index {
+        base: Box<Expr>,
+        index: Box<Expr>,
+        // Span of the `[idx]` brackets — used for diagnostics.
+        bracket_span: Span,
+    },
+    // `name!(args)` — macro invocation. Currently only `panic!(msg)`
+    // is recognized; typeck rejects other names. Kept as a generic
+    // `MacroCall` so future macros (e.g. `assert!`, `println!`) can
+    // hang off the same node.
+    MacroCall {
+        name: String,
+        name_span: Span,
+        args: Vec<Expr>,
+    },
 }
 
 // Variant construction reuses the existing nodes:

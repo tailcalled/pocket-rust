@@ -1558,11 +1558,14 @@ impl Parser {
 
     fn parse_postfix(&mut self) -> Result<Expr, Error> {
         let mut expr = self.parse_atom()?;
-        // Postfix loop covering `.field` / `.method(...)` / `.tuple_idx`
-        // and the `?` try operator. `?` and `.` share the same
-        // precedence level — both bind tighter than any prefix or
+        // Postfix loop covering `.field` / `.method(...)` / `.tuple_idx`,
+        // the `?` try operator, and `[idx]` indexing. All three share
+        // the same precedence level — bind tighter than any prefix or
         // binary operator.
-        while self.peek_kind(&TokenKind::Dot) || self.peek_kind(&TokenKind::Question) {
+        while self.peek_kind(&TokenKind::Dot)
+            || self.peek_kind(&TokenKind::Question)
+            || self.peek_kind(&TokenKind::LBracket)
+        {
             if self.peek_kind(&TokenKind::Question) {
                 let q_span = self.tokens[self.pos].span.copy();
                 self.pos += 1;
@@ -1572,6 +1575,26 @@ impl Parser {
                     kind: ExprKind::Try {
                         inner: Box::new(expr),
                         question_span: q_span,
+                    },
+                    span,
+                    id,
+                };
+                continue;
+            }
+            if self.peek_kind(&TokenKind::LBracket) {
+                let lb = self.expect(&TokenKind::LBracket, "`[`")?;
+                let saved = self.no_struct_lit;
+                self.no_struct_lit = false;
+                let idx_expr = self.parse_expr()?;
+                self.no_struct_lit = saved;
+                let rb = self.expect(&TokenKind::RBracket, "`]`")?;
+                let span = Span::new(expr.span.start.copy(), rb.end.copy());
+                let id = self.alloc_node_id();
+                expr = Expr {
+                    kind: ExprKind::Index {
+                        base: Box::new(expr),
+                        index: Box::new(idx_expr),
+                        bracket_span: Span::new(lb.start, rb.end),
                     },
                     span,
                     id,
@@ -2174,6 +2197,29 @@ impl Parser {
     fn parse_path_atom(&mut self) -> Result<Expr, Error> {
         let path = self.parse_path()?;
         let had_turbofish = path.segments.iter().any(|s| !s.args.is_empty());
+        // `name!(args)` — macro invocation. Single-segment path
+        // followed by `!` then `(args)`. The call-args parser
+        // accepts the same shapes as a normal call.
+        if path.segments.len() == 1
+            && !had_turbofish
+            && self.peek_two(&TokenKind::Bang, &TokenKind::LParen)
+        {
+            let bang_span = self.expect(&TokenKind::Bang, "`!`")?;
+            let args = self.parse_call_args()?;
+            let end = self.tokens[self.pos - 1].span.end.copy();
+            let span = Span::new(path.span.start.copy(), end);
+            let id = self.alloc_node_id();
+            let _ = bang_span;
+            return Ok(Expr {
+                kind: ExprKind::MacroCall {
+                    name: path.segments[0].name.clone(),
+                    name_span: path.segments[0].span.copy(),
+                    args,
+                },
+                span,
+                id,
+            });
+        }
         if self.peek_kind(&TokenKind::LParen) {
             let args = self.parse_call_args()?;
             let end = self.tokens[self.pos - 1].span.end.copy();

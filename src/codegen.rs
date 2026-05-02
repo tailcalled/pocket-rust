@@ -186,7 +186,11 @@ pub fn emit(
         }
         total
     };
-    let mut mono = MonoState::new(funcs.entries.len() as u32, str_pool_base_offset);
+    // Imported functions occupy wasm idxs 0..imports.len(); typeck
+    // assigned non-generic entries idxs starting at imports.len(); so
+    // mono picks up after both.
+    let mono_start = wasm_mod.imports.len() as u32 + funcs.entries.len() as u32;
+    let mut mono = MonoState::new(mono_start, str_pool_base_offset);
     emit_module(wasm_mod, root, &mut module_path, structs, enums, traits, funcs, &mut mono)?;
     while !mono.queue.is_empty() {
         let work = mono.queue.remove(0);
@@ -752,6 +756,17 @@ fn walk_expr_drop_marks(
         ExprKind::Try { inner, .. } => {
             walk_expr_drop_marks(inner, expr_types, traits, info);
         }
+        ExprKind::Index { base, index, .. } => {
+            walk_expr_drop_marks(base, expr_types, traits, info);
+            walk_expr_drop_marks(index, expr_types, traits, info);
+        }
+        ExprKind::MacroCall { args, .. } => {
+            let mut i = 0;
+            while i < args.len() {
+                walk_expr_drop_marks(&args[i], expr_types, traits, info);
+                i += 1;
+            }
+        }
     }
 }
 
@@ -969,6 +984,37 @@ fn walk_expr_addr(
             }
         }
         ExprKind::Try { inner, .. } => walk_expr_addr(inner, stack, info),
+        ExprKind::MacroCall { args, .. } => {
+            let mut i = 0;
+            while i < args.len() {
+                walk_expr_addr(&args[i], stack, info);
+                i += 1;
+            }
+        }
+        ExprKind::Index { base, index, .. } => {
+            // Indexing implicitly takes `&base` (or `&mut base`) for
+            // the Index/IndexMut method call. Mark the base's root
+            // binding as addressed so escape analysis spills it.
+            if let Some(chain) = extract_place(base) {
+                let root = &chain[0];
+                let mut i = stack.len();
+                while i > 0 {
+                    i -= 1;
+                    if binding_ref_name(&stack[i]) == root {
+                        match &stack[i] {
+                            BindingRef::Param(idx, _) => info.param_addressed[*idx] = true,
+                            BindingRef::Let(id, _) => info.let_addressed[*id as usize] = true,
+                            BindingRef::Pattern(id, _) => {
+                                info.pattern_addressed[*id as usize] = true
+                            }
+                        }
+                        break;
+                    }
+                }
+            }
+            walk_expr_addr(base, stack, info);
+            walk_expr_addr(index, stack, info);
+        }
     }
 }
 
@@ -1407,6 +1453,17 @@ fn collect_lets_in_expr(expr: &Expr, out: &mut Vec<u32>) {
             }
         }
         ExprKind::Try { inner, .. } => collect_lets_in_expr(inner, out),
+        ExprKind::Index { base, index, .. } => {
+            collect_lets_in_expr(base, out);
+            collect_lets_in_expr(index, out);
+        }
+        ExprKind::MacroCall { args, .. } => {
+            let mut i = 0;
+            while i < args.len() {
+                collect_lets_in_expr(&args[i], out);
+                i += 1;
+            }
+        }
     }
 }
 
@@ -2129,6 +2186,130 @@ fn codegen_return(ctx: &mut FnCtx, value: Option<&Expr>) -> Result<RType, Error>
     Ok(RType::Never)
 }
 
+// `arr[idx]` in value position — synthesize the equivalent of
+// `*<Index>::index(&arr, idx)`. Resolves the impl via `solve_impl`,
+// emits the recv as a borrow of base (matching `&self`), the idx,
+// and the call; the call returns `&Output` as one i32 (the
+// pointer), and we then load the `Output`'s flat scalars from that
+// address. Caller-context-aware variants for assign/borrow contexts
+// live in `codegen_index_ref` and `codegen_index_assign`.
+fn codegen_index_value(
+    ctx: &mut FnCtx,
+    base: &Expr,
+    idx: &Expr,
+    expr_id: crate::ast::NodeId,
+) -> Result<RType, Error> {
+    let (callee_idx, _ref_ret_rt) = resolve_index_callee(ctx, base, false);
+    let result_ty = ctx.expr_types[expr_id as usize]
+        .as_ref()
+        .expect("typeck recorded the index expr's type")
+        .clone();
+    let result_ty = substitute_rtype(&result_ty, &ctx.env);
+    // Receiver shape: if base is already a `&Self` (e.g. `s: &[T]`
+    // calling `[T]::index(&self)`), pass it through; otherwise take
+    // `&base`.
+    emit_index_recv(ctx, base, false)?;
+    codegen_expr(ctx, idx)?;
+    ctx.instructions.push(wasm::Instruction::Call(callee_idx));
+    // Stack now has an i32 (address of &Output). Load `Output` from
+    // it.
+    let addr_local = ctx.next_wasm_local;
+    ctx.extra_locals.push(wasm::ValType::I32);
+    ctx.next_wasm_local += 1;
+    ctx.instructions.push(wasm::Instruction::LocalSet(addr_local));
+    load_flat_from_memory(ctx, &result_ty, BaseAddr::WasmLocal(addr_local), 0);
+    Ok(result_ty)
+}
+
+// Push the right receiver value for an Index/IndexMut method call.
+// If `base`'s type already matches the method's `&self` shape — i.e.
+// `base` is `&T` (for Index) or `&mut T` (for IndexMut) — pass it
+// through with `codegen_expr`. Otherwise (base is owned `T` or
+// matches in some other ref-permutation) take `&base` / `&mut base`
+// via `codegen_borrow`.
+fn emit_index_recv(ctx: &mut FnCtx, base: &Expr, mutable: bool) -> Result<(), Error> {
+    let base_rt = ctx.expr_types[base.id as usize]
+        .as_ref()
+        .expect("typeck recorded base type")
+        .clone();
+    let base_rt = substitute_rtype(&base_rt, &ctx.env);
+    let already_right_ref = match (&base_rt, mutable) {
+        (RType::Ref { mutable: false, .. }, false) => true,
+        (RType::Ref { mutable: true, .. }, true) => true,
+        // `&mut T` can downgrade to `&T` — pass through for Index.
+        (RType::Ref { mutable: true, .. }, false) => true,
+        _ => false,
+    };
+    if already_right_ref {
+        codegen_expr(ctx, base)?;
+    } else {
+        codegen_borrow(ctx, base, mutable)?;
+    }
+    Ok(())
+}
+
+// Resolve the wasm idx + return type of the appropriate Index /
+// IndexMut method for `base`'s type. `mutable=true` selects
+// IndexMut::index_mut. Used by both value-position indexing and the
+// (future) borrow / assign paths.
+fn resolve_index_callee(
+    ctx: &mut FnCtx,
+    base: &Expr,
+    mutable: bool,
+) -> (u32, RType) {
+    let base_rt = ctx.expr_types[base.id as usize]
+        .as_ref()
+        .expect("typeck recorded base type")
+        .clone();
+    let base_rt = substitute_rtype(&base_rt, &ctx.env);
+    let lookup_rt = match &base_rt {
+        RType::Ref { inner, .. } => (**inner).clone(),
+        _ => base_rt.clone(),
+    };
+    let trait_path: Vec<String> = if mutable {
+        vec!["std".to_string(), "ops".to_string(), "IndexMut".to_string()]
+    } else {
+        vec!["std".to_string(), "ops".to_string(), "Index".to_string()]
+    };
+    let method_name = if mutable { "index_mut" } else { "index" };
+    let resolution = crate::typeck::solve_impl(&trait_path, &lookup_rt, ctx.traits, 0)
+        .expect("typeck verified Index/IndexMut impl exists");
+    let cand = crate::typeck::find_trait_impl_method(ctx.funcs, resolution.impl_idx, method_name)
+        .expect("impl has the index/index_mut method");
+    match cand {
+        crate::typeck::MethodCandidate::Direct(i) => {
+            let entry = &ctx.funcs.entries[i];
+            let ret = entry.return_type.clone().expect("index returns a ref");
+            (entry.idx, ret)
+        }
+        crate::typeck::MethodCandidate::Template(i) => {
+            let tmpl = &ctx.funcs.templates[i];
+            let impl_param_count = tmpl.impl_type_param_count;
+            let mut concrete: Vec<RType> = Vec::new();
+            let mut k = 0;
+            while k < impl_param_count {
+                let name = &tmpl.type_params[k];
+                let bound = resolution
+                    .subst
+                    .iter()
+                    .find(|s| s.0 == *name)
+                    .map(|s| s.1.clone())
+                    .expect("impl-param bound by solve_impl");
+                concrete.push(bound);
+                k += 1;
+            }
+            // Index / IndexMut have no method-level type-params.
+            let tmpl_env = build_env(&tmpl.type_params, &concrete);
+            let return_rt = substitute_rtype(
+                tmpl.return_type.as_ref().expect("index returns"),
+                &tmpl_env,
+            );
+            let idx = ctx.mono.intern(i, concrete);
+            (idx, return_rt)
+        }
+    }
+}
+
 // `expr?` codegen. Inner is `Result<T, E>` (an enum); function's
 // return is `Result<U, E>`. Lower as:
 //
@@ -2516,6 +2697,53 @@ fn needs_drop_flag(
 fn codegen_assign_stmt(ctx: &mut FnCtx, assign: &AssignStmt) -> Result<(), Error> {
     if let Some((deref_inner, fields)) = extract_deref_chain(&assign.lhs) {
         return codegen_deref_assign(ctx, deref_inner, &fields, &assign.rhs);
+    }
+    // `arr[idx] = val` — synthesize the equivalent of
+    // `*<IndexMut>::index_mut(&mut arr, idx) = val`. Codegen the
+    // value, resolve the index_mut callee, push the address, and
+    // store-through.
+    if let ExprKind::Index { base, index, .. } = &assign.lhs.kind {
+        let elem_ty = ctx.expr_types[assign.lhs.id as usize]
+            .as_ref()
+            .expect("typeck recorded LHS index type")
+            .clone();
+        let elem_ty = substitute_rtype(&elem_ty, &ctx.env);
+        // Push rhs value.
+        codegen_expr(ctx, &assign.rhs)?;
+        // Stash flat scalars so we can compute the address afterward.
+        let mut flat: Vec<wasm::ValType> = Vec::new();
+        crate::typeck::flatten_rtype(&elem_ty, ctx.structs, &mut flat);
+        let val_save_start = ctx.next_wasm_local;
+        let mut k = 0;
+        while k < flat.len() {
+            ctx.extra_locals.push(flat[k].copy());
+            ctx.next_wasm_local += 1;
+            k += 1;
+        }
+        let mut k = flat.len();
+        while k > 0 {
+            k -= 1;
+            ctx.instructions
+                .push(wasm::Instruction::LocalSet(val_save_start + k as u32));
+        }
+        // Resolve index_mut and compute the destination address.
+        let (callee_idx, _ret_rt) = resolve_index_callee(ctx, base, true);
+        emit_index_recv(ctx, base, true)?;
+        codegen_expr(ctx, index)?;
+        ctx.instructions.push(wasm::Instruction::Call(callee_idx));
+        let addr_local = ctx.next_wasm_local;
+        ctx.extra_locals.push(wasm::ValType::I32);
+        ctx.next_wasm_local += 1;
+        ctx.instructions.push(wasm::Instruction::LocalSet(addr_local));
+        // Store the saved value to that address.
+        let mut k = 0;
+        while k < flat.len() {
+            ctx.instructions
+                .push(wasm::Instruction::LocalGet(val_save_start + k as u32));
+            k += 1;
+        }
+        store_flat_to_memory(ctx, &elem_ty, BaseAddr::WasmLocal(addr_local), 0);
+        return Ok(());
     }
     let chain = extract_place(&assign.lhs).expect("typeck verified LHS is a place");
 
@@ -2927,7 +3155,29 @@ fn codegen_expr(ctx: &mut FnCtx, expr: &Expr) -> Result<RType, Error> {
         ExprKind::Continue { label, .. } => codegen_continue(ctx, label.as_deref()),
         ExprKind::Return { value } => codegen_return(ctx, value.as_deref()),
         ExprKind::Try { inner, .. } => codegen_try(ctx, inner, expr.id),
+        ExprKind::Index { base, index, .. } => codegen_index_value(ctx, base, index, expr.id),
+        ExprKind::MacroCall { name, args, .. } => codegen_macro_call(ctx, name, args),
     }
+}
+
+// `panic!(msg)` — codegen the &str arg (pushes ptr, len), call the
+// imported `env.panic` (wasm function index 0), then `unreachable`.
+// The expression's "result" is `!` so wasm validator accepts the
+// dead code that follows.
+fn codegen_macro_call(
+    ctx: &mut FnCtx,
+    name: &str,
+    args: &Vec<Expr>,
+) -> Result<RType, Error> {
+    if name != "panic" {
+        unreachable!("typeck verified macro is `panic!`");
+    }
+    // The arg is `&str` — a 2-i32 fat ref. After codegen the wasm
+    // stack has [ptr, len] which lines up with `env.panic(ptr, len)`.
+    codegen_expr(ctx, &args[0])?;
+    ctx.instructions.push(wasm::Instruction::Call(0));
+    ctx.instructions.push(wasm::Instruction::Unreachable);
+    Ok(RType::Never)
 }
 
 // `(a, b, c)` — codegen each elem in source order, leaving its
@@ -5844,6 +6094,31 @@ fn extract_field_from_stack(
 }
 
 fn codegen_borrow(ctx: &mut FnCtx, inner: &Expr, mutable: bool) -> Result<RType, Error> {
+    // `&arr[idx]` / `&mut arr[idx]` — bypass the place-chain
+    // machinery and synthesize the equivalent of
+    // `arr.index(idx)` / `arr.index_mut(idx)`. The method's return
+    // type is already `&Output` / `&mut Output`, which matches what
+    // a borrow is expected to produce.
+    if let ExprKind::Index { base, index, .. } = &inner.kind {
+        let (callee_idx, _ret_rt) = resolve_index_callee(ctx, base, mutable);
+        emit_index_recv(ctx, base, mutable)?;
+        codegen_expr(ctx, index)?;
+        ctx.instructions.push(wasm::Instruction::Call(callee_idx));
+        // The wasm result is one i32 — the &Output (or &mut Output).
+        // Recover the pointee type from the typeck's recorded type
+        // for the index expression.
+        let elem_ty = ctx
+            .expr_types[inner.id as usize]
+            .as_ref()
+            .expect("typeck recorded index expr type")
+            .clone();
+        let elem_ty = substitute_rtype(&elem_ty, &ctx.env);
+        return Ok(RType::Ref {
+            inner: Box::new(elem_ty),
+            mutable,
+            lifetime: crate::typeck::LifetimeRepr::Inferred(0),
+        });
+    }
     // `&*ptr` / `&mut *ptr` is a place borrow (a *re*-borrow, when
     // `ptr` is a ref; a raw-to-safe transition, when `ptr` is a raw
     // pointer). The result's address is `ptr`'s value — no value

@@ -109,11 +109,61 @@ pub fn instantiate(bytes: &[u8]) -> (Store<()>, wasmi::Instance) {
     let engine = Engine::default();
     let module = Module::new(&engine, bytes).expect("wasmi rejected the module");
     let mut store = Store::new(&engine, ());
-    let linker = <Linker<()>>::new(&engine);
+    let mut linker = <Linker<()>>::new(&engine);
+    // Register the host-imported `env.panic(ptr, len)` stub. Reads
+    // the panic-message bytes out of the wasm module's exported
+    // memory (`"memory"`) and traps with `panic: <message>` so tests
+    // can substring-assert against the surfaced text.
+    use wasmi::{Caller, Func};
+    let panic_fn = Func::wrap(
+        &mut store,
+        |mut caller: Caller<'_, ()>, ptr: i32, len: i32| -> Result<(), wasmi::Error> {
+            let msg = read_memory_str(&mut caller, ptr as u32, len as u32)
+                .unwrap_or_else(|| "<unreadable>".to_string());
+            Err(wasmi::Error::new(format!("panic: {}", msg)))
+        },
+    );
+    linker
+        .define("env", "panic", panic_fn)
+        .expect("define env.panic");
     let instance = linker
         .instantiate_and_start(&mut store, &module)
         .expect("instantiate failed");
     (store, instance)
+}
+
+// Read `len` bytes starting at `ptr` from the caller's exported
+// `"memory"` and decode as UTF-8. Returns None on any failure (no
+// memory export, OOB read, invalid UTF-8) so the caller can fall
+// back to a placeholder.
+pub fn read_memory_str(
+    caller: &mut wasmi::Caller<'_, ()>,
+    ptr: u32,
+    len: u32,
+) -> Option<String> {
+    let mem = caller.get_export("memory")?.into_memory()?;
+    let data = mem.data(&caller);
+    let start = ptr as usize;
+    let end = start.checked_add(len as usize)?;
+    if end > data.len() {
+        return None;
+    }
+    std::str::from_utf8(&data[start..end]).ok().map(String::from)
+}
+
+// Run an example expecting a panic and return the resulting trap's
+// formatted error string. Asserts the call did fail so each test's
+// substring check is the only thing left to verify.
+pub fn expect_panic(dir: &str) -> String {
+    let bytes = compile_example(dir, "lib.rs");
+    let (mut store, instance) = instantiate(&bytes);
+    let f = instance
+        .get_typed_func::<(), i32>(&store, "answer")
+        .expect("export `answer: i32` not found");
+    let err = f
+        .call(&mut store, ())
+        .expect_err("expected wasm trap from panic");
+    format!("{}", err)
 }
 
 // Compile `examples/<dir>/lib.rs`, instantiate, invoke `<export>`,
@@ -159,6 +209,7 @@ mod if_exprs;
 mod int_literals;
 mod let_stmts;
 mod modules;
+mod panic_macro;
 mod patterns;
 mod raw_pointers;
 mod references;

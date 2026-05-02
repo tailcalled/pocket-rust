@@ -232,6 +232,18 @@ fn walk_expr(state: &mut SafeState, expr: &Expr) -> Result<(), Error> {
             Ok(())
         }
         ExprKind::Try { inner, .. } => walk_expr(state, inner),
+        ExprKind::Index { base, index, .. } => {
+            walk_expr(state, base)?;
+            walk_expr(state, index)
+        }
+        ExprKind::MacroCall { args, .. } => {
+            let mut i = 0;
+            while i < args.len() {
+                walk_expr(state, &args[i])?;
+                i += 1;
+            }
+            Ok(())
+        }
     }
 }
 

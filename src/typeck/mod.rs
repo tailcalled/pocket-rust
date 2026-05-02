@@ -1766,6 +1766,23 @@ fn check_assign_stmt(ctx: &mut CheckCtx, assign: &AssignStmt) -> Result<(), Erro
     if let Some((root_expr, fields)) = extract_deref_rooted_chain(&assign.lhs) {
         return check_deref_rooted_assign(ctx, root_expr, &fields, assign);
     }
+    // 3. Index LHS (`arr[idx] = val`). Typecheck the LHS for its
+    //    Output type, then unify rhs against that. Codegen handles
+    //    the IndexMut dispatch + store-through.
+    if let ExprKind::Index { .. } = &assign.lhs.kind {
+        let lhs_ty = check_expr(ctx, &assign.lhs)?;
+        let rhs_ty = check_expr(ctx, &assign.rhs)?;
+        ctx.subst.unify(
+            &rhs_ty,
+            &lhs_ty,
+            ctx.traits,
+            ctx.type_params,
+            ctx.type_param_bounds,
+            &assign.span,
+            ctx.current_file,
+        )?;
+        return Ok(());
+    }
     // LHS must be a place expression (Var or Var-rooted FieldAccess chain).
     let chain = match extract_place_for_assign(&assign.lhs) {
         Some(c) => c,
@@ -2247,7 +2264,116 @@ fn check_expr_inner(ctx: &mut CheckCtx, expr: &Expr) -> Result<InferType, Error>
         }
         ExprKind::Return { value } => check_return_expr(ctx, value.as_deref(), expr),
         ExprKind::Try { inner, question_span } => check_try_expr(ctx, inner, question_span, expr),
+        ExprKind::Index { base, index, bracket_span } => {
+            check_index_expr(ctx, base, index, bracket_span, expr)
+        }
+        ExprKind::MacroCall { name, name_span, args } => {
+            check_macro_call(ctx, name, name_span, args)
+        }
     }
+}
+
+// `panic!(msg: &str)` is the only macro recognized so far. Type-checks
+// the single `&str` argument and yields `!` (the macro diverges via
+// the `env.panic` host call).
+fn check_macro_call(
+    ctx: &mut CheckCtx,
+    name: &str,
+    name_span: &Span,
+    args: &Vec<Expr>,
+) -> Result<InferType, Error> {
+    if name != "panic" {
+        return Err(Error {
+            file: ctx.current_file.to_string(),
+            message: format!("unknown macro `{}!`", name),
+            span: name_span.copy(),
+        });
+    }
+    if args.len() != 1 {
+        return Err(Error {
+            file: ctx.current_file.to_string(),
+            message: format!(
+                "wrong number of arguments to `panic!`: expected 1, got {}",
+                args.len()
+            ),
+            span: name_span.copy(),
+        });
+    }
+    let arg_ty = check_expr(ctx, &args[0])?;
+    let str_ref = InferType::Ref {
+        inner: Box::new(InferType::Str),
+        mutable: false,
+        lifetime: LifetimeRepr::Inferred(0),
+    };
+    ctx.subst.unify(
+        &arg_ty,
+        &str_ref,
+        ctx.traits,
+        ctx.type_params,
+        ctx.type_param_bounds,
+        &args[0].span,
+        ctx.current_file,
+    )?;
+    Ok(InferType::Never)
+}
+
+// `arr[idx]` — typecheck base + index, look up the `Index` impl on
+// base's type (handling autoderef of `&T`/`&mut T` so `(&v)[idx]`
+// works), unify idx with `usize`, and yield the impl's `Output`
+// associated type. Codegen branches on enclosing context to decide
+// whether to call `index` or `index_mut`.
+fn check_index_expr(
+    ctx: &mut CheckCtx,
+    base: &Expr,
+    index: &Expr,
+    bracket_span: &Span,
+    _expr: &Expr,
+) -> Result<InferType, Error> {
+    let base_ty = check_expr(ctx, base)?;
+    let resolved_base = ctx.subst.substitute(&base_ty);
+    // Autoderef through references for the trait lookup. `&Vec<u32>`
+    // and `Vec<u32>` both index the same way; the codegen handles the
+    // ref by passing it through unchanged.
+    let lookup_ty = match &resolved_base {
+        InferType::Ref { inner, .. } => (**inner).clone(),
+        other => other.clone(),
+    };
+    // Verify the index expression typechecks as `usize`.
+    let idx_ty = check_expr(ctx, index)?;
+    ctx.subst.unify(
+        &idx_ty,
+        &InferType::Int(IntKind::Usize),
+        ctx.traits,
+        ctx.type_params,
+        ctx.type_param_bounds,
+        &index.span,
+        ctx.current_file,
+    )?;
+    // Find the impl and read its Output assoc-type binding.
+    let lookup_rt = infer_to_rtype_for_check(&lookup_ty);
+    let index_path = vec!["std".to_string(), "ops".to_string(), "Index".to_string()];
+    let bindings = traits::find_assoc_binding(ctx.traits, &lookup_rt, &index_path, "Output");
+    if bindings.is_empty() {
+        return Err(Error {
+            file: ctx.current_file.to_string(),
+            message: format!(
+                "the type `{}` cannot be indexed (no `Index` impl)",
+                infer_to_string(&lookup_ty)
+            ),
+            span: bracket_span.copy(),
+        });
+    }
+    if bindings.len() > 1 {
+        return Err(Error {
+            file: ctx.current_file.to_string(),
+            message: format!(
+                "ambiguous `Index` impl for `{}`",
+                infer_to_string(&lookup_ty)
+            ),
+            span: bracket_span.copy(),
+        });
+    }
+    Ok(rtype_to_infer(&bindings[0]))
 }
 
 // `return EXPR` / `return`. EXPR (or `()` if absent) unifies against
@@ -2485,7 +2611,19 @@ fn check_if_expr(
         &outer.span,
         ctx.current_file,
     )?;
-    Ok(then_ty)
+    // The if's overall type is the non-`!` arm's type when one arm
+    // diverges (so `if cond { panic!() } else { 42 }` types as the
+    // else arm's u32, not `!`). When neither arm is `!`, returning
+    // either is fine — they unified.
+    let resolved_then = ctx.subst.substitute(&then_ty);
+    let resolved_else = ctx.subst.substitute(&else_ty);
+    let result = match (&resolved_then, &resolved_else) {
+        (InferType::Never, _) => else_ty,
+        _ => then_ty,
+    };
+    let _ = resolved_then;
+    let _ = resolved_else;
+    Ok(result)
 }
 
 // `match scrut { pat1 => arm1, pat2 if guard => arm2, _ => arm3 }`.
