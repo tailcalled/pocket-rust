@@ -35,6 +35,13 @@ pub enum TokenKind {
     // impl bodies (`type Name = T;`) so far. Lexed unconditionally; the
     // parser is the one that requires it to be in those positions.
     Type,
+    // `return` — early-exit expression. `return EXPR` or `return`.
+    Return,
+    // `?` — try-operator postfix. `expr?` short-circuits to the
+    // enclosing function's `Err(...)` if `expr` is `Err`; otherwise
+    // unwraps the `Ok(v)`. Kept as a first-class AST node (no early
+    // desugar) so error messages point at the `?` site.
+    Question,
     // The currency-sign character `¤` (U+00A4). Prefixes a builtin
     // intrinsic call: `¤name(args)`. The lexer emits this as a
     // standalone token; the following identifier (and parenthesized
@@ -105,6 +112,8 @@ pub fn token_kind_name(t: &TokenKind) -> &'static str {
         TokenKind::Impl => "`impl`",
         TokenKind::Trait => "`trait`",
         TokenKind::Type => "`type`",
+        TokenKind::Return => "`return`",
+        TokenKind::Question => "`?`",
         TokenKind::For => "`for`",
         TokenKind::SelfLower => "`self`",
         TokenKind::SelfUpper => "`Self`",
@@ -240,6 +249,11 @@ pub fn tokenize(file: &str, source: &str) -> Result<Vec<Token>, Error> {
             } else if text == "type" {
                 tokens.push(Token {
                     kind: TokenKind::Type,
+                    span,
+                });
+            } else if text == "return" {
+                tokens.push(Token {
+                    kind: TokenKind::Return,
                     span,
                 });
             } else if text == "for" {
@@ -575,6 +589,9 @@ pub fn tokenize(file: &str, source: &str) -> Result<Vec<Token>, Error> {
             byte_pos += 2;
         } else if b == b'!' {
             push_single(&mut tokens, TokenKind::Bang, line, &mut col);
+            byte_pos += 1;
+        } else if b == b'?' {
+            push_single(&mut tokens, TokenKind::Question, line, &mut col);
             byte_pos += 1;
         } else if b == b'<' && (byte_pos + 1) < bytes.len() && bytes[byte_pos + 1] == b'=' {
             let start = Pos::new(line, col);

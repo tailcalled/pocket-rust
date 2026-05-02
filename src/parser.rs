@@ -1558,7 +1558,26 @@ impl Parser {
 
     fn parse_postfix(&mut self) -> Result<Expr, Error> {
         let mut expr = self.parse_atom()?;
-        while self.peek_kind(&TokenKind::Dot) {
+        // Postfix loop covering `.field` / `.method(...)` / `.tuple_idx`
+        // and the `?` try operator. `?` and `.` share the same
+        // precedence level — both bind tighter than any prefix or
+        // binary operator.
+        while self.peek_kind(&TokenKind::Dot) || self.peek_kind(&TokenKind::Question) {
+            if self.peek_kind(&TokenKind::Question) {
+                let q_span = self.tokens[self.pos].span.copy();
+                self.pos += 1;
+                let span = Span::new(expr.span.start.copy(), q_span.end.copy());
+                let id = self.alloc_node_id();
+                expr = Expr {
+                    kind: ExprKind::Try {
+                        inner: Box::new(expr),
+                        question_span: q_span,
+                    },
+                    span,
+                    id,
+                };
+                continue;
+            }
             self.pos += 1;
             // `.<integer>` — tuple-index access. We accept any non-
             // negative integer literal here; range-checks (against the
@@ -1666,6 +1685,7 @@ impl Parser {
             TokenKind::While => self.parse_while_expr(None, None),
             TokenKind::Break => self.parse_break_expr(),
             TokenKind::Continue => self.parse_continue_expr(),
+            TokenKind::Return => self.parse_return_expr(),
             TokenKind::Lifetime(_) => self.parse_labeled_loop(),
             TokenKind::Builtin => self.parse_builtin(),
             TokenKind::Ident(_) => self.parse_path_atom(),
@@ -2003,6 +2023,40 @@ impl Parser {
         let id = self.alloc_node_id();
         Ok(Expr {
             kind: ExprKind::Continue { label, label_span },
+            span: Span::new(kw_span.start, end),
+            id,
+        })
+    }
+
+    fn parse_return_expr(&mut self) -> Result<Expr, Error> {
+        let kw_span = self.expect(&TokenKind::Return, "`return`")?;
+        // The value is optional. We consider `return` to have no
+        // value when followed by a token that can't start an
+        // expression: `;`, `,`, `)`, `]`, `}`, `=>`. Anything else
+        // we try to parse as an expression.
+        let has_value = if self.pos >= self.tokens.len() {
+            false
+        } else {
+            !matches!(
+                &self.tokens[self.pos].kind,
+                TokenKind::Semi
+                    | TokenKind::Comma
+                    | TokenKind::RParen
+                    | TokenKind::RBracket
+                    | TokenKind::RBrace
+                    | TokenKind::FatArrow
+            )
+        };
+        let (value, end) = if has_value {
+            let e = self.parse_expr()?;
+            let end = e.span.end.copy();
+            (Some(Box::new(e)), end)
+        } else {
+            (None, kw_span.end.copy())
+        };
+        let id = self.alloc_node_id();
+        Ok(Expr {
+            kind: ExprKind::Return { value },
             span: Span::new(kw_span.start, end),
             id,
         })
@@ -2406,6 +2460,8 @@ impl Parser {
             (TokenKind::Impl, TokenKind::Impl) => true,
             (TokenKind::Trait, TokenKind::Trait) => true,
             (TokenKind::Type, TokenKind::Type) => true,
+            (TokenKind::Return, TokenKind::Return) => true,
+            (TokenKind::Question, TokenKind::Question) => true,
             (TokenKind::For, TokenKind::For) => true,
             (TokenKind::Plus, TokenKind::Plus) => true,
             (TokenKind::SelfLower, TokenKind::SelfLower) => true,

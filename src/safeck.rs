@@ -225,6 +225,13 @@ fn walk_expr(state: &mut SafeState, expr: &Expr) -> Result<(), Error> {
             walk_block(state, w.body.as_ref())
         }
         ExprKind::Break { .. } | ExprKind::Continue { .. } => Ok(()),
+        ExprKind::Return { value } => {
+            if let Some(v) = value {
+                walk_expr(state, v)?;
+            }
+            Ok(())
+        }
+        ExprKind::Try { inner, .. } => walk_expr(state, inner),
     }
 }
 

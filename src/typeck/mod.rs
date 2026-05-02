@@ -1132,6 +1132,12 @@ pub(crate) struct CheckCtx<'a> {
     // the loop's optional label; `break`/`continue` validate that any
     // referenced label is in this stack.
     pub(crate) loop_labels: Vec<Option<String>>,
+    // The enclosing function's declared return type (resolved). Used
+    // by `return EXPR;` to unify EXPR against the expected type, and
+    // by `?` to verify the function's return is `Result<_, E>` with
+    // the same E as the inner Result. `None` only for tail-less fns
+    // (return type `()` is `Some(Tuple([]))`).
+    pub(crate) fn_return_rt: Option<RType>,
 }
 
 fn check_module(
@@ -1402,6 +1408,7 @@ fn check_function(
             reexports,
             use_scope: initial_use_scope,
             loop_labels: Vec::new(),
+            fn_return_rt: return_rt.clone(),
         };
         check_block(&mut ctx, &func.body, &return_rt)?;
         (
@@ -2226,7 +2233,127 @@ fn check_expr_inner(ctx: &mut CheckCtx, expr: &Expr) -> Result<InferType, Error>
             check_loop_label(ctx, label, label_span, &expr.span)?;
             Ok(InferType::Never)
         }
+        ExprKind::Return { value } => check_return_expr(ctx, value.as_deref(), expr),
+        ExprKind::Try { inner, question_span } => check_try_expr(ctx, inner, question_span, expr),
     }
+}
+
+// `return EXPR` / `return`. EXPR (or `()` if absent) unifies against
+// the enclosing function's declared return type. The whole `return`
+// expression has type `!` so it can sit anywhere a value is expected
+// without constraining surrounding inference.
+fn check_return_expr(
+    ctx: &mut CheckCtx,
+    value: Option<&Expr>,
+    expr: &Expr,
+) -> Result<InferType, Error> {
+    let expected_rt = match &ctx.fn_return_rt {
+        Some(rt) => rt.clone(),
+        None => RType::Tuple(Vec::new()),
+    };
+    let expected = rtype_to_infer(&expected_rt);
+    let actual = match value {
+        Some(e) => check_expr(ctx, e)?,
+        None => InferType::Tuple(Vec::new()),
+    };
+    let span = match value {
+        Some(e) => e.span.copy(),
+        None => expr.span.copy(),
+    };
+    ctx.subst.unify(
+        &actual,
+        &expected,
+        ctx.traits,
+        ctx.type_params,
+        ctx.type_param_bounds,
+        &span,
+        ctx.current_file,
+    )?;
+    Ok(InferType::Never)
+}
+
+// `expr?` — typecheck the inner as `Result<T, E>`, require the
+// enclosing function's return type to be `Result<U, E>` with the same
+// `E`, and yield `T`. No early desugar — codegen lowers this directly
+// so the `?` token's span carries through diagnostics.
+fn check_try_expr(
+    ctx: &mut CheckCtx,
+    inner: &Expr,
+    question_span: &Span,
+    expr: &Expr,
+) -> Result<InferType, Error> {
+    let inner_ty = check_expr(ctx, inner)?;
+    let resolved = ctx.subst.substitute(&inner_ty);
+    // Inner must be `std::result::Result<T, E>`. (No general `Try`
+    // trait yet — we hardcode the canonical Result path.)
+    let result_path = vec!["std".to_string(), "result".to_string(), "Result".to_string()];
+    let (ok_ty, err_ty) = match &resolved {
+        InferType::Enum { path, type_args, .. }
+            if path == &result_path && type_args.len() == 2 =>
+        {
+            (type_args[0].clone(), type_args[1].clone())
+        }
+        _ => {
+            return Err(Error {
+                file: ctx.current_file.to_string(),
+                message: format!(
+                    "the `?` operator requires a `Result`, got `{}`",
+                    infer_to_string(&resolved)
+                ),
+                span: question_span.copy(),
+            });
+        }
+    };
+    // The enclosing function must return `Result<_, E_fn>` with the
+    // same E. Look at fn_return_rt; if it's not a Result-shaped enum,
+    // reject.
+    let fn_ret_rt = match &ctx.fn_return_rt {
+        Some(rt) => rt.clone(),
+        None => RType::Tuple(Vec::new()),
+    };
+    let (_fn_ok, fn_err) = match &fn_ret_rt {
+        RType::Enum { path, type_args, .. }
+            if path == &result_path && type_args.len() == 2 =>
+        {
+            (type_args[0].clone(), type_args[1].clone())
+        }
+        _ => {
+            return Err(Error {
+                file: ctx.current_file.to_string(),
+                message: format!(
+                    "the `?` operator can only be used in a function returning `Result`; this function returns `{}`",
+                    rtype_to_string(&fn_ret_rt)
+                ),
+                span: question_span.copy(),
+            });
+        }
+    };
+    // Unify inner E with function's E. Mismatch → "incompatible
+    // error type" diagnostic.
+    let fn_err_infer = rtype_to_infer(&fn_err);
+    if let Err(e) = ctx.subst.unify(
+        &err_ty,
+        &fn_err_infer,
+        ctx.traits,
+        ctx.type_params,
+        ctx.type_param_bounds,
+        question_span,
+        ctx.current_file,
+    ) {
+        // Re-wrap with a `?`-specific message.
+        let _ = e;
+        return Err(Error {
+            file: ctx.current_file.to_string(),
+            message: format!(
+                "the `?` operator's error type `{}` doesn't match the function's `{}`",
+                infer_to_string(&err_ty),
+                rtype_to_string(&fn_err)
+            ),
+            span: question_span.copy(),
+        });
+    }
+    let _ = expr;
+    Ok(ok_ty)
 }
 
 // `while cond { body }`. Cond must be bool; body's tail must be ().

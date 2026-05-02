@@ -389,6 +389,25 @@ pub enum ExprKind {
         label: Option<String>,
         label_span: Option<Span>,
     },
+    // `return;` (unit) or `return EXPR;`. Type `!` (diverging). The
+    // value's type unifies against the enclosing function's return
+    // type at typeck. Codegen drops in-scope bindings, restores SP,
+    // and emits the wasm `return` (with sret memcpy first, when the
+    // function uses the sret ABI).
+    Return {
+        value: Option<Box<Expr>>,
+    },
+    // `expr?` — try-operator postfix. `expr` must be `Result<T, E>`
+    // and the enclosing function must return `Result<U, E>` (matching
+    // E). On `Err(e)` the function returns `Err(e)` immediately; on
+    // `Ok(v)` the expression evaluates to `v`. Kept as a first-class
+    // node (not desugared to match+return early) so error spans point
+    // at the `?` site rather than at synthetic match arms.
+    Try {
+        inner: Box<Expr>,
+        // Span of the `?` token itself, used for diagnostics.
+        question_span: Span,
+    },
 }
 
 // Variant construction reuses the existing nodes:

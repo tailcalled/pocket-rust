@@ -294,6 +294,31 @@ impl<'a> Builder<'a> {
             ExprKind::Continue { label, label_span: _ } => {
                 self.lower_continue(label, expr.span.copy());
             }
+            ExprKind::Return { value } => {
+                self.lower_return(value.as_deref(), expr.span.copy());
+            }
+            ExprKind::Try { inner, .. } => {
+                // The `?` operator's "happy path" extracts the Ok payload
+                // into `dest`; the error path returns the function early.
+                // For borrowck purposes we model it as: read inner once
+                // (non-trivially — the Result is consumed), then assign
+                // the Ok payload to `dest`. The Err-return diverges; we
+                // don't need to thread it through borrowck since the
+                // function ends at that point.
+                let _ = self.lower_expr_operand(inner);
+                // Synthesize an Operand-of-Ok-payload by reading the
+                // inner's place — since we already lowered the inner
+                // for its side effects, re-treat its place as the
+                // source. Conservative.
+                let rvalue = self.lower_expr_rvalue(inner);
+                self.push_stmt(
+                    CfgStmtKind::Assign {
+                        place: dest,
+                        rvalue,
+                    },
+                    expr.span.copy(),
+                );
+            }
             ExprKind::Block(b) => {
                 self.lower_block(b.as_ref(), Some(dest));
             }
@@ -608,6 +633,20 @@ impl<'a> Builder<'a> {
                     node_id: Some(expr.id),
                 })
             }
+            ExprKind::Return { value } => {
+                self.lower_return(value.as_deref(), expr.span.copy());
+                Rvalue::Use(Operand {
+                    kind: OperandKind::ConstUnit,
+                    span,
+                    node_id: Some(expr.id),
+                })
+            }
+            ExprKind::Try { inner, .. } => {
+                // Same modeling as the assign-position case: read the
+                // inner once. Borrowck doesn't need to differentiate
+                // the Ok/Err split — typeck has verified the shapes.
+                self.lower_expr_rvalue(inner)
+            }
         }
     }
 
@@ -876,6 +915,25 @@ impl<'a> Builder<'a> {
             .find_loop_continue(label.as_deref())
             .expect("typeck verified continue has a target");
         self.set_terminator(Terminator::Goto(target));
+        let unreachable = self.new_block();
+        self.current_block = unreachable;
+        let _ = span;
+    }
+
+    // `return EXPR` / `return`: lower the value (if any) into the
+    // function's return slot (`Local(0)` by convention) and terminate
+    // with `Return`. Subsequent code in the same source block sinks
+    // into a fresh unreachable block (no incoming edges).
+    fn lower_return(&mut self, value: Option<&Expr>, span: Span) {
+        if let Some(e) = value {
+            // Pretend we're assigning to local 0 — pocket-rust's
+            // existing CFG doesn't have a separate return-slot
+            // concept, but the eventual `Terminator::Return` will be
+            // honored regardless. We just need the move/borrow
+            // checker to see that `e` was read.
+            let _ = self.lower_expr_operand(e);
+        }
+        self.set_terminator(Terminator::Return);
         let unreachable = self.new_block();
         self.current_block = unreachable;
         let _ = span;

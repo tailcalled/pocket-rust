@@ -384,6 +384,24 @@ struct FnCtx<'a> {
     // they're immune to subsequent `__sp` drift from `&literal` borrow
     // temps, enum construction, sret allocations, etc.
     frame_base_local: u32,
+    // Wasm local holding the saved `__sp` from function entry. Used by
+    // `return` to restore SP before the wasm `Return` instruction;
+    // also used at function-end as the natural epilogue's SP source.
+    fn_entry_sp_local: u32,
+    // For sret-returning functions: the wasm local idx of the
+    // caller-supplied destination address (always wasm local 0).
+    // `None` for non-sret functions.
+    sret_ptr_local: Option<u32>,
+    // The function's flat return type (in wasm scalar order). Empty
+    // for unit-returning fns; `[I32]` for simple scalar returns;
+    // `[I32, I32]` for fat-ref returns; etc. For sret-returning
+    // functions this is `[I32]` (the sret address). Used by `return`
+    // to know the shape it must produce.
+    return_flat: Vec<wasm::ValType>,
+    // The function's full return RType (post-mono substitution). Used
+    // by `return` to decide the sret memcpy shape and by `?` to find
+    // the function's Result-error type.
+    return_rt: Option<RType>,
 }
 
 struct LoopCgFrame {
@@ -720,6 +738,14 @@ fn walk_expr_drop_marks(
             walk_block_drop_marks(w.body.as_ref(), expr_types, traits, info);
         }
         ExprKind::Break { .. } | ExprKind::Continue { .. } => {}
+        ExprKind::Return { value } => {
+            if let Some(v) = value {
+                walk_expr_drop_marks(v, expr_types, traits, info);
+            }
+        }
+        ExprKind::Try { inner, .. } => {
+            walk_expr_drop_marks(inner, expr_types, traits, info);
+        }
     }
 }
 
@@ -931,6 +957,12 @@ fn walk_expr_addr(
             walk_block_addr(w.body.as_ref(), stack, info);
         }
         ExprKind::Break { .. } | ExprKind::Continue { .. } => {}
+        ExprKind::Return { value } => {
+            if let Some(v) = value {
+                walk_expr_addr(v, stack, info);
+            }
+        }
+        ExprKind::Try { inner, .. } => walk_expr_addr(inner, stack, info),
     }
 }
 
@@ -1363,6 +1395,12 @@ fn collect_lets_in_expr(expr: &Expr, out: &mut Vec<u32>) {
             collect_let_value_ids(w.body.as_ref(), out);
         }
         ExprKind::Break { .. } | ExprKind::Continue { .. } => {}
+        ExprKind::Return { value } => {
+            if let Some(v) = value {
+                collect_lets_in_expr(v, out);
+            }
+        }
+        ExprKind::Try { inner, .. } => collect_lets_in_expr(inner, out),
     }
 }
 
@@ -1584,6 +1622,11 @@ fn emit_function_concrete(
         flatten_rtype(rt, structs, &mut wasm_results);
     }
 
+    let return_flat_for_ctx: Vec<wasm::ValType> = wasm_results
+        .iter()
+        .map(|v| v.copy())
+        .collect();
+
     let func_type = wasm::FuncType {
         params: wasm_params,
         results: wasm_results,
@@ -1622,6 +1665,10 @@ fn emit_function_concrete(
         loops: Vec::new(),
         cf_depth: 0,
         frame_base_local: 0,
+        fn_entry_sp_local: 0,
+        sret_ptr_local,
+        return_flat: return_flat_for_ctx,
+        return_rt: return_type.clone(),
     };
 
     // Allocate a wasm local to remember __sp on function entry. Variant
@@ -1633,6 +1680,7 @@ fn emit_function_concrete(
     let fn_entry_sp_local = ctx.next_wasm_local;
     ctx.extra_locals.push(wasm::ValType::I32);
     ctx.next_wasm_local += 1;
+    ctx.fn_entry_sp_local = fn_entry_sp_local;
     ctx.instructions
         .push(wasm::Instruction::GlobalGet(SP_GLOBAL));
     ctx.instructions
@@ -2010,6 +2058,232 @@ fn codegen_continue(ctx: &mut FnCtx, label: Option<&str>) -> Result<RType, Error
     let br_idx = cur.saturating_sub(continue_depth + 1);
     ctx.instructions.push(wasm::Instruction::Br(br_idx));
     Ok(RType::Never)
+}
+
+// `return EXPR` / `return`. Mirrors the function-end epilogue:
+// 1. Codegen the value (or unit). Stash to fresh wasm locals so we
+//    can run drops without disturbing the value.
+// 2. Drop every in-scope binding (whole `ctx.locals`).
+// 3. For sret-returning functions: memcpy the value's bytes to the
+//    caller-supplied sret slot, then push the sret slot's address.
+// 4. For non-sret functions: push the stashed flat scalars back.
+// 5. Restore SP from `fn_entry_sp_local`.
+// 6. Emit wasm `Return`.
+fn codegen_return(ctx: &mut FnCtx, value: Option<&Expr>) -> Result<RType, Error> {
+    // Step 1: codegen the value (or push unit, which produces no
+    // wasm scalars).
+    let return_rt = match &ctx.return_rt {
+        Some(rt) => rt.clone(),
+        None => RType::Tuple(Vec::new()),
+    };
+    if let Some(e) = value {
+        codegen_expr(ctx, e)?;
+    }
+    // Stash flat return scalars into fresh locals so drops don't
+    // disturb them.
+    let return_flat = ctx.return_flat.clone();
+    let save_start = ctx.next_wasm_local;
+    let mut i = 0;
+    while i < return_flat.len() {
+        ctx.extra_locals.push(return_flat[i].copy());
+        ctx.next_wasm_local += 1;
+        i += 1;
+    }
+    let mut k = return_flat.len();
+    while k > 0 {
+        k -= 1;
+        ctx.instructions
+            .push(wasm::Instruction::LocalSet(save_start + k as u32));
+    }
+    // Step 2: drop every in-scope binding.
+    let n = ctx.locals.len();
+    emit_drops_for_locals_range(ctx, 0, n)?;
+    // Step 3/4: produce the wasm return value.
+    let returns_enum = matches!(&return_rt, RType::Enum { .. });
+    if returns_enum {
+        let bytes = byte_size_of(&return_rt, ctx.structs, ctx.enums);
+        let dst = ctx.sret_ptr_local.expect("sret_ptr present for enum returns");
+        emit_memcpy(ctx, dst, save_start, bytes);
+        ctx.instructions.push(wasm::Instruction::LocalGet(dst));
+    } else {
+        let mut k = 0;
+        while k < return_flat.len() {
+            ctx.instructions
+                .push(wasm::Instruction::LocalGet(save_start + k as u32));
+            k += 1;
+        }
+    }
+    // Step 5: restore SP.
+    ctx.instructions
+        .push(wasm::Instruction::LocalGet(ctx.fn_entry_sp_local));
+    ctx.instructions
+        .push(wasm::Instruction::GlobalSet(SP_GLOBAL));
+    // Step 6: wasm Return.
+    ctx.instructions.push(wasm::Instruction::Return);
+    Ok(RType::Never)
+}
+
+// `expr?` codegen. Inner is `Result<T, E>` (an enum); function's
+// return is `Result<U, E>`. Lower as:
+//
+//   evaluate inner (pushes its address, since enums are address-passed)
+//   stash to addr_local
+//   load disc at [addr_local + 0]
+//   if disc == OK_DISC:
+//     read Ok payload at [addr_local + 4], push as result of expr?
+//   else:
+//     // Build Err(e) for the function return
+//     allocate a fresh slot for the function's Result<U, E>
+//     store disc=ERR_DISC at slot
+//     memcpy inner Err payload to slot (offset 4)
+//     codegen_return-style: memcpy slot to sret, restore SP, push, Return
+//
+// Lifted directly here (no early desugar) so the `?` token's span is
+// the diagnostic source for any error.
+fn codegen_try(
+    ctx: &mut FnCtx,
+    inner: &Expr,
+    _id: crate::ast::NodeId,
+) -> Result<RType, Error> {
+    use crate::typeck::{IntKind, byte_size_of as bso};
+    // Step 1: codegen the inner Result. It pushes an i32 (the address
+    // of the enum's bytes).
+    let inner_rt = codegen_expr(ctx, inner)?;
+    // Resolve the Result<T, E> shape from the inner type.
+    let (ok_ty, err_ty) = match &inner_rt {
+        RType::Enum { type_args, .. } if type_args.len() == 2 => {
+            (type_args[0].clone(), type_args[1].clone())
+        }
+        _ => unreachable!("typeck verified `?` operand is Result<T, E>"),
+    };
+    // Stash the address.
+    let addr_local = ctx.next_wasm_local;
+    ctx.extra_locals.push(wasm::ValType::I32);
+    ctx.next_wasm_local += 1;
+    ctx.instructions.push(wasm::Instruction::LocalSet(addr_local));
+    // Discriminants: Result is `Ok` = disc 0, `Err` = disc 1 (declaration
+    // order in `lib/std/result.rs`).
+    const OK_DISC: i32 = 0;
+    // Read disc.
+    ctx.instructions.push(wasm::Instruction::LocalGet(addr_local));
+    ctx.instructions.push(wasm::Instruction::I32Load {
+        align: 0,
+        offset: 0,
+    });
+    ctx.instructions.push(wasm::Instruction::I32Const(OK_DISC));
+    ctx.instructions.push(wasm::Instruction::I32Eq);
+    // The Ok-path produces the Ok payload (flat scalars or address);
+    // the Err-path diverges. The if's BlockType is the Ok-payload's
+    // shape.
+    let mut ok_flat: Vec<wasm::ValType> = Vec::new();
+    crate::typeck::flatten_rtype(&ok_ty, ctx.structs, &mut ok_flat);
+    let bt = match ok_flat.len() {
+        0 => wasm::BlockType::Empty,
+        1 => wasm::BlockType::Single(ok_flat[0].copy()),
+        _ => {
+            // Multi-value: register a FuncType.
+            let ft = wasm::FuncType {
+                params: Vec::new(),
+                results: ok_flat.clone(),
+            };
+            let mut found: Option<u32> = None;
+            let mut k = 0;
+            while k < ctx.pending_types.len() {
+                if func_type_eq(&ctx.pending_types[k], &ft) {
+                    found = Some(ctx.pending_types_base + k as u32);
+                    break;
+                }
+                k += 1;
+            }
+            let idx = match found {
+                Some(i) => i,
+                None => {
+                    let i = ctx.pending_types_base + ctx.pending_types.len() as u32;
+                    ctx.pending_types.push(ft);
+                    i
+                }
+            };
+            wasm::BlockType::TypeIdx(idx)
+        }
+    };
+    ctx.instructions.push(wasm::Instruction::If(bt));
+    // ── Then branch (Ok) ──
+    // Read the Ok payload from [addr_local + 4]. The payload is a
+    // tuple-shaped variant `Ok(T)` — single field at offset 4.
+    let ok_bytes = bso(&ok_ty, ctx.structs, ctx.enums);
+    if ok_bytes > 0 {
+        // Push the payload's flat scalars by reading from [addr+4].
+        // Use the existing leaf-loading machinery: we have
+        // `addr_local` and want to load `ok_ty` at offset 4.
+        load_flat_from_memory(ctx, &ok_ty, BaseAddr::WasmLocal(addr_local), 4);
+    }
+    ctx.instructions.push(wasm::Instruction::Else);
+    // ── Else branch (Err) — diverge with `return Err(e)` ──
+    // The function returns Result<U, E>. We allocate a fresh slot,
+    // write disc=Err and copy the Err payload, then memcpy to sret
+    // and Return.
+    let fn_ret_rt = match &ctx.return_rt {
+        Some(rt) => rt.clone(),
+        None => unreachable!("typeck verified function returns Result"),
+    };
+    let fn_ret_bytes = bso(&fn_ret_rt, ctx.structs, ctx.enums);
+    // SP -= fn_ret_bytes
+    ctx.instructions.push(wasm::Instruction::GlobalGet(SP_GLOBAL));
+    ctx.instructions.push(wasm::Instruction::I32Const(fn_ret_bytes as i32));
+    ctx.instructions.push(wasm::Instruction::I32Sub);
+    ctx.instructions.push(wasm::Instruction::GlobalSet(SP_GLOBAL));
+    let new_addr = ctx.next_wasm_local;
+    ctx.extra_locals.push(wasm::ValType::I32);
+    ctx.next_wasm_local += 1;
+    ctx.instructions.push(wasm::Instruction::GlobalGet(SP_GLOBAL));
+    ctx.instructions.push(wasm::Instruction::LocalSet(new_addr));
+    // Store disc = Err at [new_addr + 0]. Err is variant index 1.
+    ctx.instructions.push(wasm::Instruction::LocalGet(new_addr));
+    ctx.instructions.push(wasm::Instruction::I32Const(1));
+    ctx.instructions.push(wasm::Instruction::I32Store {
+        align: 0,
+        offset: 0,
+    });
+    // Copy err payload from [addr_local + 4] to [new_addr + 4].
+    let err_bytes = bso(&err_ty, ctx.structs, ctx.enums);
+    if err_bytes > 0 {
+        // Compute src = addr_local + 4 → temp local; dst = new_addr +
+        // 4 → temp local; emit_memcpy.
+        let src_tmp = ctx.next_wasm_local;
+        ctx.extra_locals.push(wasm::ValType::I32);
+        ctx.next_wasm_local += 1;
+        let dst_tmp = ctx.next_wasm_local;
+        ctx.extra_locals.push(wasm::ValType::I32);
+        ctx.next_wasm_local += 1;
+        ctx.instructions.push(wasm::Instruction::LocalGet(addr_local));
+        ctx.instructions.push(wasm::Instruction::I32Const(4));
+        ctx.instructions.push(wasm::Instruction::I32Add);
+        ctx.instructions.push(wasm::Instruction::LocalSet(src_tmp));
+        ctx.instructions.push(wasm::Instruction::LocalGet(new_addr));
+        ctx.instructions.push(wasm::Instruction::I32Const(4));
+        ctx.instructions.push(wasm::Instruction::I32Add);
+        ctx.instructions.push(wasm::Instruction::LocalSet(dst_tmp));
+        emit_memcpy(ctx, dst_tmp, src_tmp, err_bytes);
+        // Suppress unused.
+        let _ = (src_tmp, dst_tmp);
+    }
+    // Now mirror codegen_return: stash new_addr into a temp shaped
+    // like the function's return (one i32, since the fn returns an
+    // enum via sret), drop in-scope bindings, memcpy to sret, restore
+    // SP, push sret addr, Return.
+    let n = ctx.locals.len();
+    emit_drops_for_locals_range(ctx, 0, n)?;
+    let dst = ctx.sret_ptr_local.expect("sret_ptr present for enum returns");
+    emit_memcpy(ctx, dst, new_addr, fn_ret_bytes);
+    ctx.instructions.push(wasm::Instruction::LocalGet(dst));
+    ctx.instructions
+        .push(wasm::Instruction::LocalGet(ctx.fn_entry_sp_local));
+    ctx.instructions
+        .push(wasm::Instruction::GlobalSet(SP_GLOBAL));
+    ctx.instructions.push(wasm::Instruction::Return);
+    // Close the if/else.
+    ctx.instructions.push(wasm::Instruction::End);
+    Ok(ok_ty)
 }
 
 fn find_loop_frame(ctx: &FnCtx, label: Option<&str>) -> Option<(usize, usize)> {
@@ -2629,6 +2903,8 @@ fn codegen_expr(ctx: &mut FnCtx, expr: &Expr) -> Result<RType, Error> {
         ExprKind::While(w) => codegen_while_expr(ctx, w),
         ExprKind::Break { label, .. } => codegen_break(ctx, label.as_deref()),
         ExprKind::Continue { label, .. } => codegen_continue(ctx, label.as_deref()),
+        ExprKind::Return { value } => codegen_return(ctx, value.as_deref()),
+        ExprKind::Try { inner, .. } => codegen_try(ctx, inner, expr.id),
     }
 }
 

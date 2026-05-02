@@ -153,6 +153,10 @@ pub enum Instruction {
     Loop(BlockType),
     Br(u32),
     BrIf(u32),
+    // Wasm `return` — pops the function's expected results from the
+    // stack and exits. Used by `return EXPR;` (after the value's flat
+    // scalars are pushed) and by the `?` operator's Err-path.
+    Return,
 }
 
 // Wasm structured-control-flow block result. Three encodings, matching
@@ -569,6 +573,10 @@ fn encode_instruction(out: &mut Vec<u8>, inst: &Instruction) {
         Instruction::BrIf(label) => {
             out.push(0x0d);
             write_uleb128(out, *label);
+        }
+        Instruction::Return => {
+            // Wasm core: `return` is opcode 0x0f, no immediates.
+            out.push(0x0f);
         }
     }
 }
