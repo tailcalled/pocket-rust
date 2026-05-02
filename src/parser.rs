@@ -1668,6 +1668,17 @@ impl Parser {
         match &self.tokens[self.pos].kind {
             TokenKind::IntLit(_) => self.parse_int_lit(),
             TokenKind::StrLit(_) => self.parse_str_lit(),
+            TokenKind::CharLit(c) => {
+                let value = *c;
+                let span = self.tokens[self.pos].span.copy();
+                self.pos += 1;
+                let id = self.alloc_node_id();
+                Ok(Expr {
+                    kind: ExprKind::CharLit(value),
+                    span,
+                    id,
+                })
+            }
             TokenKind::True => {
                 let span = self.tokens[self.pos].span.copy();
                 self.pos += 1;

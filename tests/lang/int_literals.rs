@@ -141,3 +141,83 @@ fn neg_i32_min_returns_min() {
     // range check see `-2147483648` against `i32::MIN..=i32::MAX`.
     expect_answer("lang/int_literals/i32_min", i32::MIN);
 }
+
+// `'X'` char literal has type `char`. `as u32` (or any int kind)
+// extracts the Unicode codepoint.
+#[test]
+fn char_lit_basic_returns_42() {
+    expect_answer("lang/int_literals/char_lit_basic", 42u32);
+}
+
+// Common escape sequences (`\n`, `\t`, `\\`, `\0`).
+#[test]
+fn char_lit_escapes_returns_42() {
+    expect_answer("lang/int_literals/char_lit_escapes", 42u32);
+}
+
+// Lexer disambiguation: `'a` is a lifetime, `'\n'` is a char
+// literal; both appear in the same source.
+#[test]
+fn char_lit_disambig_lifetime_returns_42() {
+    expect_answer("lang/int_literals/char_lit_disambig_lifetime", 42u32);
+}
+
+// UTF-8 multi-byte char literal: '¥' is U+00A5 (165), encoded as
+// the two source bytes 0xC2 0xA5; the lexer's UTF-8 decoder
+// produces the codepoint.
+#[test]
+fn char_lit_unicode_returns_42() {
+    expect_answer("lang/int_literals/char_lit_unicode", 42u32);
+}
+
+// `\u{HH..}` escape — 1-6 hex digits naming a Unicode codepoint.
+#[test]
+fn char_lit_unicode_escape_returns_42() {
+    expect_answer("lang/int_literals/char_lit_unicode_escape", 42u32);
+}
+
+// Negative: unterminated char literal after the first char.
+#[test]
+fn char_lit_unterminated_is_rejected() {
+    let err = compile_source("fn answer() -> u32 { 'A' as u32 + 'B as u32 }");
+    assert!(
+        !err.is_empty(),
+        "expected lex error, got: {}",
+        err
+    );
+}
+
+// Negative: unknown char escape.
+#[test]
+fn char_lit_unknown_escape_is_rejected() {
+    let err = compile_source("fn answer() -> u32 { '\\q' as u32 }");
+    assert!(
+        err.contains("unknown char escape"),
+        "expected unknown-escape error, got: {}",
+        err
+    );
+}
+
+// Negative: surrogate codepoint (illegal — reserved for UTF-16
+// pairs and never appears in a valid Unicode scalar value).
+#[test]
+fn char_lit_surrogate_is_rejected() {
+    let err = compile_source("fn answer() -> u32 { '\\u{D800}' as u32 }");
+    assert!(
+        err.contains("invalid Unicode codepoint"),
+        "expected surrogate-rejection error, got: {}",
+        err
+    );
+}
+
+// Negative: char literal is type `char`, not an integer. Direct
+// arithmetic without `as` fails.
+#[test]
+fn char_lit_without_cast_is_rejected() {
+    let err = compile_source("fn answer() -> u32 { 'A' + 7 }");
+    assert!(
+        err.contains("char") || err.contains("type mismatch") || err.contains("no method"),
+        "expected char-not-int error, got: {}",
+        err
+    );
+}

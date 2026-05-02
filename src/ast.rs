@@ -324,6 +324,11 @@ pub enum ExprKind {
     // Type is always `&'static str`.
     StrLit(String),
     BoolLit(bool),
+    // `'X'` / `'\n'` / `'¥'` — char literal. Carries the Unicode
+    // codepoint as a u32. Type at use site is `char` (no integer-
+    // literal-style inference), but `as` casts let user code convert
+    // to/from integer types.
+    CharLit(u32),
     Call(Call),
     Var(String),
     StructLit(StructLit),

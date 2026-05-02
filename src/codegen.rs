@@ -541,6 +541,12 @@ fn collect_leaves(
         // `!` has zero leaves — a value of type `!` never exists, so
         // there's nothing to lay out in memory.
         RType::Never => {}
+        RType::Char => out.push(MemLeaf {
+            byte_offset: base_offset,
+            byte_size: 4,
+            signed: false,
+            valtype: wasm::ValType::I32,
+        }),
     }
 }
 
@@ -697,7 +703,7 @@ fn walk_expr_drop_marks(
         ExprKind::Cast { inner, .. } => {
             walk_expr_drop_marks(inner, expr_types, traits, info);
         }
-        ExprKind::IntLit(_) | ExprKind::NegIntLit(_) | ExprKind::StrLit(_) | ExprKind::BoolLit(_) | ExprKind::Var(_) => {}
+        ExprKind::IntLit(_) | ExprKind::NegIntLit(_) | ExprKind::StrLit(_) | ExprKind::CharLit(_) | ExprKind::BoolLit(_) | ExprKind::Var(_) => {}
         ExprKind::If(if_expr) => {
             walk_expr_drop_marks(&if_expr.cond, expr_types, traits, info);
             walk_block_drop_marks(if_expr.then_block.as_ref(), expr_types, traits, info);
@@ -834,7 +840,7 @@ fn walk_expr_addr(
     info: &mut AddressInfo,
 ) {
     match &expr.kind {
-        ExprKind::IntLit(_) | ExprKind::NegIntLit(_) | ExprKind::StrLit(_) | ExprKind::BoolLit(_) | ExprKind::Var(_) => {}
+        ExprKind::IntLit(_) | ExprKind::NegIntLit(_) | ExprKind::StrLit(_) | ExprKind::CharLit(_) | ExprKind::BoolLit(_) | ExprKind::Var(_) => {}
         ExprKind::If(if_expr) => {
             walk_expr_addr(&if_expr.cond, stack, info);
             walk_block_addr(if_expr.then_block.as_ref(), stack, info);
@@ -1329,7 +1335,7 @@ fn collect_let_value_ids(block: &Block, out: &mut Vec<u32>) {
 
 fn collect_lets_in_expr(expr: &Expr, out: &mut Vec<u32>) {
     match &expr.kind {
-        ExprKind::IntLit(_) | ExprKind::NegIntLit(_) | ExprKind::StrLit(_) | ExprKind::BoolLit(_) | ExprKind::Var(_) => {}
+        ExprKind::IntLit(_) | ExprKind::NegIntLit(_) | ExprKind::StrLit(_) | ExprKind::CharLit(_) | ExprKind::BoolLit(_) | ExprKind::Var(_) => {}
         ExprKind::If(if_expr) => {
             collect_lets_in_expr(&if_expr.cond, out);
             collect_let_value_ids(if_expr.then_block.as_ref(), out);
@@ -2834,6 +2840,11 @@ fn codegen_expr(ctx: &mut FnCtx, expr: &Expr) -> Result<RType, Error> {
             emit_int_lit(ctx, &ty, *n, true);
             Ok(ty)
         }
+        ExprKind::CharLit(cp) => {
+            // `char` flattens to one i32 — push the codepoint value.
+            ctx.instructions.push(wasm::Instruction::I32Const(*cp as i32));
+            Ok(RType::Char)
+        }
         ExprKind::StrLit(s) => {
             // Intern into the module-wide pool; emit `i32.const ptr;
             // i32.const len` — the fat-ref representation of `&str`.
@@ -2881,6 +2892,17 @@ fn codegen_expr(ctx: &mut FnCtx, expr: &Expr) -> Result<RType, Error> {
                 }
                 (RType::RawPtr { .. }, RType::Int(tgt_k)) => {
                     emit_int_to_int_cast(ctx, &IntKind::Usize, tgt_k);
+                }
+                // `char` and `u32` share the wasm-i32 representation
+                // and our 4-byte storage. char→int and int→char are
+                // bit-pattern reinterpretations — `as i64`-shaped
+                // widening still needs `extend_i32_u` so we route
+                // through `emit_int_to_int_cast` with the right kind.
+                (RType::Char, RType::Int(tgt_k)) => {
+                    emit_int_to_int_cast(ctx, &IntKind::U32, tgt_k);
+                }
+                (RType::Int(src_k), RType::Char) => {
+                    emit_int_to_int_cast(ctx, src_k, &IntKind::U32);
                 }
                 _ => {}
             }

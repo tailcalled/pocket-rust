@@ -149,7 +149,7 @@ fn walk_block(state: &mut SafeState, block: &Block) -> Result<(), Error> {
 
 fn walk_expr(state: &mut SafeState, expr: &Expr) -> Result<(), Error> {
     match &expr.kind {
-        ExprKind::IntLit(_) | ExprKind::NegIntLit(_) | ExprKind::StrLit(_) | ExprKind::BoolLit(_) | ExprKind::Var(_) => Ok(()),
+        ExprKind::IntLit(_) | ExprKind::NegIntLit(_) | ExprKind::StrLit(_) | ExprKind::CharLit(_) | ExprKind::BoolLit(_) | ExprKind::Var(_) => Ok(()),
         ExprKind::Borrow { inner, .. } => walk_expr(state, inner),
         ExprKind::Cast { inner, .. } => walk_expr(state, inner),
         ExprKind::Deref(inner) => {

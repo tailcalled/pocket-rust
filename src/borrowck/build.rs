@@ -352,6 +352,10 @@ impl<'a> Builder<'a> {
             ExprKind::NegIntLit(n) => Operand { kind: OperandKind::ConstInt(*n), span, node_id: nid },
             ExprKind::StrLit(s) => Operand { kind: OperandKind::ConstStr(s.clone()), span, node_id: nid },
             ExprKind::BoolLit(b) => Operand { kind: OperandKind::ConstBool(*b), span, node_id: nid },
+            // Char literals reduce to a 4-byte i32 codepoint — for
+            // CFG-level borrowck purposes the same as an integer
+            // constant.
+            ExprKind::CharLit(c) => Operand { kind: OperandKind::ConstInt(*c as u64), span, node_id: nid },
             ExprKind::Tuple(elems) if elems.is_empty() => {
                 Operand { kind: OperandKind::ConstUnit, span, node_id: nid }
             }
@@ -528,6 +532,11 @@ impl<'a> Builder<'a> {
             }),
             ExprKind::BoolLit(b) => Rvalue::Use(Operand {
                 kind: OperandKind::ConstBool(*b),
+                span,
+                node_id: nid,
+            }),
+            ExprKind::CharLit(c) => Rvalue::Use(Operand {
+                kind: OperandKind::ConstInt(*c as u64),
                 span,
                 node_id: nid,
             }),

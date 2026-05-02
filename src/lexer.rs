@@ -89,6 +89,13 @@ pub enum TokenKind {
     // `..=` — inclusive range, used in range patterns (`0..=9`).
     DotDotEq,
     IntLit(u64),
+    // `'X'` / `'\n'` / `'¥'` — char literal. The u32 is the Unicode
+    // codepoint after UTF-8 decoding (and escape resolution). Distinct
+    // from `IntLit` so the parser/typeck can give it `RType::Char`
+    // rather than the integer-literal default. Range is 0..=0x10FFFF
+    // excluding the surrogate range 0xD800..=0xDFFF (validated at lex
+    // time per Rust's `char::from_u32` rules).
+    CharLit(u32),
     // `"..."` — UTF-8 string literal. The `String` carries the
     // **decoded** content (escape sequences already resolved); since
     // pocket-rust source is UTF-8 and `\xNN` is restricted to ASCII
@@ -165,6 +172,7 @@ pub fn token_kind_name(t: &TokenKind) -> &'static str {
         TokenKind::DotDotEq => "`..=`",
         TokenKind::FatArrow => "`=>`",
         TokenKind::IntLit(_) => "integer literal",
+        TokenKind::CharLit(_) => "character literal",
         TokenKind::StrLit(_) => "string literal",
     }
 }
@@ -612,32 +620,204 @@ pub fn tokenize(file: &str, source: &str) -> Result<Vec<Token>, Error> {
             push_single(&mut tokens, TokenKind::RAngle, line, &mut col);
             byte_pos += 1;
         } else if b == b'\'' {
-            // `'name` — a lifetime. Single quote followed by an ident.
-            // (We don't have char literals, so the syntax is unambiguous.)
+            // Single-quote: either a char literal (`'X'`, `'\n'`,
+            // `'¥'`, …) or a lifetime (`'a`). Disambiguate by peeking
+            // past the apostrophe:
+            // - if the next byte is `\`, char literal (escape).
+            // - else if the next byte starts a non-ASCII UTF-8
+            //   sequence (≥ 0x80), char literal (multi-byte char).
+            // - else, peek the byte after the single ASCII char: if
+            //   it's `'`, single-char literal; otherwise lifetime.
             let start = Pos::new(line, col);
-            let apos_pos = byte_pos;
-            byte_pos += 1;
-            col += 1;
-            if byte_pos >= bytes.len() || !is_ident_start(bytes[byte_pos]) {
+            let next = if byte_pos + 1 < bytes.len() { Some(bytes[byte_pos + 1]) } else { None };
+            let after = if byte_pos + 2 < bytes.len() { Some(bytes[byte_pos + 2]) } else { None };
+            let is_char_lit = matches!(next, Some(b'\\'))
+                || matches!(next, Some(n) if n >= 0x80)
+                || matches!(after, Some(b'\''));
+            if is_char_lit {
+                byte_pos += 1;
+                col += 1;
+                let (value, byte_len) = if bytes[byte_pos] == b'\\' {
+                    // Escape. Recognized: \n \r \t \\ \' \" \0 \xNN \u{HHHHHH}.
+                    if byte_pos + 1 >= bytes.len() {
+                        let end = Pos::new(line, col);
+                        return Err(Error {
+                            file: file.to_string(),
+                            message: "unterminated char literal".to_string(),
+                            span: Span::new(start, end),
+                        });
+                    }
+                    let esc = bytes[byte_pos + 1];
+                    let (v, used) = match esc {
+                        b'n' => (b'\n' as u32, 2),
+                        b'r' => (b'\r' as u32, 2),
+                        b't' => (b'\t' as u32, 2),
+                        b'\\' => (b'\\' as u32, 2),
+                        b'\'' => (b'\'' as u32, 2),
+                        b'"' => (b'"' as u32, 2),
+                        b'0' => (0u32, 2),
+                        b'x' => {
+                            if byte_pos + 3 >= bytes.len() {
+                                let end = Pos::new(line, col);
+                                return Err(Error {
+                                    file: file.to_string(),
+                                    message: "unterminated `\\x` escape in char literal".to_string(),
+                                    span: Span::new(start, end),
+                                });
+                            }
+                            let hi = hex_digit_value(bytes[byte_pos + 2]);
+                            let lo = hex_digit_value(bytes[byte_pos + 3]);
+                            match (hi, lo) {
+                                (Some(h), Some(l)) => {
+                                    let v = (h as u32) * 16 + (l as u32);
+                                    // `\xNN` in char literals is
+                                    // restricted to 0x00..=0x7F per
+                                    // Rust (so it always decodes to
+                                    // a valid ASCII codepoint).
+                                    if v > 0x7F {
+                                        let end = Pos::new(line, col);
+                                        return Err(Error {
+                                            file: file.to_string(),
+                                            message: "`\\xNN` char escape must be ASCII (0x00..=0x7F)".to_string(),
+                                            span: Span::new(start, end),
+                                        });
+                                    }
+                                    (v, 4)
+                                }
+                                _ => {
+                                    let end = Pos::new(line, col);
+                                    return Err(Error {
+                                        file: file.to_string(),
+                                        message: "invalid hex digit in `\\x` char escape".to_string(),
+                                        span: Span::new(start, end),
+                                    });
+                                }
+                            }
+                        }
+                        b'u' => {
+                            // `\u{HHHHHH}` — 1..=6 hex digits, codepoint.
+                            if byte_pos + 2 >= bytes.len() || bytes[byte_pos + 2] != b'{' {
+                                let end = Pos::new(line, col);
+                                return Err(Error {
+                                    file: file.to_string(),
+                                    message: "expected `{` after `\\u` in char literal".to_string(),
+                                    span: Span::new(start, end),
+                                });
+                            }
+                            let mut p = byte_pos + 3;
+                            let mut cp: u32 = 0;
+                            let mut digits = 0;
+                            while p < bytes.len() && bytes[p] != b'}' {
+                                let d = match hex_digit_value(bytes[p]) {
+                                    Some(d) => d,
+                                    None => {
+                                        let end = Pos::new(line, col);
+                                        return Err(Error {
+                                            file: file.to_string(),
+                                            message: "invalid hex digit in `\\u{…}` escape".to_string(),
+                                            span: Span::new(start, end),
+                                        });
+                                    }
+                                };
+                                cp = cp.checked_mul(16).and_then(|v| v.checked_add(d as u32)).unwrap_or(0x110000);
+                                digits += 1;
+                                if digits > 6 {
+                                    let end = Pos::new(line, col);
+                                    return Err(Error {
+                                        file: file.to_string(),
+                                        message: "too many hex digits in `\\u{…}` escape (max 6)".to_string(),
+                                        span: Span::new(start, end),
+                                    });
+                                }
+                                p += 1;
+                            }
+                            if p >= bytes.len() || digits == 0 {
+                                let end = Pos::new(line, col);
+                                return Err(Error {
+                                    file: file.to_string(),
+                                    message: "unterminated `\\u{…}` escape".to_string(),
+                                    span: Span::new(start, end),
+                                });
+                            }
+                            (cp, p + 1 - byte_pos)
+                        }
+                        _ => {
+                            let end = Pos::new(line, col);
+                            return Err(Error {
+                                file: file.to_string(),
+                                message: format!("unknown char escape `\\{}`", esc as char),
+                                span: Span::new(start, end),
+                            });
+                        }
+                    };
+                    (v, used)
+                } else {
+                    // UTF-8 sequence. Decode 1-4 bytes per the spec
+                    // and produce the codepoint.
+                    let lead = bytes[byte_pos];
+                    let (cp, len) = decode_utf8_codepoint(bytes, byte_pos)
+                        .map_err(|m| Error {
+                            file: file.to_string(),
+                            message: m,
+                            span: Span::new(start.copy(), Pos::new(line, col)),
+                        })?;
+                    let _ = lead;
+                    (cp, len)
+                };
+                byte_pos += byte_len;
+                col += byte_len as u32;
+                // Validate codepoint: 0..=0x10FFFF, excluding the
+                // surrogate range 0xD800..=0xDFFF (per Rust's
+                // `char::from_u32`).
+                if value > 0x10FFFF || (value >= 0xD800 && value <= 0xDFFF) {
+                    let end = Pos::new(line, col);
+                    return Err(Error {
+                        file: file.to_string(),
+                        message: format!("invalid Unicode codepoint U+{:04X} in char literal", value),
+                        span: Span::new(start, end),
+                    });
+                }
+                if byte_pos >= bytes.len() || bytes[byte_pos] != b'\'' {
+                    let end = Pos::new(line, col);
+                    return Err(Error {
+                        file: file.to_string(),
+                        message: "expected `'` to close char literal".to_string(),
+                        span: Span::new(start, end),
+                    });
+                }
+                byte_pos += 1;
+                col += 1;
                 let end = Pos::new(line, col);
-                return Err(Error {
-                    file: file.to_string(),
-                    message: "expected lifetime name after `'`".to_string(),
+                tokens.push(Token {
+                    kind: TokenKind::CharLit(value),
+                    span: Span::new(start, end),
+                });
+            } else {
+                // Lifetime: `'name`.
+                let apos_pos = byte_pos;
+                byte_pos += 1;
+                col += 1;
+                if byte_pos >= bytes.len() || !is_ident_start(bytes[byte_pos]) {
+                    let end = Pos::new(line, col);
+                    return Err(Error {
+                        file: file.to_string(),
+                        message: "expected lifetime name after `'`".to_string(),
+                        span: Span::new(start, end),
+                    });
+                }
+                let name_start = byte_pos;
+                while byte_pos < bytes.len() && is_ident_continue(bytes[byte_pos]) {
+                    byte_pos += 1;
+                    col += 1;
+                }
+                let name = source[name_start..byte_pos].to_string();
+                let end = Pos::new(line, col);
+                let _ = apos_pos;
+                tokens.push(Token {
+                    kind: TokenKind::Lifetime(name),
                     span: Span::new(start, end),
                 });
             }
-            let name_start = byte_pos;
-            while byte_pos < bytes.len() && is_ident_continue(bytes[byte_pos]) {
-                byte_pos += 1;
-                col += 1;
-            }
-            let name = source[name_start..byte_pos].to_string();
-            let end = Pos::new(line, col);
-            let _ = apos_pos;
-            tokens.push(Token {
-                kind: TokenKind::Lifetime(name),
-                span: Span::new(start, end),
-            });
         } else if b == b'-' && (byte_pos + 1) < bytes.len() && bytes[byte_pos + 1] == b'>' {
             let start = Pos::new(line, col);
             col += 2;
@@ -713,4 +893,60 @@ fn is_ident_continue(b: u8) -> bool {
 
 fn is_digit(b: u8) -> bool {
     b >= b'0' && b <= b'9'
+}
+
+// Decode one UTF-8 codepoint starting at `bytes[start]`. Returns the
+// codepoint plus the number of bytes consumed (1-4). Validates the
+// continuation-byte pattern and the canonical-form rule (no
+// over-long encodings); rejects invalid sequences.
+fn decode_utf8_codepoint(bytes: &[u8], start: usize) -> Result<(u32, usize), String> {
+    if start >= bytes.len() {
+        return Err("unexpected end of input in char literal".to_string());
+    }
+    let b0 = bytes[start];
+    // ASCII fast-path (0xxxxxxx).
+    if b0 < 0x80 {
+        return Ok((b0 as u32, 1));
+    }
+    // Multi-byte sequences. Determine length from the leading byte.
+    let (len, mask, min_cp) = if b0 & 0b1110_0000 == 0b1100_0000 {
+        (2, 0b0001_1111u32, 0x80u32)
+    } else if b0 & 0b1111_0000 == 0b1110_0000 {
+        (3, 0b0000_1111u32, 0x800u32)
+    } else if b0 & 0b1111_1000 == 0b1111_0000 {
+        (4, 0b0000_0111u32, 0x10000u32)
+    } else {
+        return Err(format!("invalid UTF-8 leading byte 0x{:02X}", b0));
+    };
+    if start + len > bytes.len() {
+        return Err("truncated UTF-8 sequence in char literal".to_string());
+    }
+    let mut cp: u32 = (b0 as u32) & mask;
+    let mut i = 1;
+    while i < len {
+        let b = bytes[start + i];
+        if b & 0b1100_0000 != 0b1000_0000 {
+            return Err(format!("invalid UTF-8 continuation byte 0x{:02X}", b));
+        }
+        cp = (cp << 6) | ((b as u32) & 0b0011_1111);
+        i += 1;
+    }
+    if cp < min_cp {
+        return Err(format!("over-long UTF-8 encoding for codepoint U+{:04X}", cp));
+    }
+    Ok((cp, len))
+}
+
+// Hex digit (0-9, a-f, A-F) → integer value 0..15. None for non-hex.
+// Used by char literal `\xNN` escape.
+fn hex_digit_value(b: u8) -> Option<u8> {
+    if b >= b'0' && b <= b'9' {
+        Some(b - b'0')
+    } else if b >= b'a' && b <= b'f' {
+        Some(b - b'a' + 10)
+    } else if b >= b'A' && b <= b'F' {
+        Some(b - b'A' + 10)
+    } else {
+        None
+    }
 }

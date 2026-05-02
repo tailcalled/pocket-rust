@@ -79,6 +79,9 @@ pub fn resolve_type(
                 if path.segments[0].name == "str" {
                     return Ok(RType::Str);
                 }
+                if path.segments[0].name == "char" {
+                    return Ok(RType::Char);
+                }
                 if let Some(k) = int_kind_from_name(&path.segments[0].name) {
                     return Ok(RType::Int(k));
                 }

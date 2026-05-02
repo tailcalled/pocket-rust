@@ -962,7 +962,7 @@ fn collect_sized_required_params(t: &RType, sized_ctx: bool, out: &mut Vec<Strin
             // [T] requires T: Sized (Rust's slice element type).
             collect_sized_required_params(inner, true, out);
         }
-        RType::Int(_) | RType::Bool | RType::Str | RType::Never => {}
+        RType::Int(_) | RType::Bool | RType::Str | RType::Never | RType::Char => {}
         RType::AssocProj { .. } => {
             // Conservative: an unconcretized projection isn't itself a
             // bare Param binding, so we don't collect anything from it

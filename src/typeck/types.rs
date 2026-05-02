@@ -155,6 +155,13 @@ pub enum RType {
     // type level so users get `&str` in error messages and so future UTF-8
     // invariants can attach here. Same DST rules as `Slice`.
     Str,
+    // `char` — Unicode scalar value (0..=0x10FFFF excluding surrogates).
+    // Stored as a 4-byte u32 in memory; flattens to one `i32` in wasm.
+    // Distinct from `u32` at the type level: `'X' as u32` is required
+    // to convert. Codegen treats char-as-int (and int-as-char with
+    // range check skipped at the moment — relying on the lexer's
+    // codepoint validation upstream).
+    Char,
     // `!` — the never type. Has no inhabitants. Coerces freely to any
     // other type at unification time so `break`/`continue`/`return`
     // (and calls to functions returning `!`) can sit as one arm of an
@@ -270,6 +277,7 @@ pub fn rtype_eq(a: &RType, b: &RType) -> bool {
             RType::AssocProj { base: bb, trait_path: tb, name: nb },
         ) => ta == tb && na == nb && rtype_eq(ba, bb),
         (RType::Never, RType::Never) => true,
+        (RType::Char, RType::Char) => true,
         _ => false,
     }
 }
@@ -352,6 +360,7 @@ pub fn rtype_to_string(t: &RType) -> String {
             format!("<{} as ?>::{}", rtype_to_string(base), name)
         }
         RType::Never => "!".to_string(),
+        RType::Char => "char".to_string(),
     }
 }
 
@@ -405,6 +414,7 @@ pub fn rtype_size(ty: &RType, structs: &StructTable) -> u32 {
         // practice expressions of type `!` divert via br / unreachable
         // before any storage layout matters.
         RType::Never => 0,
+        RType::Char => 1,
     }
 }
 
@@ -477,6 +487,9 @@ pub fn flatten_rtype(ty: &RType, structs: &StructTable, out: &mut Vec<crate::was
         // claims to return `!` produces no wasm result. Same shape as
         // a 0-tuple from the wasm-ABI's perspective.
         RType::Never => {}
+        // `char` flattens to a single i32 (the codepoint as a 4-byte
+        // value).
+        RType::Char => out.push(crate::wasm::ValType::I32),
     }
 }
 
@@ -541,6 +554,7 @@ pub fn byte_size_of(rt: &RType, structs: &StructTable, enums: &EnumTable) -> u32
             "byte_size_of called on unresolved associated-type projection"
         ),
         RType::Never => 0,
+        RType::Char => 4,
     }
 }
 
@@ -647,6 +661,7 @@ pub fn substitute_rtype(rt: &RType, env: &Vec<(String, RType)>) -> RType {
             name: name.clone(),
         },
         RType::Never => RType::Never,
+        RType::Char => RType::Char,
     }
 }
 

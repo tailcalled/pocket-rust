@@ -43,7 +43,8 @@ fn satisfies_num(
         | InferType::Slice(_)
         | InferType::Str
         | InferType::AssocProj { .. }
-        | InferType::Never => false,
+        | InferType::Never
+        | InferType::Char => false,
     }
 }
 
@@ -245,6 +246,7 @@ pub(crate) fn infer_to_rtype_for_check(t: &InferType) -> RType {
             name: name.clone(),
         },
         InferType::Never => RType::Never,
+        InferType::Char => RType::Char,
     }
 }
 
@@ -378,6 +380,8 @@ pub(crate) enum InferType {
     // inference proceeds. Produced by `break`/`continue`/`return`
     // typecheckers and by calls to functions with `!` return type.
     Never,
+    // `char` — InferType counterpart of `RType::Char`.
+    Char,
 }
 
 // Build a name → InferType env from a generic struct/template's type-param
@@ -455,6 +459,7 @@ pub(crate) fn rtype_to_infer(rt: &RType) -> InferType {
             name: name.clone(),
         },
         RType::Never => InferType::Never,
+        RType::Char => InferType::Char,
     }
 }
 
@@ -528,6 +533,7 @@ pub(crate) fn infer_substitute(t: &InferType, env: &Vec<(String, InferType)>) ->
             name: name.clone(),
         },
         InferType::Never => InferType::Never,
+        InferType::Char => InferType::Char,
     }
 }
 
@@ -609,6 +615,7 @@ pub(crate) fn infer_to_string(t: &InferType) -> String {
             format!("<{} as ?>::{}", infer_to_string(base), name)
         }
         InferType::Never => "!".to_string(),
+        InferType::Char => "char".to_string(),
     }
 }
 
@@ -700,6 +707,7 @@ impl Subst {
                 name: name.clone(),
             },
             InferType::Never => InferType::Never,
+            InferType::Char => InferType::Char,
         }
     }
 
@@ -926,6 +934,8 @@ impl Subst {
                 }
             }
             (InferType::Bool, InferType::Bool) => Ok(()),
+            (InferType::Char, InferType::Char) => Ok(()),
+            (InferType::Str, InferType::Str) => Ok(()),
             (InferType::Tuple(ea), InferType::Tuple(eb)) => {
                 if ea.len() != eb.len() {
                     return Err(Error {
@@ -1069,6 +1079,7 @@ impl Subst {
                 name,
             },
             InferType::Never => RType::Never,
+            InferType::Char => RType::Char,
         }
     }
 }
@@ -2170,6 +2181,7 @@ fn check_expr_inner(ctx: &mut CheckCtx, expr: &Expr) -> Result<InferType, Error>
         ExprKind::Block(block) => check_block_expr(ctx, block.as_ref()),
         ExprKind::MethodCall(mc) => check_method_call(ctx, mc, expr),
         ExprKind::BoolLit(_) => Ok(InferType::Bool),
+        ExprKind::CharLit(_) => Ok(InferType::Char),
         ExprKind::If(if_expr) => check_if_expr(ctx, if_expr, expr),
         ExprKind::Builtin { name, name_span, type_args, args } => {
             check_builtin(ctx, name, name_span, type_args, args, expr)
@@ -3645,11 +3657,12 @@ fn check_cast(
     )?;
     let target_is_ptr = is_raw_ptr(&target);
     let target_is_int = matches!(&target, RType::Int(_));
-    if !target_is_ptr && !target_is_int {
+    let target_is_char = matches!(&target, RType::Char);
+    if !target_is_ptr && !target_is_int && !target_is_char {
         return Err(Error {
             file: ctx.current_file.to_string(),
             message: format!(
-                "casts are only allowed to raw pointer or integer types, got `{}`",
+                "casts are only allowed to raw pointer, integer, or `char` types, got `{}`",
                 rtype_to_string(&target)
             ),
             span: ty.span.copy(),
@@ -3665,15 +3678,22 @@ fn check_cast(
                 | InferType::Int(_)
                 | InferType::Var(_)
         )
+    } else if target_is_char {
+        // `as char` only valid from `u8` (Rust's exact rule). Other
+        // ints would need range-checking; pocket-rust skips the check
+        // and accepts anything int-typed for now — codegen treats
+        // both as i32.
+        matches!(&resolved_src, InferType::Int(_) | InferType::Var(_))
     } else {
         // Int target: source must be an integer, an unbound integer
-        // var, or a raw pointer (the `*T as usize` round-trip is the
-        // only ergonomic way to compare addresses, e.g. `p.is_null()`).
-        // At codegen, raw pointers and integers ≤ 32 bits both flatten
-        // to wasm `i32`, so the cast is a no-op or a standard widening.
+        // var, a raw pointer (the `*T as usize` round-trip is the
+        // only ergonomic way to compare addresses, e.g. `p.is_null()`),
+        // or a `char` (`'X' as u32` is the canonical char→int
+        // conversion). At codegen, raw pointers, integers ≤ 32 bits,
+        // and `char` all flatten to wasm `i32`.
         matches!(
             &resolved_src,
-            InferType::Int(_) | InferType::Var(_) | InferType::RawPtr { .. }
+            InferType::Int(_) | InferType::Var(_) | InferType::RawPtr { .. } | InferType::Char
         )
     };
     if !src_ok {

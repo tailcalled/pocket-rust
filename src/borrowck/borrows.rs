@@ -409,6 +409,8 @@ fn rtype_contains_ref(t: &crate::typeck::RType) -> bool {
         RType::AssocProj { .. } => true,
         // `!` has no inhabitants — no borrows ever attach to it.
         RType::Never => false,
+        // `char` is a 4-byte u32 codepoint — no refs inside.
+        RType::Char => false,
     }
 }
 
