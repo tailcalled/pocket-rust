@@ -109,13 +109,23 @@ pub struct TraitTable {
     pub impls: Vec<TraitImplEntry>,
 }
 
+// One supertrait edge declared on a trait. `args` reference the
+// trait's own type-params (and `Self`); at the obligation check site,
+// `args` are substituted using the impl's `trait_args` mapping plus
+// `Self → impl_target`, then `solve_impl_with_args(path, args, target)`
+// looks for the matching impl.
+pub struct SupertraitRef {
+    pub path: Vec<String>,
+    pub args: Vec<RType>,
+}
+
 pub struct TraitEntry {
     pub path: Vec<String>,
     pub name_span: Span,
     pub file: String,
     pub methods: Vec<TraitMethodEntry>,
     pub is_pub: bool,
-    pub supertraits: Vec<Vec<String>>,
+    pub supertraits: Vec<SupertraitRef>,
     // `type Name;` declarations inside the trait body. Each impl of
     // this trait must bind exactly these names (no missing, no extras).
     pub assoc_types: Vec<String>,

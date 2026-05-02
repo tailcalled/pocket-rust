@@ -215,6 +215,7 @@ mod let_stmts;
 mod modules;
 mod panic_macro;
 mod patterns;
+mod ranges;
 mod raw_pointers;
 mod references;
 mod returns;

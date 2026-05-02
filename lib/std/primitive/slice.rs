@@ -10,6 +10,12 @@ use crate::mem;
 use crate::option::Option;
 use crate::ops::Index;
 use crate::ops::IndexMut;
+use crate::ops::Range;
+use crate::ops::RangeFrom;
+use crate::ops::RangeTo;
+use crate::ops::RangeInclusive;
+use crate::ops::RangeToInclusive;
+use crate::ops::RangeFull;
 
 impl<T> [T] {
     // The number of elements in the slice. Reads the length half of
@@ -75,7 +81,7 @@ impl<T> [T] {
 // Bounds-checked: on out-of-range index, calls `panic!` which
 // invokes the host-imported `env.panic`. Returns `&T` / `&mut T` to
 // the element in place.
-impl<T> Index for [T] {
+impl<T> Index<usize> for [T] {
     type Output = T;
     fn index(&self, idx: usize) -> &T {
         if idx >= ¤slice_len::<T>(self) {
@@ -90,7 +96,7 @@ impl<T> Index for [T] {
     }
 }
 
-impl<T> IndexMut for [T] {
+impl<T> IndexMut<usize> for [T] {
     fn index_mut(&mut self, idx: usize) -> &mut T {
         if idx >= ¤slice_len::<T>(self) {
             panic!("slice index out of bounds")
@@ -100,6 +106,195 @@ impl<T> IndexMut for [T] {
             let base: *mut T = ¤slice_mut_ptr::<T>(self);
             let elt: *mut T = base.cast::<u8>().byte_add(offset).cast::<T>();
             &mut *elt
+        }
+    }
+}
+
+// `arr[start..end]` etc. — Range slicing for `[T]`. Each impl
+// bounds-checks then constructs a sub-slice via the `¤make_slice` /
+// `¤make_mut_slice` raw-parts intrinsics. Out-of-range or reversed
+// indices `panic!`. The `Output` is the slice type itself (`[T]`),
+// so the caller gets `&[T]` / `&mut [T]` after the autoderef the
+// indexing codegen does. Repetitive across the six range shapes —
+// the variation is just which bounds to check and which start/end
+// to use; structure is the same.
+
+impl<T> Index<Range<usize>> for [T] {
+    type Output = [T];
+    fn index(&self, r: Range<usize>) -> &[T] {
+        let len: usize = ¤slice_len::<T>(self);
+        if r.start > r.end {
+            panic!("slice range start > end")
+        }
+        if r.end > len {
+            panic!("slice range end out of bounds")
+        }
+        let new_len: usize = r.end - r.start;
+        unsafe {
+            let base: *const T = ¤slice_ptr::<T>(self);
+            let new_ptr: *const u8 = base.cast::<u8>().byte_add(r.start * mem::size_of::<T>());
+            ¤make_slice::<T>(new_ptr, new_len)
+        }
+    }
+}
+
+impl<T> IndexMut<Range<usize>> for [T] {
+    fn index_mut(&mut self, r: Range<usize>) -> &mut [T] {
+        let len: usize = ¤slice_len::<T>(self);
+        if r.start > r.end {
+            panic!("slice range start > end")
+        }
+        if r.end > len {
+            panic!("slice range end out of bounds")
+        }
+        let new_len: usize = r.end - r.start;
+        unsafe {
+            let base: *mut T = ¤slice_mut_ptr::<T>(self);
+            let new_ptr: *mut u8 = base.cast::<u8>().byte_add(r.start * mem::size_of::<T>());
+            ¤make_mut_slice::<T>(new_ptr, new_len)
+        }
+    }
+}
+
+impl<T> Index<RangeFrom<usize>> for [T] {
+    type Output = [T];
+    fn index(&self, r: RangeFrom<usize>) -> &[T] {
+        let len: usize = ¤slice_len::<T>(self);
+        if r.start > len {
+            panic!("slice range start out of bounds")
+        }
+        let new_len: usize = len - r.start;
+        unsafe {
+            let base: *const T = ¤slice_ptr::<T>(self);
+            let new_ptr: *const u8 = base.cast::<u8>().byte_add(r.start * mem::size_of::<T>());
+            ¤make_slice::<T>(new_ptr, new_len)
+        }
+    }
+}
+
+impl<T> IndexMut<RangeFrom<usize>> for [T] {
+    fn index_mut(&mut self, r: RangeFrom<usize>) -> &mut [T] {
+        let len: usize = ¤slice_len::<T>(self);
+        if r.start > len {
+            panic!("slice range start out of bounds")
+        }
+        let new_len: usize = len - r.start;
+        unsafe {
+            let base: *mut T = ¤slice_mut_ptr::<T>(self);
+            let new_ptr: *mut u8 = base.cast::<u8>().byte_add(r.start * mem::size_of::<T>());
+            ¤make_mut_slice::<T>(new_ptr, new_len)
+        }
+    }
+}
+
+impl<T> Index<RangeTo<usize>> for [T] {
+    type Output = [T];
+    fn index(&self, r: RangeTo<usize>) -> &[T] {
+        let len: usize = ¤slice_len::<T>(self);
+        if r.end > len {
+            panic!("slice range end out of bounds")
+        }
+        unsafe {
+            let base: *const T = ¤slice_ptr::<T>(self);
+            ¤make_slice::<T>(base.cast::<u8>(), r.end)
+        }
+    }
+}
+
+impl<T> IndexMut<RangeTo<usize>> for [T] {
+    fn index_mut(&mut self, r: RangeTo<usize>) -> &mut [T] {
+        let len: usize = ¤slice_len::<T>(self);
+        if r.end > len {
+            panic!("slice range end out of bounds")
+        }
+        unsafe {
+            let base: *mut T = ¤slice_mut_ptr::<T>(self);
+            ¤make_mut_slice::<T>(base.cast::<u8>(), r.end)
+        }
+    }
+}
+
+impl<T> Index<RangeInclusive<usize>> for [T] {
+    type Output = [T];
+    fn index(&self, r: RangeInclusive<usize>) -> &[T] {
+        let len: usize = ¤slice_len::<T>(self);
+        if r.start > r.end {
+            panic!("slice range start > end")
+        }
+        if r.end >= len {
+            panic!("slice range end out of bounds")
+        }
+        let new_len: usize = r.end - r.start + 1;
+        unsafe {
+            let base: *const T = ¤slice_ptr::<T>(self);
+            let new_ptr: *const u8 = base.cast::<u8>().byte_add(r.start * mem::size_of::<T>());
+            ¤make_slice::<T>(new_ptr, new_len)
+        }
+    }
+}
+
+impl<T> IndexMut<RangeInclusive<usize>> for [T] {
+    fn index_mut(&mut self, r: RangeInclusive<usize>) -> &mut [T] {
+        let len: usize = ¤slice_len::<T>(self);
+        if r.start > r.end {
+            panic!("slice range start > end")
+        }
+        if r.end >= len {
+            panic!("slice range end out of bounds")
+        }
+        let new_len: usize = r.end - r.start + 1;
+        unsafe {
+            let base: *mut T = ¤slice_mut_ptr::<T>(self);
+            let new_ptr: *mut u8 = base.cast::<u8>().byte_add(r.start * mem::size_of::<T>());
+            ¤make_mut_slice::<T>(new_ptr, new_len)
+        }
+    }
+}
+
+impl<T> Index<RangeToInclusive<usize>> for [T] {
+    type Output = [T];
+    fn index(&self, r: RangeToInclusive<usize>) -> &[T] {
+        let len: usize = ¤slice_len::<T>(self);
+        if r.end >= len {
+            panic!("slice range end out of bounds")
+        }
+        unsafe {
+            let base: *const T = ¤slice_ptr::<T>(self);
+            ¤make_slice::<T>(base.cast::<u8>(), r.end + 1)
+        }
+    }
+}
+
+impl<T> IndexMut<RangeToInclusive<usize>> for [T] {
+    fn index_mut(&mut self, r: RangeToInclusive<usize>) -> &mut [T] {
+        let len: usize = ¤slice_len::<T>(self);
+        if r.end >= len {
+            panic!("slice range end out of bounds")
+        }
+        unsafe {
+            let base: *mut T = ¤slice_mut_ptr::<T>(self);
+            ¤make_mut_slice::<T>(base.cast::<u8>(), r.end + 1)
+        }
+    }
+}
+
+impl<T> Index<RangeFull> for [T] {
+    type Output = [T];
+    fn index(&self, _r: RangeFull) -> &[T] {
+        let len: usize = ¤slice_len::<T>(self);
+        unsafe {
+            let base: *const T = ¤slice_ptr::<T>(self);
+            ¤make_slice::<T>(base.cast::<u8>(), len)
+        }
+    }
+}
+
+impl<T> IndexMut<RangeFull> for [T] {
+    fn index_mut(&mut self, _r: RangeFull) -> &mut [T] {
+        let len: usize = ¤slice_len::<T>(self);
+        unsafe {
+            let base: *mut T = ¤slice_mut_ptr::<T>(self);
+            ¤make_mut_slice::<T>(base.cast::<u8>(), len)
         }
     }
 }

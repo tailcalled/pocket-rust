@@ -24,8 +24,9 @@ Defines `Copy` (pure marker trait) and primitive `impl Copy for {u8, i8, …, is
 
 Defines:
 - `Drop { fn drop(&mut self); }` — destructor.
-- `Index { type Output; fn index(&self, idx: usize) -> &Self::Output; }`.
-- `IndexMut: Index { fn index_mut(&mut self, idx: usize) -> &mut Self::Output; }`.
+- `Index<Idx> { type Output; fn index(&self, idx: Idx) -> &Self::Output; }`.
+- `IndexMut<Idx>: Index<Idx> { fn index_mut(&mut self, idx: Idx) -> &mut Self::Output; }`.
+- Range types (no methods, plain data): `Range<Idx> { start, end }`, `RangeFrom<Idx> { start }`, `RangeTo<Idx> { end }`, `RangeInclusive<Idx> { start, end }`, `RangeToInclusive<Idx> { end }`, `RangeFull` (unit struct). Constructed by the parser's range-literal desugar.
 - `Add<Rhs = Self>` / `Sub<Rhs = Self>` / `Mul<Rhs = Self>` / `Div<Rhs = Self>` / `Rem<Rhs = Self>` — Rust-style operator-overloading traits, each with `type Output; fn op(self, other: Rhs) -> Self::Output;`.
 - `Neg { type Output; fn neg(self) -> Self::Output; }`.
 - `Not { type Output; fn not(self) -> Self::Output; }`.
@@ -64,7 +65,7 @@ Methods: `new`, `len`, `is_empty`, `capacity`, `push`, `pop`, `get`, `get_mut`, 
 
 Drop impl calls `mem::drop` on each element then `¤free`s the buffer. Uses the `mem::size_of` / `*mut T::byte_add` / `*mut T::cast` stdlib wrappers internally rather than the underlying intrinsics, so the only intrinsics it touches directly are `¤alloc` and `¤free` (which have no wrappers yet).
 
-`Index`/`IndexMut` impls cover `Idx = usize` (no generic-trait support yet — `trait Index<Idx>` requires generic trait params); both do bounds checks via `panic!`.
+`Index<usize>` / `IndexMut<usize>` impls cover element indexing. Range slicing impls (`Index<Range<usize>>` / `Index<RangeFrom<usize>>` / `Index<RangeTo<usize>>` / `Index<RangeInclusive<usize>>` / `Index<RangeToInclusive<usize>>` / `Index<RangeFull>`, plus matching `IndexMut`) wrap the corresponding `[T]` slicing impls via `as_slice` / `as_mut_slice`. All do bounds checks via `panic!`.
 
 ## `lib/std/boxed.rs`
 
@@ -79,7 +80,7 @@ Drop runs T's destructor (if Drop) and frees the buffer; `into_raw` / `into_inne
 Currently re-exports:
 - `lib/std/primitive/pointer.rs` — inherent `unsafe fn byte_add` / `byte_sub` / `byte_offset`, safe `is_null`, and safe `cast::<U>(self)` on `*const T` and `*mut T`.
 - `lib/std/primitive/slice.rs` — `[T]` methods (`len`, `is_empty`, `as_ptr`, `as_mut_ptr`, `get`, `get_mut`); `Index`/`IndexMut` impls for `Idx = usize` with bounds checks via `panic!`.
-- `lib/std/primitive/str.rs` — `str` methods (`len`, `is_empty`, `as_bytes`).
+- `lib/std/primitive/str.rs` — `str` methods (`len`, `is_empty`, `as_bytes`, `is_char_boundary`); `Index<Range*<usize>>` / `IndexMut<Range*<usize>>` impls covering all six range forms. Slicing impls bounds-check the byte indices AND char-boundary-check them via `is_char_boundary` (which tests for UTF-8 continuation bytes via the `0xC0` mask) — slicing mid-codepoint panics rather than producing an invalid `&str`. Mutable slicing constructs `&mut str` via the new `¤make_mut_str` / `¤str_as_mut_bytes` builtins (mirrors of the existing immutable variants; codegen is identical pass-through).
 
 ## `lib/std/dummy.rs`
 

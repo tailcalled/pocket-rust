@@ -484,7 +484,17 @@ impl<'a> Builder<'a> {
             self.ctx.type_params,
             self.ctx.type_param_bounds,
         );
-        if copy {
+        // Implicit function/builtin-arg reborrow for `&mut T`: same
+        // justification as method-receiver reborrow (`lower_recv_reborrow`).
+        // The call scope-bounds the borrow; after the call, the original
+        // `&mut T` binding is usable again. Without this, calling two
+        // builtins/funcs with the same `&mut self` arg in a method body
+        // (e.g. `IndexMut for str`'s body using `¤str_len(self)` then
+        // `¤str_as_mut_bytes(self)`) errors with "self already moved".
+        // Sound because pocket-rust treats the reborrow as exclusive
+        // for the duration of the call, just like Rust does.
+        let mut_ref_reborrow = matches!(&ty, RType::Ref { mutable: true, .. });
+        if copy || mut_ref_reborrow {
             return Operand {
                 kind: OperandKind::Copy(place.clone()),
                 span,

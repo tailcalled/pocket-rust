@@ -45,8 +45,11 @@ fn pointer_mut_byte_add_returns_42() {
 }
 
 #[test]
-fn pointer_addr_cast_returns_8() {
-    // `*const T as usize` — first heap alloc lands at offset 8 (the
-    // initial `__heap_top` value).
-    expect_answer("std/pointer/addr_cast", 8u32);
+fn pointer_addr_cast_returns_4() {
+    // `*const T as usize` — two consecutive 4-byte allocations should
+    // be exactly 4 bytes apart (the bump allocator advances by the
+    // requested size). Test the spacing rather than the absolute
+    // first-alloc address, which shifts whenever a stdlib string
+    // literal lands in the data segment ahead of the heap.
+    expect_answer("std/pointer/addr_cast", 4u32);
 }

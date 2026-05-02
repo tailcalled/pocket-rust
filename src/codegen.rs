@@ -2684,7 +2684,7 @@ fn codegen_index_value(
     idx: &Expr,
     expr_id: crate::ast::NodeId,
 ) -> Result<RType, Error> {
-    let (callee_idx, _ref_ret_rt) = resolve_index_callee(ctx, base, false);
+    let (callee_idx, _ref_ret_rt) = resolve_index_callee(ctx, base, idx, false);
     let result_ty = ctx.expr_types[expr_id as usize]
         .as_ref()
         .expect("typeck recorded the index expr's type")
@@ -2740,6 +2740,7 @@ fn emit_index_recv(ctx: &mut FnCtx, base: &Expr, mutable: bool) -> Result<(), Er
 fn resolve_index_callee(
     ctx: &mut FnCtx,
     base: &Expr,
+    index: &Expr,
     mutable: bool,
 ) -> (u32, RType) {
     let base_rt = ctx.expr_types[base.id as usize]
@@ -2751,14 +2752,29 @@ fn resolve_index_callee(
         RType::Ref { inner, .. } => (**inner).clone(),
         _ => base_rt.clone(),
     };
+    // Pull the index expression's resolved type — this is the trait
+    // arg for `Index<Idx>` / `IndexMut<Idx>` dispatch (`usize` for
+    // element indexing, `Range<usize>`/`RangeFrom<usize>`/etc. for
+    // slicing).
+    let idx_rt = ctx.expr_types[index.id as usize]
+        .as_ref()
+        .expect("typeck recorded index type")
+        .clone();
+    let idx_rt = substitute_rtype(&idx_rt, &ctx.env);
     let trait_path: Vec<String> = if mutable {
         vec!["std".to_string(), "ops".to_string(), "IndexMut".to_string()]
     } else {
         vec!["std".to_string(), "ops".to_string(), "Index".to_string()]
     };
     let method_name = if mutable { "index_mut" } else { "index" };
-    let resolution = crate::typeck::solve_impl(&trait_path, &lookup_rt, ctx.traits, 0)
-        .expect("typeck verified Index/IndexMut impl exists");
+    let resolution = crate::typeck::solve_impl_with_args(
+        &trait_path,
+        &vec![idx_rt],
+        &lookup_rt,
+        ctx.traits,
+        0,
+    )
+    .expect("typeck verified Index/IndexMut impl exists");
     let cand = crate::typeck::find_trait_impl_method(ctx.funcs, resolution.impl_idx, method_name)
         .expect("impl has the index/index_mut method");
     match cand {
@@ -3407,7 +3423,7 @@ fn codegen_assign_stmt(ctx: &mut FnCtx, assign: &AssignStmt) -> Result<(), Error
                 .push(wasm::Instruction::LocalSet(val_save_start + k as u32));
         }
         // Resolve index_mut and compute the destination address.
-        let (callee_idx, _ret_rt) = resolve_index_callee(ctx, base, true);
+        let (callee_idx, _ret_rt) = resolve_index_callee(ctx, base, index, true);
         emit_index_recv(ctx, base, true)?;
         codegen_expr(ctx, index)?;
         ctx.instructions.push(wasm::Instruction::Call(callee_idx));
@@ -4055,12 +4071,16 @@ fn codegen_builtin(
         }
         // str_len reuses slice_len (same fat-ref shape, same drop-ptr-keep-len).
         "str_len" => return codegen_builtin_slice_len(ctx, args, node_id),
-        // str_as_bytes is a 1-arg pure pass-through: `&str` and `&[u8]`
-        // share the fat-ref representation, so codegenning the arg
-        // already leaves (ptr, len) on the stack — the result.
+        // str_as_bytes / str_as_mut_bytes are 1-arg pure pass-throughs:
+        // `&str`/`&mut str` and `&[u8]`/`&mut [u8]` share the fat-ref
+        // representation, so codegenning the arg already leaves (ptr,
+        // len) on the stack — the result.
         "str_as_bytes" => return codegen_builtin_passthrough_one(ctx, args, node_id),
-        // make_str(ptr, len) builds a fat ref, exactly like make_slice.
+        "str_as_mut_bytes" => return codegen_builtin_passthrough_one(ctx, args, node_id),
+        // make_str / make_mut_str(ptr, len) build a fat ref, exactly
+        // like make_slice / make_mut_slice — codegen is identical.
         "make_str" => return codegen_builtin_make_slice(ctx, args, node_id),
+        "make_mut_str" => return codegen_builtin_make_slice(ctx, args, node_id),
         "make_mut_slice" => return codegen_builtin_make_slice(ctx, args, node_id),
         "ptr_usize_add" => return codegen_builtin_ptr_arith(ctx, args, node_id, PtrArith::Add),
         "ptr_usize_sub" => return codegen_builtin_ptr_arith(ctx, args, node_id, PtrArith::Sub),
@@ -6825,7 +6845,7 @@ fn codegen_borrow(ctx: &mut FnCtx, inner: &Expr, mutable: bool) -> Result<RType,
     // type is already `&Output` / `&mut Output`, which matches what
     // a borrow is expected to produce.
     if let ExprKind::Index { base, index, .. } = &inner.kind {
-        let (callee_idx, _ret_rt) = resolve_index_callee(ctx, base, mutable);
+        let (callee_idx, _ret_rt) = resolve_index_callee(ctx, base, index, mutable);
         emit_index_recv(ctx, base, mutable)?;
         codegen_expr(ctx, index)?;
         ctx.instructions.push(wasm::Instruction::Call(callee_idx));

@@ -1,6 +1,6 @@
 use super::{
     EnumEntry, EnumTable, EnumVariantEntry, FnSymbol, FuncTable, GenericTemplate, LifetimeRepr,
-    RType, RTypedField, ReExportTable, StructEntry, StructTable, TraitEntry, TraitImplEntry,
+    RType, RTypedField, ReExportTable, StructEntry, StructTable, SupertraitRef, TraitEntry, TraitImplEntry,
     TraitMethodEntry, TraitReceiverShape, TraitTable, UseEntry, VariantPayloadResolved, copy_trait_path, drop_trait_path,
     find_elision_source, freshen_inferred_lifetimes, func_lookup,
     is_copy_with_bounds, is_visible_from, module_use_entries, outer_lifetime, place_to_string,
@@ -127,23 +127,34 @@ pub(super) fn resolve_trait_methods(
                     e += 1;
                 }
                 let entry_idx = entry_idx.expect("trait registered above");
-                // Supertrait paths are resolved here to canonical
-                // paths only; trait-arg matching for supertraits
-                // (e.g. `trait Eq: PartialEq<Rhs = Self>`) is a
-                // follow-up — `td.supertraits[s].assoc_constraints`
-                // and trait_args are not yet propagated through.
-                let mut supertraits: Vec<Vec<String>> = Vec::new();
+                // Supertrait edges: resolve each `Trait<X, Y, …>` to a
+                // canonical path + concrete arg types. Args reference
+                // the trait's own type-params (and `Self`); the
+                // obligation check substitutes them per impl row.
+                // Assoc-type constraints on supertrait bounds (e.g.
+                // `trait Foo: Bar<Item = u32>`) are still a follow-up.
+                let trait_type_params_names: Vec<String> = td
+                    .type_params
+                    .iter()
+                    .map(|p| p.name.clone())
+                    .collect();
+                let self_target_for_sup = RType::Param("Self".to_string());
+                let mut supertraits: Vec<SupertraitRef> = Vec::new();
                 let mut s = 0;
                 while s < td.supertraits.len() {
-                    let resolved = resolve_trait_path(
+                    let (resolved_path, args) = resolve_trait_ref(
                         &td.supertraits[s].path,
                         path,
+                        structs,
+                        enums,
+                        Some(&self_target_for_sup),
+                        &trait_type_params_names,
                         traits,
                         &use_scope,
                         reexports,
                         &module.source_file,
                     )?;
-                    supertraits.push(resolved);
+                    supertraits.push(SupertraitRef { path: resolved_path, args });
                     s += 1;
                 }
                 traits.entries[entry_idx].supertraits = supertraits;
@@ -151,11 +162,6 @@ pub(super) fn resolve_trait_methods(
                 // `Self` is in scope (= self_target = `Param("Self")`),
                 // and earlier trait-params are also visible so a later
                 // default can reference an earlier one.
-                let trait_type_params_names: Vec<String> = td
-                    .type_params
-                    .iter()
-                    .map(|p| p.name.clone())
-                    .collect();
                 let mut tp = 0;
                 while tp < td.type_params.len() {
                     if let Some(default_ty) = &td.type_params[tp].default {
@@ -958,39 +964,54 @@ fn resolve_self_assoc_via_impl(
     file: &str,
 ) -> Result<RType, Error> {
     // Find this impl's row in the table to read its resolved
-    // assoc_type_bindings (already validated/resolved at registration).
+    // assoc_type_bindings (already validated/resolved at registration)
+    // and trait_args (so we can disambiguate among multiple Index<X>
+    // impls when the projection points at a supertrait's assoc).
     let idx = match crate::typeck::find_trait_impl_idx_by_span(traits, file, &ib.span) {
         Some(i) => i,
-        // Inherent impl or pre-registration; fall back to global.
         None => {
             let _ = impl_assoc_bindings_ast;
             return Ok(crate::typeck::concretize_assoc_proj(rt, traits));
         }
     };
     let bindings: Vec<(String, RType)> = traits.impls[idx].assoc_type_bindings.clone();
-    Ok(walk_resolve_self_proj(rt, trait_full, target_rt, &bindings, traits))
+    let trait_args: Vec<RType> = traits.impls[idx].trait_args.clone();
+    Ok(walk_resolve_self_proj(
+        rt,
+        trait_full,
+        &trait_args,
+        target_rt,
+        &bindings,
+        traits,
+    ))
 }
 
 fn walk_resolve_self_proj(
     rt: &RType,
     trait_full: &Vec<String>,
+    trait_args: &Vec<RType>,
     target_rt: &RType,
     bindings: &Vec<(String, RType)>,
     traits: &TraitTable,
 ) -> RType {
-    let recurse = |r: &RType| walk_resolve_self_proj(r, trait_full, target_rt, bindings, traits);
+    let recurse = |r: &RType| {
+        walk_resolve_self_proj(r, trait_full, trait_args, target_rt, bindings, traits)
+    };
     match rt {
         RType::AssocProj { base, trait_path, name } => {
             let new_base = recurse(base);
-            // Match `<target as this-impl-trait>::name` directly.
-            // For cross-trait projections (e.g. `Self::Output`
-            // pointing at a supertrait's assoc), fall through to
-            // the global `concretize_assoc_proj` which finds the
-            // *other* trait's impl row and reads its bindings.
-            // Multi-impl ambiguity only happens within a single
-            // trait's row set, so the global lookup is safe here.
-            let trait_match = trait_path.is_empty() || trait_path == trait_full;
-            if trait_match && rtype_eq(&new_base, target_rt) {
+            // Resolution priority for `<base as P>::name`:
+            //   1. P matches this impl's trait → look in `bindings`.
+            //   2. P is a supertrait of this impl's trait → walk that
+            //      supertrait edge with this impl's trait_args
+            //      substituted in, then `find_assoc_binding_with_args`
+            //      to disambiguate among multiple impl rows of the
+            //      supertrait that share the same target.
+            //   3. Otherwise (cross-trait): defer to global lookup,
+            //      which uses the projection's own trait_path.
+            let trait_match_self = trait_path.is_empty() || trait_path == trait_full;
+            let base_matches = rtype_eq(&new_base, target_rt);
+            if trait_match_self && base_matches {
                 let mut k = 0;
                 while k < bindings.len() {
                     if bindings[k].0 == *name {
@@ -999,8 +1020,49 @@ fn walk_resolve_self_proj(
                     k += 1;
                 }
             }
-            // Cross-trait — defer to global lookup, which correctly
-            // disambiguates by the projection's own trait_path.
+            // Supertrait path (only meaningful when base matches —
+            // otherwise the global lookup is the right fallback).
+            if base_matches && !trait_path.is_empty() && trait_path != trait_full {
+                if let Some(entry) = trait_lookup(traits, trait_full) {
+                    let mut env: Vec<(String, RType)> = Vec::new();
+                    env.push(("Self".to_string(), target_rt.clone()));
+                    let mut tp = 0;
+                    while tp < entry.trait_type_params.len() && tp < trait_args.len() {
+                        env.push((
+                            entry.trait_type_params[tp].clone(),
+                            trait_args[tp].clone(),
+                        ));
+                        tp += 1;
+                    }
+                    let mut s = 0;
+                    while s < entry.supertraits.len() {
+                        let sup = &entry.supertraits[s];
+                        if &sup.path != trait_path {
+                            s += 1;
+                            continue;
+                        }
+                        let sup_args: Vec<RType> = sup
+                            .args
+                            .iter()
+                            .map(|a| substitute_rtype(a, &env))
+                            .collect();
+                        let found = crate::typeck::traits::find_assoc_binding_with_args(
+                            traits,
+                            target_rt,
+                            &sup.path,
+                            &Some(sup_args),
+                            name,
+                        );
+                        if found.len() == 1 {
+                            return recurse(&found[0]);
+                        }
+                        s += 1;
+                    }
+                }
+            }
+            // Cross-trait projection (explicit `<T as Trait>::Name`)
+            // — defer to global lookup, which disambiguates by the
+            // projection's own trait_path.
             let projected = RType::AssocProj {
                 base: Box::new(new_base),
                 trait_path: trait_path.clone(),
@@ -1812,11 +1874,28 @@ pub(super) fn validate_supertrait_obligations(traits: &TraitTable) -> Result<(),
                 continue;
             }
         };
+        // Build the substitution env that maps the trait's type-params
+        // (and `Self`) to this impl row's bindings. The supertrait's
+        // declared `args` are written against the trait's vocabulary;
+        // substitute through this env to get the obligation's args.
+        let mut env: Vec<(String, RType)> = Vec::new();
+        env.push(("Self".to_string(), row.target.clone()));
+        let mut tp = 0;
+        while tp < entry.trait_type_params.len() && tp < row.trait_args.len() {
+            env.push((entry.trait_type_params[tp].clone(), row.trait_args[tp].clone()));
+            tp += 1;
+        }
         let mut s = 0;
         while s < entry.supertraits.len() {
             let sup = &entry.supertraits[s];
-            if solve_impl_in_ctx(
-                sup,
+            let sup_args: Vec<RType> = sup
+                .args
+                .iter()
+                .map(|a| substitute_rtype(a, &env))
+                .collect();
+            if crate::typeck::traits::solve_impl_in_ctx_with_args(
+                &sup.path,
+                &sup_args,
                 &row.target,
                 traits,
                 &row.impl_type_params,
@@ -1830,7 +1909,7 @@ pub(super) fn validate_supertrait_obligations(traits: &TraitTable) -> Result<(),
                     message: format!(
                         "the trait bound `{}: {}` is not satisfied (required by `{}`)",
                         rtype_to_string(&row.target),
-                        place_to_string(sup),
+                        place_to_string(&sup.path),
                         place_to_string(&row.trait_path)
                     ),
                     span: row.span.copy(),

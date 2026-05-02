@@ -68,7 +68,7 @@ At codegen, each literal is interned into a per-crate string pool (see codegen-m
 
 ## Structs
 
-`struct NAME { field: Type, … }` or `struct NAME<T1, T2> { field: T1, … }` for generic structs. No tuple structs, no unit structs, no derive. Struct fields cannot be reference types but can use type params.
+`struct NAME { field: Type, … }` or `struct NAME<T1, T2> { field: T1, … }` for generic structs. **Unit structs** are also supported — `struct NAME;` (semicolon body), constructed via the empty struct-lit form `NAME {}` (no bare-ident form, to avoid clashing with variable references). Layout: zero fields, `byte_size_of = 0`, flat scalar shape `[]`. Used by `std::ops::RangeFull`. No tuple structs, no derive. Struct fields cannot be reference types but can use type params.
 
 **Field-init shorthand:** `Foo { x }` parses as `Foo { x: x }` when the field name is followed by `,` or `}`; the value desugars to a synthetic `Var("x")` expression that name-resolves like any other. Mixing shorthand and explicit `name: expr` initializers in the same literal is fine.
 

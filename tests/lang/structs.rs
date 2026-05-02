@@ -12,6 +12,14 @@ fn methods_returns_42() {
     expect_answer("lang/structs/methods", 42i32);
 }
 
+// Unit struct: `struct Marker;` declares a zero-field struct;
+// `Marker {}` constructs one. Layout is 0 bytes; flat scalar shape
+// is empty. Used by `std::ops::RangeFull`.
+#[test]
+fn unit_struct_returns_42() {
+    expect_answer("lang/structs/unit_struct", 42i32);
+}
+
 #[test]
 fn unknown_struct_field_reports_use_site() {
     let err = compile_source(

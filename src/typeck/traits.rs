@@ -802,18 +802,18 @@ pub fn supertrait_closure(start: &Vec<String>, traits: &TraitTable) -> Vec<Vec<S
         if let Some(entry) = trait_lookup(traits, &out[i]) {
             let mut s = 0;
             while s < entry.supertraits.len() {
-                let sup = &entry.supertraits[s];
+                let sup_path = &entry.supertraits[s].path;
                 let mut already = false;
                 let mut j = 0;
                 while j < out.len() {
-                    if &out[j] == sup {
+                    if &out[j] == sup_path {
                         already = true;
                         break;
                     }
                     j += 1;
                 }
                 if !already {
-                    out.push(sup.clone());
+                    out.push(sup_path.clone());
                 }
                 s += 1;
             }

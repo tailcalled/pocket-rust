@@ -20,6 +20,12 @@ use crate::option::Option;
 use crate::ops::Drop;
 use crate::ops::Index;
 use crate::ops::IndexMut;
+use crate::ops::Range;
+use crate::ops::RangeFrom;
+use crate::ops::RangeTo;
+use crate::ops::RangeInclusive;
+use crate::ops::RangeToInclusive;
+use crate::ops::RangeFull;
 
 pub struct Vec<T> {
     ptr: *mut T,
@@ -191,7 +197,7 @@ impl<T> Drop for Vec<T> {
 // Bounds-checked: on out-of-range index, calls `panic!` to invoke
 // the host. `Vec::get` / `get_mut` provide the safe Option-returning
 // variants.
-impl<T> Index for Vec<T> {
+impl<T> Index<usize> for Vec<T> {
     type Output = T;
     fn index(&self, idx: usize) -> &T {
         if idx >= self.len {
@@ -206,7 +212,7 @@ impl<T> Index for Vec<T> {
     }
 }
 
-impl<T> IndexMut for Vec<T> {
+impl<T> IndexMut<usize> for Vec<T> {
     fn index_mut(&mut self, idx: usize) -> &mut T {
         if idx >= self.len {
             panic!("Vec index out of bounds")
@@ -217,6 +223,89 @@ impl<T> IndexMut for Vec<T> {
             let elt: *mut T = buf_u8.byte_add(offset).cast::<T>();
             &mut *elt
         }
+    }
+}
+
+// `vec[start..end]` etc. — Range slicing for `Vec<T>`. Each impl
+// thin-wraps `[T]`'s slicing impl by going through `as_slice` /
+// `as_mut_slice`. The actual bounds checks live in the `[T]` impls.
+// Output is `[T]` so the indexing codegen returns `&[T]` / `&mut [T]`.
+
+impl<T> Index<Range<usize>> for Vec<T> {
+    type Output = [T];
+    fn index(&self, r: Range<usize>) -> &[T] {
+        &self.as_slice()[r]
+    }
+}
+
+impl<T> IndexMut<Range<usize>> for Vec<T> {
+    fn index_mut(&mut self, r: Range<usize>) -> &mut [T] {
+        &mut self.as_mut_slice()[r]
+    }
+}
+
+impl<T> Index<RangeFrom<usize>> for Vec<T> {
+    type Output = [T];
+    fn index(&self, r: RangeFrom<usize>) -> &[T] {
+        &self.as_slice()[r]
+    }
+}
+
+impl<T> IndexMut<RangeFrom<usize>> for Vec<T> {
+    fn index_mut(&mut self, r: RangeFrom<usize>) -> &mut [T] {
+        &mut self.as_mut_slice()[r]
+    }
+}
+
+impl<T> Index<RangeTo<usize>> for Vec<T> {
+    type Output = [T];
+    fn index(&self, r: RangeTo<usize>) -> &[T] {
+        &self.as_slice()[r]
+    }
+}
+
+impl<T> IndexMut<RangeTo<usize>> for Vec<T> {
+    fn index_mut(&mut self, r: RangeTo<usize>) -> &mut [T] {
+        &mut self.as_mut_slice()[r]
+    }
+}
+
+impl<T> Index<RangeInclusive<usize>> for Vec<T> {
+    type Output = [T];
+    fn index(&self, r: RangeInclusive<usize>) -> &[T] {
+        &self.as_slice()[r]
+    }
+}
+
+impl<T> IndexMut<RangeInclusive<usize>> for Vec<T> {
+    fn index_mut(&mut self, r: RangeInclusive<usize>) -> &mut [T] {
+        &mut self.as_mut_slice()[r]
+    }
+}
+
+impl<T> Index<RangeToInclusive<usize>> for Vec<T> {
+    type Output = [T];
+    fn index(&self, r: RangeToInclusive<usize>) -> &[T] {
+        &self.as_slice()[r]
+    }
+}
+
+impl<T> IndexMut<RangeToInclusive<usize>> for Vec<T> {
+    fn index_mut(&mut self, r: RangeToInclusive<usize>) -> &mut [T] {
+        &mut self.as_mut_slice()[r]
+    }
+}
+
+impl<T> Index<RangeFull> for Vec<T> {
+    type Output = [T];
+    fn index(&self, r: RangeFull) -> &[T] {
+        &self.as_slice()[r]
+    }
+}
+
+impl<T> IndexMut<RangeFull> for Vec<T> {
+    fn index_mut(&mut self, r: RangeFull) -> &mut [T] {
+        &mut self.as_mut_slice()[r]
     }
 }
 

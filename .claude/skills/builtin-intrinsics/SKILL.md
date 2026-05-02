@@ -76,7 +76,9 @@ Codegen for both is a pure no-op: both args already flatten to one i32, leaving 
 ## `str` construction / inspection
 
 - `¤make_str(ptr: *const u8, len: usize) -> &str` — raw-parts route, identical codegen to `¤make_slice` since the ABIs match.
-- `¤str_len(s: &str) -> usize` — reuses `¤slice_len`'s codegen.
+- `¤make_mut_str(ptr: *mut u8, len: usize) -> &mut str` — mutable counterpart; same codegen.
+- `¤str_len(s)` — reuses `¤slice_len`'s codegen. Accepts either `&str` or `&mut str` since the read is mutability-agnostic (mirror of `¤slice_len`'s `&[T]`/`&mut [T]` flexibility).
 - `¤str_as_bytes(s: &str) -> &[u8]` — 1-arg pure pass-through; `&str` and `&[u8]` share the fat-ref shape.
+- `¤str_as_mut_bytes(s: &mut str) -> &mut [u8]` — mutable counterpart; same codegen.
 
-`str::len` / `is_empty` / `as_bytes` (in `lib/std/primitive/str.rs`) wrap these.
+`str::len` / `is_empty` / `as_bytes` / `is_char_boundary` and the `Index<Range*<usize>>` / `IndexMut<Range*<usize>>` slicing impls (in `lib/std/primitive/str.rs`) wrap these. The mutable variants are what make `&mut s[a..b]` work end-to-end.

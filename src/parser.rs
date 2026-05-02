@@ -460,8 +460,22 @@ impl Parser {
         } else {
             (Vec::new(), Vec::new())
         };
-        self.expect(&TokenKind::LBrace, "`{`")?;
+        // Unit struct: `struct Foo;` / `struct Foo<T>;` — no body, terminated
+        // with `;`. Construction syntax is the empty struct-lit form `Foo {}`
+        // (no bare-ident form to avoid clashing with variable references).
         let mut fields = Vec::new();
+        if self.peek_kind(&TokenKind::Semi) {
+            self.pos += 1;
+            return Ok(StructDef {
+                name,
+                name_span,
+                lifetime_params,
+                type_params,
+                fields,
+                is_pub,
+            });
+        }
+        self.expect(&TokenKind::LBrace, "`{` or `;`")?;
         if !self.peek_kind(&TokenKind::RBrace) {
             fields.push(self.parse_struct_field()?);
             while self.peek_kind(&TokenKind::Comma) {
@@ -1430,7 +1444,146 @@ impl Parser {
     }
 
     fn parse_expr(&mut self) -> Result<Expr, Error> {
-        self.parse_logical_or()
+        self.parse_range()
+    }
+
+    // Range literals — `a..b`, `a..`, `..b`, `..`, `a..=b`, `..=b`.
+    // Lowest expression precedence (just above the assignment-stmt
+    // level, which isn't an expression in pocket-rust). Non-associative
+    // — `a..b..c` is a parse error from the inner `parse_logical_or`
+    // not seeing a second `..`.
+    //
+    // Desugars at parse-time to struct literals of the corresponding
+    // `std::ops::Range*` types so the rest of the pipeline (typeck,
+    // codegen) sees ordinary struct construction. The bare path
+    // (`Range`, `RangeFrom`, …) relies on the implicit `use std::*;`
+    // prelude.
+    fn parse_range(&mut self) -> Result<Expr, Error> {
+        // Prefix range: `..end`, `..=end`, or bare `..` (RangeFull).
+        if self.peek_kind(&TokenKind::DotDot) || self.peek_kind(&TokenKind::DotDotEq) {
+            let inclusive = self.peek_kind(&TokenKind::DotDotEq);
+            let dot_span = self.tokens[self.pos].span.copy();
+            self.pos += 1;
+            if self.is_range_terminator() {
+                if inclusive {
+                    return Err(Error {
+                        file: self.file.clone(),
+                        message: "`..=` requires a right-side expression".to_string(),
+                        span: dot_span,
+                    });
+                }
+                return Ok(self.build_range_full(dot_span));
+            }
+            let end = self.parse_logical_or()?;
+            if inclusive {
+                return Ok(self.build_range_to_inclusive(end, dot_span));
+            }
+            return Ok(self.build_range_to(end, dot_span));
+        }
+        let left = self.parse_logical_or()?;
+        if self.peek_kind(&TokenKind::DotDot) || self.peek_kind(&TokenKind::DotDotEq) {
+            let inclusive = self.peek_kind(&TokenKind::DotDotEq);
+            let dot_span = self.tokens[self.pos].span.copy();
+            self.pos += 1;
+            if self.is_range_terminator() {
+                if inclusive {
+                    return Err(Error {
+                        file: self.file.clone(),
+                        message: "`..=` requires a right-side expression".to_string(),
+                        span: dot_span,
+                    });
+                }
+                return Ok(self.build_range_from(left, dot_span));
+            }
+            let right = self.parse_logical_or()?;
+            if inclusive {
+                return Ok(self.build_range_inclusive(left, right, dot_span));
+            }
+            return Ok(self.build_range(left, right, dot_span));
+        }
+        Ok(left)
+    }
+
+    // True iff the next token can't start an expression — used to
+    // distinguish `..end` / `start..end` (right side present) from
+    // `..` / `start..` (no right side).
+    fn is_range_terminator(&self) -> bool {
+        if self.pos >= self.tokens.len() {
+            return true;
+        }
+        matches!(
+            &self.tokens[self.pos].kind,
+            TokenKind::RParen
+                | TokenKind::RBracket
+                | TokenKind::RBrace
+                | TokenKind::Comma
+                | TokenKind::Semi
+        )
+    }
+
+    // Build a one-segment path `Range` (relying on `use std::*;`
+    // prelude). Used by all range desugarings.
+    fn make_range_path(&self, name: &str, span: &Span) -> Path {
+        Path {
+            segments: vec![PathSegment {
+                name: name.to_string(),
+                span: span.copy(),
+                lifetime_args: Vec::new(),
+                args: Vec::new(),
+            }],
+            span: span.copy(),
+        }
+    }
+
+    fn make_range_struct_lit(&mut self, name: &str, fields: Vec<(&str, Expr)>, span: Span) -> Expr {
+        let path = self.make_range_path(name, &span);
+        let field_inits: Vec<FieldInit> = fields
+            .into_iter()
+            .map(|(n, v)| FieldInit {
+                name: n.to_string(),
+                name_span: span.copy(),
+                value: v,
+            })
+            .collect();
+        let id = self.alloc_node_id();
+        Expr {
+            kind: ExprKind::StructLit(StructLit { path, fields: field_inits }),
+            span,
+            id,
+        }
+    }
+
+    fn build_range(&mut self, start: Expr, end: Expr, _dot_span: Span) -> Expr {
+        let span = Span::new(start.span.start.copy(), end.span.end.copy());
+        self.make_range_struct_lit("Range", vec![("start", start), ("end", end)], span)
+    }
+
+    fn build_range_from(&mut self, start: Expr, dot_span: Span) -> Expr {
+        let span = Span::new(start.span.start.copy(), dot_span.end.copy());
+        self.make_range_struct_lit("RangeFrom", vec![("start", start)], span)
+    }
+
+    fn build_range_to(&mut self, end: Expr, dot_span: Span) -> Expr {
+        let span = Span::new(dot_span.start.copy(), end.span.end.copy());
+        self.make_range_struct_lit("RangeTo", vec![("end", end)], span)
+    }
+
+    fn build_range_inclusive(&mut self, start: Expr, end: Expr, _dot_span: Span) -> Expr {
+        let span = Span::new(start.span.start.copy(), end.span.end.copy());
+        self.make_range_struct_lit(
+            "RangeInclusive",
+            vec![("start", start), ("end", end)],
+            span,
+        )
+    }
+
+    fn build_range_to_inclusive(&mut self, end: Expr, dot_span: Span) -> Expr {
+        let span = Span::new(dot_span.start.copy(), end.span.end.copy());
+        self.make_range_struct_lit("RangeToInclusive", vec![("end", end)], span)
+    }
+
+    fn build_range_full(&mut self, dot_span: Span) -> Expr {
+        self.make_range_struct_lit("RangeFull", Vec::new(), dot_span)
     }
 
     // `||` and `&&` short-circuit. Desugar at parse-time to if-else

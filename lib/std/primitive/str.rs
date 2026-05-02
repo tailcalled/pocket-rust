@@ -9,6 +9,15 @@
 // (data_offset, byte_len). The methods here only consume an existing
 // `&str` reference.
 
+use crate::ops::Index;
+use crate::ops::IndexMut;
+use crate::ops::Range;
+use crate::ops::RangeFrom;
+use crate::ops::RangeTo;
+use crate::ops::RangeInclusive;
+use crate::ops::RangeToInclusive;
+use crate::ops::RangeFull;
+
 impl str {
     // Length in bytes (not chars). `&str`'s fat ref carries this
     // value as its second i32; the intrinsic drops the data ptr and
@@ -30,6 +39,288 @@ impl str {
     // freely).
     pub fn as_bytes(&self) -> &[u8] {
         ¤str_as_bytes(self)
+    }
+
+    // True iff `idx` falls on a UTF-8 char boundary — that is, the
+    // byte at position `idx` is the start of a codepoint (or `idx`
+    // is exactly the string length / zero). Slicing helpers below
+    // panic if any range boundary fails this check, since splitting
+    // mid-codepoint would produce an invalid `&str`.
+    //
+    // A UTF-8 continuation byte has the bit pattern `10xxxxxx` —
+    // `(b & 0xC0) == 0x80`. Anything else is a codepoint start.
+    pub fn is_char_boundary(&self, idx: usize) -> bool {
+        let len: usize = ¤str_len(self);
+        if idx == 0 {
+            return true;
+        }
+        if idx == len {
+            return true;
+        }
+        if idx > len {
+            return false;
+        }
+        let bytes: &[u8] = ¤str_as_bytes(self);
+        let b: u8 = bytes[idx];
+        // `b & 0xC0` (== 192) tests whether `b` is a UTF-8
+        // continuation byte (`10xxxxxx`, mask = 0xC0, value = 0x80).
+        // Use the bitwise builtin directly — surface `&` isn't an
+        // expression operator yet, and pocket-rust's lexer is
+        // decimal-only, so we write the constants in decimal too.
+        let masked: u8 = ¤u8_and(b, 192u8);
+        masked != 128u8
+    }
+}
+
+// `s[start..end]` etc. — Range slicing for `str`. Returns a sub-`&str`
+// (or `&mut str`) over the same byte range. Bounds-checked: out-of-
+// range or reversed indices `panic!`. **Boundary-checked too:** every
+// byte index passed in (start and end, with end becoming end+1 for
+// inclusive ranges) must fall on a UTF-8 char boundary — see
+// `is_char_boundary`. Slicing mid-codepoint would yield an invalid
+// `&str`, so we panic at the slicing call rather than letting the
+// invalid ref propagate.
+//
+// Output is `str` (not `[u8]`) so the indexing codegen returns
+// `&str` / `&mut str` and downstream code keeps the string-vs-bytes
+// distinction. RangeFull skips both the bounds and boundary checks
+// — `0..len` is always valid by construction.
+
+impl Index<Range<usize>> for str {
+    type Output = str;
+    fn index(&self, r: Range<usize>) -> &str {
+        let len: usize = ¤str_len(self);
+        if r.start > r.end {
+            panic!("str range start > end")
+        }
+        if r.end > len {
+            panic!("str range end out of bounds")
+        }
+        if !self.is_char_boundary(r.start) {
+            panic!("str slice start is not a char boundary")
+        }
+        if !self.is_char_boundary(r.end) {
+            panic!("str slice end is not a char boundary")
+        }
+        let new_len: usize = r.end - r.start;
+        unsafe {
+            let bytes: &[u8] = ¤str_as_bytes(self);
+            let base: *const u8 = bytes.as_ptr();
+            let new_ptr: *const u8 = base.byte_add(r.start);
+            ¤make_str(new_ptr, new_len)
+        }
+    }
+}
+
+impl IndexMut<Range<usize>> for str {
+    fn index_mut(&mut self, r: Range<usize>) -> &mut str {
+        let len: usize = ¤str_len(self);
+        if r.start > r.end {
+            panic!("str range start > end")
+        }
+        if r.end > len {
+            panic!("str range end out of bounds")
+        }
+        if !self.is_char_boundary(r.start) {
+            panic!("str slice start is not a char boundary")
+        }
+        if !self.is_char_boundary(r.end) {
+            panic!("str slice end is not a char boundary")
+        }
+        let new_len: usize = r.end - r.start;
+        unsafe {
+            let bytes: &mut [u8] = ¤str_as_mut_bytes(self);
+            let base: *mut u8 = bytes.as_mut_ptr();
+            let new_ptr: *mut u8 = base.byte_add(r.start);
+            ¤make_mut_str(new_ptr, new_len)
+        }
+    }
+}
+
+impl Index<RangeFrom<usize>> for str {
+    type Output = str;
+    fn index(&self, r: RangeFrom<usize>) -> &str {
+        let len: usize = ¤str_len(self);
+        if r.start > len {
+            panic!("str range start out of bounds")
+        }
+        if !self.is_char_boundary(r.start) {
+            panic!("str slice start is not a char boundary")
+        }
+        let new_len: usize = len - r.start;
+        unsafe {
+            let bytes: &[u8] = ¤str_as_bytes(self);
+            let base: *const u8 = bytes.as_ptr();
+            let new_ptr: *const u8 = base.byte_add(r.start);
+            ¤make_str(new_ptr, new_len)
+        }
+    }
+}
+
+impl IndexMut<RangeFrom<usize>> for str {
+    fn index_mut(&mut self, r: RangeFrom<usize>) -> &mut str {
+        let len: usize = ¤str_len(self);
+        if r.start > len {
+            panic!("str range start out of bounds")
+        }
+        if !self.is_char_boundary(r.start) {
+            panic!("str slice start is not a char boundary")
+        }
+        let new_len: usize = len - r.start;
+        unsafe {
+            let bytes: &mut [u8] = ¤str_as_mut_bytes(self);
+            let base: *mut u8 = bytes.as_mut_ptr();
+            let new_ptr: *mut u8 = base.byte_add(r.start);
+            ¤make_mut_str(new_ptr, new_len)
+        }
+    }
+}
+
+impl Index<RangeTo<usize>> for str {
+    type Output = str;
+    fn index(&self, r: RangeTo<usize>) -> &str {
+        let len: usize = ¤str_len(self);
+        if r.end > len {
+            panic!("str range end out of bounds")
+        }
+        if !self.is_char_boundary(r.end) {
+            panic!("str slice end is not a char boundary")
+        }
+        unsafe {
+            let bytes: &[u8] = ¤str_as_bytes(self);
+            let base: *const u8 = bytes.as_ptr();
+            ¤make_str(base, r.end)
+        }
+    }
+}
+
+impl IndexMut<RangeTo<usize>> for str {
+    fn index_mut(&mut self, r: RangeTo<usize>) -> &mut str {
+        let len: usize = ¤str_len(self);
+        if r.end > len {
+            panic!("str range end out of bounds")
+        }
+        if !self.is_char_boundary(r.end) {
+            panic!("str slice end is not a char boundary")
+        }
+        unsafe {
+            let bytes: &mut [u8] = ¤str_as_mut_bytes(self);
+            let base: *mut u8 = bytes.as_mut_ptr();
+            ¤make_mut_str(base, r.end)
+        }
+    }
+}
+
+impl Index<RangeInclusive<usize>> for str {
+    type Output = str;
+    fn index(&self, r: RangeInclusive<usize>) -> &str {
+        let len: usize = ¤str_len(self);
+        if r.start > r.end {
+            panic!("str range start > end")
+        }
+        if r.end >= len {
+            panic!("str range end out of bounds")
+        }
+        let exclusive_end: usize = r.end + 1;
+        if !self.is_char_boundary(r.start) {
+            panic!("str slice start is not a char boundary")
+        }
+        if !self.is_char_boundary(exclusive_end) {
+            panic!("str slice end is not a char boundary")
+        }
+        let new_len: usize = exclusive_end - r.start;
+        unsafe {
+            let bytes: &[u8] = ¤str_as_bytes(self);
+            let base: *const u8 = bytes.as_ptr();
+            let new_ptr: *const u8 = base.byte_add(r.start);
+            ¤make_str(new_ptr, new_len)
+        }
+    }
+}
+
+impl IndexMut<RangeInclusive<usize>> for str {
+    fn index_mut(&mut self, r: RangeInclusive<usize>) -> &mut str {
+        let len: usize = ¤str_len(self);
+        if r.start > r.end {
+            panic!("str range start > end")
+        }
+        if r.end >= len {
+            panic!("str range end out of bounds")
+        }
+        let exclusive_end: usize = r.end + 1;
+        if !self.is_char_boundary(r.start) {
+            panic!("str slice start is not a char boundary")
+        }
+        if !self.is_char_boundary(exclusive_end) {
+            panic!("str slice end is not a char boundary")
+        }
+        let new_len: usize = exclusive_end - r.start;
+        unsafe {
+            let bytes: &mut [u8] = ¤str_as_mut_bytes(self);
+            let base: *mut u8 = bytes.as_mut_ptr();
+            let new_ptr: *mut u8 = base.byte_add(r.start);
+            ¤make_mut_str(new_ptr, new_len)
+        }
+    }
+}
+
+impl Index<RangeToInclusive<usize>> for str {
+    type Output = str;
+    fn index(&self, r: RangeToInclusive<usize>) -> &str {
+        let len: usize = ¤str_len(self);
+        if r.end >= len {
+            panic!("str range end out of bounds")
+        }
+        let exclusive_end: usize = r.end + 1;
+        if !self.is_char_boundary(exclusive_end) {
+            panic!("str slice end is not a char boundary")
+        }
+        unsafe {
+            let bytes: &[u8] = ¤str_as_bytes(self);
+            let base: *const u8 = bytes.as_ptr();
+            ¤make_str(base, exclusive_end)
+        }
+    }
+}
+
+impl IndexMut<RangeToInclusive<usize>> for str {
+    fn index_mut(&mut self, r: RangeToInclusive<usize>) -> &mut str {
+        let len: usize = ¤str_len(self);
+        if r.end >= len {
+            panic!("str range end out of bounds")
+        }
+        let exclusive_end: usize = r.end + 1;
+        if !self.is_char_boundary(exclusive_end) {
+            panic!("str slice end is not a char boundary")
+        }
+        unsafe {
+            let bytes: &mut [u8] = ¤str_as_mut_bytes(self);
+            let base: *mut u8 = bytes.as_mut_ptr();
+            ¤make_mut_str(base, exclusive_end)
+        }
+    }
+}
+
+impl Index<RangeFull> for str {
+    type Output = str;
+    fn index(&self, _r: RangeFull) -> &str {
+        let len: usize = ¤str_len(self);
+        unsafe {
+            let bytes: &[u8] = ¤str_as_bytes(self);
+            let base: *const u8 = bytes.as_ptr();
+            ¤make_str(base, len)
+        }
+    }
+}
+
+impl IndexMut<RangeFull> for str {
+    fn index_mut(&mut self, _r: RangeFull) -> &mut str {
+        let len: usize = ¤str_len(self);
+        unsafe {
+            let bytes: &mut [u8] = ¤str_as_mut_bytes(self);
+            let base: *mut u8 = bytes.as_mut_ptr();
+            ¤make_mut_str(base, len)
+        }
     }
 }
 

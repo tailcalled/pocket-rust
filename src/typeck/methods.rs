@@ -595,6 +595,23 @@ pub(super) fn check_method_call(
     let recv_is_ref = matches!(&recv_full, InferType::Ref { .. });
     let as_is_adjust = if recv_is_ref { ReceiverAdjust::ByRef } else { ReceiverAdjust::Move };
     levels.push((recv_full.clone(), as_is_adjust, LevelKind::AsIs));
+    // Mutable→shared downgrade: when recv is `&mut T`, also try `&T`.
+    // Mirrors Rust's auto-reborrow rule for method dispatch — lets a
+    // `&self` method be called on a `&mut T` binding without an
+    // explicit cast. ABI-wise this is a no-op (both refs are an i32
+    // address), so `ReceiverAdjust::ByRef` (the "pass through as-is"
+    // adjust) is the right pick.
+    if let InferType::Ref { inner, mutable: true, .. } = &recv_full {
+        levels.push((
+            InferType::Ref {
+                inner: inner.clone(),
+                mutable: false,
+                lifetime: crate::typeck::LifetimeRepr::Inferred(0),
+            },
+            ReceiverAdjust::ByRef,
+            LevelKind::AsIs,
+        ));
+    }
     levels.push((
         InferType::Ref {
             inner: Box::new(recv_full.clone()),

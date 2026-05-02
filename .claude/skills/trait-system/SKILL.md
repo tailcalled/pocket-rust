@@ -39,7 +39,7 @@ Symbolic dispatch through bounds (`check_method_call_symbolic`) uses the trait m
 
 ## Supertraits
 
-`trait Sub: Super1 + Super2 { ... }` declares `Sub` as a refinement of its supertraits. `TraitDef.supertraits: Vec<TraitBound>` carries the parsed bounds; `resolve_trait_methods` resolves each to a canonical path and stores them on `TraitEntry.supertraits`. `supertrait_closure(start, traits)` returns `[start] + transitive supertraits`, deduplicated (cycles break naturally on the dedup check).
+`trait Sub: Super1 + Super2 { ... }` declares `Sub` as a refinement of its supertraits. `TraitDef.supertraits: Vec<TraitBound>` carries the parsed bounds; `resolve_trait_methods` resolves each via `resolve_trait_ref` (paths + concrete arg types) and stores them on `TraitEntry.supertraits: Vec<SupertraitRef>` where each entry has `path: Vec<String>` plus `args: Vec<RType>` (the args reference the trait's own type-params and `Self`). `validate_supertrait_obligations` substitutes the impl's `trait_args` (and `Self → impl_target`) into each supertrait's args before calling `solve_impl_in_ctx_with_args`. Without arg-aware supertrait checks, `IndexMut<Range<usize>>: Index<Range<usize>>` would resolve against `Index<usize>` instead. `supertrait_closure(start, traits)` returns `[start] + transitive supertraits`, deduplicated (cycles break naturally on the dedup check). Supertrait `Self::Output` references in `IndexMut`'s body are resolved through `walk_resolve_self_proj`'s supertrait-aware branch — when a projection's trait_path is a supertrait of the trait being checked, it substitutes the impl's trait_args into the supertrait's args and looks up the matching impl row via `find_assoc_binding_with_args`.
 
 Three places consume the closure:
 1. `validate_supertrait_obligations` — run after all impls are registered; requires that every `impl Sub for T` row has matching `impl Super for T` rows for each supertrait. Uses `solve_impl_in_ctx` so generic impls like `impl<T: PartialEq> Eq for Wrap<T>` are satisfied by the matching generic PartialEq impl.
@@ -96,6 +96,7 @@ For each candidate (impl, method) the **effective receiver type** is `subst(meth
 
 Walk the chain in order; at each level, try to unify every candidate's effective recv type against the level. First level with at least one match wins; the level chosen drives `recv_adjust` directly:
 - level 0 → `ByRef` if recv is a Ref else `Move`
+- when recv is `&mut T`, also try `&T` at the same level → `ByRef` (mut→shared downgrade, ABI no-op since both refs are i32). Mirrors Rust's auto-reborrow rule: a `&self` method called on a `&mut T` binding is implicitly downgraded to `&T`.
 - `&recv_full` → `BorrowImm`
 - `&mut recv_full` → `BorrowMut`
 

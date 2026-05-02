@@ -2668,42 +2668,112 @@ fn check_index_expr(
         InferType::Ref { inner, .. } => (**inner).clone(),
         other => other.clone(),
     };
-    // Verify the index expression typechecks as `usize`.
+    // The index expression's type drives which `Index<Idx>` impl
+    // we look up (`Idx = usize` for element indexing, `Idx = Range<usize>`
+    // etc. for slicing). For unconstrained integer literals — the
+    // bare-int `v[0]` case AND nested ones like `s[1..4]` whose
+    // `Range<?int>` wraps unbound int vars — default every still-loose
+    // int-class var inside the idx type to `usize` before dispatch so
+    // the common shape (`Index<usize>` / `Index<Range<usize>>`) keeps
+    // working without explicit `0usize` / `1usize..4usize` annotations.
     let idx_ty = check_expr(ctx, index)?;
-    ctx.subst.unify(
-        &idx_ty,
-        &InferType::Int(IntKind::Usize),
-        ctx.traits,
-        ctx.type_params,
-        ctx.type_param_bounds,
-        &index.span,
-        ctx.current_file,
-    )?;
-    // Find the impl and read its Output assoc-type binding.
+    default_int_vars_to_usize(ctx, &idx_ty, &index.span)?;
+    let idx_rt = infer_to_rtype_for_check(&ctx.subst.substitute(&idx_ty));
     let lookup_rt = infer_to_rtype_for_check(&lookup_ty);
     let index_path = vec!["std".to_string(), "ops".to_string(), "Index".to_string()];
-    let bindings = traits::find_assoc_binding(ctx.traits, &lookup_rt, &index_path, "Output");
-    if bindings.is_empty() {
-        return Err(Error {
-            file: ctx.current_file.to_string(),
-            message: format!(
-                "the type `{}` cannot be indexed (no `Index` impl)",
-                infer_to_string(&lookup_ty)
-            ),
-            span: bracket_span.copy(),
-        });
+    let resolution = traits::solve_impl_with_args(
+        &index_path,
+        &vec![idx_rt.clone()],
+        &lookup_rt,
+        ctx.traits,
+        0,
+    );
+    let resolution = match resolution {
+        Some(r) => r,
+        None => {
+            return Err(Error {
+                file: ctx.current_file.to_string(),
+                message: format!(
+                    "the type `{}` cannot be indexed by `{}` (no matching `Index<{}>` impl)",
+                    rtype_to_string(&lookup_rt),
+                    rtype_to_string(&idx_rt),
+                    rtype_to_string(&idx_rt)
+                ),
+                span: bracket_span.copy(),
+            });
+        }
+    };
+    // Read the resolved impl's `Output` binding and substitute the
+    // impl's type-params using the resolution's subst.
+    let impl_row = &ctx.traits.impls[resolution.impl_idx];
+    let mut output_rt: Option<RType> = None;
+    let mut k = 0;
+    while k < impl_row.assoc_type_bindings.len() {
+        if impl_row.assoc_type_bindings[k].0 == "Output" {
+            output_rt = Some(substitute_rtype(
+                &impl_row.assoc_type_bindings[k].1,
+                &resolution.subst,
+            ));
+            break;
+        }
+        k += 1;
     }
-    if bindings.len() > 1 {
-        return Err(Error {
-            file: ctx.current_file.to_string(),
-            message: format!(
-                "ambiguous `Index` impl for `{}`",
-                infer_to_string(&lookup_ty)
-            ),
-            span: bracket_span.copy(),
-        });
+    let output_rt = output_rt.ok_or_else(|| Error {
+        file: ctx.current_file.to_string(),
+        message: format!(
+            "internal: `Index<{}> for {}` impl missing `Output` binding",
+            rtype_to_string(&idx_rt),
+            rtype_to_string(&lookup_rt)
+        ),
+        span: bracket_span.copy(),
+    })?;
+    Ok(rtype_to_infer(&output_rt))
+}
+
+// Walk an `InferType`, defaulting every still-unbound integer-class
+// `Var` to `usize`. Used at index sites so naked `arr[0]` and
+// `s[1..4]` (whose `Range<?int>` argument has unbound int vars
+// inside) pick `Index<usize>` / `Index<Range<usize>>` rather than
+// failing dispatch because `?int` won't have defaulted to `i32`
+// until end-of-fn.
+fn default_int_vars_to_usize(
+    ctx: &mut CheckCtx,
+    ty: &InferType,
+    span: &Span,
+) -> Result<(), Error> {
+    let resolved = ctx.subst.substitute(ty);
+    match &resolved {
+        InferType::Var(v) => {
+            if (*v as usize) < ctx.subst.is_num_lit.len() && ctx.subst.is_num_lit[*v as usize] {
+                ctx.subst.unify(
+                    ty,
+                    &InferType::Int(IntKind::Usize),
+                    ctx.traits,
+                    ctx.type_params,
+                    ctx.type_param_bounds,
+                    span,
+                    ctx.current_file,
+                )?;
+            }
+            Ok(())
+        }
+        InferType::Struct { type_args, .. } | InferType::Enum { type_args, .. } => {
+            for a in type_args {
+                default_int_vars_to_usize(ctx, a, span)?;
+            }
+            Ok(())
+        }
+        InferType::Ref { inner, .. } | InferType::RawPtr { inner, .. } => {
+            default_int_vars_to_usize(ctx, inner, span)
+        }
+        InferType::Tuple(elems) => {
+            for e in elems {
+                default_int_vars_to_usize(ctx, e, span)?;
+            }
+            Ok(())
+        }
+        _ => Ok(()),
     }
-    Ok(rtype_to_infer(&bindings[0]))
 }
 
 // `return EXPR` / `return`. EXPR (or `()` if absent) unifies against
@@ -3218,8 +3288,10 @@ fn check_builtin(
         "slice_ptr" => return check_builtin_slice_ptr(ctx, type_args, args, expr, false),
         "slice_mut_ptr" => return check_builtin_slice_ptr(ctx, type_args, args, expr, true),
         "str_len" => return check_builtin_str_len(ctx, type_args, args, expr),
-        "str_as_bytes" => return check_builtin_str_as_bytes(ctx, type_args, args, expr),
-        "make_str" => return check_builtin_make_str(ctx, type_args, args, expr),
+        "str_as_bytes" => return check_builtin_str_as_bytes(ctx, type_args, args, expr, false),
+        "str_as_mut_bytes" => return check_builtin_str_as_bytes(ctx, type_args, args, expr, true),
+        "make_str" => return check_builtin_make_str(ctx, type_args, args, expr, false),
+        "make_mut_str" => return check_builtin_make_str(ctx, type_args, args, expr, true),
         "ptr_usize_add" | "ptr_usize_sub" => {
             return check_builtin_ptr_usize_offset(ctx, name, type_args, args, expr);
         }
@@ -3455,31 +3527,37 @@ fn check_builtin_str_len(
         });
     }
     let arg_ty = check_expr(ctx, &args[0])?;
-    let expected = InferType::Ref {
-        inner: Box::new(InferType::Str),
-        mutable: false,
-        lifetime: LifetimeRepr::Inferred(0),
-    };
-    ctx.subst.unify(
-        &arg_ty,
-        &expected,
-        ctx.traits,
-        ctx.type_params,
-        ctx.type_param_bounds,
-        &args[0].span,
-        ctx.current_file,
-    )?;
+    // Accept either `&str` or `&mut str` — length read is mutability-
+    // agnostic. Mirrors `¤slice_len`'s behaviour for `&[T]`/`&mut [T]`.
+    let resolved = ctx.subst.substitute(&arg_ty);
+    let ok = matches!(
+        &resolved,
+        InferType::Ref { inner, .. } if matches!(inner.as_ref(), InferType::Str)
+    );
+    if !ok {
+        return Err(Error {
+            file: ctx.current_file.to_string(),
+            message: format!(
+                "builtin `¤str_len` first argument must be `&str` or `&mut str`, got `{}`",
+                infer_to_string(&resolved)
+            ),
+            span: args[0].span.copy(),
+        });
+    }
     Ok(rtype_to_infer(&RType::Int(IntKind::Usize)))
 }
 
-// `¤str_as_bytes(s: &str) -> &[u8]`. The fat-ref representation of
-// `&str` and `&[u8]` is bit-identical (both are (ptr, len) over u8
-// bytes), so codegen is a pure pass-through.
+// `¤str_as_bytes(s: &str) -> &[u8]` (mutable=false) and
+// `¤str_as_mut_bytes(s: &mut str) -> &mut [u8]` (mutable=true). The
+// fat-ref representation of `&str`/`&mut str` and `&[u8]`/`&mut [u8]`
+// is bit-identical (both are (ptr, len) over u8 bytes), so codegen
+// is a pure pass-through.
 fn check_builtin_str_as_bytes(
     ctx: &mut CheckCtx,
     type_args: &Vec<crate::ast::Type>,
     args: &Vec<Expr>,
     expr: &Expr,
+    mutable: bool,
 ) -> Result<InferType, Error> {
     if !type_args.is_empty() {
         return Err(Error {
@@ -3501,7 +3579,7 @@ fn check_builtin_str_as_bytes(
     let arg_ty = check_expr(ctx, &args[0])?;
     let expected = InferType::Ref {
         inner: Box::new(InferType::Str),
-        mutable: false,
+        mutable,
         lifetime: LifetimeRepr::Inferred(0),
     };
     ctx.subst.unify(
@@ -3515,25 +3593,28 @@ fn check_builtin_str_as_bytes(
     )?;
     Ok(InferType::Ref {
         inner: Box::new(InferType::Slice(Box::new(InferType::Int(IntKind::U8)))),
-        mutable: false,
+        mutable,
         lifetime: LifetimeRepr::Inferred(0),
     })
 }
 
-// `¤make_str(ptr: *const u8, len: usize) -> &str`. Constructs a fat
-// `&str` from raw parts. The caller is responsible for the UTF-8
-// invariant (currently unenforced — a `make_str` call site is fully
-// trusted). Codegen is a pure no-op (args already form the fat ref).
+// `¤make_str(ptr: *const u8, len: usize) -> &str` (mutable=false) and
+// `¤make_mut_str(ptr: *mut u8, len: usize) -> &mut str` (mutable=true).
+// Constructs a fat `&str`/`&mut str` from raw parts. UTF-8 invariant
+// is the caller's responsibility (unenforced). Codegen is a pure
+// no-op — args already form the fat ref.
 fn check_builtin_make_str(
     ctx: &mut CheckCtx,
     type_args: &Vec<crate::ast::Type>,
     args: &Vec<Expr>,
     expr: &Expr,
+    mutable: bool,
 ) -> Result<InferType, Error> {
+    let name = if mutable { "make_mut_str" } else { "make_str" };
     if !type_args.is_empty() {
         return Err(Error {
             file: ctx.current_file.to_string(),
-            message: "builtin `¤make_str` does not take type arguments".to_string(),
+            message: format!("builtin `¤{}` does not take type arguments", name),
             span: expr.span.copy(),
         });
     }
@@ -3541,7 +3622,8 @@ fn check_builtin_make_str(
         return Err(Error {
             file: ctx.current_file.to_string(),
             message: format!(
-                "builtin `¤make_str` takes 2 arguments (ptr, len), got {}",
+                "builtin `¤{}` takes 2 arguments (ptr, len), got {}",
+                name,
                 args.len()
             ),
             span: expr.span.copy(),
@@ -3551,7 +3633,7 @@ fn check_builtin_make_str(
     let arg1_ty = check_expr(ctx, &args[1])?;
     let expected0 = rtype_to_infer(&RType::RawPtr {
         inner: Box::new(RType::Int(IntKind::U8)),
-        mutable: false,
+        mutable,
     });
     ctx.subst.unify(
         &arg0_ty,
@@ -3574,7 +3656,7 @@ fn check_builtin_make_str(
     )?;
     Ok(InferType::Ref {
         inner: Box::new(InferType::Str),
-        mutable: false,
+        mutable,
         lifetime: LifetimeRepr::Inferred(0),
     })
 }
@@ -3985,9 +4067,9 @@ mod tables;
 pub use tables::{
     CallResolution, EnumEntry, EnumTable, EnumVariantEntry, FnSymbol, FuncTable, GenericTemplate,
     MethodResolution, MoveStatus, MovedPlace, RTypedField, ReceiverAdjust, StructEntry,
-    StructTable, TraitDispatch, TraitEntry, TraitImplEntry, TraitMethodEntry, TraitReceiverShape,
-    TraitTable, VariantPayloadResolved, enum_lookup, find_inherent_synth_idx, func_lookup,
-    struct_lookup, template_lookup, trait_lookup,
+    StructTable, SupertraitRef, TraitDispatch, TraitEntry, TraitImplEntry, TraitMethodEntry,
+    TraitReceiverShape, TraitTable, VariantPayloadResolved, enum_lookup, find_inherent_synth_idx,
+    func_lookup, struct_lookup, template_lookup, trait_lookup,
 };
 
 mod traits;

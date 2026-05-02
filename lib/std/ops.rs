@@ -4,25 +4,52 @@ pub trait Drop {
 
 // Indexing read: `arr[idx]` desugars at typeck/codegen to
 // `*Index::index(&arr, idx)`. The associated `Output` lets each impl
-// pick what it returns (typically the element type).
-//
-// Pocket-rust currently hardcodes the index type to `usize` (no
-// generic-trait support yet — `trait Index<Idx>` requires generic
-// trait parameters which the parser doesn't accept). When generic
-// traits land, the canonical signature is `trait Index<Idx> { type
-// Output; fn index(&self, idx: Idx) -> &Self::Output; }` and impls
-// are restated with `usize`.
-pub trait Index {
+// pick what it returns (the element type for `Idx = usize`, a
+// re-sliced `&Self` for the various `Range*<usize>` indices).
+pub trait Index<Idx> {
     type Output;
-    fn index(&self, idx: usize) -> &Self::Output;
+    fn index(&self, idx: Idx) -> &Self::Output;
 }
 
 // Indexing write: `arr[idx] = …` and `&mut arr[idx]` desugar to
 // `IndexMut::index_mut(&mut arr, idx)`. `IndexMut: Index` so the
 // shared-ref `index` is always available too.
-pub trait IndexMut: Index {
-    fn index_mut(&mut self, idx: usize) -> &mut Self::Output;
+pub trait IndexMut<Idx>: Index<Idx> {
+    fn index_mut(&mut self, idx: Idx) -> &mut Self::Output;
 }
+
+// Range literal types — produced at parse-time by the range-expr
+// desugar (`a..b`, `a..`, `..b`, `..`, `a..=b`, `..=b`). Each is a
+// plain struct so existing struct-lit / field-access machinery
+// handles construction and field reads. Slicing impls in
+// `lib/std/{vec,primitive/{slice,str}}.rs` accept these as `Idx`.
+pub struct Range<Idx> {
+    pub start: Idx,
+    pub end: Idx,
+}
+
+pub struct RangeFrom<Idx> {
+    pub start: Idx,
+}
+
+pub struct RangeTo<Idx> {
+    pub end: Idx,
+}
+
+pub struct RangeInclusive<Idx> {
+    pub start: Idx,
+    pub end: Idx,
+}
+
+pub struct RangeToInclusive<Idx> {
+    pub end: Idx,
+}
+
+// `..` — unbounded range. Unit struct: zero fields, byte_size 0,
+// flat layout `[]`. Constructed via the empty-struct-lit form
+// `RangeFull {}`, which is what the parser desugar emits for bare
+// `..`.
+pub struct RangeFull;
 
 // Smart-pointer dereference. `*box` for a `box: Box<T>` desugars at
 // typeck/codegen to `*Deref::deref(&box)` (where the call returns
