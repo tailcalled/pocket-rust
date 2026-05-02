@@ -208,6 +208,8 @@ mod enums;
 mod generics;
 mod if_exprs;
 mod int_literals;
+mod logical_ops;
+mod macros;
 mod let_stmts;
 mod modules;
 mod panic_macro;

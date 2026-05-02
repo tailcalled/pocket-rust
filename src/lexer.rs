@@ -86,6 +86,11 @@ pub enum TokenKind {
     StarEq,
     SlashEq,
     PercentEq,
+    // `&&` and `||` — short-circuiting boolean operators. Parsed
+    // below comparison precedence and desugared to if-else at parse
+    // time (`a && b` → `if a { b } else { false }`).
+    AndAnd,
+    OrOr,
     // `_` — wildcard / placeholder. Used by patterns (matches anything,
     // binds nothing) and `let _ = …;`. Lexed as a standalone token, not
     // an identifier — pure-`_` ident isn't a binding name.
@@ -176,6 +181,8 @@ pub fn token_kind_name(t: &TokenKind) -> &'static str {
         TokenKind::StarEq => "`*=`",
         TokenKind::SlashEq => "`/=`",
         TokenKind::PercentEq => "`%=`",
+        TokenKind::AndAnd => "`&&`",
+        TokenKind::OrOr => "`||`",
         TokenKind::NotEq => "`!=`",
         TokenKind::LtEq => "`<=`",
         TokenKind::GtEq => "`>=`",
@@ -518,6 +525,12 @@ pub fn tokenize(file: &str, source: &str) -> Result<Vec<Token>, Error> {
         } else if b == b'.' {
             push_single(&mut tokens, TokenKind::Dot, line, &mut col);
             byte_pos += 1;
+        } else if b == b'&' && (byte_pos + 1) < bytes.len() && bytes[byte_pos + 1] == b'&' {
+            let start = Pos::new(line, col);
+            col += 2;
+            let end = Pos::new(line, col);
+            tokens.push(Token { kind: TokenKind::AndAnd, span: Span::new(start, end) });
+            byte_pos += 2;
         } else if b == b'&' {
             push_single(&mut tokens, TokenKind::Amp, line, &mut col);
             byte_pos += 1;
@@ -887,6 +900,12 @@ pub fn tokenize(file: &str, source: &str) -> Result<Vec<Token>, Error> {
         } else if b == b':' {
             push_single(&mut tokens, TokenKind::Colon, line, &mut col);
             byte_pos += 1;
+        } else if b == b'|' && (byte_pos + 1) < bytes.len() && bytes[byte_pos + 1] == b'|' {
+            let start = Pos::new(line, col);
+            col += 2;
+            let end = Pos::new(line, col);
+            tokens.push(Token { kind: TokenKind::OrOr, span: Span::new(start, end) });
+            byte_pos += 2;
         } else if b == b'|' {
             push_single(&mut tokens, TokenKind::Pipe, line, &mut col);
             byte_pos += 1;

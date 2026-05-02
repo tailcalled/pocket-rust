@@ -1178,6 +1178,23 @@ impl Parser {
                 });
             }
         }
+        // In type position, `&&T` means `& &T` (a ref to a ref), not
+        // logical-AND. Split the `&&` token into two `&`s so the
+        // existing single-`&` branch below handles the inner ref.
+        if self.peek_kind(&TokenKind::AndAnd) {
+            let span = self.tokens[self.pos].span.copy();
+            let mid = Pos::new(span.start.line, span.start.col + 1);
+            let first = Token {
+                kind: TokenKind::Amp,
+                span: Span::new(span.start.copy(), mid.copy()),
+            };
+            let second = Token {
+                kind: TokenKind::Amp,
+                span: Span::new(mid, span.end.copy()),
+            };
+            self.tokens[self.pos] = first;
+            self.tokens.insert(self.pos + 1, second);
+        }
         if self.peek_kind(&TokenKind::Amp) {
             let amp_span = self.expect(&TokenKind::Amp, "`&`")?;
             let lifetime = if self.peek_lifetime() {
@@ -1410,7 +1427,73 @@ impl Parser {
     }
 
     fn parse_expr(&mut self) -> Result<Expr, Error> {
-        self.parse_comparison()
+        self.parse_logical_or()
+    }
+
+    // `||` and `&&` short-circuit. Desugar at parse-time to if-else
+    // expressions (`a && b` → `if a { b } else { false }`, `a || b`
+    // → `if a { true } else { b }`) so semantics — including the
+    // skipping of the rhs when the lhs decides the result — fall out
+    // of the existing if-expr machinery. Precedence: `||` lowest, then
+    // `&&`, then comparisons (matches Rust).
+    fn parse_logical_or(&mut self) -> Result<Expr, Error> {
+        let mut expr = self.parse_logical_and()?;
+        while self.peek_kind(&TokenKind::OrOr) {
+            self.pos += 1;
+            let rhs = self.parse_logical_and()?;
+            expr = self.build_short_circuit(expr, rhs, /*is_and=*/ false);
+        }
+        Ok(expr)
+    }
+
+    fn parse_logical_and(&mut self) -> Result<Expr, Error> {
+        let mut expr = self.parse_comparison()?;
+        while self.peek_kind(&TokenKind::AndAnd) {
+            self.pos += 1;
+            let rhs = self.parse_comparison()?;
+            expr = self.build_short_circuit(expr, rhs, /*is_and=*/ true);
+        }
+        Ok(expr)
+    }
+
+    // Build `if lhs { rhs } else { false }` (AND) or `if lhs { true }
+    // else { rhs }` (OR). Each synthesized expression gets a fresh
+    // node id so typeck's per-Expr.id artifacts line up.
+    fn build_short_circuit(&mut self, lhs: Expr, rhs: Expr, is_and: bool) -> Expr {
+        let span = Span::new(lhs.span.start.copy(), rhs.span.end.copy());
+        let bool_lit = |this: &mut Self, value: bool, sp: Span| -> Expr {
+            let id = this.alloc_node_id();
+            Expr {
+                kind: ExprKind::BoolLit(value),
+                span: sp,
+                id,
+            }
+        };
+        let mk_block = |expr: Expr, sp: Span| -> Block {
+            Block {
+                stmts: Vec::new(),
+                tail: Some(expr),
+                span: sp,
+            }
+        };
+        let (then_expr, else_expr) = if is_and {
+            (rhs, bool_lit(self, false, span.copy()))
+        } else {
+            (bool_lit(self, true, span.copy()), rhs)
+        };
+        let then_span = then_expr.span.copy();
+        let else_span = else_expr.span.copy();
+        let if_expr = IfExpr {
+            cond: Box::new(lhs),
+            then_block: Box::new(mk_block(then_expr, then_span)),
+            else_block: Box::new(mk_block(else_expr, else_span)),
+        };
+        let id = self.alloc_node_id();
+        Expr {
+            kind: ExprKind::If(if_expr),
+            span,
+            id,
+        }
     }
 
     // Comparison ops are non-associative (precedence layer right above
@@ -1618,6 +1701,28 @@ impl Parser {
                 kind: ExprKind::MethodCall(MethodCall {
                     receiver: Box::new(inner),
                     method: "neg".to_string(),
+                    method_span: op_span,
+                    turbofish_args: Vec::new(),
+                    args: Vec::new(),
+                }),
+                span,
+                id,
+            });
+        }
+        // Prefix `!` — boolean / bitwise NOT. Desugars to `inner.not()`,
+        // dispatched via `std::ops::Not`. Distinguished from the
+        // `name!(args)` macro form by macro detection happening in
+        // `parse_path_atom` which only fires when the `!` follows an
+        // ident-path; bare `!` here is always a unary operator.
+        if self.peek_kind(&TokenKind::Bang) {
+            let op_span = self.expect(&TokenKind::Bang, "`!`")?;
+            let inner = self.parse_unary()?;
+            let span = Span::new(op_span.start.copy(), inner.span.end.copy());
+            let id = self.alloc_node_id();
+            return Ok(Expr {
+                kind: ExprKind::MethodCall(MethodCall {
+                    receiver: Box::new(inner),
+                    method: "not".to_string(),
                     method_span: op_span,
                     turbofish_args: Vec::new(),
                     args: Vec::new(),
@@ -2270,19 +2375,37 @@ impl Parser {
     fn parse_path_atom(&mut self) -> Result<Expr, Error> {
         let path = self.parse_path()?;
         let had_turbofish = path.segments.iter().any(|s| !s.args.is_empty());
-        // `name!(args)` — macro invocation. Single-segment path
-        // followed by `!` then `(args)`. The call-args parser
-        // accepts the same shapes as a normal call.
-        if path.segments.len() == 1
+        // `name!(args)` / `name![args]` — macro invocation. Single-
+        // segment path followed by `!` and an open delimiter. Both
+        // bracket forms parse identical args (comma-separated exprs);
+        // `[]` is what `vec![…]` uses.
+        let macro_paren = path.segments.len() == 1
             && !had_turbofish
-            && self.peek_two(&TokenKind::Bang, &TokenKind::LParen)
-        {
+            && self.peek_two(&TokenKind::Bang, &TokenKind::LParen);
+        let macro_bracket = path.segments.len() == 1
+            && !had_turbofish
+            && self.peek_two(&TokenKind::Bang, &TokenKind::LBracket);
+        if macro_paren || macro_bracket {
             let bang_span = self.expect(&TokenKind::Bang, "`!`")?;
-            let args = self.parse_call_args()?;
+            let args = if macro_paren {
+                self.parse_call_args()?
+            } else {
+                self.parse_macro_bracket_args()?
+            };
             let end = self.tokens[self.pos - 1].span.end.copy();
             let span = Span::new(path.span.start.copy(), end);
-            let id = self.alloc_node_id();
             let _ = bang_span;
+            // `vec![a, b, c]` desugars to a block expression at parse
+            // time: `{ let mut __pr_vec_<id> = Vec::new(); __v.push(a);
+            // __v.push(b); __v.push(c); __v }`. The block's value is
+            // the freshly built Vec. Empty `vec![]` is just
+            // `Vec::new()` (the let + tail still produce that). Type
+            // inference fills T from the pushed elements (or from
+            // surrounding context if `vec![]`).
+            if path.segments[0].name == "vec" {
+                return Ok(self.desugar_vec_macro(args, span));
+            }
+            let id = self.alloc_node_id();
             return Ok(Expr {
                 kind: ExprKind::MacroCall {
                     name: path.segments[0].name.clone(),
@@ -2351,6 +2474,111 @@ impl Parser {
         self.pos + 1 < self.tokens.len()
             && Self::kind_eq(&self.tokens[self.pos].kind, a)
             && Self::kind_eq(&self.tokens[self.pos + 1].kind, b)
+    }
+
+    fn parse_macro_bracket_args(&mut self) -> Result<Vec<Expr>, Error> {
+        self.expect(&TokenKind::LBracket, "`[`")?;
+        if self.peek_kind(&TokenKind::RBracket) {
+            self.pos += 1;
+            return Ok(Vec::new());
+        }
+        let mut args = Vec::new();
+        args.push(self.parse_expr()?);
+        while self.peek_kind(&TokenKind::Comma) {
+            self.pos += 1;
+            if self.peek_kind(&TokenKind::RBracket) {
+                break;
+            }
+            args.push(self.parse_expr()?);
+        }
+        self.expect(&TokenKind::RBracket, "`]`")?;
+        Ok(args)
+    }
+
+    // Build the AST for `{ let mut <var> = Vec::new(); <var>.push(a);
+    // <var>.push(b); …; <var> }`. All freshly synthesized expressions
+    // get fresh node IDs so typeck's per-Expr.id artifacts (expr_types,
+    // method_resolutions, …) line up. The temporary's name is
+    // disambiguated with the outer macro's node id so multiple
+    // `vec![…]` invocations in the same function don't shadow each
+    // other.
+    fn desugar_vec_macro(&mut self, args: Vec<Expr>, span: Span) -> Expr {
+        let outer_id = self.alloc_node_id();
+        let var_name = format!("__pr_vec_{}", outer_id);
+        let mk_var = |this: &mut Self| -> Expr {
+            let id = this.alloc_node_id();
+            Expr {
+                kind: ExprKind::Var(var_name.clone()),
+                span: span.copy(),
+                id,
+            }
+        };
+        // `Vec::new()` — Call with two-segment path.
+        let new_call = {
+            let id = self.alloc_node_id();
+            let path = Path {
+                segments: vec![
+                    PathSegment {
+                        name: "Vec".to_string(),
+                        span: span.copy(),
+                        lifetime_args: Vec::new(),
+                        args: Vec::new(),
+                    },
+                    PathSegment {
+                        name: "new".to_string(),
+                        span: span.copy(),
+                        lifetime_args: Vec::new(),
+                        args: Vec::new(),
+                    },
+                ],
+                span: span.copy(),
+            };
+            Expr {
+                kind: ExprKind::Call(Call {
+                    callee: path,
+                    args: Vec::new(),
+                }),
+                span: span.copy(),
+                id,
+            }
+        };
+        let let_stmt = Stmt::Let(LetStmt {
+            name: var_name.clone(),
+            name_span: span.copy(),
+            mutable: true,
+            ty: None,
+            value: new_call,
+        });
+        let mut stmts: Vec<Stmt> = vec![let_stmt];
+        let mut i = 0;
+        while i < args.len() {
+            let recv = mk_var(self);
+            let push_id = self.alloc_node_id();
+            let push_call = Expr {
+                kind: ExprKind::MethodCall(MethodCall {
+                    receiver: Box::new(recv),
+                    method: "push".to_string(),
+                    method_span: span.copy(),
+                    turbofish_args: Vec::new(),
+                    args: vec![args[i].clone()],
+                }),
+                span: span.copy(),
+                id: push_id,
+            };
+            stmts.push(Stmt::Expr(push_call));
+            i += 1;
+        }
+        let tail = mk_var(self);
+        let block = Block {
+            stmts,
+            tail: Some(tail),
+            span: span.copy(),
+        };
+        Expr {
+            kind: ExprKind::Block(Box::new(block)),
+            span,
+            id: outer_id,
+        }
     }
 
     fn parse_call_args(&mut self) -> Result<Vec<Expr>, Error> {
@@ -2616,6 +2844,8 @@ impl Parser {
             (TokenKind::StarEq, TokenKind::StarEq) => true,
             (TokenKind::SlashEq, TokenKind::SlashEq) => true,
             (TokenKind::PercentEq, TokenKind::PercentEq) => true,
+            (TokenKind::AndAnd, TokenKind::AndAnd) => true,
+            (TokenKind::OrOr, TokenKind::OrOr) => true,
             (TokenKind::NotEq, TokenKind::NotEq) => true,
             (TokenKind::LtEq, TokenKind::LtEq) => true,
             (TokenKind::GtEq, TokenKind::GtEq) => true,

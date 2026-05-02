@@ -21,6 +21,7 @@ pub use crate::ops::Mul;
 pub use crate::ops::Div;
 pub use crate::ops::Rem;
 pub use crate::ops::Neg;
+pub use crate::ops::Not;
 pub use crate::ops::AddAssign;
 pub use crate::ops::SubAssign;
 pub use crate::ops::MulAssign;

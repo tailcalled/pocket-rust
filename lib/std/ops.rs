@@ -70,6 +70,24 @@ pub trait Neg {
     fn neg(self) -> Self::Output;
 }
 
+// Unary `!` prefix operator. Desugars `!x` to `x.not()`. Used by
+// `bool` (boolean negation) and the integer kinds (bitwise NOT —
+// pocket-rust's `bool_not` builtin handles bool; integer bitwise NOT
+// is a TODO since it needs `iN.const -1` + `iN.xor`).
+pub trait Not {
+    type Output;
+    fn not(self) -> Self::Output;
+}
+
+impl Not for bool {
+    type Output = bool;
+    fn not(self) -> bool { ¤bool_not(self) }
+}
+
+// TODO: impl Not for u8/i8/.../u128/i128/usize/isize — needs an
+// `¤<T>_not` builtin or an `xor(self, !0)` desugar; today only bool's
+// `!` is supported.
+
 // Compound-assignment traits (`a += b` desugars to
 // `AddAssign::add_assign(&mut a, b)` and similarly for the other
 // four). The receiver is `&mut self` and the method returns no value;
