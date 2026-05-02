@@ -92,6 +92,41 @@ pub fn resolve_type(
                     i += 1;
                 }
             }
+            // Two-segment path whose first segment is `Self` or a known
+            // type-param: parse as an associated-type projection
+            // (`Self::Item` / `T::Item`). The second segment is the
+            // assoc name; trait_path is left empty here — it's filled
+            // in either by the impl-method-validation pass (using the
+            // impl's trait) or by the body-checking pass (resolving
+            // through the type-param's bounds, which carry the trait).
+            if path.segments.len() == 2 && path.segments[1].args.is_empty()
+                && path.segments[1].lifetime_args.is_empty()
+            {
+                let head = &path.segments[0].name;
+                let tail = &path.segments[1].name;
+                if head == "Self" {
+                    let base = match self_target {
+                        Some(rt) => rt.clone(),
+                        None => RType::Param("Self".to_string()),
+                    };
+                    return Ok(RType::AssocProj {
+                        base: Box::new(base),
+                        trait_path: Vec::new(),
+                        name: tail.clone(),
+                    });
+                }
+                let mut i = 0;
+                while i < type_params.len() {
+                    if type_params[i] == *head {
+                        return Ok(RType::AssocProj {
+                            base: Box::new(RType::Param(head.clone())),
+                            trait_path: Vec::new(),
+                            name: tail.clone(),
+                        });
+                    }
+                    i += 1;
+                }
+            }
             // Try use-table resolution: probe for both struct and enum
             // entries (a use-imported name could be either).
             let raw_segs: Vec<String> =

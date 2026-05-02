@@ -1,9 +1,9 @@
 use crate::ast::{
-    AssignStmt, Block, Call, EnumDef, EnumVariant, Expr, ExprKind, FieldAccess, FieldInit,
-    FieldPattern, Function, IfExpr, IfLetExpr, ImplBlock, LetStmt, Lifetime, LifetimeParam,
-    MatchArm, MatchExpr, MethodCall, Param, Path, PathSegment, Pattern, PatternKind, Stmt,
-    StructDef, StructField, StructLit, TraitBound, TraitDef, TraitMethodSig, Type, TypeKind,
-    TypeParam, UseDecl, UseTree, VariantPayload,
+    AssignStmt, AssocConstraint, Block, Call, EnumDef, EnumVariant, Expr, ExprKind, FieldAccess,
+    FieldInit, FieldPattern, Function, IfExpr, IfLetExpr, ImplAssocType, ImplBlock, LetStmt,
+    Lifetime, LifetimeParam, MatchArm, MatchExpr, MethodCall, Param, Path, PathSegment, Pattern,
+    PatternKind, Stmt, StructDef, StructField, StructLit, TraitAssocType, TraitBound, TraitDef,
+    TraitMethodSig, Type, TypeKind, TypeParam, UseDecl, UseTree, VariantPayload,
 };
 use crate::lexer::{Token, TokenKind, token_kind_name};
 use crate::span::{Error, Pos, Span};
@@ -241,7 +241,21 @@ impl Parser {
         };
         self.expect(&TokenKind::LBrace, "`{`")?;
         let mut methods: Vec<Function> = Vec::new();
+        let mut assoc_type_bindings: Vec<ImplAssocType> = Vec::new();
         while !self.peek_kind(&TokenKind::RBrace) {
+            if self.peek_kind(&TokenKind::Type) {
+                self.pos += 1;
+                let (aname, aname_span) = self.expect_ident()?;
+                self.expect(&TokenKind::Eq, "`=`")?;
+                let aty = self.parse_type()?;
+                self.expect(&TokenKind::Semi, "`;`")?;
+                assoc_type_bindings.push(ImplAssocType {
+                    name: aname,
+                    name_span: aname_span,
+                    ty: aty,
+                });
+                continue;
+            }
             // Optional `pub` on inherent impl methods. For trait
             // impls, methods inherit the trait's visibility — `pub`
             // is silently allowed but doesn't change anything beyond
@@ -262,7 +276,9 @@ impl Parser {
                 self.pos
             };
             if next >= self.tokens.len() || !matches!(self.tokens[next].kind, TokenKind::Fn) {
-                return Err(self.error_at_current("expected `fn` inside `impl` block"));
+                return Err(self.error_at_current(
+                    "expected `fn` or `type` inside `impl` block",
+                ));
             }
             methods.push(self.parse_function_with_vis(method_is_pub)?);
         }
@@ -273,6 +289,7 @@ impl Parser {
             trait_path,
             target,
             methods,
+            assoc_type_bindings,
             span: Span::new(impl_span.start, rb.end),
         })
     }
@@ -295,9 +312,22 @@ impl Parser {
         }
         self.expect(&TokenKind::LBrace, "`{`")?;
         let mut methods: Vec<TraitMethodSig> = Vec::new();
+        let mut assoc_types: Vec<TraitAssocType> = Vec::new();
         while !self.peek_kind(&TokenKind::RBrace) {
+            if self.peek_kind(&TokenKind::Type) {
+                self.pos += 1;
+                let (aname, aname_span) = self.expect_ident()?;
+                self.expect(&TokenKind::Semi, "`;`")?;
+                assoc_types.push(TraitAssocType {
+                    name: aname,
+                    name_span: aname_span,
+                });
+                continue;
+            }
             if !self.peek_kind(&TokenKind::Fn) {
-                return Err(self.error_at_current("expected `fn` inside `trait` body"));
+                return Err(self.error_at_current(
+                    "expected `fn` or `type` inside `trait` body",
+                ));
             }
             methods.push(self.parse_trait_method_sig()?);
         }
@@ -307,6 +337,7 @@ impl Parser {
             name_span,
             supertraits,
             methods,
+            assoc_types,
             span: Span::new(trait_kw.start, rb.end),
             is_pub,
         })
@@ -965,11 +996,35 @@ impl Parser {
     }
 
     fn parse_trait_bound(&mut self) -> Result<TraitBound, Error> {
-        // For now: a bound is just a path (e.g. `Show` or `crate::Foo`). Trait
-        // generic args (e.g. `Iterator<Item>`) aren't supported yet — we only
-        // recognize path-shaped bounds.
-        let path = self.parse_path_with_type_args()?;
-        Ok(TraitBound { path })
+        // A bound is either `Path` (plain) or `Path<Name = Type, …>`
+        // (associated-type constraints). The bound's path itself doesn't
+        // carry generic type args today — `Trait<…>` brackets parse only
+        // as `Name = Type` pairs. (Plain trait generic args like
+        // `Foo<i32>` aren't supported on bounds yet — would need
+        // disambiguation against the assoc-constraint syntax.)
+        let path = self.parse_path()?;
+        let mut assoc_constraints: Vec<AssocConstraint> = Vec::new();
+        if self.peek_kind(&TokenKind::LAngle) {
+            self.pos += 1;
+            // Empty `<>` is allowed but pointless; loop until `>`.
+            while !self.peek_kind(&TokenKind::RAngle) {
+                let (cname, cname_span) = self.expect_ident()?;
+                self.expect(&TokenKind::Eq, "`=` (associated-type constraint)")?;
+                let cty = self.parse_type()?;
+                assoc_constraints.push(AssocConstraint {
+                    name: cname,
+                    name_span: cname_span,
+                    ty: cty,
+                });
+                if self.peek_kind(&TokenKind::Comma) {
+                    self.pos += 1;
+                } else {
+                    break;
+                }
+            }
+            self.expect(&TokenKind::RAngle, "`>`")?;
+        }
+        Ok(TraitBound { path, assoc_constraints })
     }
 
     fn parse_params(&mut self) -> Result<Vec<Param>, Error> {
@@ -1068,12 +1123,18 @@ impl Parser {
             return self.parse_tuple_type();
         }
         if self.peek_kind(&TokenKind::SelfUpper) {
-            let span = self.tokens[self.pos].span.copy();
-            self.pos += 1;
-            return Ok(Type {
-                kind: TypeKind::SelfType,
-                span,
-            });
+            // Bare `Self` → SelfType. `Self::Name` → fall through to
+            // path parsing (`parse_path_with_type_args` handles the
+            // `Self` segment via `expect_path_segment`); resolution
+            // of the assoc-type projection happens at typeck time.
+            if !self.peek_two(&TokenKind::SelfUpper, &TokenKind::PathSep) {
+                let span = self.tokens[self.pos].span.copy();
+                self.pos += 1;
+                return Ok(Type {
+                    kind: TypeKind::SelfType,
+                    span,
+                });
+            }
         }
         if self.peek_kind(&TokenKind::Amp) {
             let amp_span = self.expect(&TokenKind::Amp, "`&`")?;
@@ -2335,6 +2396,7 @@ impl Parser {
             (TokenKind::Unsafe, TokenKind::Unsafe) => true,
             (TokenKind::Impl, TokenKind::Impl) => true,
             (TokenKind::Trait, TokenKind::Trait) => true,
+            (TokenKind::Type, TokenKind::Type) => true,
             (TokenKind::For, TokenKind::For) => true,
             (TokenKind::Plus, TokenKind::Plus) => true,
             (TokenKind::SelfLower, TokenKind::SelfLower) => true,

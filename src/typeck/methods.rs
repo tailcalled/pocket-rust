@@ -9,13 +9,25 @@ use super::{
 use crate::ast::Expr;
 use crate::span::{Error, Span};
 
+// Shape of a receiver passed through symbolic (Param-bound) dispatch:
+// owned `T`, `&T`, or `&mut T`. Drives the recv-adjust derivation
+// against the trait method's declared receiver shape.
+#[derive(Clone, Copy)]
+enum SymRecvShape {
+    Owned,
+    SharedRef,
+    MutRef,
+}
+
 fn check_method_call_symbolic(
     ctx: &mut CheckCtx,
     mc: &crate::ast::MethodCall,
     call_expr: &Expr,
     param_name: String,
-    recv_through_mut_ref: bool,
+    recv_shape: SymRecvShape,
 ) -> Result<InferType, Error> {
+    let recv_through_mut_ref = matches!(recv_shape, SymRecvShape::MutRef);
+    let recv_through_shared_ref = matches!(recv_shape, SymRecvShape::SharedRef);
     // Find the param's index in ctx.type_params.
     let mut idx: Option<usize> = None;
     let mut i = 0;
@@ -57,7 +69,7 @@ fn check_method_call_symbolic(
         call_expr,
         InferType::Param(param_name.clone()),
         matching_traits,
-        recv_through_mut_ref,
+        recv_shape,
         param_name,
     )
 }
@@ -112,9 +124,11 @@ fn dispatch_method_through_trait(
     call_expr: &Expr,
     recv_self_infer: InferType,
     matching_traits: Vec<Vec<String>>,
-    recv_through_mut_ref: bool,
+    recv_shape: SymRecvShape,
     display_name: String,
 ) -> Result<InferType, Error> {
+    let recv_through_mut_ref = matches!(recv_shape, SymRecvShape::MutRef);
+    let recv_through_shared_ref = matches!(recv_shape, SymRecvShape::SharedRef);
     let param_name = display_name;
     if matching_traits.is_empty() {
         return Err(Error {
@@ -289,9 +303,11 @@ fn dispatch_method_through_trait(
             ReceiverAdjust::Move
         }
         Some(TraitReceiverShape::BorrowImm) => {
-            if recv_through_mut_ref {
+            if recv_through_mut_ref || recv_through_shared_ref {
+                // Recv is already a ref — pass it as-is, no autoref.
                 ReceiverAdjust::ByRef
             } else {
+                // Owned recv → take its address.
                 ReceiverAdjust::BorrowImm
             }
         }
@@ -349,7 +365,15 @@ fn dispatch_method_through_trait(
     // return `()`.
     let _ = call_expr;
     let infer = match &trait_return_type {
-        Some(ret_rt) => infer_substitute(&rtype_to_infer(ret_rt), &method_subst),
+        Some(ret_rt) => {
+            let raw = infer_substitute(&rtype_to_infer(ret_rt), &method_subst);
+            crate::typeck::infer_concretize_assoc_proj(
+                &raw,
+                ctx.traits,
+                ctx.type_params,
+                ctx.type_param_bound_assoc,
+            )
+        }
         None => InferType::Tuple(Vec::new()),
     };
     Ok(infer)
@@ -365,17 +389,22 @@ pub(super) fn check_method_call(
     // T2: handle symbolic dispatch when recv is `Param(T)` — find the
     // method via T's trait bounds.
     if let InferType::Param(name) = &resolved_recv {
-        return check_method_call_symbolic(ctx, mc, call_expr, name.clone(), false);
+        return check_method_call_symbolic(
+            ctx,
+            mc,
+            call_expr,
+            name.clone(),
+            SymRecvShape::Owned,
+        );
     }
     if let InferType::Ref { inner, mutable, .. } = &resolved_recv {
         if let InferType::Param(name) = inner.as_ref() {
-            return check_method_call_symbolic(
-                ctx,
-                mc,
-                call_expr,
-                name.clone(),
-                *mutable,
-            );
+            let shape = if *mutable {
+                SymRecvShape::MutRef
+            } else {
+                SymRecvShape::SharedRef
+            };
+            return check_method_call_symbolic(ctx, mc, call_expr, name.clone(), shape);
         }
     }
     // Method on an unbound integer literal var (e.g. `30 + 12` or
@@ -398,7 +427,7 @@ pub(super) fn check_method_call(
                 call_expr,
                 InferType::Var(*v),
                 matching,
-                false,
+                SymRecvShape::Owned,
                 "integer".to_string(),
             );
         }
@@ -412,13 +441,18 @@ pub(super) fn check_method_call(
                     &vec![num_path],
                     &mc.method,
                 );
+                let shape = if *mutable {
+                    SymRecvShape::MutRef
+                } else {
+                    SymRecvShape::SharedRef
+                };
                 return dispatch_method_through_trait(
                     ctx,
                     mc,
                     call_expr,
                     InferType::Var(*v),
                     matching,
-                    *mutable,
+                    shape,
                     "integer".to_string(),
                 );
             }
@@ -929,5 +963,11 @@ fn collect_sized_required_params(t: &RType, sized_ctx: bool, out: &mut Vec<Strin
             collect_sized_required_params(inner, true, out);
         }
         RType::Int(_) | RType::Bool | RType::Str => {}
+        RType::AssocProj { .. } => {
+            // Conservative: an unconcretized projection isn't itself a
+            // bare Param binding, so we don't collect anything from it
+            // (the projection's own base param has already been visited
+            // in its enclosing context if relevant).
+        }
     }
 }

@@ -74,7 +74,19 @@ pub struct ImplBlock {
     // allowed (e.g., `&T`, `*const T`).
     pub target: Type,
     pub methods: Vec<Function>,
+    // `type Name = Type;` bindings inside the impl body. Trait impls
+    // must provide one binding per associated type the trait declares;
+    // inherent impls are not allowed to declare any.
+    pub assoc_type_bindings: Vec<ImplAssocType>,
     pub span: Span,
+}
+
+// `type Name = ConcreteType;` inside an impl body.
+#[derive(Clone)]
+pub struct ImplAssocType {
+    pub name: String,
+    pub name_span: Span,
+    pub ty: Type,
 }
 
 #[derive(Clone)]
@@ -83,8 +95,18 @@ pub struct TraitDef {
     pub name_span: Span,
     pub supertraits: Vec<TraitBound>,
     pub methods: Vec<TraitMethodSig>,
+    // `type Name;` declarations inside the trait body. Each impl of
+    // this trait must bind every name listed here.
+    pub assoc_types: Vec<TraitAssocType>,
     pub span: Span,
     pub is_pub: bool,
+}
+
+// `type Name;` inside a trait body. No defaults, no bounds yet.
+#[derive(Clone)]
+pub struct TraitAssocType {
+    pub name: String,
+    pub name_span: Span,
 }
 
 #[derive(Clone)]
@@ -100,6 +122,18 @@ pub struct TraitMethodSig {
 #[derive(Clone)]
 pub struct TraitBound {
     pub path: Path,
+    // `Trait<Name = Type>` constraints. Each entry pins one of the
+    // trait's associated types to a specific type at the bound site.
+    // Empty for plain `Trait` bounds.
+    pub assoc_constraints: Vec<AssocConstraint>,
+}
+
+// `Name = Type` inside a `Trait<…>` bound.
+#[derive(Clone)]
+pub struct AssocConstraint {
+    pub name: String,
+    pub name_span: Span,
+    pub ty: Type,
 }
 
 #[derive(Clone)]

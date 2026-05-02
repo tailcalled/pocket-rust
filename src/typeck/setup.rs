@@ -46,6 +46,12 @@ pub(super) fn collect_trait_names(module: &Module, path: &mut Vec<String>, table
                     });
                     k += 1;
                 }
+                let mut assoc_type_names: Vec<String> = Vec::new();
+                let mut at_i = 0;
+                while at_i < td.assoc_types.len() {
+                    assoc_type_names.push(td.assoc_types[at_i].name.clone());
+                    at_i += 1;
+                }
                 table.entries.push(TraitEntry {
                     path: full,
                     name_span: td.name_span.copy(),
@@ -53,6 +59,7 @@ pub(super) fn collect_trait_names(module: &Module, path: &mut Vec<String>, table
                     methods,
                     is_pub: td.is_pub,
                     supertraits: Vec::new(),
+                    assoc_types: assoc_type_names,
                 });
             }
             Item::Module(m) => {
@@ -575,6 +582,22 @@ pub(super) fn collect_funcs(
                             traits,
                             &module.source_file,
                         )?;
+                        // Resolve & validate `type Name = T;` bindings
+                        // against the trait's declared assoc_types. Must
+                        // cover every name, no extras, no duplicates.
+                        let assoc_bindings = resolve_and_validate_assoc_bindings(
+                            ib,
+                            &trait_full,
+                            &target_rt,
+                            path,
+                            structs,
+                            enums,
+                            traits,
+                            &impl_type_params,
+                            &use_scope,
+                            reexports,
+                            &module.source_file,
+                        )?;
                         let idx = traits.impls.len();
                         register_trait_impl(
                             ib,
@@ -583,6 +606,7 @@ pub(super) fn collect_funcs(
                             &impl_type_params,
                             &impl_lifetime_params,
                             &impl_type_param_bounds,
+                            assoc_bindings,
                             traits,
                             &module.source_file,
                         )?;
@@ -603,6 +627,15 @@ pub(super) fn collect_funcs(
                         }
                         Some(idx)
                     } else {
+                        // Inherent impls can't declare associated types.
+                        if !ib.assoc_type_bindings.is_empty() {
+                            return Err(Error {
+                                file: module.source_file.clone(),
+                                message: "associated type bindings are only allowed in trait impls"
+                                    .to_string(),
+                                span: ib.assoc_type_bindings[0].name_span.copy(),
+                            });
+                        }
                         None
                     };
                 // Method-path prefix. Mirror codegen's derivation: take the
@@ -942,13 +975,21 @@ fn validate_trait_impl_signatures(
         let mut expected_param_types: Vec<RType> = Vec::new();
         let mut p = 0;
         while p < trait_method.param_types.len() {
-            expected_param_types.push(substitute_rtype(&trait_method.param_types[p], &trait_env));
+            let subst = substitute_rtype(&trait_method.param_types[p], &trait_env);
+            // After Self gets substituted to the impl target, any
+            // `Self::Item` projection now points at a concrete type —
+            // resolve through the impl's bindings so the comparison
+            // against the impl method's signature lines up.
+            expected_param_types.push(crate::typeck::concretize_assoc_proj(&subst, traits));
             p += 1;
         }
         let expected_return_type: Option<RType> = trait_method
             .return_type
             .as_ref()
-            .map(|rt| substitute_rtype(rt, &trait_env));
+            .map(|rt| {
+                let subst = substitute_rtype(rt, &trait_env);
+                crate::typeck::concretize_assoc_proj(&subst, traits)
+            });
         // Substitute the impl method's signature too, so its `<V>`
         // params land on the same placeholders as the trait's `<U>`.
         let mut impl_param_types_sub: Vec<RType> = Vec::new();
@@ -1090,6 +1131,7 @@ fn register_trait_impl(
     impl_type_params: &Vec<String>,
     impl_lifetime_params: &Vec<String>,
     impl_type_param_bounds: &Vec<Vec<Vec<String>>>,
+    assoc_type_bindings: Vec<(String, RType)>,
     traits: &mut TraitTable,
     file: &str,
 ) -> Result<(), Error> {
@@ -1159,10 +1201,127 @@ fn register_trait_impl(
         impl_type_params: impl_type_params.clone(),
         impl_lifetime_params: impl_lifetime_params.clone(),
         impl_type_param_bounds: bounds_clone,
+        assoc_type_bindings,
         file: file.to_string(),
         span: ib.span.copy(),
     });
     Ok(())
+}
+
+// Resolves each `type Name = T;` binding and verifies that the impl
+// covers exactly the trait's `assoc_types` — no missing, no extras, no
+// duplicates. Returns the resolved bindings in the trait's declared
+// order. Inherent impls (no `trait_full`) aren't allowed to declare
+// assoc bindings; the caller only routes here for trait impls.
+pub(super) fn resolve_and_validate_assoc_bindings(
+    ib: &crate::ast::ImplBlock,
+    trait_full: &Vec<String>,
+    target_rt: &RType,
+    current_module: &Vec<String>,
+    structs: &StructTable,
+    enums: &EnumTable,
+    traits: &TraitTable,
+    impl_type_params: &Vec<String>,
+    use_scope: &Vec<UseEntry>,
+    reexports: &ReExportTable,
+    file: &str,
+) -> Result<Vec<(String, RType)>, Error> {
+    // Look up the trait to know its declared assoc_types.
+    let trait_entry = match trait_lookup(traits, trait_full) {
+        Some(e) => e,
+        None => unreachable!("validate_trait_impl already ensured trait exists"),
+    };
+    // Reject duplicates first — a Name listed twice in the impl body
+    // is always an error regardless of trait declaration.
+    let mut i = 0;
+    while i < ib.assoc_type_bindings.len() {
+        let mut j = i + 1;
+        while j < ib.assoc_type_bindings.len() {
+            if ib.assoc_type_bindings[i].name == ib.assoc_type_bindings[j].name {
+                return Err(Error {
+                    file: file.to_string(),
+                    message: format!(
+                        "duplicate associated type binding `{}` in impl",
+                        ib.assoc_type_bindings[j].name
+                    ),
+                    span: ib.assoc_type_bindings[j].name_span.copy(),
+                });
+            }
+            j += 1;
+        }
+        i += 1;
+    }
+    // Reject extras (binding for a name the trait doesn't declare).
+    let mut bi = 0;
+    while bi < ib.assoc_type_bindings.len() {
+        let bname = &ib.assoc_type_bindings[bi].name;
+        if !trait_entry.assoc_types.contains(bname) {
+            return Err(Error {
+                file: file.to_string(),
+                message: format!(
+                    "associated type `{}` is not a member of trait `{}`",
+                    bname,
+                    place_to_string(trait_full)
+                ),
+                span: ib.assoc_type_bindings[bi].name_span.copy(),
+            });
+        }
+        bi += 1;
+    }
+    // Reject missing — every declared assoc_type must have a binding.
+    let mut ti = 0;
+    while ti < trait_entry.assoc_types.len() {
+        let want = &trait_entry.assoc_types[ti];
+        let mut found = false;
+        let mut bi = 0;
+        while bi < ib.assoc_type_bindings.len() {
+            if &ib.assoc_type_bindings[bi].name == want {
+                found = true;
+                break;
+            }
+            bi += 1;
+        }
+        if !found {
+            return Err(Error {
+                file: file.to_string(),
+                message: format!(
+                    "missing associated type binding `{}` in impl of `{}` for `{}`",
+                    want,
+                    place_to_string(trait_full),
+                    rtype_to_string(target_rt)
+                ),
+                span: ib.span.copy(),
+            });
+        }
+        ti += 1;
+    }
+    // Resolve each binding's RHS type, in trait-declared order.
+    let mut out: Vec<(String, RType)> = Vec::new();
+    let mut ti = 0;
+    while ti < trait_entry.assoc_types.len() {
+        let want = trait_entry.assoc_types[ti].clone();
+        let mut bi = 0;
+        while bi < ib.assoc_type_bindings.len() {
+            if ib.assoc_type_bindings[bi].name == want {
+                let rt = resolve_type(
+                    &ib.assoc_type_bindings[bi].ty,
+                    current_module,
+                    structs,
+                    enums,
+                    Some(target_rt),
+                    impl_type_params,
+                    use_scope,
+                    reexports,
+                    file,
+                )?;
+                out.push((want.clone(), rt));
+                break;
+            }
+            bi += 1;
+        }
+        ti += 1;
+    }
+    Ok(out)
 }
 
 // Walks every registered `impl Trait for T` and verifies that for each
@@ -1327,21 +1486,27 @@ pub(super) fn register_function(
             reexports,
             source_file,
         )?;
+        // Concretize Self::Item / T::Item projections via the trait
+        // table (which by this point has the impl's bindings).
+        let rt = crate::typeck::concretize_assoc_proj(&rt, traits);
         param_types.push(rt);
         k += 1;
     }
     let mut return_type = match &f.return_type {
-        Some(ty) => Some(resolve_type(
-            ty,
-            current_module,
-            structs,
-            enums,
-            self_target,
-            &type_param_names,
-            use_scope,
-            reexports,
-            source_file,
-        )?),
+        Some(ty) => Some({
+            let rt = resolve_type(
+                ty,
+                current_module,
+                structs,
+                enums,
+                self_target,
+                &type_param_names,
+                use_scope,
+                reexports,
+                source_file,
+            )?;
+            crate::typeck::concretize_assoc_proj(&rt, traits)
+        }),
         None => None,
     };
     // Per-function fresh-id counter for elided lifetimes. 0 stays as the
@@ -1449,11 +1614,57 @@ pub(super) fn register_function(
         type_param_bounds.push(row);
         i += 1;
     }
+    // Per-type-param `Trait<Name = T, ...>` constraints. Aligned to
+    // `type_param_bounds` (impl-level slots first — currently always
+    // empty since impl bounds don't carry assoc constraints yet —
+    // followed by fn-level slots resolved from `f.type_params`).
+    let mut type_param_bound_assoc: Vec<Vec<Vec<(String, RType)>>> = Vec::new();
+    let mut i = 0;
+    while i < impl_type_param_bounds.len() {
+        let mut row: Vec<Vec<(String, RType)>> = Vec::new();
+        let mut j = 0;
+        while j < impl_type_param_bounds[i].len() {
+            row.push(Vec::new());
+            j += 1;
+        }
+        type_param_bound_assoc.push(row);
+        i += 1;
+    }
+    let mut i = 0;
+    while i < f.type_params.len() {
+        let mut row: Vec<Vec<(String, RType)>> = Vec::new();
+        let mut j = 0;
+        while j < f.type_params[i].bounds.len() {
+            let mut constraints: Vec<(String, RType)> = Vec::new();
+            let mut c = 0;
+            while c < f.type_params[i].bounds[j].assoc_constraints.len() {
+                let ac = &f.type_params[i].bounds[j].assoc_constraints[c];
+                let cty = resolve_type(
+                    &ac.ty,
+                    current_module,
+                    structs,
+                    enums,
+                    self_target,
+                    &type_param_names,
+                    use_scope,
+                    reexports,
+                    source_file,
+                )?;
+                constraints.push((ac.name.clone(), cty));
+                c += 1;
+            }
+            row.push(constraints);
+            j += 1;
+        }
+        type_param_bound_assoc.push(row);
+        i += 1;
+    }
     if is_generic {
         funcs.templates.push(GenericTemplate {
             path: full,
             type_params: type_param_names,
             type_param_bounds,
+            type_param_bound_assoc,
             impl_type_param_count: impl_type_params.len(),
             func: f.clone(),
             enclosing_module: current_module.clone(),

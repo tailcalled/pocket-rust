@@ -403,6 +403,10 @@ fn rtype_contains_ref(t: &crate::typeck::RType) -> bool {
         // Ref, which is handled by the Ref arm above. A bare Slice/Str in
         // a value position shouldn't reach here.
         RType::Slice(_) | RType::Str => true,
+        // Unconcretized assoc-type projections shouldn't reach borrowck —
+        // typeck either resolves them to a concrete type or rejects.
+        // Conservative: treat as ref-bearing to avoid over-pruning.
+        RType::AssocProj { .. } => true,
     }
 }
 

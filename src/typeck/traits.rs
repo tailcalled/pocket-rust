@@ -1,6 +1,6 @@
 use super::{
     FuncTable, InferType, RType, Subst,
-    TraitTable, rtype_eq, trait_lookup,
+    TraitTable, rtype_eq, substitute_rtype, trait_lookup,
 };
 use crate::span::Span;
 
@@ -128,6 +128,170 @@ pub fn solve_impl_in_ctx(
         i += 1;
     }
     None
+}
+
+// Resolve `<base as Trait>::Name` (or `<base as ?>::Name` when
+// `trait_path` is empty) by scanning all registered impl rows. Returns
+// every concrete binding the lookup matches — empty Vec when no impl
+// covers `base+name`, length > 1 when multiple traits supply the same
+// assoc name on the same target (caller decides ambiguity).
+pub fn find_assoc_binding(
+    traits: &TraitTable,
+    base: &RType,
+    trait_path: &Vec<String>,
+    name: &str,
+) -> Vec<RType> {
+    let mut results: Vec<RType> = Vec::new();
+    let mut i = 0;
+    while i < traits.impls.len() {
+        let row = &traits.impls[i];
+        if !trait_path.is_empty() && &row.trait_path != trait_path {
+            i += 1;
+            continue;
+        }
+        let trait_entry = match trait_lookup(traits, &row.trait_path) {
+            Some(e) => e,
+            None => {
+                i += 1;
+                continue;
+            }
+        };
+        if !trait_entry.assoc_types.iter().any(|a| a == name) {
+            i += 1;
+            continue;
+        }
+        let mut subst: Vec<(String, RType)> = Vec::new();
+        if !try_match_rtype(&row.target, base, &mut subst) {
+            i += 1;
+            continue;
+        }
+        let mut k = 0;
+        while k < row.assoc_type_bindings.len() {
+            if row.assoc_type_bindings[k].0 == name {
+                let concrete = substitute_rtype(&row.assoc_type_bindings[k].1, &subst);
+                results.push(concrete);
+                break;
+            }
+            k += 1;
+        }
+        i += 1;
+    }
+    results
+}
+
+// Walk an RType, replacing every `AssocProj` whose base is concrete
+// enough to find a unique impl binding via `find_assoc_binding`. Leaves
+// unresolved projections as-is (e.g. when the base is a Param with no
+// matching bound, or when no impl covers it yet). Recursive — handles
+// nested `T::Item::Inner`.
+pub fn concretize_assoc_proj(rt: &RType, traits: &TraitTable) -> RType {
+    concretize_assoc_proj_with_bounds(rt, traits, &Vec::new(), &Vec::new())
+}
+
+// Like `concretize_assoc_proj` but also resolves `T::Name` projections
+// against the in-scope type-param bounds. `type_param_bound_assoc[i]`
+// is the list of (assoc_name, concrete_type) constraints attached to
+// `type_params[i]`'s bounds (from `Trait<Name = X>` syntax). When the
+// projection's base is a `Param("T")` whose bound carries a matching
+// constraint, the projection resolves to the constrained type.
+pub fn concretize_assoc_proj_with_bounds(
+    rt: &RType,
+    traits: &TraitTable,
+    type_params: &Vec<String>,
+    type_param_bound_assoc: &Vec<Vec<(String, RType)>>,
+) -> RType {
+    let recurse = |inner: &RType| {
+        concretize_assoc_proj_with_bounds(inner, traits, type_params, type_param_bound_assoc)
+    };
+    match rt {
+        RType::AssocProj { base, trait_path, name } => {
+            let new_base = recurse(base);
+            // T::Name via in-scope bound constraint?
+            if let RType::Param(t_name) = &new_base {
+                let mut i = 0;
+                while i < type_params.len() {
+                    if &type_params[i] == t_name && i < type_param_bound_assoc.len() {
+                        let mut k = 0;
+                        while k < type_param_bound_assoc[i].len() {
+                            if &type_param_bound_assoc[i][k].0 == name {
+                                return concretize_assoc_proj_with_bounds(
+                                    &type_param_bound_assoc[i][k].1,
+                                    traits,
+                                    type_params,
+                                    type_param_bound_assoc,
+                                );
+                            }
+                            k += 1;
+                        }
+                        break;
+                    }
+                    i += 1;
+                }
+            }
+            // Otherwise fall through to traits-table lookup.
+            let candidates = find_assoc_binding(traits, &new_base, trait_path, name);
+            if candidates.len() == 1 {
+                concretize_assoc_proj_with_bounds(
+                    &candidates[0],
+                    traits,
+                    type_params,
+                    type_param_bound_assoc,
+                )
+            } else {
+                RType::AssocProj {
+                    base: Box::new(new_base),
+                    trait_path: trait_path.clone(),
+                    name: name.clone(),
+                }
+            }
+        }
+        RType::Ref { inner, mutable, lifetime } => RType::Ref {
+            inner: Box::new(recurse(inner)),
+            mutable: *mutable,
+            lifetime: lifetime.clone(),
+        },
+        RType::RawPtr { inner, mutable } => RType::RawPtr {
+            inner: Box::new(recurse(inner)),
+            mutable: *mutable,
+        },
+        RType::Struct { path, type_args, lifetime_args } => {
+            let mut new_args: Vec<RType> = Vec::new();
+            let mut i = 0;
+            while i < type_args.len() {
+                new_args.push(recurse(&type_args[i]));
+                i += 1;
+            }
+            RType::Struct {
+                path: path.clone(),
+                type_args: new_args,
+                lifetime_args: lifetime_args.clone(),
+            }
+        }
+        RType::Enum { path, type_args, lifetime_args } => {
+            let mut new_args: Vec<RType> = Vec::new();
+            let mut i = 0;
+            while i < type_args.len() {
+                new_args.push(recurse(&type_args[i]));
+                i += 1;
+            }
+            RType::Enum {
+                path: path.clone(),
+                type_args: new_args,
+                lifetime_args: lifetime_args.clone(),
+            }
+        }
+        RType::Tuple(elems) => {
+            let mut new_elems: Vec<RType> = Vec::new();
+            let mut i = 0;
+            while i < elems.len() {
+                new_elems.push(recurse(&elems[i]));
+                i += 1;
+            }
+            RType::Tuple(new_elems)
+        }
+        RType::Slice(inner) => RType::Slice(Box::new(recurse(inner))),
+        _ => rt.clone(),
+    }
 }
 
 // Find a method by name within a registered trait impl. Returns the
@@ -491,6 +655,11 @@ fn try_match_against_infer_ctx(
             _ => false,
         },
         RType::Str => matches!(resolved, InferType::Str),
+        // An unconcretized projection in the pattern can't match
+        // anything structurally; the candidate would need its
+        // projection resolved before reaching dispatch. Conservative
+        // false — caller eagerly concretizes or rejects upstream.
+        RType::AssocProj { .. } => false,
     }
 }
 pub fn find_trait_impl_idx_by_span(

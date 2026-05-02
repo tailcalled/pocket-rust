@@ -517,6 +517,9 @@ fn collect_leaves(
             signed: false,
             valtype: wasm::ValType::I32,
         }),
+        RType::AssocProj { .. } => unreachable!(
+            "collect_leaves on unresolved associated-type projection — typeck should have concretized"
+        ),
     }
 }
 

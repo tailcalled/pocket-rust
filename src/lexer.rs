@@ -31,6 +31,10 @@ pub enum TokenKind {
     While,
     Break,
     Continue,
+    // `type` — only meaningful inside trait bodies (`type Name;`) and
+    // impl bodies (`type Name = T;`) so far. Lexed unconditionally; the
+    // parser is the one that requires it to be in those positions.
+    Type,
     // The currency-sign character `¤` (U+00A4). Prefixes a builtin
     // intrinsic call: `¤name(args)`. The lexer emits this as a
     // standalone token; the following identifier (and parenthesized
@@ -100,6 +104,7 @@ pub fn token_kind_name(t: &TokenKind) -> &'static str {
         TokenKind::Unsafe => "`unsafe`",
         TokenKind::Impl => "`impl`",
         TokenKind::Trait => "`trait`",
+        TokenKind::Type => "`type`",
         TokenKind::For => "`for`",
         TokenKind::SelfLower => "`self`",
         TokenKind::SelfUpper => "`Self`",
@@ -230,6 +235,11 @@ pub fn tokenize(file: &str, source: &str) -> Result<Vec<Token>, Error> {
             } else if text == "trait" {
                 tokens.push(Token {
                     kind: TokenKind::Trait,
+                    span,
+                });
+            } else if text == "type" {
+                tokens.push(Token {
+                    kind: TokenKind::Type,
                     span,
                 });
             } else if text == "for" {

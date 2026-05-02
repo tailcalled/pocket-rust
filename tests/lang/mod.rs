@@ -148,6 +148,7 @@ pub fn answer_u32(bytes: &[u8]) -> i32 {
     f.call(&mut store, ()).expect("call failed")
 }
 
+mod assoc_types;
 mod basics;
 mod block_exprs;
 mod borrowck;

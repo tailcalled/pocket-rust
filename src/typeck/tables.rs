@@ -116,6 +116,9 @@ pub struct TraitEntry {
     pub methods: Vec<TraitMethodEntry>,
     pub is_pub: bool,
     pub supertraits: Vec<Vec<String>>,
+    // `type Name;` declarations inside the trait body. Each impl of
+    // this trait must bind exactly these names (no missing, no extras).
+    pub assoc_types: Vec<String>,
 }
 
 pub struct TraitMethodEntry {
@@ -159,6 +162,11 @@ pub struct TraitImplEntry {
     // `impl_type_params`. `solve_impl` enforces these recursively when
     // matching a candidate impl against a concrete type.
     pub impl_type_param_bounds: Vec<Vec<Vec<String>>>,
+    // Resolved associated-type bindings declared inside the impl body
+    // (`type Name = T;`). One entry per name listed by the trait's
+    // `assoc_types`, in the same order. Validated against the trait at
+    // setup time.
+    pub assoc_type_bindings: Vec<(String, RType)>,
     pub file: String,
     pub span: Span,
 }
@@ -270,6 +278,14 @@ pub struct GenericTemplate {
     // type-param. Used by symbolic trait-method dispatch in generic
     // bodies (`fn f<T: Show>(t: T) { t.show() }`).
     pub type_param_bounds: Vec<Vec<Vec<String>>>,
+    // Per type-param `Trait<Name = X, ...>` constraints, parallel to
+    // `type_param_bounds`. Indexed `[param_idx][bound_idx][k]` →
+    // `(assoc_name, ConcreteType)`. Empty vectors when no constraints.
+    // Enforced at call sites: an inferred type-arg must satisfy each
+    // bound's assoc constraints (impl's binding for `name` must equal
+    // the constraint's type), otherwise a static "type mismatch on
+    // associated type" error is raised.
+    pub type_param_bound_assoc: Vec<Vec<Vec<(String, RType)>>>,
     // Number of leading entries in `type_params` that come from the
     // enclosing `impl<...>` block (the rest are the method's own type
     // params). Zero for free generic functions.

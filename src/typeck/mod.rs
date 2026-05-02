@@ -40,7 +40,8 @@ fn satisfies_num(
         | InferType::Tuple(_)
         | InferType::Enum { .. }
         | InferType::Slice(_)
-        | InferType::Str => false,
+        | InferType::Str
+        | InferType::AssocProj { .. } => false,
     }
 }
 
@@ -51,6 +52,132 @@ fn satisfies_num(
 // arise from inference, only from explicit user-written types.)
 pub(crate) fn is_sized_infer(t: &InferType) -> bool {
     !matches!(t, InferType::Slice(_) | InferType::Str)
+}
+
+// InferType counterpart of `concretize_assoc_proj_with_bounds`. Walks
+// the InferType, replacing any `AssocProj` whose base resolves enough
+// to find a unique impl binding (or a matching `T: Trait<Name = X>`
+// constraint on an in-scope type-param). Used at dispatch sites where
+// the call result type is an InferType that may carry a projection.
+pub(crate) fn infer_concretize_assoc_proj(
+    t: &InferType,
+    traits: &TraitTable,
+    type_params: &Vec<String>,
+    type_param_bound_assoc: &Vec<Vec<(String, RType)>>,
+) -> InferType {
+    match t {
+        InferType::AssocProj { base, trait_path, name } => {
+            let new_base = infer_concretize_assoc_proj(
+                base,
+                traits,
+                type_params,
+                type_param_bound_assoc,
+            );
+            // T::Name via in-scope bound constraint?
+            if let InferType::Param(t_name) = &new_base {
+                let mut i = 0;
+                while i < type_params.len() {
+                    if &type_params[i] == t_name && i < type_param_bound_assoc.len() {
+                        let mut k = 0;
+                        while k < type_param_bound_assoc[i].len() {
+                            if &type_param_bound_assoc[i][k].0 == name {
+                                let rt = &type_param_bound_assoc[i][k].1;
+                                return rtype_to_infer(rt);
+                            }
+                            k += 1;
+                        }
+                        break;
+                    }
+                    i += 1;
+                }
+            }
+            // Otherwise: try traits-table lookup on the base if it's a
+            // concrete RType-equivalent (Struct / Enum / etc.). For
+            // simplicity convert base to RType via best-effort and run
+            // `find_assoc_binding`; if it returns exactly one, use it.
+            let base_rt = infer_to_rtype_for_check(&new_base);
+            let candidates = traits::find_assoc_binding(traits, &base_rt, trait_path, name);
+            if candidates.len() == 1 {
+                rtype_to_infer(&candidates[0])
+            } else {
+                InferType::AssocProj {
+                    base: Box::new(new_base),
+                    trait_path: trait_path.clone(),
+                    name: name.clone(),
+                }
+            }
+        }
+        InferType::Ref { inner, mutable, lifetime } => InferType::Ref {
+            inner: Box::new(infer_concretize_assoc_proj(
+                inner,
+                traits,
+                type_params,
+                type_param_bound_assoc,
+            )),
+            mutable: *mutable,
+            lifetime: lifetime.clone(),
+        },
+        InferType::RawPtr { inner, mutable } => InferType::RawPtr {
+            inner: Box::new(infer_concretize_assoc_proj(
+                inner,
+                traits,
+                type_params,
+                type_param_bound_assoc,
+            )),
+            mutable: *mutable,
+        },
+        InferType::Struct { path, type_args, lifetime_args } => {
+            let mut new_args: Vec<InferType> = Vec::new();
+            for arg in type_args {
+                new_args.push(infer_concretize_assoc_proj(
+                    arg,
+                    traits,
+                    type_params,
+                    type_param_bound_assoc,
+                ));
+            }
+            InferType::Struct {
+                path: path.clone(),
+                type_args: new_args,
+                lifetime_args: lifetime_args.clone(),
+            }
+        }
+        InferType::Enum { path, type_args, lifetime_args } => {
+            let mut new_args: Vec<InferType> = Vec::new();
+            for arg in type_args {
+                new_args.push(infer_concretize_assoc_proj(
+                    arg,
+                    traits,
+                    type_params,
+                    type_param_bound_assoc,
+                ));
+            }
+            InferType::Enum {
+                path: path.clone(),
+                type_args: new_args,
+                lifetime_args: lifetime_args.clone(),
+            }
+        }
+        InferType::Tuple(elems) => {
+            let mut new_elems: Vec<InferType> = Vec::new();
+            for e in elems {
+                new_elems.push(infer_concretize_assoc_proj(
+                    e,
+                    traits,
+                    type_params,
+                    type_param_bound_assoc,
+                ));
+            }
+            InferType::Tuple(new_elems)
+        }
+        InferType::Slice(inner) => InferType::Slice(Box::new(infer_concretize_assoc_proj(
+            inner,
+            traits,
+            type_params,
+            type_param_bound_assoc,
+        ))),
+        _ => t.clone(),
+    }
 }
 
 // Convert an `InferType` to an `RType` for the purposes of impl-table
@@ -110,6 +237,11 @@ pub(crate) fn infer_to_rtype_for_check(t: &InferType) -> RType {
         }
         InferType::Slice(inner) => RType::Slice(Box::new(infer_to_rtype_for_check(inner))),
         InferType::Str => RType::Str,
+        InferType::AssocProj { base, trait_path, name } => RType::AssocProj {
+            base: Box::new(infer_to_rtype_for_check(base)),
+            trait_path: trait_path.clone(),
+            name: name.clone(),
+        },
     }
 }
 
@@ -230,6 +362,14 @@ pub(crate) enum InferType {
     Slice(Box<InferType>),
     // `str` — UTF-8 string DST. Only valid as the inner of a Ref.
     Str,
+    // Associated-type projection — InferType counterpart of
+    // `RType::AssocProj`. Carries the symbolic base + trait + name
+    // until concretization at substitution time.
+    AssocProj {
+        base: Box<InferType>,
+        trait_path: Vec<String>,
+        name: String,
+    },
 }
 
 // Build a name → InferType env from a generic struct/template's type-param
@@ -301,6 +441,11 @@ pub(crate) fn rtype_to_infer(rt: &RType) -> InferType {
         }
         RType::Slice(inner) => InferType::Slice(Box::new(rtype_to_infer(inner))),
         RType::Str => InferType::Str,
+        RType::AssocProj { base, trait_path, name } => InferType::AssocProj {
+            base: Box::new(rtype_to_infer(base)),
+            trait_path: trait_path.clone(),
+            name: name.clone(),
+        },
     }
 }
 
@@ -368,6 +513,11 @@ pub(crate) fn infer_substitute(t: &InferType, env: &Vec<(String, InferType)>) ->
         }
         InferType::Slice(inner) => InferType::Slice(Box::new(infer_substitute(inner, env))),
         InferType::Str => InferType::Str,
+        InferType::AssocProj { base, trait_path, name } => InferType::AssocProj {
+            base: Box::new(infer_substitute(base, env)),
+            trait_path: trait_path.clone(),
+            name: name.clone(),
+        },
     }
 }
 
@@ -445,6 +595,9 @@ pub(crate) fn infer_to_string(t: &InferType) -> String {
         }
         InferType::Slice(inner) => format!("[{}]", infer_to_string(inner)),
         InferType::Str => "str".to_string(),
+        InferType::AssocProj { base, name, .. } => {
+            format!("<{} as ?>::{}", infer_to_string(base), name)
+        }
     }
 }
 
@@ -530,6 +683,11 @@ impl Subst {
             }
             InferType::Slice(inner) => InferType::Slice(Box::new(self.substitute(inner))),
             InferType::Str => InferType::Str,
+            InferType::AssocProj { base, trait_path, name } => InferType::AssocProj {
+                base: Box::new(self.substitute(base)),
+                trait_path: trait_path.clone(),
+                name: name.clone(),
+            },
         }
     }
 
@@ -883,6 +1041,11 @@ impl Subst {
             }
             InferType::Slice(inner) => RType::Slice(Box::new(self.finalize(&inner))),
             InferType::Str => RType::Str,
+            InferType::AssocProj { base, trait_path, name } => RType::AssocProj {
+                base: Box::new(self.finalize(&base)),
+                trait_path,
+                name,
+            },
         }
     }
 }
@@ -937,6 +1100,11 @@ pub(crate) struct CheckCtx<'a> {
     // `GenericTemplate.type_param_bounds` — `[i]` lists the bound traits
     // on `type_params[i]`. Empty for non-generic functions.
     pub(crate) type_param_bounds: &'a Vec<Vec<Vec<String>>>,
+    // Per-type-param `Trait<Name = X>` constraints from the function's
+    // bounds. `[i]` lists `(name, ResolvedRType)` for each constraint
+    // on `type_params[i]`'s bounds. Used by AssocProj concretization to
+    // resolve `T::Name` projections inside the body.
+    pub(crate) type_param_bound_assoc: &'a Vec<Vec<(String, RType)>>,
     // Stack of enclosing loop labels (innermost-last). Each entry is
     // the loop's optional label; `break`/`continue` validate that any
     // referenced label is in this stack.
@@ -1069,6 +1237,50 @@ fn check_function(
             }
             None => (Vec::new(), Vec::new()),
         };
+    // Per type-param, collect all `Trait<Name = X>` constraints from
+    // the function's bounds (resolved at check time from the AST). Used
+    // for `T::Name` projections inside the body.
+    let mut type_param_bound_assoc: Vec<Vec<(String, RType)>> = Vec::new();
+    {
+        let mut idx_offset = 0;
+        // Skip impl-level type params (they appear first in
+        // type_param_names but their bounds are on the impl, not on
+        // `func.type_params`).
+        if type_param_names.len() > func.type_params.len() {
+            idx_offset = type_param_names.len() - func.type_params.len();
+            for _ in 0..idx_offset {
+                type_param_bound_assoc.push(Vec::new());
+            }
+        }
+        let mut tp = 0;
+        while tp < func.type_params.len() {
+            let mut row: Vec<(String, RType)> = Vec::new();
+            let mut b = 0;
+            while b < func.type_params[tp].bounds.len() {
+                let bound = &func.type_params[tp].bounds[b];
+                let mut c = 0;
+                while c < bound.assoc_constraints.len() {
+                    let cname = bound.assoc_constraints[c].name.clone();
+                    let cty = resolve_type(
+                        &bound.assoc_constraints[c].ty,
+                        current_module,
+                        structs,
+                        enums,
+                        self_target,
+                        &type_param_names,
+                        module_use_scope,
+                        reexports,
+                        current_file,
+                    )?;
+                    row.push((cname, cty));
+                    c += 1;
+                }
+                b += 1;
+            }
+            type_param_bound_assoc.push(row);
+            tp += 1;
+        }
+    }
     // Build initial locals from params (params are immutable bindings in our subset).
     let mut locals: Vec<LocalEntry> = Vec::new();
     let mut k = 0;
@@ -1084,6 +1296,12 @@ fn check_function(
             reexports,
             current_file,
         )?;
+        let rt = concretize_assoc_proj_with_bounds(
+            &rt,
+            traits,
+            &type_param_names,
+            &type_param_bound_assoc,
+        );
         locals.push(LocalEntry {
             name: func.params[k].name.clone(),
             ty: rtype_to_infer(&rt),
@@ -1092,17 +1310,25 @@ fn check_function(
         k += 1;
     }
     let return_rt: Option<RType> = match &func.return_type {
-        Some(ty) => Some(resolve_type(
-            ty,
-            current_module,
-            structs,
-            enums,
-            self_target,
-            &type_param_names,
-            module_use_scope,
-            reexports,
-            current_file,
-        )?),
+        Some(ty) => Some({
+            let rt = resolve_type(
+                ty,
+                current_module,
+                structs,
+                enums,
+                self_target,
+                &type_param_names,
+                module_use_scope,
+                reexports,
+                current_file,
+            )?;
+            concretize_assoc_proj_with_bounds(
+                &rt,
+                traits,
+                &type_param_names,
+                &type_param_bound_assoc,
+            )
+        }),
         None => None,
     };
 
@@ -1149,6 +1375,7 @@ fn check_function(
             self_target,
             type_params: &type_param_names,
             type_param_bounds: &type_param_bounds,
+            type_param_bound_assoc: &type_param_bound_assoc,
             reexports,
             use_scope: initial_use_scope,
             loop_labels: Vec::new(),
@@ -3038,8 +3265,10 @@ pub use tables::{
 
 mod traits;
 pub use traits::{
-    ImplResolution, MethodCandidate, find_method_candidates, find_trait_impl_idx_by_span,
-    find_trait_impl_method, solve_impl, solve_impl_in_ctx, supertrait_closure,
+    ImplResolution, MethodCandidate, concretize_assoc_proj,
+    concretize_assoc_proj_with_bounds, find_assoc_binding, find_method_candidates,
+    find_trait_impl_idx_by_span, find_trait_impl_method, solve_impl, solve_impl_in_ctx,
+    supertrait_closure,
 };
 pub(crate) use traits::try_match_against_infer;
 
@@ -3538,7 +3767,7 @@ fn check_call(ctx: &mut CheckCtx, call: &Call, call_expr: &Expr) -> Result<Infer
         };
         ctx.call_resolutions[call_expr.id as usize] = Some(PendingCall::Generic {
             template_idx,
-            type_var_ids: var_ids,
+            type_var_ids: var_ids.clone(),
         });
         let mut i = 0;
         while i < call.args.len() {
@@ -3553,6 +3782,80 @@ fn check_call(ctx: &mut CheckCtx, call: &Call, call_expr: &Expr) -> Result<Infer
                 ctx.current_file,
             )?;
             i += 1;
+        }
+        // Static enforcement of `Trait<Name = T>` bound constraints.
+        // Each type-arg the call inferred for the template's type-params
+        // must satisfy every `<Name = T>` constraint on its bounds:
+        // looking up the impl of the bound trait for the inferred
+        // type, the impl's binding for `Name` must equal `T`.
+        let tmpl_bounds = ctx.funcs.templates[template_idx].type_param_bounds.clone();
+        let tmpl_bound_assoc =
+            ctx.funcs.templates[template_idx].type_param_bound_assoc.clone();
+        let mut p = 0;
+        while p < var_ids.len() {
+            if p >= tmpl_bounds.len() {
+                p += 1;
+                continue;
+            }
+            let inferred = ctx.subst.substitute(&InferType::Var(var_ids[p]));
+            let inferred_rt = infer_to_rtype_for_check(&inferred);
+            let mut b = 0;
+            while b < tmpl_bounds[p].len() {
+                let trait_path = &tmpl_bounds[p][b];
+                let constraints = if b < tmpl_bound_assoc[p].len() {
+                    &tmpl_bound_assoc[p][b]
+                } else {
+                    p += 1;
+                    continue;
+                };
+                if constraints.is_empty() {
+                    b += 1;
+                    continue;
+                }
+                let mut c = 0;
+                while c < constraints.len() {
+                    let (cname, cty_expected) = &constraints[c];
+                    let actual_candidates = traits::find_assoc_binding(
+                        ctx.traits,
+                        &inferred_rt,
+                        trait_path,
+                        cname,
+                    );
+                    if actual_candidates.is_empty() {
+                        return Err(Error {
+                            file: ctx.current_file.to_string(),
+                            message: format!(
+                                "the trait bound `{}: {}` is not satisfied (no impl found to satisfy `{} = {}`)",
+                                rtype_to_string(&inferred_rt),
+                                place_to_string(trait_path),
+                                cname,
+                                rtype_to_string(cty_expected),
+                            ),
+                            span: call_expr.span.copy(),
+                        });
+                    }
+                    if actual_candidates.len() > 1
+                        || !rtype_eq(&actual_candidates[0], cty_expected)
+                    {
+                        return Err(Error {
+                            file: ctx.current_file.to_string(),
+                            message: format!(
+                                "type mismatch on associated type `{}::{}`: expected `{}`, got `{}` (from `impl {} for {}`)",
+                                place_to_string(trait_path),
+                                cname,
+                                rtype_to_string(cty_expected),
+                                rtype_to_string(&actual_candidates[0]),
+                                place_to_string(trait_path),
+                                rtype_to_string(&inferred_rt),
+                            ),
+                            span: call_expr.span.copy(),
+                        });
+                    }
+                    c += 1;
+                }
+                b += 1;
+            }
+            p += 1;
         }
         return Ok(return_infer);
     }

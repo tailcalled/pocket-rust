@@ -155,6 +155,18 @@ pub enum RType {
     // type level so users get `&str` in error messages and so future UTF-8
     // invariants can attach here. Same DST rules as `Slice`.
     Str,
+    // Associated-type projection: `Self::Item` or `T::Item` in source.
+    // `base` is `Param("Self")` / `Param("T")` until substitution lands
+    // a concrete type; `concretize_assoc_proj` then resolves to the
+    // impl's binding. `trait_path` is the trait that declares this
+    // assoc — populated when uniquely determined from the param's
+    // bounds (or always at trait-method-sig time when Self refers to
+    // the enclosing trait). `name` is the assoc-type name.
+    AssocProj {
+        base: Box<RType>,
+        trait_path: Vec<String>,
+        name: String,
+    },
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -245,6 +257,10 @@ pub fn rtype_eq(a: &RType, b: &RType) -> bool {
                 ..
             },
         ) => pa == pb && rtype_vec_eq(aa, ab),
+        (
+            RType::AssocProj { base: ba, trait_path: ta, name: na },
+            RType::AssocProj { base: bb, trait_path: tb, name: nb },
+        ) => ta == tb && na == nb && rtype_eq(ba, bb),
         _ => false,
     }
 }
@@ -323,6 +339,9 @@ pub fn rtype_to_string(t: &RType) -> String {
         }
         RType::Slice(inner) => format!("[{}]", rtype_to_string(inner)),
         RType::Str => "str".to_string(),
+        RType::AssocProj { base, name, .. } => {
+            format!("<{} as ?>::{}", rtype_to_string(base), name)
+        }
     }
 }
 
@@ -367,6 +386,9 @@ pub fn rtype_size(ty: &RType, structs: &StructTable) -> u32 {
         // address. See `byte_size_of` for the on-stack-frame size and
         // `flatten_rtype` for the matching wasm shape.
         RType::Enum { .. } => 1,
+        RType::AssocProj { .. } => unreachable!(
+            "rtype_size called on unresolved associated-type projection"
+        ),
     }
 }
 
@@ -432,6 +454,9 @@ pub fn flatten_rtype(ty: &RType, structs: &StructTable, out: &mut Vec<crate::was
         // stack disc+payload bytes). Construction allocates the slot
         // and yields its address; reads chase the address.
         RType::Enum { .. } => out.push(crate::wasm::ValType::I32),
+        RType::AssocProj { .. } => unreachable!(
+            "flatten_rtype called on unresolved associated-type projection"
+        ),
     }
 }
 
@@ -492,6 +517,9 @@ pub fn byte_size_of(rt: &RType, structs: &StructTable, enums: &EnumTable) -> u32
             }
             4 + max_payload
         }
+        RType::AssocProj { .. } => unreachable!(
+            "byte_size_of called on unresolved associated-type projection"
+        ),
     }
 }
 
@@ -592,6 +620,11 @@ pub fn substitute_rtype(rt: &RType, env: &Vec<(String, RType)>) -> RType {
         }
         RType::Slice(inner) => RType::Slice(Box::new(substitute_rtype(inner, env))),
         RType::Str => RType::Str,
+        RType::AssocProj { base, trait_path, name } => RType::AssocProj {
+            base: Box::new(substitute_rtype(base, env)),
+            trait_path: trait_path.clone(),
+            name: name.clone(),
+        },
     }
 }
 
