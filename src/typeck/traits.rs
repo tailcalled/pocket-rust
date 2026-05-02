@@ -221,8 +221,26 @@ pub fn try_match_rtype(
     concrete: &RType,
     subst: &mut Vec<(String, RType)>,
 ) -> bool {
+    try_match_rtype_ctx(pattern, concrete, subst, true)
+}
+
+// `param_must_be_sized` carries the implicit `T: Sized` rule: at the
+// outer pattern position (impl_target itself, or inside Tuple/Struct/
+// Enum elements), a Param binding must be Sized. Recursing through
+// `Ref`/`RawPtr` flips it off — `&T` and `*const T` accept unsized
+// `T` (which is what makes `impl<T> Copy for &T` cover `&str`, mirror
+// of Rust's `impl<T: ?Sized> Copy for &T`).
+fn try_match_rtype_ctx(
+    pattern: &RType,
+    concrete: &RType,
+    subst: &mut Vec<(String, RType)>,
+    param_must_be_sized: bool,
+) -> bool {
     match (pattern, concrete) {
         (RType::Param(name), c) => {
+            if param_must_be_sized && !crate::typeck::is_sized(c) {
+                return false;
+            }
             // Already bound? Must equal.
             let mut i = 0;
             while i < subst.len() {
@@ -252,7 +270,7 @@ pub fn try_match_rtype(
             }
             let mut i = 0;
             while i < aa.len() {
-                if !try_match_rtype(&aa[i], &ab[i], subst) {
+                if !try_match_rtype_ctx(&aa[i], &ab[i], subst, true) {
                     return false;
                 }
                 i += 1;
@@ -270,7 +288,7 @@ pub fn try_match_rtype(
                 mutable: mb,
                 ..
             },
-        ) => ma == mb && try_match_rtype(ia, ib, subst),
+        ) => ma == mb && try_match_rtype_ctx(ia, ib, subst, false),
         (
             RType::RawPtr {
                 inner: ia,
@@ -280,7 +298,7 @@ pub fn try_match_rtype(
                 inner: ib,
                 mutable: mb,
             },
-        ) => ma == mb && try_match_rtype(ia, ib, subst),
+        ) => ma == mb && try_match_rtype_ctx(ia, ib, subst, false),
         (RType::Bool, RType::Bool) => true,
         (RType::Tuple(a), RType::Tuple(b)) => {
             if a.len() != b.len() {
@@ -288,7 +306,7 @@ pub fn try_match_rtype(
             }
             let mut i = 0;
             while i < a.len() {
-                if !try_match_rtype(&a[i], &b[i], subst) {
+                if !try_match_rtype_ctx(&a[i], &b[i], subst, true) {
                     return false;
                 }
                 i += 1;
@@ -312,7 +330,7 @@ pub fn try_match_rtype(
             }
             let mut i = 0;
             while i < aa.len() {
-                if !try_match_rtype(&aa[i], &ab[i], subst) {
+                if !try_match_rtype_ctx(&aa[i], &ab[i], subst, true) {
                     return false;
                 }
                 i += 1;
@@ -335,9 +353,27 @@ pub(crate) fn try_match_against_infer(
     env: &mut Vec<(String, InferType)>,
     pending: &mut Vec<(InferType, InferType)>,
 ) -> bool {
+    try_match_against_infer_ctx(pattern, concrete, subst, env, pending, true)
+}
+
+// Like `try_match_against_infer`, with the same `param_must_be_sized`
+// context as `try_match_rtype_ctx`. Recursing into Ref/RawPtr flips it
+// off so DST-bearing refs (`&str`, `&[U]`) match impls like
+// `impl<T> Copy for &T`.
+fn try_match_against_infer_ctx(
+    pattern: &RType,
+    concrete: &InferType,
+    subst: &Subst,
+    env: &mut Vec<(String, InferType)>,
+    pending: &mut Vec<(InferType, InferType)>,
+    param_must_be_sized: bool,
+) -> bool {
     let resolved = subst.substitute(concrete);
     match pattern {
         RType::Param(name) => {
+            if param_must_be_sized && !crate::typeck::is_sized_infer(&resolved) {
+                return false;
+            }
             // Already bound? Stage a unification with the prior binding.
             let mut existing: Option<InferType> = None;
             let mut k = 0;
@@ -379,7 +415,7 @@ pub(crate) fn try_match_against_infer(
                 }
                 let mut i = 0;
                 while i < aa.len() {
-                    if !try_match_against_infer(&aa[i], &ab[i], subst, env, pending) {
+                    if !try_match_against_infer_ctx(&aa[i], &ab[i], subst, env, pending, true) {
                         return false;
                     }
                     i += 1;
@@ -397,7 +433,7 @@ pub(crate) fn try_match_against_infer(
                 inner: ib,
                 mutable: mb,
                 ..
-            } => ma == mb && try_match_against_infer(ia, ib, subst, env, pending),
+            } => ma == mb && try_match_against_infer_ctx(ia, ib, subst, env, pending, false),
             _ => false,
         },
         RType::RawPtr {
@@ -407,7 +443,7 @@ pub(crate) fn try_match_against_infer(
             InferType::RawPtr {
                 inner: ib,
                 mutable: mb,
-            } => ma == mb && try_match_against_infer(ia, ib, subst, env, pending),
+            } => ma == mb && try_match_against_infer_ctx(ia, ib, subst, env, pending, false),
             _ => false,
         },
         RType::Tuple(pa) => match &resolved {
@@ -417,7 +453,7 @@ pub(crate) fn try_match_against_infer(
                 }
                 let mut i = 0;
                 while i < pa.len() {
-                    if !try_match_against_infer(&pa[i], &pb[i], subst, env, pending) {
+                    if !try_match_against_infer_ctx(&pa[i], &pb[i], subst, env, pending, true) {
                         return false;
                     }
                     i += 1;
@@ -441,7 +477,7 @@ pub(crate) fn try_match_against_infer(
                 }
                 let mut i = 0;
                 while i < aa.len() {
-                    if !try_match_against_infer(&aa[i], &ab[i], subst, env, pending) {
+                    if !try_match_against_infer_ctx(&aa[i], &ab[i], subst, env, pending, true) {
                         return false;
                     }
                     i += 1;
@@ -451,7 +487,7 @@ pub(crate) fn try_match_against_infer(
             _ => false,
         },
         RType::Slice(ia) => match &resolved {
-            InferType::Slice(ib) => try_match_against_infer(ia, ib, subst, env, pending),
+            InferType::Slice(ib) => try_match_against_infer_ctx(ia, ib, subst, env, pending, true),
             _ => false,
         },
         RType::Str => matches!(resolved, InferType::Str),

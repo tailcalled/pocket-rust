@@ -228,9 +228,14 @@ fn mut_method_through_shared_ref_is_rejected() {
              r.set(99) \
          }",
     );
+    // Receiver-type dispatch: `set`'s recv type is `&mut Point`. The
+    // candidate-self-type chain for `r: &Point` is [`&Point`, `&&Point`]
+    // (the `&mut &Point` level is excluded because `r` isn't a mutable
+    // place). `&mut Point` doesn't unify with either level, so no
+    // candidate matches → "no method".
     assert!(
-        err.contains("&mut self") && err.contains("shared"),
-        "expected mut-method-through-shared error, got: {}",
+        err.contains("no method") && err.contains("set"),
+        "expected mut-method-through-shared rejection, got: {}",
         err
     );
 }
@@ -245,9 +250,12 @@ fn mut_method_on_immutable_owned_is_rejected() {
              pt.set(99) \
          }",
     );
+    // `pt` is owned but not declared `mut`, so the `&mut Point` level
+    // is excluded from the candidate-self-type chain. `set`'s recv
+    // type `&mut Point` doesn't match `Point` or `&Point` levels.
     assert!(
-        err.contains("immutable receiver"),
-        "expected immutable-receiver error, got: {}",
+        err.contains("no method") && err.contains("set"),
+        "expected immutable-receiver rejection, got: {}",
         err
     );
 }

@@ -640,6 +640,16 @@ pub fn is_raw_ptr(t: &RType) -> bool {
     matches!(t, RType::RawPtr { .. })
 }
 
+// Whether `t` is `Sized` — i.e. has a known compile-time size. The two
+// DSTs in pocket-rust are `str` and `[T]`; everything else is Sized
+// (refs/pointers to DSTs are Sized — a `&str` is two i32s). A `Param`
+// is conservatively treated as Sized: every type-param implicitly
+// carries a `T: Sized` bound, so a binding to a non-Sized type is
+// rejected at unification (see `bind_var`).
+pub fn is_sized(t: &RType) -> bool {
+    !matches!(t, RType::Slice(_) | RType::Str)
+}
+
 pub fn is_ref_mutable(t: &RType) -> bool {
     matches!(t, RType::Ref { mutable: true, .. })
 }

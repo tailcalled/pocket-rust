@@ -471,171 +471,159 @@ pub(super) fn check_method_call(
             span: mc.method_span.copy(),
         });
     }
-    // Per matched candidate we record a `match_tier`, lower = more
-    // direct (mirrors Rust's deref-probe sequence; see "Method
-    // dispatch" in CLAUDE.md):
-    //   0 — direct: pattern matches recv_full as-is.
-    //   1 — pattern-side autoref: pattern is `&T` / `&mut T`; the
-    //       pattern's inner matches recv_full. Corresponds to Rust
-    //       autoref'ing the receiver to align with the impl pattern.
-    //   2 — recv-side peel: recv is a Ref and the pattern matches the
-    //       peeled inner. Corresponds to autoderef.
-    let mut matched: Vec<(
+    // Receiver-type-based dispatch (mirrors Rust's method-call
+    // resolution). Each impl's method has an "effective receiver
+    // type" Y = subst(method.params[0], Self → impl_target) — already
+    // substituted at impl-method registration in setup.rs, so just the
+    // raw `param_types[0]` of the impl method. We walk a candidate
+    // self-type chain built from `recv_full` and at each level look
+    // for impls whose Y unifies with the level. First level with at
+    // least one match wins. Multi-match at the same level → ambiguity.
+    //
+    // Levels (in order):
+    //   0 — recv_full as-is. If recv_full is a Ref → ByRef; else Move.
+    //   1 — &recv_full (autoref imm) → BorrowImm.
+    //   2 — &mut recv_full (autoref mut) → BorrowMut. Skipped when
+    //       recv is not a mutable place.
+    //
+    // The deref level (`*recv_full`, when recv is a Ref) is *not*
+    // implemented — pocket-rust doesn't currently support
+    // autoderef-then-pass-by-value (it would require a Copy/move-out
+    // analysis). Existing tests only exercise the three levels above.
+    enum LevelKind {
+        AsIs,
+        AutorefImm,
+        AutorefMut,
+    }
+    let mut levels: Vec<(InferType, ReceiverAdjust, LevelKind)> = Vec::new();
+    let recv_is_ref = matches!(&recv_full, InferType::Ref { .. });
+    let as_is_adjust = if recv_is_ref { ReceiverAdjust::ByRef } else { ReceiverAdjust::Move };
+    levels.push((recv_full.clone(), as_is_adjust, LevelKind::AsIs));
+    levels.push((
+        InferType::Ref {
+            inner: Box::new(recv_full.clone()),
+            mutable: false,
+            lifetime: crate::typeck::LifetimeRepr::Inferred(0),
+        },
+        ReceiverAdjust::BorrowImm,
+        LevelKind::AutorefImm,
+    ));
+    if is_mutable_place(ctx, &mc.receiver) {
+        levels.push((
+            InferType::Ref {
+                inner: Box::new(recv_full.clone()),
+                mutable: true,
+                lifetime: crate::typeck::LifetimeRepr::Inferred(0),
+            },
+            ReceiverAdjust::BorrowMut,
+            LevelKind::AutorefMut,
+        ));
+    }
+    let mut chosen: Option<(
         MethodCandidate,
         Vec<(String, InferType)>,
         Vec<(InferType, InferType)>,
-        u8,
-    )> = Vec::new();
-    for cand in &candidates {
-        let impl_target_opt: Option<RType> = match cand {
-            MethodCandidate::Direct(i) => {
-                ctx.funcs.entries[*i].impl_target.clone()
-            }
-            MethodCandidate::Template(i) => {
-                ctx.funcs.templates[*i].impl_target.clone()
-            }
-        };
-        let pat = match &impl_target_opt {
-            Some(p) => p,
-            None => continue,
-        };
-        // Tier 0: full recv.
-        let mut env_so_far: Vec<(String, InferType)> = Vec::new();
-        let mut pending: Vec<(InferType, InferType)> = Vec::new();
-        let mut ok = try_match_against_infer(
-            pat,
-            &recv_full,
-            &ctx.subst,
-            &mut env_so_far,
-            &mut pending,
-        );
-        let mut match_tier: u8 = 0;
-        if !ok {
-            // Tier 1: pattern-side autoref. Only meaningful when the
-            // pattern is shaped `&T` / `&mut T`; we peel that off and
-            // match its inner against recv_full.
-            if let RType::Ref { inner: pat_inner, .. } = pat {
-                env_so_far = Vec::new();
-                pending = Vec::new();
-                ok = try_match_against_infer(
-                    pat_inner,
-                    &recv_full,
-                    &ctx.subst,
-                    &mut env_so_far,
-                    &mut pending,
-                );
-                if ok {
-                    match_tier = 1;
-                }
-            }
-        }
-        if !ok {
-            // Tier 2: recv-side peel.
-            if let Some(peeled) = &recv_peeled {
-                env_so_far = Vec::new();
-                pending = Vec::new();
-                ok = try_match_against_infer(
-                    pat,
-                    peeled,
-                    &ctx.subst,
-                    &mut env_so_far,
-                    &mut pending,
-                );
-                if ok {
-                    match_tier = 2;
-                }
-            }
-        }
-        if ok {
-            matched.push((*cand, env_so_far, pending, match_tier));
-        }
-    }
-    if matched.is_empty() {
-        return Err(Error {
-            file: ctx.current_file.to_string(),
-            message: format!("no method `{}` on `{}`", mc.method, infer_to_string(&recv_full)),
-            span: mc.method_span.copy(),
-        });
-    }
-    // T2.6.5: when more than one candidate type-matched, filter by
-    // recv-adjust validity. Drop candidates whose `derive_recv_adjust`
-    // would error (e.g. method takes `self` by value but recv is a
-    // borrow). Only declare ambiguity if multiple still survive.
-    if matched.len() > 1 {
-        let mut adjust_valid: Vec<usize> = Vec::new();
-        let mut idx = 0;
-        while idx < matched.len() {
-            let cand = &matched[idx].0;
-            let recv_param: RType = match cand {
+        ReceiverAdjust,
+    )> = None;
+    for (level_ty, level_adjust, _level_kind) in &levels {
+        let mut matches_at_level: Vec<(
+            MethodCandidate,
+            Vec<(String, InferType)>,
+            Vec<(InferType, InferType)>,
+        )> = Vec::new();
+        for cand in &candidates {
+            let (method_recv_param, impl_target_opt): (RType, Option<RType>) = match cand {
                 MethodCandidate::Direct(i) => {
-                    ctx.funcs.entries[*i].param_types[0].clone()
+                    if ctx.funcs.entries[*i].param_types.is_empty() {
+                        continue;
+                    }
+                    (
+                        ctx.funcs.entries[*i].param_types[0].clone(),
+                        ctx.funcs.entries[*i].impl_target.clone(),
+                    )
                 }
                 MethodCandidate::Template(i) => {
-                    ctx.funcs.templates[*i].param_types[0].clone()
+                    if ctx.funcs.templates[*i].param_types.is_empty() {
+                        continue;
+                    }
+                    (
+                        ctx.funcs.templates[*i].param_types[0].clone(),
+                        ctx.funcs.templates[*i].impl_target.clone(),
+                    )
                 }
             };
-            if derive_recv_adjust(
-                &recv_kind,
-                &recv_param,
-                ctx,
-                &mc.receiver,
-                &mc.method_span,
-            )
-            .is_ok()
-            {
-                adjust_valid.push(idx);
+            let mut env_so_far: Vec<(String, InferType)> = Vec::new();
+            let mut pending: Vec<(InferType, InferType)> = Vec::new();
+            if !try_match_against_infer(
+                &method_recv_param,
+                level_ty,
+                &ctx.subst,
+                &mut env_so_far,
+                &mut pending,
+            ) {
+                continue;
             }
-            idx += 1;
+            // Implicit `T: Sized` enforcement on impl-level type-params:
+            // walk the impl_target to find which params appear outside
+            // any Ref/RawPtr (those positions need a known size, e.g.
+            // `impl<T> Trait for T` or `impl<T> Trait for Vec<T>`). For
+            // any such param, the env binding must be Sized — otherwise
+            // the impl doesn't actually cover the candidate type. Params
+            // appearing only inside Ref/RawPtr (e.g. `impl<T> Copy for
+            // &T`) are NOT subject to the Sized check here, mirroring
+            // Rust's `impl<T: ?Sized> Copy for &T` opt-out.
+            let mut sized_required: Vec<String> = Vec::new();
+            if let Some(it) = &impl_target_opt {
+                collect_sized_required_params(it, true, &mut sized_required);
+            }
+            let mut sized_ok = true;
+            let mut k = 0;
+            while k < env_so_far.len() {
+                if sized_required.contains(&env_so_far[k].0) {
+                    let resolved = ctx.subst.substitute(&env_so_far[k].1);
+                    if !crate::typeck::is_sized_infer(&resolved) {
+                        sized_ok = false;
+                        break;
+                    }
+                }
+                k += 1;
+            }
+            if !sized_ok {
+                continue;
+            }
+            matches_at_level.push((*cand, env_so_far, pending));
         }
-        if adjust_valid.is_empty() {
-            // None of the candidates can adjust to the receiver shape.
+        if matches_at_level.is_empty() {
+            continue;
+        }
+        if matches_at_level.len() > 1 {
             return Err(Error {
                 file: ctx.current_file.to_string(),
                 message: format!(
-                    "no method `{}` callable on `{}`",
+                    "ambiguous method `{}` on `{}`: multiple impls match",
                     mc.method,
                     infer_to_string(&recv_full)
                 ),
                 span: mc.method_span.copy(),
             });
         }
-        // Drop adjust-invalid candidates first.
-        let valid_set: Vec<usize> = adjust_valid;
-        matched = matched
-            .into_iter()
-            .enumerate()
-            .filter_map(|(i, m)| if valid_set.contains(&i) { Some(m) } else { None })
-            .collect();
-        // If still ambiguous, prefer the minimum match_tier — Rust's
-        // dispatch probes the receiver type as-is first, then autoref,
-        // then deref. Stops at the first hit. Only a true overlap at
-        // the same tier (e.g. unrelated traits supplying the same
-        // method name on the same recv shape) declares ambiguity.
-        if matched.len() > 1 {
-            let mut min_tier: u8 = u8::MAX;
-            let mut k = 0;
-            while k < matched.len() {
-                if matched[k].3 < min_tier {
-                    min_tier = matched[k].3;
-                }
-                k += 1;
-            }
-            matched = matched.into_iter().filter(|m| m.3 == min_tier).collect();
-            if matched.len() > 1 {
-                return Err(Error {
-                    file: ctx.current_file.to_string(),
-                    message: format!(
-                        "ambiguous method `{}` on `{}`: multiple impls match",
-                        mc.method,
-                        infer_to_string(&recv_full)
-                    ),
-                    span: mc.method_span.copy(),
-                });
-            }
-        }
+        let (cand, env_at, pending_at) = matches_at_level.into_iter().next().unwrap();
+        chosen = Some((cand, env_at, pending_at, *level_adjust));
+        break;
     }
-    let (chosen_cand, mut chosen_env, chosen_pending, _match_tier) =
-        matched.into_iter().next().unwrap();
+    let (chosen_cand, mut chosen_env, chosen_pending, chosen_adjust) = match chosen {
+        Some(c) => c,
+        None => {
+            return Err(Error {
+                file: ctx.current_file.to_string(),
+                message: format!("no method `{}` on `{}`", mc.method, infer_to_string(&recv_full)),
+                span: mc.method_span.copy(),
+            });
+        }
+    };
+    // Suppress unused-warning for recv_kind / recv_peeled — kept for
+    // potential future deref-level support but not consulted here.
+    let _ = (&recv_kind, &recv_peeled);
     // Commit the pending unifications discovered during pattern matching.
     let mut pi = 0;
     while pi < chosen_pending.len() {
@@ -795,8 +783,9 @@ pub(super) fn check_method_call(
             span: mc.method_span.copy(),
         });
     }
-    let recv_param = &mp_param_types[0];
-    let recv_adjust = derive_recv_adjust(&recv_kind, recv_param, ctx, &mc.receiver, &mc.method_span)?;
+    // recv_adjust was already determined by which level of the
+    // candidate-self-type chain matched.
+    let recv_adjust = chosen_adjust;
     let expected_arg_count = mp_param_types.len() - 1;
     if mc.args.len() != expected_arg_count {
         return Err(Error {
@@ -898,69 +887,47 @@ pub(super) fn check_method_call(
     })
 }
 
+// `RecvShape` was used by the old pattern-tier dispatch's per-shape
+// adjust derivation. Receiver-type-based dispatch determines the
+// adjustment from which level of the candidate-self-type chain
+// matched, so neither the shape enum nor the derive helpers are
+// referenced any longer; kept as deletions in the diff.
 enum RecvShape {
     Owned,
     SharedRef,
     MutRef,
 }
 
-fn derive_recv_adjust(
-    recv_kind: &RecvShape,
-    recv_param: &RType,
-    ctx: &CheckCtx,
-    recv_expr: &Expr,
-    method_span: &Span,
-) -> Result<ReceiverAdjust, Error> {
-    match recv_param {
-        RType::Ref {
-            mutable: param_mut,
-            ..
-        } => {
-            // Method takes `&Self` or `&mut Self`.
-            match (recv_kind, param_mut) {
-                (RecvShape::Owned, false) => Ok(ReceiverAdjust::BorrowImm),
-                (RecvShape::Owned, true) => {
-                    if !is_mutable_place(ctx, recv_expr) {
-                        return Err(Error {
-                            file: ctx.current_file.to_string(),
-                            message:
-                                "cannot call `&mut self` method on an immutable receiver"
-                                    .to_string(),
-                            span: method_span.copy(),
-                        });
-                    }
-                    Ok(ReceiverAdjust::BorrowMut)
-                }
-                (RecvShape::SharedRef, false) => Ok(ReceiverAdjust::ByRef),
-                (RecvShape::SharedRef, true) => Err(Error {
-                    file: ctx.current_file.to_string(),
-                    message:
-                        "cannot call `&mut self` method through a shared reference"
-                            .to_string(),
-                    span: method_span.copy(),
-                }),
-                (RecvShape::MutRef, false) => Ok(ReceiverAdjust::ByRef),
-                (RecvShape::MutRef, true) => Ok(ReceiverAdjust::ByRef),
+// Walk an impl's target pattern and collect every `Param` name that
+// appears outside any `Ref` / `RawPtr` wrapper. Those are the params
+// the implicit `T: Sized` bound bites on — the impl's type *must* have
+// a known compile-time size at those positions. Params nested only
+// inside `&T` / `*const T` aren't subject to the check (mirror of
+// Rust's auto-derived `?Sized` allowance for ref/ptr-only positions).
+fn collect_sized_required_params(t: &RType, sized_ctx: bool, out: &mut Vec<String>) {
+    match t {
+        RType::Param(name) => {
+            if sized_ctx && !out.contains(name) {
+                out.push(name.clone());
             }
         }
-        // T2.6: any non-Ref recv_param (Struct, Int, RawPtr, Param)
-        // means "method takes Self by value" — receiver moves in.
-        _ => match recv_kind {
-            RecvShape::Owned => Ok(ReceiverAdjust::Move),
-            _ => Err(Error {
-                file: ctx.current_file.to_string(),
-                message: format!(
-                    "cannot move out of borrow to call `{}` (which takes `self` by value)",
-                    token_method_name(recv_expr)
-                ),
-                span: method_span.copy(),
-            }),
-        },
+        RType::Struct { type_args, .. } | RType::Enum { type_args, .. } => {
+            for arg in type_args {
+                collect_sized_required_params(arg, true, out);
+            }
+        }
+        RType::Tuple(elems) => {
+            for e in elems {
+                collect_sized_required_params(e, true, out);
+            }
+        }
+        RType::Ref { inner, .. } | RType::RawPtr { inner, .. } => {
+            collect_sized_required_params(inner, false, out);
+        }
+        RType::Slice(inner) => {
+            // [T] requires T: Sized (Rust's slice element type).
+            collect_sized_required_params(inner, true, out);
+        }
+        RType::Int(_) | RType::Bool | RType::Str => {}
     }
-}
-
-fn token_method_name(_recv: &Expr) -> &'static str {
-    // Placeholder: we only use this in an error message that's about the
-    // receiver, not the method itself.
-    "this method"
 }

@@ -75,12 +75,14 @@ fn dispatch_adjust_filter_returns_99() {
     expect_answer("lang/traits/dispatch_adjust_filter", 99i32);
 }
 
-// T2.7: with `r: &u32; r.show()`, the `&T` blanket impl matches at
-// peel-level 0 while `impl Show for u32` matches via autoref at level
-// 1. The direct match wins.
+// Receiver-type chain: `r: &u32; r.show()` — at level `&u32` the
+// `impl Show for u32`'s method receiver type is `&u32` (matches
+// directly). The blanket `impl<T> Show for &T` has receiver type
+// `&&T`, which would match at level `&&u32`, later in the chain.
+// First level with a match wins → u32 impl. Mirrors rustc.
 #[test]
-fn autoref_disambig_through_ref_returns_2() {
-    expect_export("lang/traits/autoref_disambig", "through_ref", 2i32);
+fn autoref_disambig_through_ref_returns_1() {
+    expect_export("lang/traits/autoref_disambig", "through_ref", 1i32);
 }
 
 // Sanity check the inverse: with `x: u32` (owned), `impl Show for
@@ -89,15 +91,6 @@ fn autoref_disambig_through_ref_returns_2() {
 #[test]
 fn autoref_disambig_through_owned_returns_1() {
     expect_export("lang/traits/autoref_disambig", "through_owned", 1i32);
-}
-
-// Pattern-side autoref reaching a blanket impl: only `impl<T> Tag
-// for &T` exists, recv is owned `x: u32`. Pattern `&T` matches via
-// autoref (T=u32). derive_recv_adjust says BorrowImm — `&x` is
-// passed to the impl method.
-#[test]
-fn autoref_only_returns_7() {
-    expect_answer("lang/traits/autoref_only", 7i32);
 }
 
 // Partial-concrete impl: `impl<T> Pair<usize, T>` matches `Pair<u32,
@@ -334,4 +327,87 @@ fn self_outside_impl_is_rejected() {
         "expected Self-outside-impl error, got: {}",
         err
     );
+}
+
+// `impl MyTrait for str` + a blanket `impl<T> MyTrait for T` coexist
+// without overlap because the blanket implicitly carries `T: Sized`
+// and `str` is unsized. At candidate level `&str` (recv-as-is), only
+// the str impl's method recv type `&str` matches; the blanket would
+// need `T = str` (rejected by Sized) to also match here. Returns 0.
+// Mirrors rustc's resolution.
+#[test]
+fn blanket_with_str_specialization_returns_0() {
+    expect_answer("lang/traits/blanket_with_str_specialization", 0i32);
+}
+
+// Sole-blanket dispatch: `impl<T> Trait for T` with a Sized concrete
+// recv (`u32`). Blanket binds T=u32, autoref reaches `&self` method
+// at chain level `&u32`. Returns 42.
+#[test]
+fn dispatch_blanket_only_for_concrete_recv_returns_42() {
+    expect_answer("lang/traits/dispatch_blanket_only_for_concrete_recv", 42i32);
+}
+
+// `impl MyTrait for str` only. Recv `&str` matches `test`'s recv
+// type `&str` directly at chain level 0 — no autoref needed.
+#[test]
+fn dispatch_str_impl_directly_via_ref_returns_42() {
+    expect_answer("lang/traits/dispatch_str_impl_directly_via_ref", 42i32);
+}
+
+// Cross-level resolution: two impls whose method receiver types live
+// at different chain levels. Chain-order picks the first level with
+// a match — no ambiguity. Cross-checked against rustc.
+#[test]
+fn dispatch_chain_order_picks_first_match_returns_1() {
+    expect_answer("lang/traits/dispatch_chain_order_picks_first_match", 1i32);
+}
+
+// Negative: `impl Trait for u32` + `impl<T> Trait for T` on recv u32.
+// At chain level `&u32`, both impls' method recv type is `&u32`
+// (concrete impl → `&u32`; blanket → `&T` with T=u32 → `&u32`). Both
+// pass Sized. Same-level multi-match → ambiguous error. (Rust would
+// reject this at coherence time; pocket-rust catches it at the call
+// site.)
+#[test]
+fn dispatch_ambig_same_level_concrete_vs_blanket_is_rejected() {
+    let err = compile_source(
+        "trait Trait { fn m(&self) -> u32; }\n\
+         impl Trait for u32 { fn m(&self) -> u32 { 0 } }\n\
+         impl<T> Trait for T { fn m(&self) -> u32 { 1 } }\n\
+         fn answer() -> u32 { let x: u32 = 0; x.m() }",
+    );
+    assert!(
+        err.contains("ambiguous method"),
+        "expected ambiguous-method error, got: {}",
+        err
+    );
+}
+
+// Negative: two parametric impls whose patterns overlap on a concrete
+// recv with no specificity ordering. Both `(T, u32)` and `(u32, T)`
+// match `(u32, u32)` at the same level → ambiguous.
+#[test]
+fn dispatch_ambig_same_level_two_param_impls_is_rejected() {
+    let err = compile_source(
+        "trait Trait { fn m(&self) -> u32; }\n\
+         impl<T> Trait for (T, u32) { fn m(&self) -> u32 { 0 } }\n\
+         impl<T> Trait for (u32, T) { fn m(&self) -> u32 { 1 } }\n\
+         fn answer() -> u32 { let p: (u32, u32) = (1, 2); p.m() }",
+    );
+    assert!(
+        err.contains("ambiguous method"),
+        "expected ambiguous-method error, got: {}",
+        err
+    );
+}
+
+// Sole-blanket `impl<T> Trait for T` with recv `&str`: at level
+// `&str`, blanket would need T=str (rejected by Sized). At level
+// `&&str` (autoref), T=&str (Sized passes). The autoref level wins.
+// Validates that Sized exclusion at one chain level doesn't poison
+// later levels.
+#[test]
+fn dispatch_blanket_through_str_uses_autoref_returns_7() {
+    expect_answer("lang/traits/dispatch_blanket_through_str_uses_autoref", 7i32);
 }

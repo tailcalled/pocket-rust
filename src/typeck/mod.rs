@@ -6,7 +6,7 @@ use crate::span::{Error, Span};
 mod types;
 pub use types::{
     IntKind, LifetimeRepr, RType, byte_size_of, copy_trait_path, drop_trait_path, num_trait_path, flatten_rtype,
-    int_kind_name, is_copy, is_copy_with_bounds, is_drop, is_raw_ptr, is_ref_mutable,
+    int_kind_name, is_copy, is_copy_with_bounds, is_drop, is_raw_ptr, is_ref_mutable, is_sized,
     outer_lifetime, rtype_eq, rtype_to_string, substitute_rtype,
 };
 use types::{int_kind_from_name, int_kind_max, int_kind_neg_magnitude, int_kind_signed, struct_env};
@@ -42,6 +42,15 @@ fn satisfies_num(
         | InferType::Slice(_)
         | InferType::Str => false,
     }
+}
+
+// Whether `t` (an InferType, possibly partially resolved) is `Sized`.
+// `Slice(_)` and `Str` are unsized; everything else, including refs to
+// DSTs and unresolved Vars/Params, is treated as Sized. (A Var that
+// later resolves to a DST is unrealistic in practice — DSTs don't
+// arise from inference, only from explicit user-written types.)
+pub(crate) fn is_sized_infer(t: &InferType) -> bool {
+    !matches!(t, InferType::Slice(_) | InferType::Str)
 }
 
 // Convert an `InferType` to an `RType` for the purposes of impl-table
