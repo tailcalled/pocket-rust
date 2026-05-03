@@ -300,16 +300,11 @@ struct FnCtx<'a> {
     enums: &'a crate::typeck::EnumTable,
     traits: &'a crate::typeck::TraitTable,
     funcs: &'a FuncTable,
-    // Per-let `BindingStorageKind` keyed by `let_stmt.value.id`. Sparse:
-    // `Some(Memory{off})` for spilled lets, `Some(Local)` for non-spilled
-    // lets, `None` for non-let nodes. Sized to `func.node_count`.
-    let_storage: Vec<Option<BindingStorageKind>>,
-    // Per-pattern-binding storage kind, keyed by `Pattern.id`. Sparse:
-    // `Some(MemoryAt)` for addressed pattern bindings (allocate a
-    // shadow-stack slot at bind time), `Some(Local)` for non-addressed
-    // pattern bindings, `None` for non-binding pattern nodes. Sized to
-    // `func.node_count`.
-    pattern_storage: Vec<Option<BindingStorageKind>>,
+    // Per-binding storage kind, keyed by `BindingId` (parallel to
+    // `mono_body.locals`). Populated from `MonoLayout.binding_storage`
+    // at FnCtx construction. Codegen consults this to pick `Storage`
+    // for each let, pattern leaf, param, or synthesized binding.
+    binding_storage: Vec<BindingStorageKind>,
     // T4.6: borrowck's snapshot of every place whose move-state at scope
     // end was non-Init (Moved or MaybeMoved). emit_drops_for_locals_range
     // looks up each Drop binding's name as a single-segment entry — Moved
@@ -728,7 +723,15 @@ fn emit_monomorphic(
     mono: &mut MonoState,
 ) -> Result<(), Error> {
     let tmpl = &funcs.templates[template_idx];
-    let mono_fn = build_mono_for_template(tmpl, type_args, wasm_idx);
+    let input = build_mono_input_for_template(tmpl, type_args, wasm_idx);
+    let mono_fn = crate::mono::lower_to_mono(
+        &input,
+        structs,
+        enums,
+        traits,
+        funcs,
+        &mono.mono_table,
+    )?;
     emit_function_concrete(
         wasm_mod,
         &mono_fn,
@@ -740,14 +743,15 @@ fn emit_monomorphic(
     )
 }
 
-// Build a `MonoFn` for one (template, concrete type_args) pair: substitute
-// every Param-bearing artifact through the env so the result is fully
-// concrete.
-fn build_mono_for_template<'a>(
+// Build a `MonoFnInput` for one (template, concrete type_args) pair:
+// substitute every Param-bearing artifact through the env so the input
+// is fully concrete. The caller passes this to `lower_to_mono` which
+// produces the codegen-ready `MonoFn`.
+fn build_mono_input_for_template<'a>(
     tmpl: &'a GenericTemplate,
     type_args: Vec<RType>,
     wasm_idx: u32,
-) -> MonoFn<'a> {
+) -> crate::mono::MonoFnInput<'a> {
     let env = build_env(&tmpl.type_params, &type_args);
     let param_types = subst_vec(&tmpl.param_types, &env);
     let return_type = tmpl.return_type.as_ref().map(|t| substitute_rtype(t, &env));
@@ -759,8 +763,7 @@ fn build_mono_for_template<'a>(
     // snapshot from borrowck applies to every monomorphization.
     let moved_places = clone_moved_places(&tmpl.moved_places);
     let move_sites = clone_move_sites(&tmpl.move_sites);
-    let _ = &env; // env feeds the per-resolution `subst_opt_*` calls above; not stored on MonoFn
-    MonoFn {
+    crate::mono::MonoFnInput {
         func: &tmpl.func,
         param_types,
         return_type,
@@ -885,8 +888,8 @@ fn emit_function(
     let mut full = path_prefix.clone();
     full.push(func.name.clone());
     let entry = func_lookup(funcs, &full).expect("typeck registered this function");
-    let _ = self_target; // impl-target propagation lives in build_mono_for_template; non-generic paths don't need it
-    let mono_fn = MonoFn {
+    let _ = self_target; // impl-target propagation lives in build_mono_input_for_template; non-generic paths don't need it
+    let input = crate::mono::MonoFnInput {
         func,
         param_types: entry.param_types.clone(),
         return_type: entry.return_type.clone(),
@@ -899,6 +902,14 @@ fn emit_function(
         wasm_idx: entry.idx,
         is_export: current_module.is_empty() && path_prefix.len() == current_module.len(),
     };
+    let mono_fn = crate::mono::lower_to_mono(
+        &input,
+        structs,
+        enums,
+        traits,
+        funcs,
+        &mono.mono_table,
+    )?;
     emit_function_concrete(
         wasm_mod,
         &mono_fn,
@@ -947,60 +958,39 @@ fn clone_move_sites(
 
 fn emit_function_concrete(
     wasm_mod: &mut wasm::Module,
-    mono_fn: &MonoFn,
+    mono_fn: &crate::mono::MonoFn,
     structs: &StructTable,
     enums: &crate::typeck::EnumTable,
     traits: &crate::typeck::TraitTable,
     funcs: &FuncTable,
     mono: &mut MonoState,
 ) -> Result<(), Error> {
-    let func = mono_fn.func;
+    let body = &mono_fn.body;
     let param_types = &mono_fn.param_types;
     let return_type = &mono_fn.return_type;
     let wasm_idx = mono_fn.wasm_idx;
     let is_export = mono_fn.is_export;
-    // Per-mono frame layout pass: precomputed escape analysis + frame
-    // offsets + per-binding storage kinds. Codegen reads from `layout`
-    // instead of computing inline.
-    let layout = crate::layout::compute_layout(mono_fn, structs, enums, traits);
-    let param_storage = &layout.param_storage;
-    let let_storage = &layout.let_storage;
-    let frame_size = layout.frame_size;
-    // Phase 1c: try lowering to Mono. If lowering succeeds AND the
-    // body uses only variants that codegen_mono_block supports, the
-    // body emission switches to the Mono path. Otherwise codegen falls
-    // back to the AST path. The lowered MonoBody is held as an Option
-    // for the body-codegen step below.
-    let mono_body_opt: Option<crate::mono::MonoBody> = match crate::mono::lower_to_mono(
-        mono_fn,
+    // Per-mono frame layout pass: walks the Mono IR to mark addressed
+    // bindings + compute per-binding storage kind + frame offsets.
+    // Codegen reads `binding_storage` (BindingId-keyed) directly.
+    let layout = crate::layout::compute_mono_layout(
+        body,
+        &mono_fn.moved_places,
         structs,
         enums,
         traits,
-        funcs,
-        &mono.mono_table,
-    ) {
-        Ok(body) => {
-            // Compute MonoLayout as well — currently unused by codegen
-            // but exercises the layout pass on every mono.
-            let _mono_layout = crate::layout::compute_mono_layout(
-                &body,
-                &mono_fn.moved_places,
-                structs,
-                enums,
-                traits,
-            );
-            if std::env::var("MONO_TRACE").is_ok() {
-                eprintln!("MONO_OK fn={}", mono_fn.func.name);
-            }
-            Some(body)
-        }
-        Err(e) => {
-            if std::env::var("MONO_TRACE").is_ok() {
-                eprintln!("MONO_ERR fn={} msg={}", mono_fn.func.name, e.message);
-            }
-            None
-        }
-    };
+    );
+    let frame_size = layout.frame_size;
+    // Param storage is the prefix of binding_storage corresponding to
+    // BindingOrigin::Param entries. Lowering declares params first in
+    // BindingId order, so binding_storage[0..param_count] matches.
+    let param_count = mono_fn.param_types.len();
+    let param_storage: Vec<BindingStorageKind> =
+        layout.binding_storage[..param_count].to_vec();
+    if std::env::var("MONO_TRACE").is_ok() {
+        eprintln!("MONO_OK fn={}", mono_fn.name);
+    }
+    let _ = funcs; // currently unused by emit_function_concrete (lowering, which needed it, ran upstream)
 
     // Build the WASM signature: refs collapse to a single i32; everything else
     // flattens to flat scalars as before. Functions returning enums use sret:
@@ -1018,7 +1008,7 @@ fn emit_function_concrete(
     }
     let mut locals: Vec<LocalBinding> = Vec::new();
     let mut k = 0;
-    while k < func.params.len() {
+    while k < param_count {
         let pty = param_types[k].clone();
         let storage = match param_storage[k] {
             BindingStorageKind::Memory { frame_offset } => Storage::Memory { frame_offset },
@@ -1049,7 +1039,9 @@ fn emit_function_concrete(
                 j += 1;
             }
         }
-        let pname = func.params[k].name.clone();
+        // Param names live on body.locals[k] (lowering declares params
+        // first in BindingId order — see `lower_to_mono`).
+        let pname = body.locals[k].name.clone();
         let drop_action = crate::layout::compute_drop_action(
             &pname,
             &pty,
@@ -1094,8 +1086,7 @@ fn emit_function_concrete(
         enums,
         traits,
         funcs,
-        let_storage: let_storage.clone(),
-        pattern_storage: layout.pattern_storage.clone(),
+        binding_storage: layout.binding_storage.clone(),
         moved_places: clone_moved_places(&mono_fn.moved_places),
         move_sites: clone_move_sites(&mono_fn.move_sites),
         drop_flags: Vec::new(),
@@ -1172,7 +1163,7 @@ fn emit_function_concrete(
         // the first spilled-param slot, corrupting `self`.
         let mut p = 0;
         let mut wasm_local_cursor: u32 = if returns_enum { 1 } else { 0 };
-        while p < func.params.len() {
+        while p < param_count {
             let pty = ctx.locals[p].rtype.clone();
             let mut vts: Vec<wasm::ValType> = Vec::new();
             flatten_rtype(&pty, structs, &mut vts);
@@ -1219,7 +1210,7 @@ fn emit_function_concrete(
     // Allocate drop flags for any param that's MaybeMoved at scope-end.
     // Init = 1 (param always initialized at fn entry).
     let mut p = 0;
-    while p < func.params.len() {
+    while p < param_count {
         let local_name = ctx.locals[p].name.clone();
         if matches!(ctx.locals[p].drop_action, crate::layout::DropAction::Flagged) {
             let flag_idx = ctx.next_wasm_local;
@@ -1233,36 +1224,29 @@ fn emit_function_concrete(
     }
 
     // Phase 1c step 2: try Mono-driven body codegen if available and
-    // supported. Fall back to AST codegen on any miss.
-    // Functions with `MaybeMoved` bindings need drop-flag clearing at
-    // every move site — Mono path doesn't yet handle this (the
-    // `Local(BindingId)` lookup in `codegen_mono_expr` doesn't know
-    // whether the read is a move site). Fall back to AST when any
-    // moved_places entry is MaybeMoved.
-    // All function bodies go through Mono codegen. Lowering and the
-    // per-variant support check together cover every shape pocket-rust
-    // accepts; failures here surface as compile errors rather than
-    // silent fallbacks (no more AST shadow path).
-    let body = mono_body_opt.ok_or_else(|| Error {
-        file: String::new(),
-        message: format!(
-            "codegen: Mono lowering failed for fn `{}` (no AST fallback)",
-            mono_fn.func.name
-        ),
-        span: func.body.span.copy(),
-    })?;
+    // The MonoBody was lowered upstream (in `emit_function` for
+    // non-generics, in `emit_monomorphic` for generic instances); the
+    // codegen-side per-variant support check is the only remaining gate
+    // before byte emission.
     if !mono_codegen_supports(&body) {
         return Err(Error {
             file: String::new(),
             message: format!(
                 "codegen: Mono codegen rejected fn `{}` ({})",
-                mono_fn.func.name,
+                mono_fn.name,
                 first_unsupported_block(&body.body),
             ),
-            span: func.body.span.copy(),
+            // No precise span available — MonoBody is post-lowering and
+            // doesn't carry the source range of the entire function body.
+            // This error is a compiler invariant violation, not a user
+            // diagnostic; the message identifies the fn by name.
+            span: crate::span::Span::new(
+                crate::span::Pos::new(1, 1),
+                crate::span::Pos::new(1, 1),
+            ),
         });
     }
-    ctx.mono_body = Some(&body);
+    ctx.mono_body = Some(body);
     // Initialize BindingId → ctx.locals map. Params have identity
     // mapping (they were pushed in BindingId order before Mono codegen
     // runs). Other entries (lets) get populated by `codegen_mono_stmt`'s
@@ -1364,7 +1348,7 @@ fn emit_function_concrete(
 
     if is_export {
         wasm_mod.exports.push(wasm::Export {
-            name: func.name.clone(),
+            name: mono_fn.name.clone(),
             kind: wasm::ExportKind::Func,
             index: func_idx,
         });
@@ -2607,6 +2591,28 @@ fn bind_pattern_ref(
     });
 }
 
+// Resolve a pattern leaf's `BindingId` by looking up its AST node id
+// in the lowered body's locals (BindingOrigin::Pattern(nid)). Returns
+// `None` if the pattern wasn't declared via `declare_pattern_bindings`
+// (e.g. wildcard, refutable lit, etc.) — the caller treats that as
+// "not addressed".
+fn pattern_binding_id_for(
+    ctx: &FnCtx,
+    pattern_id: crate::ast::NodeId,
+) -> Option<u32> {
+    let body = ctx.mono_body?;
+    let mut k = 0;
+    while k < body.locals.len() {
+        if let crate::mono::BindingOrigin::Pattern(nid) = &body.locals[k].origin {
+            if *nid == pattern_id {
+                return Some(k as u32);
+            }
+        }
+        k += 1;
+    }
+    None
+}
+
 fn bind_pattern_value(
     ctx: &mut FnCtx,
     name: &str,
@@ -2657,12 +2663,11 @@ fn bind_pattern_value(
     // Non-enum value: if escape analysis flagged this binding as
     // addressed, allocate a shadow-stack slot up front so reads /
     // writes / borrows all share one stable location. Otherwise stash
-    // into wasm locals (the fast path).
-    let addressed = (pattern_id as usize) < ctx.pattern_storage.len()
-        && matches!(
-            ctx.pattern_storage[pattern_id as usize],
-            Some(BindingStorageKind::MemoryAt)
-        );
+    // into wasm locals (the fast path). Look up the pattern leaf's
+    // BindingId via its origin (Pattern(pat.id)) in the lowered body.
+    let addressed = pattern_binding_id_for(ctx, pattern_id)
+        .map(|bid| matches!(ctx.binding_storage[bid as usize], BindingStorageKind::MemoryAt))
+        .unwrap_or(false);
     if addressed {
         let bytes = byte_size_of(ty, ctx.structs, ctx.enums);
         ctx.instructions
@@ -3973,82 +3978,18 @@ fn codegen_mono_stmt(
             Ok(())
         }
         crate::mono::MonoStmt::Let { binding, value, .. } => {
-            // Look up the binding's MonoLocal info from mono_body.
+            // Look up the binding's MonoLocal info + pre-computed
+            // storage decision (BindingId-keyed). Synthesized bindings
+            // (for-loop `__iter`, try-op arm bodies) get MemoryAt:
+            // codegen allocates a dynamic shadow-stack slot here. Plain
+            // `let x = e` bindings get Memory or Local from the layout
+            // pass's escape analysis. Pattern leaves never appear as
+            // MonoStmt::Let (codegen_pattern at match-arm time handles
+            // those via bind_pattern_value).
             let mono_body = ctx.mono_body
                 .expect("Mono codegen invoked without ctx.mono_body set");
             let local = &mono_body.locals[*binding as usize];
-            // Pick storage:
-            //   - LetValue(id): use the layout pass's pre-computed
-            //     `let_storage[id]` (Memory if escape-analyzed addressed,
-            //     Local otherwise).
-            //   - Synthesized(_): no AST let_stmt → no `let_storage`
-            //     entry. Conservatively allocate a dynamic shadow-stack
-            //     slot (Memory) so taking `&__synth` works for cases like
-            //     for-loop's `&mut __iter`. Function epilogue restores SP
-            //     so the slot is reclaimed at fn end.
-            //   - Pattern(_): pattern-bound; doesn't appear as a
-            //     MonoStmt::Let (codegen_pattern handles those via
-            //     bind_pattern_value at match-arm time).
-            let storage_kind = match &local.origin {
-                crate::mono::BindingOrigin::LetValue(id) => {
-                    let value_id = *id as usize;
-                    match ctx.let_storage[value_id] {
-                        Some(k) => k,
-                        None => return Err(Error {
-                            file: String::new(),
-                            message: format!(
-                                "codegen_mono_stmt: no let_storage for value_id={}",
-                                value_id
-                            ),
-                            span: value.span.copy(),
-                        }),
-                    }
-                }
-                crate::mono::BindingOrigin::Synthesized(_) => {
-                    let bytes = byte_size_of(&local.ty, ctx.structs, ctx.enums);
-                    ctx.instructions.push(wasm::Instruction::GlobalGet(SP_GLOBAL));
-                    ctx.instructions.push(wasm::Instruction::I32Const(bytes as i32));
-                    ctx.instructions.push(wasm::Instruction::I32Sub);
-                    ctx.instructions.push(wasm::Instruction::GlobalSet(SP_GLOBAL));
-                    let addr_local = ctx.next_wasm_local;
-                    ctx.extra_locals.push(wasm::ValType::I32);
-                    ctx.next_wasm_local += 1;
-                    ctx.instructions.push(wasm::Instruction::GlobalGet(SP_GLOBAL));
-                    ctx.instructions.push(wasm::Instruction::LocalSet(addr_local));
-                    let name = local.name.clone();
-                    let ty = local.ty.clone();
-                    let drop_action = crate::layout::compute_drop_action(
-                        &name, &ty, &ctx.moved_places, ctx.traits,
-                    );
-                    codegen_mono_expr(ctx, value)?;
-                    store_flat_to_memory(ctx, &ty, BaseAddr::WasmLocal(addr_local), 0);
-                    ctx.locals.push(LocalBinding {
-                        name: name.clone(),
-                        rtype: ty.clone(),
-                        storage: Storage::MemoryAt { addr_local },
-                        drop_action,
-                    });
-                    ctx.mono_binding_to_local[*binding as usize] =
-                        Some(ctx.locals.len() as u32 - 1);
-                    if matches!(drop_action, crate::layout::DropAction::Flagged) {
-                        let flag_idx = ctx.next_wasm_local;
-                        ctx.extra_locals.push(wasm::ValType::I32);
-                        ctx.next_wasm_local += 1;
-                        ctx.drop_flags.push((name, flag_idx));
-                        ctx.instructions.push(wasm::Instruction::I32Const(1));
-                        ctx.instructions.push(wasm::Instruction::LocalSet(flag_idx));
-                    }
-                    return Ok(());
-                }
-                _ => return Err(Error {
-                    file: String::new(),
-                    message: format!(
-                        "codegen_mono_stmt: Let binding `{}` has unexpected origin",
-                        local.name
-                    ),
-                    span: value.span.copy(),
-                }),
-            };
+            let storage_kind = ctx.binding_storage[*binding as usize];
             let name = local.name.clone();
             let ty = local.ty.clone();
             // Compute drop_action for the binding.
@@ -4098,10 +4039,28 @@ fn codegen_mono_stmt(
                     });
                 }
                 BindingStorageKind::MemoryAt => {
-                    return Err(Error {
-                        file: String::new(),
-                        message: "codegen_mono_stmt: Let with MemoryAt storage not yet supported".to_string(),
-                        span: value.span.copy(),
+                    // Dynamic shadow-stack allocation: __sp -= bytes,
+                    // cache addr_local = __sp, store the value's flat
+                    // scalars (still on the wasm stack) into the slot.
+                    // Synthesized bindings (for-loop's __iter, try-op
+                    // arm bodies) and any addressed binding the layout
+                    // pass marked MemoryAt land here.
+                    let bytes = byte_size_of(&ty, ctx.structs, ctx.enums);
+                    ctx.instructions.push(wasm::Instruction::GlobalGet(SP_GLOBAL));
+                    ctx.instructions.push(wasm::Instruction::I32Const(bytes as i32));
+                    ctx.instructions.push(wasm::Instruction::I32Sub);
+                    ctx.instructions.push(wasm::Instruction::GlobalSet(SP_GLOBAL));
+                    let addr_local = ctx.next_wasm_local;
+                    ctx.extra_locals.push(wasm::ValType::I32);
+                    ctx.next_wasm_local += 1;
+                    ctx.instructions.push(wasm::Instruction::GlobalGet(SP_GLOBAL));
+                    ctx.instructions.push(wasm::Instruction::LocalSet(addr_local));
+                    store_flat_to_memory(ctx, &ty, BaseAddr::WasmLocal(addr_local), 0);
+                    ctx.locals.push(LocalBinding {
+                        name: name.clone(),
+                        rtype: ty.clone(),
+                        storage: Storage::MemoryAt { addr_local },
+                        drop_action,
                     });
                 }
             }

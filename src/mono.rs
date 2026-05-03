@@ -16,9 +16,14 @@ use crate::typeck::{
 // substituted through env).
 //
 // Lifetime `'a` borrows the source AST: for non-generic functions, from
-// the user/library `Module`; for monomorphizations, from
-// `FuncTable.templates[idx].func`. Both outlive the codegen call.
-pub struct MonoFn<'a> {
+// `MonoFnInput`: what `lower_to_mono` consumes — AST body + typeck-
+// computed artifacts (per-NodeId types and resolutions, borrowck's
+// move-state snapshot, etc.). Holds a `&'a Function` borrow into
+// either the user/library `Module` or `FuncTable.templates[idx].func`;
+// both outlive the lowering call. Built by `emit_function` /
+// `emit_monomorphic` and discarded immediately after lowering — only
+// `MonoFn` (which owns the lowered body) flows into codegen.
+pub struct MonoFnInput<'a> {
     pub func: &'a Function,
     pub param_types: Vec<RType>,
     pub return_type: Option<RType>,
@@ -26,6 +31,21 @@ pub struct MonoFn<'a> {
     pub method_resolutions: Vec<Option<MethodResolution>>,
     pub call_resolutions: Vec<Option<CallResolution>>,
     pub builtin_type_targets: Vec<Option<Vec<RType>>>,
+    pub moved_places: Vec<MovedPlace>,
+    pub move_sites: Vec<(NodeId, String)>,
+    pub wasm_idx: u32,
+    pub is_export: bool,
+}
+
+// `MonoFn`: what `emit_function_concrete` consumes — owns the lowered
+// `MonoBody` plus the codegen-time scaffolding (signature, drop-state
+// snapshot, wasm idx). No AST reference, no typeck input caches —
+// those were consumed by lowering and don't outlive it.
+pub struct MonoFn {
+    pub name: String,
+    pub param_types: Vec<RType>,
+    pub return_type: Option<RType>,
+    pub body: MonoBody,
     pub moved_places: Vec<MovedPlace>,
     pub move_sites: Vec<(NodeId, String)>,
     pub wasm_idx: u32,
@@ -1268,9 +1288,11 @@ pub struct MonoLocal {
 #[allow(dead_code)]
 #[derive(Clone)]
 pub enum BindingOrigin {
-    Param(usize),       // index into MonoFn.func.params
-    LetValue(NodeId),   // let_stmt.value.id
-    Pattern(NodeId),    // pattern Binding/At node id
+    Param(usize),       // index into MonoFn.param_types
+    LetValue,           // bound by a `Stmt::Let` (no further info needed —
+                        // codegen consults `MonoLayout.binding_storage[binding_id]`)
+    Pattern(NodeId),    // pattern Binding/At node id (kept for
+                        // map_arm_pattern_bindings to wire up arm bindings)
     // Compiler-synthesized binding (`__iter` for For desugar, etc.).
     // Carries a description for diagnostics.
     Synthesized(String),
@@ -1510,7 +1532,7 @@ pub struct MonoBody {
 
 #[allow(dead_code)]
 struct LowerCtx<'a> {
-    mono_fn: &'a MonoFn<'a>,
+    input: &'a MonoFnInput<'a>,
     structs: &'a StructTable,
     enums: &'a EnumTable,
     traits: &'a TraitTable,
@@ -1528,7 +1550,7 @@ struct LowerCtx<'a> {
 #[allow(dead_code)]
 impl<'a> LowerCtx<'a> {
     fn new(
-        mono_fn: &'a MonoFn<'a>,
+        input: &'a MonoFnInput<'a>,
         structs: &'a StructTable,
         enums: &'a EnumTable,
         traits: &'a TraitTable,
@@ -1536,7 +1558,7 @@ impl<'a> LowerCtx<'a> {
         mono_table: &'a MonoTable,
     ) -> Self {
         Self {
-            mono_fn,
+            input,
             structs,
             enums,
             traits,
@@ -1580,7 +1602,7 @@ impl<'a> LowerCtx<'a> {
     }
 
     fn expr_ty(&self, expr: &Expr) -> Result<RType, Error> {
-        match &self.mono_fn.expr_types[expr.id as usize] {
+        match &self.input.expr_types[expr.id as usize] {
             Some(t) => Ok(t.clone()),
             None => Err(Error {
                 file: String::new(),
@@ -1594,29 +1616,42 @@ impl<'a> LowerCtx<'a> {
     }
 }
 
-// Top-level entry: lower one MonoFn's body to a MonoBody.
+// Top-level entry: lower a MonoFnInput (AST body + typeck artifacts)
+// to a fully-owned MonoFn (lowered MonoBody + signature + drop state).
+// The input's typeck caches are consumed here and not stored on the
+// returned MonoFn — codegen reads from MonoBody / MonoLayout instead.
 #[allow(dead_code)]
 pub fn lower_to_mono(
-    mono_fn: &MonoFn,
+    input: &MonoFnInput,
     structs: &StructTable,
     enums: &EnumTable,
     traits: &TraitTable,
     funcs: &FuncTable,
     mono_table: &MonoTable,
-) -> Result<MonoBody, Error> {
-    let mut ctx = LowerCtx::new(mono_fn, structs, enums, traits, funcs, mono_table);
+) -> Result<MonoFn, Error> {
+    let mut ctx = LowerCtx::new(input, structs, enums, traits, funcs, mono_table);
     // Declare params first, in declaration order. Storage and
     // drop-action decisions are computed by a separate post-lowering
     // layout pass that walks the Mono IR.
     let mut k = 0;
-    while k < mono_fn.func.params.len() {
-        let name = mono_fn.func.params[k].name.clone();
-        let ty = mono_fn.param_types[k].clone();
+    while k < input.func.params.len() {
+        let name = input.func.params[k].name.clone();
+        let ty = input.param_types[k].clone();
         ctx.declare_binding(name, ty, BindingOrigin::Param(k));
         k += 1;
     }
-    let body = lower_block(&mut ctx, &mono_fn.func.body)?;
-    Ok(MonoBody { locals: ctx.locals, body })
+    let body_block = lower_block(&mut ctx, &input.func.body)?;
+    let body = MonoBody { locals: ctx.locals, body: body_block };
+    Ok(MonoFn {
+        name: input.func.name.clone(),
+        param_types: input.param_types.clone(),
+        return_type: input.return_type.clone(),
+        body,
+        moved_places: input.moved_places.clone(),
+        move_sites: input.move_sites.clone(),
+        wasm_idx: input.wasm_idx,
+        is_export: input.is_export,
+    })
 }
 
 #[allow(dead_code)]
@@ -1657,7 +1692,7 @@ fn lower_stmt(ctx: &mut LowerCtx, stmt: &Stmt) -> Result<Option<MonoStmt>, Error
                 let binding = ctx.declare_binding(
                     name.to_string(),
                     ty,
-                    BindingOrigin::LetValue(ls.value.id),
+                    BindingOrigin::LetValue,
                 );
                 return Ok(Some(MonoStmt::Let { binding, value, span: ls.value.span.copy() }));
             }
@@ -1828,7 +1863,7 @@ fn lower_expr(ctx: &mut LowerCtx, expr: &Expr) -> Result<MonoExpr, Error> {
                 out_args.push(lower_expr(ctx, &args[i])?);
                 i += 1;
             }
-            let type_args = match &ctx.mono_fn.builtin_type_targets[expr.id as usize] {
+            let type_args = match &ctx.input.builtin_type_targets[expr.id as usize] {
                 Some(ts) => ts.clone(),
                 None => Vec::new(),
             };
@@ -1961,7 +1996,7 @@ fn lower_expr(ctx: &mut LowerCtx, expr: &Expr) -> Result<MonoExpr, Error> {
                 i += 1;
             }
             // Resolve callee from typeck's CallResolution.
-            let resolution = ctx.mono_fn.call_resolutions[expr.id as usize].as_ref();
+            let resolution = ctx.input.call_resolutions[expr.id as usize].as_ref();
             let resolution = match resolution {
                 Some(r) => r,
                 None => return Err(Error {
@@ -2008,7 +2043,7 @@ fn lower_expr(ctx: &mut LowerCtx, expr: &Expr) -> Result<MonoExpr, Error> {
             // variant — `v[0].add_assign(1)` needs `index_mut`, not
             // `index` (which would return `&u32` and silently let
             // add_assign write through what borrowck should reject).
-            let resolution = ctx.mono_fn.method_resolutions[expr.id as usize].as_ref();
+            let resolution = ctx.input.method_resolutions[expr.id as usize].as_ref();
             let resolution = match resolution {
                 Some(r) => r,
                 None => return Err(Error {
@@ -2074,7 +2109,7 @@ fn lower_expr(ctx: &mut LowerCtx, expr: &Expr) -> Result<MonoExpr, Error> {
             //     variant's declared field order.
             if let Some(crate::typeck::CallResolution::Variant {
                 enum_path, disc, type_args,
-            }) = ctx.mono_fn.call_resolutions[expr.id as usize].as_ref() {
+            }) = ctx.input.call_resolutions[expr.id as usize].as_ref() {
                 let enum_path = enum_path.clone();
                 let disc = *disc;
                 let type_args = type_args.clone();
@@ -2754,7 +2789,7 @@ fn declare_pattern_bindings(ctx: &mut LowerCtx, pat: &AstPattern) -> Result<(), 
     match &pat.kind {
         PatternKind::Binding { name, .. } => {
             let id = pat.id as usize;
-            let ty = match ctx.mono_fn.expr_types.get(id).and_then(|o| o.as_ref()) {
+            let ty = match ctx.input.expr_types.get(id).and_then(|o| o.as_ref()) {
                 Some(t) => t.clone(),
                 None => return Err(Error {
                     file: String::new(),
@@ -2770,7 +2805,7 @@ fn declare_pattern_bindings(ctx: &mut LowerCtx, pat: &AstPattern) -> Result<(), 
         }
         PatternKind::At { name, inner, .. } => {
             let id = pat.id as usize;
-            let ty = match ctx.mono_fn.expr_types.get(id).and_then(|o| o.as_ref()) {
+            let ty = match ctx.input.expr_types.get(id).and_then(|o| o.as_ref()) {
                 Some(t) => t.clone(),
                 None => return Err(Error {
                     file: String::new(),
@@ -3219,7 +3254,7 @@ fn lower_try(
     // (by typeck's ?-rules), so we reuse result_path. The function's
     // return type's Ok arg might differ from this expression's; pull
     // from mono_fn.return_type.
-    let fn_return_ty = match &ctx.mono_fn.return_type {
+    let fn_return_ty = match &ctx.input.return_type {
         Some(t) => t.clone(),
         None => return Err(Error {
             file: String::new(),

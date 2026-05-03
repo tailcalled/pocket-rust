@@ -32,6 +32,21 @@ fn for_wildcard_returns_42() {
     expect_answer("lang/for_loops/for_wildcard", 42i32);
 }
 
+// For-loop desugar's synth `__iter` binding must end up in
+// `Storage::MemoryAt` (dynamic shadow-stack slot) — `&mut __iter` is
+// taken to call `Iterator::next`, so the binding needs an address.
+// Regression test for codegen_mono_stmt::Let's MemoryAt branch:
+// without it (e.g. if the layout pass marked __iter as Local), the
+// `&mut __iter` borrow yields a wasm-locals address that doesn't
+// exist, the iterator state never advances across iterations, and the
+// loop either runs forever (n stays at start) or terminates after one
+// iter (n stale). 10 + 14 + 18 = 42 verifies in-place mutation
+// survives across iterations.
+#[test]
+fn iter_binding_addressed_returns_42() {
+    expect_answer("lang/for_loops/iter_binding_addressed", 42i32);
+}
+
 // Negative: iter expression's type doesn't impl Iterator. Error
 // should mention `for` and Iterator (typeck sees ForLoop directly).
 #[test]
