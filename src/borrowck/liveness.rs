@@ -15,7 +15,7 @@
 // enough for borrow regions and matches what NLL needs in practice.
 
 use super::cfg::{
-    BasicBlock, BlockId, Cfg, CfgStmt, CfgStmtKind, LocalId, Operand, OperandKind, Place, Rvalue,
+    BasicBlock, BlockId, Cfg, CfgStmt, CfgStmtKind, LocalId, Operand, OperandKind, Rvalue,
     Terminator,
 };
 

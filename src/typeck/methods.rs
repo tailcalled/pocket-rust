@@ -7,7 +7,7 @@ use super::{
     rtype_to_infer, supertrait_closure, trait_lookup, try_match_against_infer,
 };
 use crate::ast::Expr;
-use crate::span::{Error, Span};
+use crate::span::Error;
 
 // Shape of a receiver passed through symbolic (Param-bound) dispatch:
 // owned `T`, `&T`, or `&mut T`. Drives the recv-adjust derivation

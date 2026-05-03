@@ -6,8 +6,8 @@ use crate::span::{Error, Span};
 mod types;
 pub use types::{
     IntKind, LifetimeRepr, RType, byte_size_of, copy_trait_path, drop_trait_path, numeric_lit_op_traits_for_method, flatten_rtype,
-    int_kind_name, is_copy, is_copy_with_bounds, is_drop, is_raw_ptr, is_ref_mutable, is_sized,
-    is_uninhabited, is_variant_payload_uninhabited,
+    int_kind_name, is_copy_with_bounds, is_drop, is_raw_ptr, is_sized,
+    is_variant_payload_uninhabited,
     outer_lifetime, rtype_contains_param, rtype_eq, rtype_to_string, substitute_rtype,
 };
 use types::{int_kind_from_name, int_kind_max, int_kind_neg_magnitude, int_kind_signed, struct_env};
@@ -274,7 +274,7 @@ pub use use_scope::{
 
 mod path_resolve;
 pub use path_resolve::{
-    enum_lookup_resolved, lookup_variant_path, place_to_string, resolve_full_path, resolve_type,
+    lookup_variant_path, place_to_string, resolve_full_path, resolve_type,
     segments_to_string,
 };
 
@@ -4074,9 +4074,9 @@ pub use tables::{
 
 mod traits;
 pub use traits::{
-    ImplResolution, MethodCandidate, concretize_assoc_proj,
+    MethodCandidate, concretize_assoc_proj,
     concretize_assoc_proj_with_bounds, find_assoc_binding, find_method_candidates,
-    find_trait_impl_idx_by_span, find_trait_impl_method, solve_impl, solve_impl_in_ctx,
+    find_trait_impl_idx_by_span, find_trait_impl_method, solve_impl,
     solve_impl_with_args, supertrait_closure,
 };
 pub(crate) use traits::try_match_against_infer;
@@ -4084,7 +4084,7 @@ pub(crate) use traits::try_match_against_infer;
 mod setup;
 use setup::{
     collect_enum_names, collect_funcs, collect_struct_names, collect_trait_names,
-    find_trait_impl_idx, push_root_name, resolve_enum_variants,
+    push_root_name, resolve_enum_variants,
     resolve_impl_target, resolve_struct_fields, resolve_trait_methods,
     validate_supertrait_obligations,
 };

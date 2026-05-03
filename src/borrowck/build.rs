@@ -6,7 +6,7 @@
 // a successor.
 
 use crate::ast::{
-    self, AssignStmt, Block, Call, Expr, ExprKind, FieldAccess, Function, IfLetExpr, LetStmt,
+    self, AssignStmt, Block, Call, Expr, ExprKind, Function, IfLetExpr, LetStmt,
     MatchExpr, MethodCall, Pattern, PatternKind, Stmt, StructLit,
 };
 use super::cfg::{

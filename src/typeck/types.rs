@@ -1,7 +1,8 @@
 use super::{
     EnumTable, StructTable, TraitTable, VariantPayloadResolved, enum_lookup, place_to_string,
-    solve_impl, solve_impl_in_ctx, struct_lookup,
+    solve_impl, struct_lookup,
 };
+use super::traits::solve_impl_in_ctx;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum IntKind {

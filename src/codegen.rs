@@ -1,6 +1,5 @@
 use crate::ast::{Function, Item, Module, Path, Pattern};
 use crate::layout::BindingStorageKind;
-use crate::mono::MonoFn;
 use crate::span::Error;
 use crate::typeck::{
     CallResolution, FuncTable, GenericTemplate, IntKind, MethodResolution, RType, ReceiverAdjust,

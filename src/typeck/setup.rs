@@ -5,7 +5,7 @@ use super::{
     find_elision_source, freshen_inferred_lifetimes, func_lookup,
     is_copy_with_bounds, is_visible_from, module_use_entries, outer_lifetime, place_to_string,
     require_no_inferred_lifetimes, resolve_type, resolve_via_use_scopes,
-    rtype_eq, rtype_to_string, segments_to_string, solve_impl_in_ctx, struct_env, struct_lookup, substitute_rtype, supertrait_closure, template_lookup, trait_lookup,
+    rtype_eq, rtype_to_string, segments_to_string, struct_env, struct_lookup, substitute_rtype, supertrait_closure, template_lookup, trait_lookup,
     trait_lookup_resolved, type_defining_module, validate_named_lifetimes,
 };
 use crate::ast::{Function, Item, Module};

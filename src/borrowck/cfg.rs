@@ -12,7 +12,7 @@
 
 use crate::ast;
 use crate::span::Span;
-use crate::typeck::{LifetimeRepr, RType};
+use crate::typeck::RType;
 
 pub type BlockId = u32;
 pub type LocalId = u32;
