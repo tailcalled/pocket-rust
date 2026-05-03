@@ -300,11 +300,6 @@ struct FnCtx<'a> {
     enums: &'a crate::typeck::EnumTable,
     traits: &'a crate::typeck::TraitTable,
     funcs: &'a FuncTable,
-    current_module: Vec<String>,
-    // Per-NodeId types and resolutions, populated by typeck and substituted
-    // through the monomorphization env at emit_function entry. Each consumer
-    // (codegen_let_stmt, codegen_call, etc.) looks up by `expr.id`.
-    expr_types: Vec<Option<RType>>,
     // Per-let `BindingStorageKind` keyed by `let_stmt.value.id`. Sparse:
     // `Some(Memory{off})` for spilled lets, `Some(Local)` for non-spilled
     // lets, `None` for non-let nodes. Sized to `func.node_count`.
@@ -315,14 +310,6 @@ struct FnCtx<'a> {
     // pattern bindings, `None` for non-binding pattern nodes. Sized to
     // `func.node_count`.
     pattern_storage: Vec<Option<BindingStorageKind>>,
-    method_resolutions: Vec<Option<MethodResolution>>,
-    call_resolutions: Vec<Option<CallResolution>>,
-    // Per-NodeId resolved type-args for builtins that need them at codegen
-    // (currently only `¤size_of::<T>()`). Substituted through the mono env
-    // by the caller; codegen reads with `expr.id` and uses
-    // `byte_size_of(T, structs, enums)`.
-    builtin_type_targets: Vec<Option<Vec<RType>>>,
-    self_target: Option<RType>,
     // T4.6: borrowck's snapshot of every place whose move-state at scope
     // end was non-Init (Moved or MaybeMoved). emit_drops_for_locals_range
     // looks up each Drop binding's name as a single-segment entry — Moved
@@ -346,13 +333,6 @@ struct FnCtx<'a> {
     // construction, so a pending entry's typeidx is `base + idx_in_pending`.
     pending_types: Vec<wasm::FuncType>,
     pending_types_base: u32,
-    // Substitution map for the current monomorphization (empty for non-generic
-    // functions). Walks of `Cast` and inner `Generic` callee resolutions apply
-    // this env to lower `Param("T")` to concrete RTypes.
-    env: Vec<(String, RType)>,
-    // Type-param names visible in this function (for `resolve_type` on Cast
-    // targets). Empty for non-generic.
-    type_params: Vec<String>,
     mono: &'a mut MonoState,
     // Stack of enclosing loops (innermost-last). Each frame records the
     // wasm structured-control-flow depth at the loop's entry, used to
@@ -361,11 +341,6 @@ struct FnCtx<'a> {
     // `break_depth` is the depth of the wrapping `Block` (= break
     // target).
     loops: Vec<LoopCgFrame>,
-    // Current wasm structured-control-flow depth (number of open
-    // structured constructs: Block, Loop, If). `Br(N)` jumps to the
-    // construct at depth `N` from the innermost. break/continue
-    // compute their `Br` index as `depth_at_emit - frame.depth - 1`.
-    cf_depth: u32,
     // Wasm local holding `__sp` immediately after the prologue's
     // `__sp -= frame_size` subtraction. Spilled-binding accesses
     // (BaseAddr::StackPointer) emit `LocalGet(frame_base_local)` so
@@ -784,19 +759,9 @@ fn build_mono_for_template<'a>(
     // snapshot from borrowck applies to every monomorphization.
     let moved_places = clone_moved_places(&tmpl.moved_places);
     let move_sites = clone_move_sites(&tmpl.move_sites);
-    // Self target for the body: substitute the impl's stored target pattern
-    // through the monomorphization env. This generalizes from the old
-    // 1:1-recv-args=impl-args assumption — `impl<T> Pair<usize, T>` produces
-    // `Pair<usize, T_concrete>` here.
-    let self_target: Option<RType> = tmpl
-        .impl_target
-        .as_ref()
-        .map(|pat| substitute_rtype(pat, &env));
+    let _ = &env; // env feeds the per-resolution `subst_opt_*` calls above; not stored on MonoFn
     MonoFn {
         func: &tmpl.func,
-        current_module: tmpl.enclosing_module.clone(),
-        path_prefix: tmpl.enclosing_module.clone(),
-        self_target,
         param_types,
         return_type,
         expr_types,
@@ -805,8 +770,6 @@ fn build_mono_for_template<'a>(
         builtin_type_targets,
         moved_places,
         move_sites,
-        env,
-        type_params: tmpl.type_params.clone(),
         wasm_idx,
         is_export: false, // monomorphic instances are never exported
     }
@@ -922,11 +885,9 @@ fn emit_function(
     let mut full = path_prefix.clone();
     full.push(func.name.clone());
     let entry = func_lookup(funcs, &full).expect("typeck registered this function");
+    let _ = self_target; // impl-target propagation lives in build_mono_for_template; non-generic paths don't need it
     let mono_fn = MonoFn {
         func,
-        current_module: current_module.clone(),
-        path_prefix: path_prefix.clone(),
-        self_target: self_target.cloned(),
         param_types: entry.param_types.clone(),
         return_type: entry.return_type.clone(),
         expr_types: entry.expr_types.clone(),
@@ -935,8 +896,6 @@ fn emit_function(
         builtin_type_targets: clone_btt(&entry.builtin_type_targets),
         moved_places: clone_moved_places(&entry.moved_places),
         move_sites: clone_move_sites(&entry.move_sites),
-        env: Vec::new(),
-        type_params: Vec::new(),
         wasm_idx: entry.idx,
         is_export: current_module.is_empty() && path_prefix.len() == current_module.len(),
     };
@@ -1135,24 +1094,15 @@ fn emit_function_concrete(
         enums,
         traits,
         funcs,
-        current_module: mono_fn.current_module.clone(),
-        expr_types: mono_fn.expr_types.clone(),
         let_storage: let_storage.clone(),
         pattern_storage: layout.pattern_storage.clone(),
-        method_resolutions: mono_fn.method_resolutions.clone(),
-        call_resolutions: mono_fn.call_resolutions.clone(),
-        builtin_type_targets: clone_btt(&mono_fn.builtin_type_targets),
-        self_target: mono_fn.self_target.clone(),
         moved_places: clone_moved_places(&mono_fn.moved_places),
         move_sites: clone_move_sites(&mono_fn.move_sites),
         drop_flags: Vec::new(),
         pending_types: Vec::new(),
         pending_types_base: wasm_mod.types.len() as u32,
-        env: mono_fn.env.clone(),
-        type_params: mono_fn.type_params.clone(),
         mono,
         loops: Vec::new(),
-        cf_depth: 0,
         frame_base_local: 0,
         fn_entry_sp_local: 0,
         sret_ptr_local,
@@ -2217,7 +2167,9 @@ fn codegen_pattern(
     no_match_target: u32,
 ) -> Result<(), Error> {
     use crate::ast::PatternKind;
-    let resolved_scrut = substitute_rtype(scrut_ty, &ctx.env);
+    // Mono lowering pre-substitutes the scrutinee type — `scrut_ty` is
+    // always concrete by the time codegen_pattern runs.
+    let resolved_scrut = scrut_ty.clone();
     match &pattern.kind {
         PatternKind::Wildcard => Ok(()),
         PatternKind::Binding { name, by_ref, mutable, .. } => {
@@ -3055,16 +3007,6 @@ fn val_type_struct_eq(a: &wasm::ValType, b: &wasm::ValType) -> bool {
 // the method by name, then emit a regular call to its (possibly
 // monomorphized) wasm idx.
 
-enum RecvAdjustLocal {
-    Move,
-    BorrowImm,
-    BorrowMut,
-    ByRef,
-}
-
-// Map a WASM function index back to its FuncTable entry index. They're
-// allocated in lockstep, so equal numerically.
-
 // Emits wasm conversion ops for an int-to-int `as` cast. Pocket-rust's
 // storage classes: ≤32-bit integers (and usize/isize on wasm32) flatten
 // to wasm `i32`; 64-bit integers flatten to `i64`; 128-bit integers
@@ -3365,81 +3307,6 @@ fn codegen_place_chain_load(
 
 
 
-fn extract_field_from_stack(
-    ctx: &mut FnCtx,
-    base_type: &RType,
-    field_name: &str,
-) -> Result<RType, Error> {
-    // Compute total flat size, field flat offset, field flat size, field type.
-    let (struct_path, struct_args) = match base_type {
-        RType::Struct { path, type_args, .. } => (path.clone(), type_args.clone()),
-        RType::Ref { inner, .. } => match inner.as_ref() {
-            RType::Struct { path, type_args, .. } => (path.clone(), type_args.clone()),
-            _ => unreachable!("typeck rejects field access on non-struct"),
-        },
-        _ => unreachable!("typeck rejects field access on non-struct"),
-    };
-    let mut total_flat: u32 = 0;
-    let mut field_flat_off: u32 = 0;
-    let mut field_valtypes: Vec<wasm::ValType> = Vec::new();
-    let mut field_ty: RType = RType::Int(IntKind::I32);
-    {
-        let entry = struct_lookup(ctx.structs, &struct_path).expect("resolved struct");
-        let env = make_struct_env(&entry.type_params, &struct_args);
-        let mut found = false;
-        let mut i = 0;
-        while i < entry.fields.len() {
-            let fty = substitute_rtype(&entry.fields[i].ty, &env);
-            let mut vts: Vec<wasm::ValType> = Vec::new();
-            flatten_rtype(&fty, ctx.structs, &mut vts);
-            let s = vts.len() as u32;
-            if entry.fields[i].name == field_name {
-                field_flat_off = total_flat;
-                field_valtypes = vts;
-                field_ty = fty;
-                found = true;
-            }
-            total_flat += s;
-            i += 1;
-        }
-        if !found {
-            unreachable!("typeck verified field");
-        }
-    }
-    let field_size = field_valtypes.len() as u32;
-    let drop_top = total_flat - field_flat_off - field_size;
-
-    let mut i = 0;
-    while i < drop_top {
-        ctx.instructions.push(wasm::Instruction::Drop);
-        i += 1;
-    }
-    let stash_start = ctx.next_wasm_local;
-    let mut k = 0;
-    while k < field_valtypes.len() {
-        ctx.extra_locals.push(field_valtypes[k].copy());
-        ctx.next_wasm_local += 1;
-        k += 1;
-    }
-    let mut k = 0;
-    while k < field_size {
-        ctx.instructions
-            .push(wasm::Instruction::LocalSet(stash_start + field_size - 1 - k));
-        k += 1;
-    }
-    let mut i = 0;
-    while i < field_flat_off {
-        ctx.instructions.push(wasm::Instruction::Drop);
-        i += 1;
-    }
-    let mut k = 0;
-    while k < field_size {
-        ctx.instructions
-            .push(wasm::Instruction::LocalGet(stash_start + k));
-        k += 1;
-    }
-    Ok(field_ty)
-}
 
 
 // Returns a WASM local whose value is the i32 pointee address held by a ref

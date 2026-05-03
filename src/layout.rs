@@ -91,6 +91,12 @@ pub enum BindingStorageKind {
 // frame, plus the per-binding storage kind. Computed once per `MonoFn`
 // before byte emission begins.
 pub struct FrameLayout {
+    // Carries the param_addressed/let_addressed/pattern_addressed bools
+    // computed during analysis. Codegen consults the per-binding
+    // `*_storage` fields below directly; `address_info` is retained so
+    // future passes (escape-analysis-aware diagnostics, lints) can
+    // query the raw flags without re-running `analyze_addresses`.
+    #[allow(dead_code)]
     pub address_info: AddressInfo,
     // For each function param (parallel to `func.params`): the
     // pre-decided storage kind. `Memory { frame_offset }` if addressed,
@@ -1235,6 +1241,15 @@ use crate::mono::{
     MonoPlaceKind, MonoStmt, MonoBody,
 };
 
+// Per-mono layout decisions keyed by `BindingId` (the post-lowering
+// binding identifier from `MonoBody.locals`). Computed by
+// `compute_mono_layout` and currently *not* consumed by codegen — the
+// active codegen path still reads `FrameLayout` (which keys off AST
+// `Pattern.id` / `let_stmt.value.id`). The MonoLayout pass is exercised
+// on every mono as a smoke test so it stays in sync with `MonoBody`
+// shape changes; it'll become the load-bearing layout once the codegen
+// transitions to a Mono-IR-only frame model.
+#[allow(dead_code)]
 pub struct MonoLayout {
     // Per BindingId: storage decision (Local / Memory{frame_offset} /
     // MemoryAt). Param/Let/Synthesized addressed bindings get Memory;

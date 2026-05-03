@@ -20,9 +20,6 @@ use crate::typeck::{
 // `FuncTable.templates[idx].func`. Both outlive the codegen call.
 pub struct MonoFn<'a> {
     pub func: &'a Function,
-    pub current_module: Vec<String>,
-    pub path_prefix: Vec<String>,
-    pub self_target: Option<RType>,
     pub param_types: Vec<RType>,
     pub return_type: Option<RType>,
     pub expr_types: Vec<Option<RType>>,
@@ -31,8 +28,6 @@ pub struct MonoFn<'a> {
     pub builtin_type_targets: Vec<Option<Vec<RType>>>,
     pub moved_places: Vec<MovedPlace>,
     pub move_sites: Vec<(NodeId, String)>,
-    pub env: Vec<(String, RType)>,
-    pub type_params: Vec<String>,
     pub wasm_idx: u32,
     pub is_export: bool,
 }
