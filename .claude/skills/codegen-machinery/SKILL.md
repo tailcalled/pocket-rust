@@ -1,6 +1,6 @@
 ---
 name: codegen-machinery
-description: Use when modifying or debugging pocket-rust's WASM codegen (`src/codegen.rs`). Covers the shadow stack discipline, escape analysis, frame layout, `Storage` variants, `BaseAddr` semantics, monomorphization worklist, the string pool, and field/deref codegen patterns.
+description: Use when modifying or debugging pocket-rust's WASM codegen (`src/codegen.rs`), pre-codegen mono expansion (`src/mono.rs`), or per-mono frame layout (`src/layout.rs`). Covers the shadow stack discipline, escape analysis, frame layout, `Storage` variants, `BaseAddr` semantics, the eager `MonoFn`/`MonoTable` expansion that runs before byte emission, the per-mono `compute_layout` pass, the string pool, and field/deref codegen patterns.
 ---
 
 # codegen machinery
@@ -8,6 +8,41 @@ description: Use when modifying or debugging pocket-rust's WASM codegen (`src/co
 Entry: `pub fn emit(&mut wasm::Module, &Module, &StructTable, &FuncTable) -> Result<(), Error>`.
 
 Appends to an existing `wasm::Module` rather than constructing a fresh one — same accumulating shape as `typeck::check`, so libraries' functions land in the WASM module first and user functions follow. Trusts that `typeck` and `borrowck` have already accepted the program; uses `unreachable!`/`expect` for cases the earlier passes would have caught. Reads typing artifacts from `expr_types` / `method_resolutions` / `call_resolutions` (NodeId-keyed) instead of recomputing types.
+
+## Single-path codegen
+
+There is **one** codegen path: `mono::expand` lowers each `MonoFn` to a `MonoBody` (an explicit, fully-resolved IR with no surface constructs left — `if`/`while`/`for`/`?`/`&&`/`||`/`if let`/`Index` all desugar to `Match`/`Loop`/`MethodCall` shapes), and `codegen::emit_function_concrete` invokes `codegen_mono_block` on it. There is no AST-driven codegen shadow path: if lowering fails or the per-variant `mono_supports_*` check rejects the body, the compile errors out (not a silent fallback). This was historically a dual-path arrangement; the AST codegen was removed once every reachable shape was Mono-supported.
+
+Helpers shared by Mono codegen (kept after the AST removal): `codegen_pattern` + `bind_pattern_value` / `bind_pattern_ref` / `codegen_struct_pattern` / `codegen_variant_pattern` / `spill_match_scrutinee` / `stash_match_scrutinee` (pattern matching), `codegen_place_chain_load` (Field/TupleIndex chain reads — the Storage::Local branch extracts directly from the wasm-locals window via `flat_chain_offset`), `store_flat_to_memory` / `load_flat_from_memory` / `emit_memcpy` / `emit_base` (memory I/O), `emit_drops_for_locals_range` / `emit_drop_call_for_local` (drops), `codegen_builtin_128` + `emit_128_*` (128-bit arithmetic; routed through `emit_simple_builtin`'s wide-op dispatch), `emit_simple_builtin` (typed and arithmetic intrinsics), `emit_int_lit` / `emit_int_to_int_cast` / `push_int_*` (integer codegen primitives), `current_cf_depth` / `find_loop_frame` (loop break/continue depth), `block_type_for` / `pattern_uses_ref_binding` / `irrefutable_pattern` (small predicates).
+
+## Pre-codegen passes
+
+Two annotation passes run before any byte emission:
+
+**`src/mono.rs` (`mono::expand`)**: walks every reachable function body — non-generic functions in the module tree, then template instances popped off the growing `MonoTable.entries` vector via an index cursor — and registers every required `(template_idx, concrete_args)` pair via `mono_table.intern`. Discovery covers the eight dispatch shapes that previously triggered lazy interning during emission:
+
+- explicit `Call`s with `CallResolution::Generic { template_idx, type_args }`
+- explicit `MethodCall`s with `MethodResolution.template_idx = Some(_)`
+- trait-dispatched `MethodCall`s (`MethodResolution.trait_dispatch`) — re-runs `solve_impl_with_args` against the substituted recv to find the impl row
+- `for x in iter` → `Iterator::next` via `solve_impl`
+- `arr[i]` / `arr[range]` → `Index::index` (immutable contexts) OR `IndexMut::index_mut` (mutable contexts: `&mut`, assign LHS, `+=`-style compound assign whose autoref is `BorrowMut`). Lowering picks one based on the enclosing context — there is no `MonoExprKind::Index` variant; the AST `Index` node desugars at lowering time to `*<Index|IndexMut>::index{,_mut}(&base, i)` (a `Deref`-of-`MethodCall` place). The mutability flag threads through `lower_place(_, mutable)` and through `MethodCall` lowering's recv handling — `BorrowMut` recv_adjust reroutes its receiver through `lower_place(.., true)` so an inner `arr[i]` picks `index_mut`.
+- `*expr` where `expr_types[inner.id]` is a struct (smart-pointer) → `Deref::deref`
+- `let` value types and parameter types that are Drop → `Drop::drop`
+
+After expand, `codegen::emit` iterates `mono_table.entries()` by index — entries can grow mid-loop if a body-walk dispatch site discovers a mono that expand missed, and the index walk picks them up. `MonoFn` is the per-function input to byte emission: it owns substituted `expr_types` / `method_resolutions` / `call_resolutions` / `builtin_type_targets` / `moved_places` / `move_sites` / `param_types` / `return_type` / `env` / `type_params` / `wasm_idx` / `is_export`, plus a `&Function` reference into the source AST (templates' `func` for monomorphizations, the module's `Item::Function` for non-generics).
+
+`MonoState` (the codegen-side state struct) owns the `MonoTable` plus the string pool. `mono.intern(template_idx, args)` delegates to `mono_table.intern` for backward-compat with body-walking dispatch sites — these calls are now idempotent lookups against the pre-populated table.
+
+**`src/layout.rs` (`layout::compute_layout`)**: per-mono pass that produces a `FrameLayout { address_info, param_storage, let_storage, pattern_storage, frame_size }`. Runs after `mono::expand` and before `emit_function_concrete`. Five steps:
+1. `analyze_addresses(func)` — pure AST walk; for every `&binding…` / method-receiver autoref / index-base, marks the chain's root binding as addressed (params, lets, pattern bindings). For `let <destructure> = e;`, each destructure leaf is pushed as a `BindingRef::Pattern(leaf_id)` so per-leaf `&binding` flips `pattern_addressed[leaf_id]`; only top-level `let x = e;` pushes as `BindingRef::Let(value_id)`.
+2. `mark_drop_bindings_addressed(func, param_types, expr_types, traits)` — adds Drop-typed params + let bindings + Drop pattern leaves of *any* let (including plain `let (a, b) = ...`, not just let-else) to the addressed set, since scope-end `Drop::drop(&mut binding)` needs an address.
+3. `propagate_pattern_to_let_addressed(func.body)` — for `let <destructure> = e;`, if any leaf is `pattern_addressed`, also flip `let_addressed[value_id]`. The AST tuple-destructure codegen (which spills the whole tuple to a frame slot and assigns each leaf a sub-offset `Storage::Memory`) keys off `let_storage[value_id] == Memory`; this propagation keeps that path firing now that step 1 routes `&leaf` through `pattern_addressed` instead.
+4. Per-binding `BindingStorageKind` selection — for each param/let/pattern leaf, picks `Memory { frame_offset }` (addressed → spilled), `MemoryAt` (addressed pattern bindings → addr_local at bind time), or `Local`. Frame offsets assigned in source order: params first, then lets.
+5. Pattern-storage walker populates `pattern_storage[pat.id]` for every binding/at pattern leaf in the body.
+
+`BindingStorageKind` is the *decision* layout makes; codegen fills in emission-time details (`wasm_start` for `Local`, `addr_local` for `MemoryAt`). Codegen reads `layout.param_storage[k]`, `ctx.let_storage[value_id]`, `ctx.pattern_storage[pat.id]` and matches on the kind — never consults the underlying address-info or offset vectors directly. `layout.frame_size` is what the prologue subtracts from `__sp`.
+
+Per-binding `DropAction` (also in `src/layout.rs`) is computed via `compute_drop_action(name, ty, moved_places, traits)` at every `LocalBinding` decl site and stashed on the binding directly. Codegen's drop emission (`emit_drops_for_locals_range`) and flag-allocation paths read `LocalBinding.drop_action` instead of recomputing `is_drop` + move-status — the decision lives in one place. See the `drop-and-destructors` skill for the action variants.
 
 ## Shadow stack — real pointers in linear memory
 
@@ -44,7 +79,7 @@ A `LocalBinding` carries one of:
 
 ## Monomorphization
 
-Each `(template, concrete type_args)` pair becomes a separate WASM function with a fresh idx, populated via a FIFO worklist drained at the end of `codegen::emit`. `ctx.mono.intern(template_idx, concrete_types)` returns the wasm function index, allocating a new entry on first use.
+Each `(template, concrete type_args)` pair becomes a separate WASM function with a fresh idx. Discovery is eager — `mono::expand` walks every reachable body before codegen begins, registering each pair via `MonoTable.intern` (allocates idx on first call, returns existing idx on repeat). Codegen then iterates `mono_table.entries()` by index to emit each body via `emit_monomorphic` → `build_mono_for_template` → `emit_function_concrete(&MonoFn, ...)`.
 
 Methods on generic impls register as templates whose `type_params = impl's params + method's own params` (in that order); method-call resolution binds the impl-bound slots from the receiver's struct `type_args` and allocates fresh inference vars for the method's own slots.
 

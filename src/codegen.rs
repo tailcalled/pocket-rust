@@ -1,11 +1,10 @@
-use crate::ast::{
-    AssignStmt, Block, Call, Expr, ExprKind, FieldAccess, Function, Item, LetStmt, MethodCall,
-    Module, Path, Pattern, Stmt, StructLit,
-};
+use crate::ast::{Function, Item, Module, Path, Pattern};
+use crate::layout::BindingStorageKind;
+use crate::mono::MonoFn;
 use crate::span::Error;
 use crate::typeck::{
     CallResolution, FuncTable, GenericTemplate, IntKind, MethodResolution, RType, ReceiverAdjust,
-    StructTable, byte_size_of, flatten_rtype, func_lookup, rtype_eq, struct_lookup, substitute_rtype,
+    StructTable, byte_size_of, flatten_rtype, func_lookup, struct_lookup, substitute_rtype,
 };
 use crate::wasm;
 
@@ -15,15 +14,13 @@ use crate::wasm;
 const SP_GLOBAL: u32 = 0;
 const HEAP_GLOBAL: u32 = 1;
 
-// Tracks monomorphic instantiations of generic templates. Maps each
-// (template_idx, concrete type_args) to a wasm function index; queues new ones
-// for later emission. Codegen drains the queue after the AST walk.
+// Codegen-side state: owns the per-crate mono table (delegated to
+// `mono::MonoTable`) plus the string-literal pool. The mono table is
+// populated eagerly by `mono::expand` before any byte emission begins;
+// `intern` calls inside body-walking serve as idempotent lookups
+// against the pre-populated table.
 struct MonoState {
-    queue: Vec<MonoWork>,
-    map_template: Vec<usize>,
-    map_args: Vec<Vec<RType>>,
-    map_idx: Vec<u32>,
-    next_idx: u32,
+    mono_table: crate::mono::MonoTable,
     // Per-crate string-literal pool. Each entry is a deduped UTF-8
     // payload; offsets are relative to the start of *this crate's*
     // contribution. `str_pool_base_offset` is the absolute byte
@@ -41,20 +38,10 @@ struct StrPoolEntry {
     relative_offset: u32,
 }
 
-struct MonoWork {
-    template_idx: usize,
-    type_args: Vec<RType>,
-    wasm_idx: u32,
-}
-
 impl MonoState {
     fn new(start_idx: u32, str_pool_base_offset: u32) -> Self {
         Self {
-            queue: Vec::new(),
-            map_template: Vec::new(),
-            map_args: Vec::new(),
-            map_idx: Vec::new(),
-            next_idx: start_idx,
+            mono_table: crate::mono::MonoTable::new(start_idx),
             str_pool_bytes: Vec::new(),
             str_pool_entries: Vec::new(),
             str_pool_base_offset,
@@ -91,49 +78,13 @@ impl MonoState {
         (absolute, bytes.len() as u32)
     }
 
-    fn lookup(&self, template_idx: usize, type_args: &Vec<RType>) -> Option<u32> {
-        let mut i = 0;
-        while i < self.map_template.len() {
-            if self.map_template[i] == template_idx
-                && rtype_vec_eq(&self.map_args[i], type_args)
-            {
-                return Some(self.map_idx[i]);
-            }
-            i += 1;
-        }
-        None
-    }
-
     fn intern(&mut self, template_idx: usize, type_args: Vec<RType>) -> u32 {
-        if let Some(idx) = self.lookup(template_idx, &type_args) {
-            return idx;
-        }
-        let idx = self.next_idx;
-        self.next_idx += 1;
-        self.map_template.push(template_idx);
-        self.map_args.push(type_args.clone());
-        self.map_idx.push(idx);
-        self.queue.push(MonoWork {
-            template_idx,
-            type_args,
-            wasm_idx: idx,
-        });
-        idx
+        self.mono_table.intern(template_idx, type_args)
     }
-}
 
-fn rtype_vec_eq(a: &Vec<RType>, b: &Vec<RType>) -> bool {
-    if a.len() != b.len() {
-        return false;
+    fn next_idx(&self) -> u32 {
+        self.mono_table.next_idx()
     }
-    let mut i = 0;
-    while i < a.len() {
-        if !rtype_eq(&a[i], &b[i]) {
-            return false;
-        }
-        i += 1;
-    }
-    true
 }
 
 fn make_struct_env(type_params: &Vec<String>, type_args: &Vec<RType>) -> Vec<(String, RType)> {
@@ -195,12 +146,35 @@ pub fn emit(
     // crate's typeck would later register `answer` at the same idx
     // and the wasm export would point at the mono'd helper's body.)
     let mut mono = MonoState::new(*next_idx, str_pool_base_offset);
+    // Eager mono expansion: walk every reachable function body and
+    // intern each (template, args) pair before any byte emission. Then
+    // codegen iterates the populated mono table to emit bodies. Any
+    // dispatch site that still calls `mono.intern` during emission
+    // hits an idempotent lookup against the pre-populated table.
+    crate::mono::expand(root, structs, enums, traits, funcs, &mut mono.mono_table)?;
     emit_module(wasm_mod, root, &mut module_path, structs, enums, traits, funcs, &mut mono)?;
-    while !mono.queue.is_empty() {
-        let work = mono.queue.remove(0);
-        emit_monomorphic(wasm_mod, work, structs, enums, traits, funcs, &mut mono)?;
+    // Iterate the mono table by index (entries may grow if expansion
+    // missed a site and codegen's intern allocates a new entry — the
+    // index walk picks those up too). For each entry, emit the
+    // monomorphic body.
+    let mut i = 0;
+    while i < mono.mono_table.len() {
+        let (template_idx, args_ref, wasm_idx) = mono.mono_table.entry(i);
+        let type_args = args_ref.clone();
+        emit_monomorphic(
+            wasm_mod,
+            template_idx,
+            type_args,
+            wasm_idx,
+            structs,
+            enums,
+            traits,
+            funcs,
+            &mut mono,
+        )?;
+        i += 1;
     }
-    *next_idx = mono.next_idx;
+    *next_idx = mono.next_idx();
     // Flush this crate's pool contribution into the single segment at
     // STR_POOL_BASE — appending if a prior crate already created it,
     // creating fresh if not — and bump `__heap_top`'s init past the
@@ -311,6 +285,10 @@ struct LocalBinding {
     name: String,
     rtype: RType,
     storage: Storage,
+    // Pre-computed scope-end drop decision (`is_drop` + move-status
+    // lookup), centralized in `layout::compute_drop_action` and stashed
+    // here at decl time so scope-end drop emission doesn't recompute.
+    drop_action: crate::layout::DropAction,
 }
 
 struct FnCtx<'a> {
@@ -327,15 +305,16 @@ struct FnCtx<'a> {
     // through the monomorphization env at emit_function entry. Each consumer
     // (codegen_let_stmt, codegen_call, etc.) looks up by `expr.id`.
     expr_types: Vec<Option<RType>>,
-    // Per-let `Some(frame_offset)` if the binding is spilled to the shadow
-    // stack, `None` otherwise. Indexed by `let_stmt.value.id`. Sized to
+    // Per-let `BindingStorageKind` keyed by `let_stmt.value.id`. Sparse:
+    // `Some(Memory{off})` for spilled lets, `Some(Local)` for non-spilled
+    // lets, `None` for non-let nodes. Sized to `func.node_count`.
+    let_storage: Vec<Option<BindingStorageKind>>,
+    // Per-pattern-binding storage kind, keyed by `Pattern.id`. Sparse:
+    // `Some(MemoryAt)` for addressed pattern bindings (allocate a
+    // shadow-stack slot at bind time), `Some(Local)` for non-addressed
+    // pattern bindings, `None` for non-binding pattern nodes. Sized to
     // `func.node_count`.
-    let_offsets: Vec<Option<u32>>,
-    // Per-pattern-binding (Binding/At Pattern.id) flag — `true` means the
-    // binding is borrowed somewhere in the arm, so `bind_pattern_value`
-    // allocates a shadow-stack slot at bind time (Storage::MemoryAt).
-    // Indexed by Pattern.id. Sized to `func.node_count`.
-    pattern_addressed: Vec<bool>,
+    pattern_storage: Vec<Option<BindingStorageKind>>,
     method_resolutions: Vec<Option<MethodResolution>>,
     call_resolutions: Vec<Option<CallResolution>>,
     // Per-NodeId resolved type-args for builtins that need them at codegen
@@ -411,6 +390,19 @@ struct FnCtx<'a> {
     // by `return` to decide the sret memcpy shape and by `?` to find
     // the function's Result-error type.
     return_rt: Option<RType>,
+    // Phase 1c: when codegen takes the Mono-driven body path, this is
+    // set to the lowered MonoBody so `codegen_mono_*` handlers can look
+    // up `MonoLocal` info by `BindingId`. None when AST path is used.
+    mono_body: Option<&'a crate::mono::MonoBody>,
+    // Per-Mono-BindingId: index into `ctx.locals` where the binding
+    // currently lives (Some(idx)) or hasn't yet been declared / has
+    // been truncated by an inner block's scope-end (None / stale).
+    // Set up before Mono codegen runs (params get identity mapping)
+    // and updated by `codegen_mono_stmt`'s Let handler. Inner block
+    // truncation may leave entries pointing at indices that no
+    // longer exist, but no live BindingId reference points there
+    // (`lower_to_mono` enforces lexical scoping).
+    mono_binding_to_local: Vec<Option<u32>>,
 }
 
 struct LoopCgFrame {
@@ -597,642 +589,6 @@ fn store_instr(leaf: &MemLeaf, base_offset: u32) -> wasm::Instruction {
     }
 }
 
-// ============================================================================
-// Address-taken analysis (escape analysis)
-// ============================================================================
-
-struct AddressInfo {
-    param_addressed: Vec<bool>,
-    // Indexed by `let_stmt.value.id` (a per-function NodeId). `true` means
-    // some `&binding…` chain rooted at that let-binding takes its address;
-    // the binding then needs a shadow-stack slot.
-    let_addressed: Vec<bool>,
-    // Indexed by Pattern.id of the binding pattern node (a `Binding` or
-    // `At` pattern). Same semantics as `let_addressed` but for match-arm
-    // and (later) if-let pattern bindings: when a binding is borrowed
-    // (`&n` of the binding, autoref of a method receiver, `&n.field`,
-    // etc.), `bind_pattern_value` allocates a shadow-stack slot for it
-    // so the address is stable; otherwise the binding sits in wasm
-    // locals.
-    pattern_addressed: Vec<bool>,
-}
-
-// T4: walk the function body, marking each `let` whose binding type
-// implements Drop as addressed (so it gets a shadow-stack slot). The
-// implicit `drop(&mut binding)` call at scope end needs the binding's
-// address. T4.5: also marks Drop-typed function parameters so they
-// drop at function-body end like any other in-scope Drop binding.
-fn mark_drop_bindings_addressed(
-    func: &Function,
-    param_types: &Vec<RType>,
-    expr_types: &Vec<Option<RType>>,
-    traits: &crate::typeck::TraitTable,
-    info: &mut AddressInfo,
-) {
-    let mut i = 0;
-    while i < param_types.len() && i < info.param_addressed.len() {
-        if crate::typeck::is_drop(&param_types[i], traits) {
-            info.param_addressed[i] = true;
-        }
-        i += 1;
-    }
-    walk_block_drop_marks(&func.body, expr_types, traits, info);
-}
-
-fn walk_block_drop_marks(
-    block: &Block,
-    expr_types: &Vec<Option<RType>>,
-    traits: &crate::typeck::TraitTable,
-    info: &mut AddressInfo,
-) {
-    let mut i = 0;
-    while i < block.stmts.len() {
-        match &block.stmts[i] {
-            Stmt::Let(ls) => {
-                let id = ls.value.id as usize;
-                if let Some(rt) = &expr_types[id] {
-                    if crate::typeck::is_drop(rt, traits) {
-                        info.let_addressed[id] = true;
-                    }
-                }
-                // Pattern bindings interaction with Drop: if any leaf
-                // binding under the pattern is Drop-typed, the scope-end
-                // drop machinery needs an address for it. Tuple
-                // destructure (`let (a, b) = …;`) routes through the
-                // let_addressed path — frame-spilling the whole tuple
-                // and addressing each binding at a sub-offset. let-else
-                // routes through codegen_pattern, which honors
-                // pattern_addressed[leaf.id] per leaf.
-                if let_pattern_has_drop_leaf(&ls.pattern, expr_types, traits) {
-                    info.let_addressed[id] = true;
-                }
-                if ls.else_block.is_some() {
-                    auto_address_drop_pattern_bindings(&ls.pattern, expr_types, traits, info);
-                }
-                walk_expr_drop_marks(&ls.value, expr_types, traits, info);
-            }
-            Stmt::Assign(a) => {
-                walk_expr_drop_marks(&a.lhs, expr_types, traits, info);
-                walk_expr_drop_marks(&a.rhs, expr_types, traits, info);
-            }
-            Stmt::Expr(e) => walk_expr_drop_marks(e, expr_types, traits, info),
-            Stmt::Use(_) => {}
-        }
-        i += 1;
-    }
-    if let Some(t) = &block.tail {
-        walk_expr_drop_marks(t, expr_types, traits, info);
-    }
-}
-
-// True iff any leaf Binding under `pat` resolves to a Drop type.
-// Used by walk_block_drop_marks to decide whether a let-stmt's
-// value needs frame-spilling (so each destructured binding has an
-// address for scope-end Drop::drop calls).
-fn let_pattern_has_drop_leaf(
-    pat: &crate::ast::Pattern,
-    expr_types: &Vec<Option<RType>>,
-    traits: &crate::typeck::TraitTable,
-) -> bool {
-    use crate::ast::PatternKind;
-    match &pat.kind {
-        PatternKind::Binding { .. } | PatternKind::At { .. } => {
-            let id = pat.id as usize;
-            if let Some(rt) = expr_types.get(id).and_then(|o| o.as_ref()) {
-                return crate::typeck::is_drop(rt, traits);
-            }
-            false
-        }
-        PatternKind::Tuple(elems) | PatternKind::VariantTuple { elems, .. } => {
-            let mut i = 0;
-            while i < elems.len() {
-                if let_pattern_has_drop_leaf(&elems[i], expr_types, traits) {
-                    return true;
-                }
-                i += 1;
-            }
-            false
-        }
-        PatternKind::Ref { inner, .. } => let_pattern_has_drop_leaf(inner, expr_types, traits),
-        PatternKind::VariantStruct { fields, .. } => {
-            let mut i = 0;
-            while i < fields.len() {
-                if let_pattern_has_drop_leaf(&fields[i].pattern, expr_types, traits) {
-                    return true;
-                }
-                i += 1;
-            }
-            false
-        }
-        _ => false,
-    }
-}
-
-// Walk a let-else (or match-arm) pattern and mark each Drop-typed
-// leaf Binding as pattern_addressed so codegen_pattern allocates
-// a shadow-stack slot for it. Without this, the binding lives in
-// wasm locals and emit_drops_for_locals_range silently skips it.
-fn auto_address_drop_pattern_bindings(
-    pat: &crate::ast::Pattern,
-    expr_types: &Vec<Option<RType>>,
-    traits: &crate::typeck::TraitTable,
-    info: &mut AddressInfo,
-) {
-    use crate::ast::PatternKind;
-    let id = pat.id as usize;
-    match &pat.kind {
-        PatternKind::Binding { .. } => {
-            if let Some(rt) = expr_types.get(id).and_then(|o| o.as_ref()) {
-                if crate::typeck::is_drop(rt, traits) && id < info.pattern_addressed.len() {
-                    info.pattern_addressed[id] = true;
-                }
-            }
-        }
-        PatternKind::At { inner, .. } => {
-            if let Some(rt) = expr_types.get(id).and_then(|o| o.as_ref()) {
-                if crate::typeck::is_drop(rt, traits) && id < info.pattern_addressed.len() {
-                    info.pattern_addressed[id] = true;
-                }
-            }
-            auto_address_drop_pattern_bindings(inner, expr_types, traits, info);
-        }
-        PatternKind::Tuple(elems) | PatternKind::VariantTuple { elems, .. } => {
-            let mut i = 0;
-            while i < elems.len() {
-                auto_address_drop_pattern_bindings(&elems[i], expr_types, traits, info);
-                i += 1;
-            }
-        }
-        PatternKind::Ref { inner, .. } => {
-            auto_address_drop_pattern_bindings(inner, expr_types, traits, info);
-        }
-        PatternKind::VariantStruct { fields, .. } => {
-            let mut i = 0;
-            while i < fields.len() {
-                auto_address_drop_pattern_bindings(&fields[i].pattern, expr_types, traits, info);
-                i += 1;
-            }
-        }
-        _ => {}
-    }
-}
-
-fn walk_expr_drop_marks(
-    expr: &Expr,
-    expr_types: &Vec<Option<RType>>,
-    traits: &crate::typeck::TraitTable,
-    info: &mut AddressInfo,
-) {
-    match &expr.kind {
-        ExprKind::Block(b) | ExprKind::Unsafe(b) => {
-            walk_block_drop_marks(b.as_ref(), expr_types, traits, info);
-        }
-        ExprKind::Call(c) => {
-            let mut i = 0;
-            while i < c.args.len() {
-                walk_expr_drop_marks(&c.args[i], expr_types, traits, info);
-                i += 1;
-            }
-        }
-        ExprKind::MethodCall(mc) => {
-            walk_expr_drop_marks(&mc.receiver, expr_types, traits, info);
-            let mut i = 0;
-            while i < mc.args.len() {
-                walk_expr_drop_marks(&mc.args[i], expr_types, traits, info);
-                i += 1;
-            }
-        }
-        ExprKind::StructLit(s) => {
-            let mut i = 0;
-            while i < s.fields.len() {
-                walk_expr_drop_marks(&s.fields[i].value, expr_types, traits, info);
-                i += 1;
-            }
-        }
-        ExprKind::FieldAccess(fa) => {
-            walk_expr_drop_marks(&fa.base, expr_types, traits, info);
-        }
-        ExprKind::Borrow { inner, .. } | ExprKind::Deref(inner) => {
-            walk_expr_drop_marks(inner, expr_types, traits, info);
-        }
-        ExprKind::Cast { inner, .. } => {
-            walk_expr_drop_marks(inner, expr_types, traits, info);
-        }
-        ExprKind::IntLit(_) | ExprKind::NegIntLit(_) | ExprKind::StrLit(_) | ExprKind::CharLit(_) | ExprKind::BoolLit(_) | ExprKind::Var(_) => {}
-        ExprKind::If(if_expr) => {
-            walk_expr_drop_marks(&if_expr.cond, expr_types, traits, info);
-            walk_block_drop_marks(if_expr.then_block.as_ref(), expr_types, traits, info);
-            walk_block_drop_marks(if_expr.else_block.as_ref(), expr_types, traits, info);
-        }
-        ExprKind::Builtin { args, .. } => {
-            let mut i = 0;
-            while i < args.len() {
-                walk_expr_drop_marks(&args[i], expr_types, traits, info);
-                i += 1;
-            }
-        }
-        ExprKind::Tuple(elems) => {
-            let mut i = 0;
-            while i < elems.len() {
-                walk_expr_drop_marks(&elems[i], expr_types, traits, info);
-                i += 1;
-            }
-        }
-        ExprKind::TupleIndex { base, .. } => {
-            walk_expr_drop_marks(base, expr_types, traits, info);
-        }
-        ExprKind::Match(m) => {
-            walk_expr_drop_marks(&m.scrutinee, expr_types, traits, info);
-            let mut i = 0;
-            while i < m.arms.len() {
-                walk_expr_drop_marks(&m.arms[i].body, expr_types, traits, info);
-                i += 1;
-            }
-        }
-        ExprKind::IfLet(il) => {
-            walk_expr_drop_marks(&il.scrutinee, expr_types, traits, info);
-            walk_block_drop_marks(il.then_block.as_ref(), expr_types, traits, info);
-            walk_block_drop_marks(il.else_block.as_ref(), expr_types, traits, info);
-        }
-        ExprKind::While(w) => {
-            walk_expr_drop_marks(&w.cond, expr_types, traits, info);
-            walk_block_drop_marks(w.body.as_ref(), expr_types, traits, info);
-        }
-        ExprKind::For(f) => {
-            walk_expr_drop_marks(&f.iter, expr_types, traits, info);
-            walk_block_drop_marks(f.body.as_ref(), expr_types, traits, info);
-        }
-        ExprKind::Break { .. } | ExprKind::Continue { .. } => {}
-        ExprKind::Return { value } => {
-            if let Some(v) = value {
-                walk_expr_drop_marks(v, expr_types, traits, info);
-            }
-        }
-        ExprKind::Try { inner, .. } => {
-            walk_expr_drop_marks(inner, expr_types, traits, info);
-        }
-        ExprKind::Index { base, index, .. } => {
-            walk_expr_drop_marks(base, expr_types, traits, info);
-            walk_expr_drop_marks(index, expr_types, traits, info);
-        }
-        ExprKind::MacroCall { args, .. } => {
-            let mut i = 0;
-            while i < args.len() {
-                walk_expr_drop_marks(&args[i], expr_types, traits, info);
-                i += 1;
-            }
-        }
-    }
-}
-
-fn analyze_addresses(func: &Function) -> AddressInfo {
-    let mut info = AddressInfo {
-        param_addressed: vec_of_false(func.params.len()),
-        let_addressed: vec_of_false(func.node_count as usize),
-        pattern_addressed: vec_of_false(func.node_count as usize),
-    };
-    let mut stack: Vec<BindingRef> = Vec::new();
-    let mut k = 0;
-    while k < func.params.len() {
-        stack.push(BindingRef::Param(k, func.params[k].name.clone()));
-        k += 1;
-    }
-    walk_block_addr(&func.body, &mut stack, &mut info);
-    info
-}
-
-fn vec_of_false(n: usize) -> Vec<bool> {
-    let mut v: Vec<bool> = Vec::with_capacity(n);
-    let mut i = 0;
-    while i < n {
-        v.push(false);
-        i += 1;
-    }
-    v
-}
-
-#[derive(Clone)]
-enum BindingRef {
-    Param(usize, String),
-    // Carries the let's value expr NodeId (used to key let_addressed /
-    // let_offsets).
-    Let(u32, String),
-    // Match / if-let pattern binding. NodeId is the Binding/At
-    // Pattern's id (used to key `pattern_addressed`). Mirrors `Let`
-    // for the address-analysis pass — we want `&binding.field…`
-    // chains rooted at a pattern binding to mark the pattern slot
-    // addressed so codegen spills it to the shadow stack from the
-    // start.
-    Pattern(u32, String),
-}
-
-fn binding_ref_name<'a>(b: &'a BindingRef) -> &'a str {
-    match b {
-        BindingRef::Param(_, n)
-        | BindingRef::Let(_, n)
-        | BindingRef::Pattern(_, n) => n,
-    }
-}
-
-// Walk a let-stmt's pattern and push each binding onto the addr-
-// analysis stack. For simple `let x = e;` and `let _ = e;` this is
-// one or zero pushes; for tuple destructure each element-binding
-// gets its own entry. All bindings share the same `value_id` so
-// `&binding…` uses inside the let's scope mark the value-side as
-// addressed (the let's value is the storage source).
-fn push_pattern_bindings_for_addr(
-    pat: &crate::ast::Pattern,
-    value_id: u32,
-    stack: &mut Vec<BindingRef>,
-) {
-    use crate::ast::PatternKind;
-    match &pat.kind {
-        PatternKind::Binding { name, .. } => {
-            stack.push(BindingRef::Let(value_id, name.clone()));
-        }
-        PatternKind::Wildcard => {}
-        PatternKind::Tuple(elems) => {
-            let mut i = 0;
-            while i < elems.len() {
-                push_pattern_bindings_for_addr(&elems[i], value_id, stack);
-                i += 1;
-            }
-        }
-        PatternKind::Ref { inner, .. } | PatternKind::At { inner, .. } => {
-            push_pattern_bindings_for_addr(inner, value_id, stack);
-        }
-        // Variant / lit / range patterns only appear in let-else,
-        // which the codegen address pass doesn't need to walk into
-        // (let-else's bindings are scoped after the test).
-        _ => {}
-    }
-}
-
-fn walk_block_addr(
-    block: &Block,
-    stack: &mut Vec<BindingRef>,
-    info: &mut AddressInfo,
-) {
-    let mark = stack.len();
-    let mut i = 0;
-    while i < block.stmts.len() {
-        match &block.stmts[i] {
-            Stmt::Let(let_stmt) => {
-                walk_expr_addr(&let_stmt.value, stack, info);
-                // Push every binding the pattern introduces; for the
-                // common `let x = e;` shape this is one entry. Tuple
-                // destructure pushes one per element binding.
-                push_pattern_bindings_for_addr(&let_stmt.pattern, let_stmt.value.id, stack);
-            }
-            Stmt::Assign(assign) => {
-                walk_expr_addr(&assign.lhs, stack, info);
-                walk_expr_addr(&assign.rhs, stack, info);
-            }
-            Stmt::Expr(expr) => walk_expr_addr(expr, stack, info),
-            Stmt::Use(_) => {}
-        }
-        i += 1;
-    }
-    if let Some(tail) = &block.tail {
-        walk_expr_addr(tail, stack, info);
-    }
-    while stack.len() > mark {
-        stack.pop();
-    }
-}
-
-fn walk_expr_addr(
-    expr: &Expr,
-    stack: &mut Vec<BindingRef>,
-    info: &mut AddressInfo,
-) {
-    match &expr.kind {
-        ExprKind::IntLit(_) | ExprKind::NegIntLit(_) | ExprKind::StrLit(_) | ExprKind::CharLit(_) | ExprKind::BoolLit(_) | ExprKind::Var(_) => {}
-        ExprKind::If(if_expr) => {
-            walk_expr_addr(&if_expr.cond, stack, info);
-            walk_block_addr(if_expr.then_block.as_ref(), stack, info);
-            walk_block_addr(if_expr.else_block.as_ref(), stack, info);
-        }
-        ExprKind::Builtin { args, .. } => {
-            let mut i = 0;
-            while i < args.len() {
-                walk_expr_addr(&args[i], stack, info);
-                i += 1;
-            }
-        }
-        ExprKind::Borrow { inner, .. } => {
-            if let Some(chain) = extract_place(inner) {
-                let root = &chain[0];
-                let mut i = stack.len();
-                while i > 0 {
-                    i -= 1;
-                    if binding_ref_name(&stack[i]) == root {
-                        match &stack[i] {
-                            BindingRef::Param(idx, _) => info.param_addressed[*idx] = true,
-                            BindingRef::Let(id, _) => info.let_addressed[*id as usize] = true,
-                            BindingRef::Pattern(id, _) => {
-                                info.pattern_addressed[*id as usize] = true
-                            }
-                        }
-                        break;
-                    }
-                }
-            }
-            walk_expr_addr(inner, stack, info);
-        }
-        ExprKind::Call(c) => {
-            let mut i = 0;
-            while i < c.args.len() {
-                walk_expr_addr(&c.args[i], stack, info);
-                i += 1;
-            }
-        }
-        ExprKind::StructLit(s) => {
-            let mut i = 0;
-            while i < s.fields.len() {
-                walk_expr_addr(&s.fields[i].value, stack, info);
-                i += 1;
-            }
-        }
-        ExprKind::FieldAccess(fa) => {
-            walk_expr_addr(&fa.base, stack, info);
-        }
-        ExprKind::Cast { inner, .. } => walk_expr_addr(inner, stack, info),
-        ExprKind::Deref(inner) => walk_expr_addr(inner, stack, info),
-        ExprKind::Unsafe(b) => walk_block_addr(b.as_ref(), stack, info),
-        ExprKind::Block(b) => walk_block_addr(b.as_ref(), stack, info),
-        ExprKind::MethodCall(mc) => {
-            // The receiver may be autoref'd (BorrowImm/BorrowMut) at codegen
-            // time; that takes its address. Without consulting typeck's
-            // recv_adjust here, conservatively mark the receiver's root binding
-            // as addressed whenever the receiver is a place chain. (Same
-            // over-approximation as walk_expr_addr for `Borrow`.)
-            if let Some(chain) = extract_place(&mc.receiver) {
-                let root = &chain[0];
-                let mut i = stack.len();
-                while i > 0 {
-                    i -= 1;
-                    if binding_ref_name(&stack[i]) == root {
-                        match &stack[i] {
-                            BindingRef::Param(idx, _) => info.param_addressed[*idx] = true,
-                            BindingRef::Let(id, _) => info.let_addressed[*id as usize] = true,
-                            BindingRef::Pattern(id, _) => {
-                                info.pattern_addressed[*id as usize] = true
-                            }
-                        }
-                        break;
-                    }
-                }
-            }
-            walk_expr_addr(&mc.receiver, stack, info);
-            let mut i = 0;
-            while i < mc.args.len() {
-                walk_expr_addr(&mc.args[i], stack, info);
-                i += 1;
-            }
-        }
-        ExprKind::Tuple(elems) => {
-            let mut i = 0;
-            while i < elems.len() {
-                walk_expr_addr(&elems[i], stack, info);
-                i += 1;
-            }
-        }
-        ExprKind::TupleIndex { base, .. } => walk_expr_addr(base, stack, info),
-        ExprKind::Match(m) => {
-            walk_expr_addr(&m.scrutinee, stack, info);
-            let mut i = 0;
-            while i < m.arms.len() {
-                let mark = stack.len();
-                push_pattern_bindings_addr(&m.arms[i].pattern, stack);
-                if let Some(g) = &m.arms[i].guard {
-                    walk_expr_addr(g, stack, info);
-                }
-                walk_expr_addr(&m.arms[i].body, stack, info);
-                while stack.len() > mark {
-                    stack.pop();
-                }
-                i += 1;
-            }
-        }
-        ExprKind::IfLet(il) => {
-            walk_expr_addr(&il.scrutinee, stack, info);
-            let mark = stack.len();
-            push_pattern_bindings_addr(&il.pattern, stack);
-            walk_block_addr(il.then_block.as_ref(), stack, info);
-            while stack.len() > mark {
-                stack.pop();
-            }
-            walk_block_addr(il.else_block.as_ref(), stack, info);
-        }
-        ExprKind::While(w) => {
-            walk_expr_addr(&w.cond, stack, info);
-            walk_block_addr(w.body.as_ref(), stack, info);
-        }
-        ExprKind::For(f) => {
-            walk_expr_addr(&f.iter, stack, info);
-            // Push the pattern's binding so `&binding…` chains in the
-            // body mark the binding as addressed (so codegen spills
-            // it to the shadow stack instead of wasm locals — needed
-            // for `for x in iter { … x.method() … }` where `x.method`
-            // takes `&x` for an `&self` call).
-            let mark = stack.len();
-            if let crate::ast::PatternKind::Binding { name, .. } = &f.pattern.kind {
-                stack.push(BindingRef::Pattern(f.pattern.id, name.clone()));
-            }
-            walk_block_addr(f.body.as_ref(), stack, info);
-            while stack.len() > mark {
-                stack.pop();
-            }
-        }
-        ExprKind::Break { .. } | ExprKind::Continue { .. } => {}
-        ExprKind::Return { value } => {
-            if let Some(v) = value {
-                walk_expr_addr(v, stack, info);
-            }
-        }
-        ExprKind::Try { inner, .. } => walk_expr_addr(inner, stack, info),
-        ExprKind::MacroCall { args, .. } => {
-            let mut i = 0;
-            while i < args.len() {
-                walk_expr_addr(&args[i], stack, info);
-                i += 1;
-            }
-        }
-        ExprKind::Index { base, index, .. } => {
-            // Indexing implicitly takes `&base` (or `&mut base`) for
-            // the Index/IndexMut method call. Mark the base's root
-            // binding as addressed so escape analysis spills it.
-            if let Some(chain) = extract_place(base) {
-                let root = &chain[0];
-                let mut i = stack.len();
-                while i > 0 {
-                    i -= 1;
-                    if binding_ref_name(&stack[i]) == root {
-                        match &stack[i] {
-                            BindingRef::Param(idx, _) => info.param_addressed[*idx] = true,
-                            BindingRef::Let(id, _) => info.let_addressed[*id as usize] = true,
-                            BindingRef::Pattern(id, _) => {
-                                info.pattern_addressed[*id as usize] = true
-                            }
-                        }
-                        break;
-                    }
-                }
-            }
-            walk_expr_addr(base, stack, info);
-            walk_expr_addr(index, stack, info);
-        }
-    }
-}
-
-// Push BindingRef::Pattern entries for every binding that `pattern`
-// introduces, so address analysis on the arm body can resolve `&name`
-// chains rooted at a pattern binding.
-fn push_pattern_bindings_addr(pattern: &Pattern, stack: &mut Vec<BindingRef>) {
-    use crate::ast::PatternKind;
-    match &pattern.kind {
-        PatternKind::Binding { name, .. } => {
-            stack.push(BindingRef::Pattern(pattern.id, name.clone()));
-        }
-        PatternKind::At { name, inner, .. } => {
-            stack.push(BindingRef::Pattern(pattern.id, name.clone()));
-            push_pattern_bindings_addr(inner, stack);
-        }
-        PatternKind::Tuple(elems) => {
-            let mut k = 0;
-            while k < elems.len() {
-                push_pattern_bindings_addr(&elems[k], stack);
-                k += 1;
-            }
-        }
-        PatternKind::Ref { inner, .. } => push_pattern_bindings_addr(inner, stack),
-        PatternKind::VariantTuple { elems, .. } => {
-            let mut k = 0;
-            while k < elems.len() {
-                push_pattern_bindings_addr(&elems[k], stack);
-                k += 1;
-            }
-        }
-        PatternKind::VariantStruct { fields, .. } => {
-            let mut k = 0;
-            while k < fields.len() {
-                push_pattern_bindings_addr(&fields[k].pattern, stack);
-                k += 1;
-            }
-        }
-        PatternKind::Or(alts) => {
-            // All alts bind the same set; walk first.
-            if !alts.is_empty() {
-                push_pattern_bindings_addr(&alts[0], stack);
-            }
-        }
-        PatternKind::Wildcard
-        | PatternKind::LitInt(_)
-        | PatternKind::LitBool(_)
-        | PatternKind::Range { .. } => {}
-    }
-}
 
 // ============================================================================
 // Module / function emission
@@ -1387,15 +743,37 @@ fn emit_module(
 // emit_function_concrete with the substituted artifacts.
 fn emit_monomorphic(
     wasm_mod: &mut wasm::Module,
-    work: MonoWork,
+    template_idx: usize,
+    type_args: Vec<RType>,
+    wasm_idx: u32,
     structs: &StructTable,
     enums: &crate::typeck::EnumTable,
     traits: &crate::typeck::TraitTable,
     funcs: &FuncTable,
     mono: &mut MonoState,
 ) -> Result<(), Error> {
-    let tmpl = &funcs.templates[work.template_idx];
-    let env = build_env(&tmpl.type_params, &work.type_args);
+    let tmpl = &funcs.templates[template_idx];
+    let mono_fn = build_mono_for_template(tmpl, type_args, wasm_idx);
+    emit_function_concrete(
+        wasm_mod,
+        &mono_fn,
+        structs,
+        enums,
+        traits,
+        funcs,
+        mono,
+    )
+}
+
+// Build a `MonoFn` for one (template, concrete type_args) pair: substitute
+// every Param-bearing artifact through the env so the result is fully
+// concrete.
+fn build_mono_for_template<'a>(
+    tmpl: &'a GenericTemplate,
+    type_args: Vec<RType>,
+    wasm_idx: u32,
+) -> MonoFn<'a> {
+    let env = build_env(&tmpl.type_params, &type_args);
     let param_types = subst_vec(&tmpl.param_types, &env);
     let return_type = tmpl.return_type.as_ref().map(|t| substitute_rtype(t, &env));
     let expr_types = subst_opt_vec(&tmpl.expr_types, &env);
@@ -1414,17 +792,11 @@ fn emit_monomorphic(
         .impl_target
         .as_ref()
         .map(|pat| substitute_rtype(pat, &env));
-    emit_function_concrete(
-        wasm_mod,
-        &tmpl.func,
-        &tmpl.enclosing_module,
-        &tmpl.enclosing_module,
-        self_target.as_ref(),
-        structs,
-        enums,
-        traits,
-        funcs,
-        mono,
+    MonoFn {
+        func: &tmpl.func,
+        current_module: tmpl.enclosing_module.clone(),
+        path_prefix: tmpl.enclosing_module.clone(),
+        self_target,
         param_types,
         return_type,
         expr_types,
@@ -1434,10 +806,10 @@ fn emit_monomorphic(
         moved_places,
         move_sites,
         env,
-        tmpl.type_params.clone(),
-        work.wasm_idx,
-        false, // monomorphic instances are never exported
-    )
+        type_params: tmpl.type_params.clone(),
+        wasm_idx,
+        is_export: false, // monomorphic instances are never exported
+    }
 }
 
 fn subst_opt_vec_vec(
@@ -1534,122 +906,6 @@ fn subst_vec(v: &Vec<RType>, env: &Vec<(String, RType)>) -> Vec<RType> {
     out
 }
 
-// Walks the body in source order, appending each `LetStmt`'s value-expr
-// NodeId. Frame layout iterates this list to assign offsets in source order
-// while keying into NodeId-sized arrays.
-fn collect_let_value_ids(block: &Block, out: &mut Vec<u32>) {
-    let mut i = 0;
-    while i < block.stmts.len() {
-        match &block.stmts[i] {
-            Stmt::Let(let_stmt) => {
-                collect_lets_in_expr(&let_stmt.value, out);
-                out.push(let_stmt.value.id);
-            }
-            Stmt::Assign(assign) => {
-                collect_lets_in_expr(&assign.lhs, out);
-                collect_lets_in_expr(&assign.rhs, out);
-            }
-            Stmt::Expr(expr) => collect_lets_in_expr(expr, out),
-            Stmt::Use(_) => {}
-        }
-        i += 1;
-    }
-    if let Some(tail) = &block.tail {
-        collect_lets_in_expr(tail, out);
-    }
-}
-
-fn collect_lets_in_expr(expr: &Expr, out: &mut Vec<u32>) {
-    match &expr.kind {
-        ExprKind::IntLit(_) | ExprKind::NegIntLit(_) | ExprKind::StrLit(_) | ExprKind::CharLit(_) | ExprKind::BoolLit(_) | ExprKind::Var(_) => {}
-        ExprKind::If(if_expr) => {
-            collect_lets_in_expr(&if_expr.cond, out);
-            collect_let_value_ids(if_expr.then_block.as_ref(), out);
-            collect_let_value_ids(if_expr.else_block.as_ref(), out);
-        }
-        ExprKind::Builtin { args, .. } => {
-            let mut i = 0;
-            while i < args.len() {
-                collect_lets_in_expr(&args[i], out);
-                i += 1;
-            }
-        }
-        ExprKind::Borrow { inner, .. } => collect_lets_in_expr(inner, out),
-        ExprKind::Cast { inner, .. } => collect_lets_in_expr(inner, out),
-        ExprKind::Deref(inner) => collect_lets_in_expr(inner, out),
-        ExprKind::FieldAccess(fa) => collect_lets_in_expr(&fa.base, out),
-        ExprKind::Call(c) => {
-            let mut i = 0;
-            while i < c.args.len() {
-                collect_lets_in_expr(&c.args[i], out);
-                i += 1;
-            }
-        }
-        ExprKind::StructLit(s) => {
-            let mut i = 0;
-            while i < s.fields.len() {
-                collect_lets_in_expr(&s.fields[i].value, out);
-                i += 1;
-            }
-        }
-        ExprKind::MethodCall(mc) => {
-            collect_lets_in_expr(&mc.receiver, out);
-            let mut i = 0;
-            while i < mc.args.len() {
-                collect_lets_in_expr(&mc.args[i], out);
-                i += 1;
-            }
-        }
-        ExprKind::Block(b) | ExprKind::Unsafe(b) => collect_let_value_ids(b.as_ref(), out),
-        ExprKind::Tuple(elems) => {
-            let mut i = 0;
-            while i < elems.len() {
-                collect_lets_in_expr(&elems[i], out);
-                i += 1;
-            }
-        }
-        ExprKind::TupleIndex { base, .. } => collect_lets_in_expr(base, out),
-        ExprKind::Match(m) => {
-            collect_lets_in_expr(&m.scrutinee, out);
-            let mut i = 0;
-            while i < m.arms.len() {
-                collect_lets_in_expr(&m.arms[i].body, out);
-                i += 1;
-            }
-        }
-        ExprKind::IfLet(il) => {
-            collect_lets_in_expr(&il.scrutinee, out);
-            collect_let_value_ids(il.then_block.as_ref(), out);
-            collect_let_value_ids(il.else_block.as_ref(), out);
-        }
-        ExprKind::While(w) => {
-            collect_lets_in_expr(&w.cond, out);
-            collect_let_value_ids(w.body.as_ref(), out);
-        }
-        ExprKind::For(f) => {
-            collect_lets_in_expr(&f.iter, out);
-            collect_let_value_ids(f.body.as_ref(), out);
-        }
-        ExprKind::Break { .. } | ExprKind::Continue { .. } => {}
-        ExprKind::Return { value } => {
-            if let Some(v) = value {
-                collect_lets_in_expr(v, out);
-            }
-        }
-        ExprKind::Try { inner, .. } => collect_lets_in_expr(inner, out),
-        ExprKind::Index { base, index, .. } => {
-            collect_lets_in_expr(base, out);
-            collect_lets_in_expr(index, out);
-        }
-        ExprKind::MacroCall { args, .. } => {
-            let mut i = 0;
-            while i < args.len() {
-                collect_lets_in_expr(&args[i], out);
-                i += 1;
-            }
-        }
-    }
-}
 
 fn emit_function(
     wasm_mod: &mut wasm::Module,
@@ -1666,42 +922,32 @@ fn emit_function(
     let mut full = path_prefix.clone();
     full.push(func.name.clone());
     let entry = func_lookup(funcs, &full).expect("typeck registered this function");
-    // Snapshot all artifacts before entering the concrete emitter (which takes
-    // them by-value). For non-generic fns these are the entry's data; the env
-    // is empty (no Param substitution to do).
-    let param_types = entry.param_types.clone();
-    let return_type = entry.return_type.clone();
-    let expr_types = entry.expr_types.clone();
-    let method_resolutions = entry.method_resolutions.clone();
-    let call_resolutions = entry.call_resolutions.clone();
-    let builtin_type_targets = clone_btt(&entry.builtin_type_targets);
-    let moved_places = clone_moved_places(&entry.moved_places);
-    let move_sites = clone_move_sites(&entry.move_sites);
-    let wasm_idx = entry.idx;
-    let is_export = current_module.is_empty() && path_prefix.len() == current_module.len();
+    let mono_fn = MonoFn {
+        func,
+        current_module: current_module.clone(),
+        path_prefix: path_prefix.clone(),
+        self_target: self_target.cloned(),
+        param_types: entry.param_types.clone(),
+        return_type: entry.return_type.clone(),
+        expr_types: entry.expr_types.clone(),
+        method_resolutions: entry.method_resolutions.clone(),
+        call_resolutions: entry.call_resolutions.clone(),
+        builtin_type_targets: clone_btt(&entry.builtin_type_targets),
+        moved_places: clone_moved_places(&entry.moved_places),
+        move_sites: clone_move_sites(&entry.move_sites),
+        env: Vec::new(),
+        type_params: Vec::new(),
+        wasm_idx: entry.idx,
+        is_export: current_module.is_empty() && path_prefix.len() == current_module.len(),
+    };
     emit_function_concrete(
         wasm_mod,
-        func,
-        current_module,
-        path_prefix,
-        self_target,
+        &mono_fn,
         structs,
         enums,
         traits,
         funcs,
         mono,
-        param_types,
-        return_type,
-        expr_types,
-        method_resolutions,
-        call_resolutions,
-        builtin_type_targets,
-        moved_places,
-        move_sites,
-        Vec::new(),
-        Vec::new(),
-        wasm_idx,
-        is_export,
     )
 }
 
@@ -1742,80 +988,67 @@ fn clone_move_sites(
 
 fn emit_function_concrete(
     wasm_mod: &mut wasm::Module,
-    func: &Function,
-    current_module: &Vec<String>,
-    path_prefix: &Vec<String>,
-    self_target: Option<&RType>,
+    mono_fn: &MonoFn,
     structs: &StructTable,
     enums: &crate::typeck::EnumTable,
     traits: &crate::typeck::TraitTable,
     funcs: &FuncTable,
     mono: &mut MonoState,
-    param_types: Vec<RType>,
-    return_type: Option<RType>,
-    expr_types: Vec<Option<RType>>,
-    method_resolutions: Vec<Option<MethodResolution>>,
-    call_resolutions: Vec<Option<CallResolution>>,
-    builtin_type_targets: Vec<Option<Vec<RType>>>,
-    moved_places: Vec<crate::typeck::MovedPlace>,
-    move_sites: Vec<(crate::ast::NodeId, String)>,
-    env: Vec<(String, RType)>,
-    type_params: Vec<String>,
-    wasm_idx: u32,
-    is_export: bool,
 ) -> Result<(), Error> {
-    let _ = path_prefix;
-    let node_count = func.node_count as usize;
-    // Address-taken analysis: who needs to live in shadow-stack memory?
-    let mut address_info = analyze_addresses(func);
-    // T4: Drop bindings need to be addressable so the implicit drop call
-    // at scope end can pass `&mut binding`. Force-mark them as addressed
-    // before frame layout.
-    mark_drop_bindings_addressed(func, &param_types, &expr_types, traits, &mut address_info);
-
-    // Compute frame layout: assign byte offsets to addressed params + lets.
-    let mut frame_size: u32 = 0;
-    let mut param_offsets: Vec<Option<u32>> = Vec::with_capacity(func.params.len());
-    let mut k = 0;
-    while k < param_types.len() {
-        if address_info.param_addressed[k] {
-            param_offsets.push(Some(frame_size));
-            frame_size += byte_size_of(&param_types[k], structs, enums);
-        } else {
-            param_offsets.push(None);
-        }
-        k += 1;
-    }
-    // let_offsets keyed by let_stmt.value.id — sparse, sized to node_count.
-    let mut let_offsets: Vec<Option<u32>> = Vec::with_capacity(node_count);
-    let mut i = 0;
-    while i < node_count {
-        let_offsets.push(None);
-        i += 1;
-    }
-    {
-        let mut order: Vec<u32> = Vec::new();
-        collect_let_value_ids(&func.body, &mut order);
-        let mut k = 0;
-        while k < order.len() {
-            let id = order[k] as usize;
-            if address_info.let_addressed[id] {
-                let_offsets[id] = Some(frame_size);
-                let ty = expr_types[id]
-                    .as_ref()
-                    .expect("typeck recorded the let's type");
-                frame_size += byte_size_of(ty, structs, enums);
+    let func = mono_fn.func;
+    let param_types = &mono_fn.param_types;
+    let return_type = &mono_fn.return_type;
+    let wasm_idx = mono_fn.wasm_idx;
+    let is_export = mono_fn.is_export;
+    // Per-mono frame layout pass: precomputed escape analysis + frame
+    // offsets + per-binding storage kinds. Codegen reads from `layout`
+    // instead of computing inline.
+    let layout = crate::layout::compute_layout(mono_fn, structs, enums, traits);
+    let param_storage = &layout.param_storage;
+    let let_storage = &layout.let_storage;
+    let frame_size = layout.frame_size;
+    // Phase 1c: try lowering to Mono. If lowering succeeds AND the
+    // body uses only variants that codegen_mono_block supports, the
+    // body emission switches to the Mono path. Otherwise codegen falls
+    // back to the AST path. The lowered MonoBody is held as an Option
+    // for the body-codegen step below.
+    let mono_body_opt: Option<crate::mono::MonoBody> = match crate::mono::lower_to_mono(
+        mono_fn,
+        structs,
+        enums,
+        traits,
+        funcs,
+        &mono.mono_table,
+    ) {
+        Ok(body) => {
+            // Compute MonoLayout as well — currently unused by codegen
+            // but exercises the layout pass on every mono.
+            let _mono_layout = crate::layout::compute_mono_layout(
+                &body,
+                &mono_fn.moved_places,
+                structs,
+                enums,
+                traits,
+            );
+            if std::env::var("MONO_TRACE").is_ok() {
+                eprintln!("MONO_OK fn={}", mono_fn.func.name);
             }
-            k += 1;
+            Some(body)
         }
-    }
+        Err(e) => {
+            if std::env::var("MONO_TRACE").is_ok() {
+                eprintln!("MONO_ERR fn={} msg={}", mono_fn.func.name, e.message);
+            }
+            None
+        }
+    };
 
     // Build the WASM signature: refs collapse to a single i32; everything else
     // flattens to flat scalars as before. Functions returning enums use sret:
     // a leading i32 param is prepended (the destination address into the
     // caller's frame), and at function-body end we memcpy the constructed
     // enum's bytes to that address before returning.
-    let returns_enum = matches!(&return_type, Some(RType::Enum { .. }));
+    let returns_enum = matches!(return_type, Some(RType::Enum { .. }));
     let mut wasm_params: Vec<wasm::ValType> = Vec::new();
     let mut next_wasm_local: u32 = 0;
     let mut sret_ptr_local: Option<u32> = None;
@@ -1828,9 +1061,9 @@ fn emit_function_concrete(
     let mut k = 0;
     while k < func.params.len() {
         let pty = param_types[k].clone();
-        let storage = match &param_offsets[k] {
-            Some(off) => Storage::Memory { frame_offset: *off },
-            None => {
+        let storage = match param_storage[k] {
+            BindingStorageKind::Memory { frame_offset } => Storage::Memory { frame_offset },
+            BindingStorageKind::Local => {
                 let mut vts: Vec<wasm::ValType> = Vec::new();
                 flatten_rtype(&pty, structs, &mut vts);
                 let start = next_wasm_local;
@@ -1845,8 +1078,9 @@ fn emit_function_concrete(
                     flat_size: vts.len() as u32,
                 }
             }
+            BindingStorageKind::MemoryAt => unreachable!("params are never MemoryAt"),
         };
-        if let Some(_) = &param_offsets[k] {
+        if matches!(param_storage[k], BindingStorageKind::Memory { .. }) {
             let mut vts: Vec<wasm::ValType> = Vec::new();
             flatten_rtype(&pty, structs, &mut vts);
             let mut j = 0;
@@ -1856,16 +1090,24 @@ fn emit_function_concrete(
                 j += 1;
             }
         }
+        let pname = func.params[k].name.clone();
+        let drop_action = crate::layout::compute_drop_action(
+            &pname,
+            &pty,
+            &mono_fn.moved_places,
+            traits,
+        );
         locals.push(LocalBinding {
-            name: func.params[k].name.clone(),
+            name: pname,
             rtype: pty,
             storage,
+            drop_action,
         });
         k += 1;
     }
 
     let mut wasm_results: Vec<wasm::ValType> = Vec::new();
-    if let Some(rt) = &return_type {
+    if let Some(rt) = return_type {
         flatten_rtype(rt, structs, &mut wasm_results);
     }
 
@@ -1893,21 +1135,21 @@ fn emit_function_concrete(
         enums,
         traits,
         funcs,
-        current_module: current_module.clone(),
-        expr_types,
-        let_offsets,
-        pattern_addressed: address_info.pattern_addressed.clone(),
-        method_resolutions,
-        call_resolutions,
-        builtin_type_targets,
-        self_target: self_target.cloned(),
-        moved_places,
-        move_sites,
+        current_module: mono_fn.current_module.clone(),
+        expr_types: mono_fn.expr_types.clone(),
+        let_storage: let_storage.clone(),
+        pattern_storage: layout.pattern_storage.clone(),
+        method_resolutions: mono_fn.method_resolutions.clone(),
+        call_resolutions: mono_fn.call_resolutions.clone(),
+        builtin_type_targets: clone_btt(&mono_fn.builtin_type_targets),
+        self_target: mono_fn.self_target.clone(),
+        moved_places: clone_moved_places(&mono_fn.moved_places),
+        move_sites: clone_move_sites(&mono_fn.move_sites),
         drop_flags: Vec::new(),
         pending_types: Vec::new(),
         pending_types_base: wasm_mod.types.len() as u32,
-        env,
-        type_params,
+        env: mono_fn.env.clone(),
+        type_params: mono_fn.type_params.clone(),
         mono,
         loops: Vec::new(),
         cf_depth: 0,
@@ -1916,6 +1158,8 @@ fn emit_function_concrete(
         sret_ptr_local,
         return_flat: return_flat_for_ctx,
         return_rt: return_type.clone(),
+        mono_body: None,
+        mono_binding_to_local: Vec::new(),
     };
 
     // Allocate a wasm local to remember __sp on function entry. Variant
@@ -1983,42 +1227,39 @@ fn emit_function_concrete(
             let mut vts: Vec<wasm::ValType> = Vec::new();
             flatten_rtype(&pty, structs, &mut vts);
             let flat_size = vts.len() as u32;
-            match &param_offsets[p] {
-                Some(off) => {
-                    if matches!(&pty, RType::Enum { .. }) {
-                        // memcpy from incoming-address (a single i32 in
-                        // wasm_local_cursor) to frame[off]. flat_size
-                        // is 1 for enums; the wasm local at cursor
-                        // holds the source address.
-                        let src_local = wasm_local_cursor;
-                        let dst_local = ctx.next_wasm_local;
-                        ctx.extra_locals.push(wasm::ValType::I32);
-                        ctx.next_wasm_local += 1;
-                        let fb = ctx.frame_base_local;
-                        ctx.instructions.push(wasm::Instruction::LocalGet(fb));
-                        if *off != 0 {
-                            ctx.instructions
-                                .push(wasm::Instruction::I32Const(*off as i32));
-                            ctx.instructions.push(wasm::Instruction::I32Add);
-                        }
-                        ctx.instructions.push(wasm::Instruction::LocalSet(dst_local));
-                        let bytes = byte_size_of(&pty, structs, enums);
-                        emit_memcpy(&mut ctx, dst_local, src_local, bytes);
-                    } else {
-                        let mut leaves: Vec<MemLeaf> = Vec::new();
-                        collect_leaves(&pty, structs, enums, 0, &mut leaves);
-                        let mut k = 0;
-                        while k < leaves.len() {
-                            ctx.instructions
-                                .push(wasm::Instruction::GlobalGet(SP_GLOBAL));
-                            ctx.instructions
-                                .push(wasm::Instruction::LocalGet(wasm_local_cursor + k as u32));
-                            ctx.instructions.push(store_instr(&leaves[k], *off));
-                            k += 1;
-                        }
+            if let BindingStorageKind::Memory { frame_offset: off } = param_storage[p] {
+                if matches!(&pty, RType::Enum { .. }) {
+                    // memcpy from incoming-address (a single i32 in
+                    // wasm_local_cursor) to frame[off]. flat_size
+                    // is 1 for enums; the wasm local at cursor
+                    // holds the source address.
+                    let src_local = wasm_local_cursor;
+                    let dst_local = ctx.next_wasm_local;
+                    ctx.extra_locals.push(wasm::ValType::I32);
+                    ctx.next_wasm_local += 1;
+                    let fb = ctx.frame_base_local;
+                    ctx.instructions.push(wasm::Instruction::LocalGet(fb));
+                    if off != 0 {
+                        ctx.instructions
+                            .push(wasm::Instruction::I32Const(off as i32));
+                        ctx.instructions.push(wasm::Instruction::I32Add);
+                    }
+                    ctx.instructions.push(wasm::Instruction::LocalSet(dst_local));
+                    let bytes = byte_size_of(&pty, structs, enums);
+                    emit_memcpy(&mut ctx, dst_local, src_local, bytes);
+                } else {
+                    let mut leaves: Vec<MemLeaf> = Vec::new();
+                    collect_leaves(&pty, structs, enums, 0, &mut leaves);
+                    let mut k = 0;
+                    while k < leaves.len() {
+                        ctx.instructions
+                            .push(wasm::Instruction::GlobalGet(SP_GLOBAL));
+                        ctx.instructions
+                            .push(wasm::Instruction::LocalGet(wasm_local_cursor + k as u32));
+                        ctx.instructions.push(store_instr(&leaves[k], off));
+                        k += 1;
                     }
                 }
-                None => {}
             }
             wasm_local_cursor += flat_size;
             p += 1;
@@ -2030,8 +1271,7 @@ fn emit_function_concrete(
     let mut p = 0;
     while p < func.params.len() {
         let local_name = ctx.locals[p].name.clone();
-        let rt = ctx.locals[p].rtype.clone();
-        if needs_drop_flag(&ctx.moved_places, &local_name, &rt, ctx.traits) {
+        if matches!(ctx.locals[p].drop_action, crate::layout::DropAction::Flagged) {
             let flag_idx = ctx.next_wasm_local;
             ctx.extra_locals.push(wasm::ValType::I32);
             ctx.next_wasm_local += 1;
@@ -2042,7 +1282,52 @@ fn emit_function_concrete(
         p += 1;
     }
 
-    codegen_block(&mut ctx, &func.body)?;
+    // Phase 1c step 2: try Mono-driven body codegen if available and
+    // supported. Fall back to AST codegen on any miss.
+    // Functions with `MaybeMoved` bindings need drop-flag clearing at
+    // every move site — Mono path doesn't yet handle this (the
+    // `Local(BindingId)` lookup in `codegen_mono_expr` doesn't know
+    // whether the read is a move site). Fall back to AST when any
+    // moved_places entry is MaybeMoved.
+    // All function bodies go through Mono codegen. Lowering and the
+    // per-variant support check together cover every shape pocket-rust
+    // accepts; failures here surface as compile errors rather than
+    // silent fallbacks (no more AST shadow path).
+    let body = mono_body_opt.ok_or_else(|| Error {
+        file: String::new(),
+        message: format!(
+            "codegen: Mono lowering failed for fn `{}` (no AST fallback)",
+            mono_fn.func.name
+        ),
+        span: func.body.span.copy(),
+    })?;
+    if !mono_codegen_supports(&body) {
+        return Err(Error {
+            file: String::new(),
+            message: format!(
+                "codegen: Mono codegen rejected fn `{}` ({})",
+                mono_fn.func.name,
+                first_unsupported_block(&body.body),
+            ),
+            span: func.body.span.copy(),
+        });
+    }
+    ctx.mono_body = Some(&body);
+    // Initialize BindingId → ctx.locals map. Params have identity
+    // mapping (they were pushed in BindingId order before Mono codegen
+    // runs). Other entries (lets) get populated by `codegen_mono_stmt`'s
+    // Let handler.
+    ctx.mono_binding_to_local = vec![None; body.locals.len()];
+    let mut k = 0;
+    while k < body.locals.len() {
+        if let crate::mono::BindingOrigin::Param(idx) = &body.locals[k].origin {
+            ctx.mono_binding_to_local[k] = Some(*idx as u32);
+        }
+        k += 1;
+    }
+    codegen_mono_block(&mut ctx, &body.body)?;
+    ctx.mono_body = None;
+    ctx.mono_binding_to_local = Vec::new();
 
     // T4: drop in-scope Drop-typed bindings at function-body end. The
     // tail value (if any) is on the WASM stack — save it to fresh
@@ -2142,74 +1427,8 @@ fn emit_function_concrete(
 // Statement / expression codegen
 // ============================================================================
 
-fn codegen_block(ctx: &mut FnCtx, block: &Block) -> Result<(), Error> {
-    let mut i = 0;
-    while i < block.stmts.len() {
-        match &block.stmts[i] {
-            Stmt::Let(let_stmt) => codegen_let_stmt(ctx, let_stmt)?,
-            Stmt::Assign(assign) => codegen_assign_stmt(ctx, assign)?,
-            Stmt::Expr(expr) => codegen_expr_stmt(ctx, expr)?,
-            Stmt::Use(_) => {}
-        }
-        i += 1;
-    }
-    if let Some(expr) = &block.tail {
-        codegen_expr(ctx, expr)?;
-    }
-    Ok(())
-}
 
-fn codegen_expr_stmt(ctx: &mut FnCtx, expr: &Expr) -> Result<(), Error> {
-    // Two flavours land here:
-    //  - tail-less block-like exprs (`unsafe { … }`, `{ … }`) — they
-    //    produce nothing on the WASM stack, just side effects.
-    //  - any other expression followed by `;` — we evaluate and then
-    //    drop the resulting flat scalars (one `drop` per scalar).
-    match &expr.kind {
-        ExprKind::Block(b) | ExprKind::Unsafe(b) if b.tail.is_none() => {
-            codegen_unit_block_stmt(ctx, b.as_ref())
-        }
-        _ => {
-            let ty = codegen_expr(ctx, expr)?;
-            let mut vts: Vec<wasm::ValType> = Vec::new();
-            flatten_rtype(&ty, ctx.structs, &mut vts);
-            let mut k = 0;
-            while k < vts.len() {
-                ctx.instructions.push(wasm::Instruction::Drop);
-                k += 1;
-            }
-            Ok(())
-        }
-    }
-}
 
-fn codegen_unit_block_stmt(ctx: &mut FnCtx, block: &Block) -> Result<(), Error> {
-    let mark = ctx.locals.len();
-    let mut i = 0;
-    while i < block.stmts.len() {
-        match &block.stmts[i] {
-            Stmt::Let(let_stmt) => codegen_let_stmt(ctx, let_stmt)?,
-            Stmt::Assign(assign) => codegen_assign_stmt(ctx, assign)?,
-            Stmt::Expr(inner) => codegen_expr_stmt(ctx, inner)?,
-            Stmt::Use(_) => {}
-        }
-        i += 1;
-    }
-    // Unit-typed blocks can still have a tail expression — happens
-    // when the last expression is one of the unit-block-like forms
-    // (`if`, `match`, `while`, `for`, …) used without a trailing `;`.
-    // Codegen the tail as if it were an expression statement: push
-    // its scalars on the wasm stack and drop them. Without this,
-    // a tail `for x in iter { … }` would silently never run.
-    if let Some(tail) = &block.tail {
-        codegen_expr_stmt(ctx, tail)?;
-    }
-    // T4: drop in-scope Drop-typed bindings in reverse declaration order
-    // before truncating the locals stack.
-    emit_drops_for_locals_range(ctx, mark, ctx.locals.len())?;
-    ctx.locals.truncate(mark);
-    Ok(())
-}
 
 // T4: walk locals[from..to] in reverse, emit a `drop(&mut binding)`
 // call for every binding whose type implements Drop. Bindings must
@@ -2254,38 +1473,6 @@ fn current_cf_depth(ctx: &FnCtx) -> u32 {
 //
 // `break` inside body: drop in-loop Drop bindings, then `Br <break_depth>`.
 // `continue` inside body: drop in-loop Drop bindings, then `Br <continue_depth>`.
-fn codegen_while_expr(ctx: &mut FnCtx, w: &crate::ast::WhileExpr) -> Result<RType, Error> {
-    let outer_depth = current_cf_depth(ctx);
-    let locals_at_entry = ctx.locals.len();
-
-    ctx.instructions
-        .push(wasm::Instruction::Block(wasm::BlockType::Empty));
-    ctx.instructions
-        .push(wasm::Instruction::Loop(wasm::BlockType::Empty));
-
-    // Cond on top of stack, eqz, br_if 1 (out of Block on false).
-    let _ = codegen_expr(ctx, &w.cond)?;
-    ctx.instructions.push(wasm::Instruction::I32Eqz);
-    ctx.instructions.push(wasm::Instruction::BrIf(1));
-
-    // Push loop frame so break/continue inside body can find this loop.
-    ctx.loops.push(LoopCgFrame {
-        label: w.label.clone(),
-        break_depth: outer_depth,
-        continue_depth: outer_depth + 1,
-        locals_len_at_entry: locals_at_entry,
-    });
-    codegen_unit_block_stmt(ctx, w.body.as_ref())?;
-    ctx.loops.pop();
-
-    // Back-edge to Loop start.
-    ctx.instructions.push(wasm::Instruction::Br(0));
-
-    ctx.instructions.push(wasm::Instruction::End); // close Loop
-    ctx.instructions.push(wasm::Instruction::End); // close Block
-
-    Ok(RType::Tuple(Vec::new()))
-}
 
 // `for pat in iter { body }` — emit equivalent of:
 //
@@ -2311,302 +1498,8 @@ fn codegen_while_expr(ctx: &mut FnCtx, w: &crate::ast::WhileExpr) -> Result<RTyp
 // type and `Item` type can have any shape — `flatten_rtype` /
 // `store_flat_to_memory` / `load_flat_from_memory` handle multi-
 // scalar layouts uniformly.
-fn codegen_for_expr(ctx: &mut FnCtx, f: &crate::ast::ForLoop) -> Result<RType, Error> {
-    let iter_ty = ctx.expr_types[f.iter.id as usize]
-        .as_ref()
-        .expect("typeck recorded iter type")
-        .clone();
-    let iter_ty = substitute_rtype(&iter_ty, &ctx.env);
-    let iterator_path = vec![
-        "std".to_string(),
-        "iter".to_string(),
-        "Iterator".to_string(),
-    ];
 
-    // Resolve `<iter_ty as Iterator>::next` to a wasm fn idx.
-    let resolution =
-        crate::typeck::solve_impl(&iterator_path, &iter_ty, ctx.traits, 0)
-            .expect("typeck verified Iterator impl exists");
-    let next_cand =
-        crate::typeck::find_trait_impl_method(ctx.funcs, resolution.impl_idx, "next")
-            .expect("Iterator impl provides next");
-    let next_callee_idx = match next_cand {
-        crate::typeck::MethodCandidate::Direct(i) => ctx.funcs.entries[i].idx,
-        crate::typeck::MethodCandidate::Template(i) => {
-            let tmpl = &ctx.funcs.templates[i];
-            let mut concrete: Vec<RType> = Vec::new();
-            let mut k = 0;
-            while k < tmpl.type_params.len() {
-                let name = &tmpl.type_params[k];
-                let mut found: Option<RType> = None;
-                let mut j = 0;
-                while j < resolution.subst.len() {
-                    if resolution.subst[j].0 == *name {
-                        found = Some(resolution.subst[j].1.clone());
-                        break;
-                    }
-                    j += 1;
-                }
-                concrete.push(found.expect("impl param bound by subst"));
-                k += 1;
-            }
-            ctx.mono.intern(i, concrete)
-        }
-    };
 
-    // Resolve Item type from the impl's `type Item = …` binding.
-    let item_ty = crate::typeck::find_assoc_binding(
-        ctx.traits,
-        &iter_ty,
-        &iterator_path,
-        "Item",
-    )
-    .into_iter()
-    .next()
-    .expect("typeck verified Item binding");
-    let item_ty = substitute_rtype(&item_ty, &ctx.env);
-
-    let option_path = vec![
-        "std".to_string(),
-        "option".to_string(),
-        "Option".to_string(),
-    ];
-    let option_ty = RType::Enum {
-        path: option_path,
-        type_args: vec![item_ty.clone()],
-        lifetime_args: Vec::new(),
-    };
-    let option_size = byte_size_of(&option_ty, ctx.structs, ctx.enums);
-    let iter_size = byte_size_of(&iter_ty, ctx.structs, ctx.enums);
-
-    // Setup: allocate __iter on the shadow stack and store the iter
-    // expression's value into it.
-    ctx.instructions.push(wasm::Instruction::GlobalGet(SP_GLOBAL));
-    ctx.instructions.push(wasm::Instruction::I32Const(iter_size as i32));
-    ctx.instructions.push(wasm::Instruction::I32Sub);
-    ctx.instructions.push(wasm::Instruction::GlobalSet(SP_GLOBAL));
-    let iter_addr_local = ctx.next_wasm_local;
-    ctx.extra_locals.push(wasm::ValType::I32);
-    ctx.next_wasm_local += 1;
-    ctx.instructions.push(wasm::Instruction::GlobalGet(SP_GLOBAL));
-    ctx.instructions.push(wasm::Instruction::LocalSet(iter_addr_local));
-    let _ = codegen_expr(ctx, &f.iter)?;
-    store_flat_to_memory(
-        ctx,
-        &iter_ty,
-        BaseAddr::WasmLocal(iter_addr_local),
-        0,
-    );
-
-    // Pre-allocate the binding's storage. Pattern is constrained to
-    // `Var(name)` or `_` per `materialize_for_loop_bindings`. If
-    // escape analysis flagged the binding as addressed (e.g.
-    // `for x in iter { foo(&x); }` takes `&x`), the binding lives in
-    // a per-iteration shadow-stack slot so it's addressable; else it
-    // lives in fresh wasm locals.
-    let mut item_flat: Vec<wasm::ValType> = Vec::new();
-    flatten_rtype(&item_ty, ctx.structs, &mut item_flat);
-    let binding_name: Option<String> = match &f.pattern.kind {
-        crate::ast::PatternKind::Binding { name, .. } => Some(name.clone()),
-        crate::ast::PatternKind::Wildcard => None,
-        _ => unreachable!(
-            "for-loop pattern destructure rejected at borrowck — \
-             only `for x in iter` and `for _ in iter` are supported"
-        ),
-    };
-    let pattern_id = f.pattern.id as usize;
-    let binding_addressed = pattern_id < ctx.pattern_addressed.len()
-        && ctx.pattern_addressed[pattern_id];
-    let item_size = byte_size_of(&item_ty, ctx.structs, ctx.enums);
-    let binding_addr_local: Option<u32> = if binding_addressed && binding_name.is_some() {
-        // Allocate a stable shadow-stack slot for the binding ABOVE
-        // the iter slot (allocated once before the loop, reused
-        // across iterations — same address every time).
-        ctx.instructions.push(wasm::Instruction::GlobalGet(SP_GLOBAL));
-        ctx.instructions.push(wasm::Instruction::I32Const(item_size as i32));
-        ctx.instructions.push(wasm::Instruction::I32Sub);
-        ctx.instructions.push(wasm::Instruction::GlobalSet(SP_GLOBAL));
-        let addr = ctx.next_wasm_local;
-        ctx.extra_locals.push(wasm::ValType::I32);
-        ctx.next_wasm_local += 1;
-        ctx.instructions.push(wasm::Instruction::GlobalGet(SP_GLOBAL));
-        ctx.instructions.push(wasm::Instruction::LocalSet(addr));
-        Some(addr)
-    } else {
-        None
-    };
-    let binding_start = ctx.next_wasm_local;
-    if binding_addr_local.is_none() {
-        let mut k = 0;
-        while k < item_flat.len() {
-            ctx.extra_locals.push(item_flat[k].copy());
-            ctx.next_wasm_local += 1;
-            k += 1;
-        }
-    }
-    let binding_flat_size = item_flat.len() as u32;
-
-    // Outer wasm Block (break target) + inner Loop (continue/back-edge).
-    let outer_depth = current_cf_depth(ctx);
-    let locals_at_entry = ctx.locals.len();
-    ctx.instructions
-        .push(wasm::Instruction::Block(wasm::BlockType::Empty));
-    ctx.instructions
-        .push(wasm::Instruction::Loop(wasm::BlockType::Empty));
-
-    // Per-iteration: allocate Option<Item> sret slot below SP.
-    ctx.instructions.push(wasm::Instruction::GlobalGet(SP_GLOBAL));
-    ctx.instructions.push(wasm::Instruction::I32Const(option_size as i32));
-    ctx.instructions.push(wasm::Instruction::I32Sub);
-    ctx.instructions.push(wasm::Instruction::GlobalSet(SP_GLOBAL));
-    let opt_addr_local = ctx.next_wasm_local;
-    ctx.extra_locals.push(wasm::ValType::I32);
-    ctx.next_wasm_local += 1;
-    ctx.instructions.push(wasm::Instruction::GlobalGet(SP_GLOBAL));
-    ctx.instructions.push(wasm::Instruction::LocalSet(opt_addr_local));
-
-    // Call `<IterT as Iterator>::next(opt_sret_addr, &mut __iter)`.
-    // Arg order: sret addr first (enum-returning ABI), then recv.
-    ctx.instructions.push(wasm::Instruction::LocalGet(opt_addr_local));
-    ctx.instructions.push(wasm::Instruction::LocalGet(iter_addr_local));
-    ctx.instructions.push(wasm::Instruction::Call(next_callee_idx));
-    // The sret-returning fn pushes the dest addr again; drop it.
-    ctx.instructions.push(wasm::Instruction::Drop);
-
-    // Read disc at opt_addr+0. None = 0 → exit loop; Some = 1 → bind
-    // payload and run body. (Option declares None before Some.)
-    ctx.instructions.push(wasm::Instruction::LocalGet(opt_addr_local));
-    ctx.instructions.push(wasm::Instruction::I32Load { align: 2, offset: 0 });
-    ctx.instructions.push(wasm::Instruction::I32Eqz);
-    // Before exiting via BrIf, restore SP (free the option slot).
-    // Actually wasm BrIf doesn't allow a side effect on the cond
-    // path — we'd need to test, then conditionally restore. Simpler:
-    // restore the option slot at the END of the loop body (back-edge
-    // path), and ALSO at the after-loop continuation (exit path).
-    // The cond `disc == 0` exits via BrIf 1 (out of Block); we then
-    // run the after-loop continuation which frees the option slot.
-    ctx.instructions.push(wasm::Instruction::BrIf(1));
-
-    // Some path: load Item payload from opt_addr+4 into the binding's
-    // storage. For wasm-local bindings, load + LocalSet each leaf;
-    // for shadow-stack bindings, memcpy the payload to addr_local.
-    if binding_name.is_some() {
-        if let Some(addr) = binding_addr_local {
-            // memcpy item_size bytes from opt_addr+4 to addr.
-            // Use the existing emit_memcpy helper which expects two
-            // local indices for src/dst — we need a temp for the
-            // `opt_addr + 4` source.
-            let src_tmp = ctx.next_wasm_local;
-            ctx.extra_locals.push(wasm::ValType::I32);
-            ctx.next_wasm_local += 1;
-            ctx.instructions.push(wasm::Instruction::LocalGet(opt_addr_local));
-            ctx.instructions.push(wasm::Instruction::I32Const(4));
-            ctx.instructions.push(wasm::Instruction::I32Add);
-            ctx.instructions.push(wasm::Instruction::LocalSet(src_tmp));
-            emit_memcpy(ctx, addr, src_tmp, item_size);
-        } else {
-            load_flat_from_memory(
-                ctx,
-                &item_ty,
-                BaseAddr::WasmLocal(opt_addr_local),
-                4,
-            );
-            let mut k = binding_flat_size;
-            while k > 0 {
-                k -= 1;
-                ctx.instructions
-                    .push(wasm::Instruction::LocalSet(binding_start + k));
-            }
-        }
-    }
-
-    // Push the binding into ctx.locals so the body can resolve it.
-    if let Some(name) = &binding_name {
-        let storage = match binding_addr_local {
-            Some(addr) => Storage::MemoryAt { addr_local: addr },
-            None => Storage::Local {
-                wasm_start: binding_start,
-                flat_size: binding_flat_size,
-            },
-        };
-        ctx.locals.push(LocalBinding {
-            name: name.clone(),
-            rtype: item_ty.clone(),
-            storage,
-        });
-    }
-
-    // Loop frame so break/continue inside body can find this loop.
-    ctx.loops.push(LoopCgFrame {
-        label: f.label.clone(),
-        break_depth: outer_depth,
-        continue_depth: outer_depth + 1,
-        locals_len_at_entry: locals_at_entry + (if binding_name.is_some() { 1 } else { 0 }),
-    });
-    codegen_unit_block_stmt(ctx, f.body.as_ref())?;
-    ctx.loops.pop();
-    if binding_name.is_some() {
-        ctx.locals.pop();
-    }
-
-    // End-of-iteration: free the Option slot, back-edge to Loop start.
-    ctx.instructions.push(wasm::Instruction::GlobalGet(SP_GLOBAL));
-    ctx.instructions.push(wasm::Instruction::I32Const(option_size as i32));
-    ctx.instructions.push(wasm::Instruction::I32Add);
-    ctx.instructions.push(wasm::Instruction::GlobalSet(SP_GLOBAL));
-    ctx.instructions.push(wasm::Instruction::Br(0));
-    ctx.instructions.push(wasm::Instruction::End); // close Loop
-    ctx.instructions.push(wasm::Instruction::End); // close Block
-
-    // After loop (exit-via-None or exit-via-break): free the Option
-    // slot (still allocated when we BrIf'd out), the binding slot
-    // (if shadow-stack-allocated), and the __iter slot.
-    ctx.instructions.push(wasm::Instruction::GlobalGet(SP_GLOBAL));
-    ctx.instructions.push(wasm::Instruction::I32Const(option_size as i32));
-    ctx.instructions.push(wasm::Instruction::I32Add);
-    ctx.instructions.push(wasm::Instruction::GlobalSet(SP_GLOBAL));
-    if binding_addr_local.is_some() {
-        ctx.instructions.push(wasm::Instruction::GlobalGet(SP_GLOBAL));
-        ctx.instructions.push(wasm::Instruction::I32Const(item_size as i32));
-        ctx.instructions.push(wasm::Instruction::I32Add);
-        ctx.instructions.push(wasm::Instruction::GlobalSet(SP_GLOBAL));
-    }
-    ctx.instructions.push(wasm::Instruction::GlobalGet(SP_GLOBAL));
-    ctx.instructions.push(wasm::Instruction::I32Const(iter_size as i32));
-    ctx.instructions.push(wasm::Instruction::I32Add);
-    ctx.instructions.push(wasm::Instruction::GlobalSet(SP_GLOBAL));
-
-    Ok(RType::Tuple(Vec::new()))
-}
-
-fn codegen_break(ctx: &mut FnCtx, label: Option<&str>) -> Result<RType, Error> {
-    // Find target loop frame.
-    let (frame_idx, locals_at_entry) = find_loop_frame(ctx, label)
-        .expect("typeck verified break has a target");
-    let break_depth = ctx.loops[frame_idx].break_depth;
-    // Emit drops for in-loop Drop bindings before the Br.
-    emit_drops_for_locals_range(ctx, locals_at_entry, ctx.locals.len())?;
-    let cur = current_cf_depth(ctx);
-    // br_index = (cf_depth - outer_depth) - 1, where outer_depth =
-    // break_depth (cf depth at loop entry, just before the Block push).
-    let br_idx = cur.saturating_sub(break_depth + 1);
-    ctx.instructions.push(wasm::Instruction::Br(br_idx));
-    // `break` has type `!` — wasm validator treats post-Br code as
-    // polymorphic, so a `Br` standing in for any expected result type
-    // (the if/match's BlockType) is accepted.
-    Ok(RType::Never)
-}
-
-fn codegen_continue(ctx: &mut FnCtx, label: Option<&str>) -> Result<RType, Error> {
-    let (frame_idx, locals_at_entry) = find_loop_frame(ctx, label)
-        .expect("typeck verified continue has a target");
-    let continue_depth = ctx.loops[frame_idx].continue_depth;
-    emit_drops_for_locals_range(ctx, locals_at_entry, ctx.locals.len())?;
-    let cur = current_cf_depth(ctx);
-    let br_idx = cur.saturating_sub(continue_depth + 1);
-    ctx.instructions.push(wasm::Instruction::Br(br_idx));
-    Ok(RType::Never)
-}
 
 // `return EXPR` / `return`. Mirrors the function-end epilogue:
 // 1. Codegen the value (or unit). Stash to fresh wasm locals so we
@@ -2617,59 +1510,6 @@ fn codegen_continue(ctx: &mut FnCtx, label: Option<&str>) -> Result<RType, Error
 // 4. For non-sret functions: push the stashed flat scalars back.
 // 5. Restore SP from `fn_entry_sp_local`.
 // 6. Emit wasm `Return`.
-fn codegen_return(ctx: &mut FnCtx, value: Option<&Expr>) -> Result<RType, Error> {
-    // Step 1: codegen the value (or push unit, which produces no
-    // wasm scalars).
-    let return_rt = match &ctx.return_rt {
-        Some(rt) => rt.clone(),
-        None => RType::Tuple(Vec::new()),
-    };
-    if let Some(e) = value {
-        codegen_expr(ctx, e)?;
-    }
-    // Stash flat return scalars into fresh locals so drops don't
-    // disturb them.
-    let return_flat = ctx.return_flat.clone();
-    let save_start = ctx.next_wasm_local;
-    let mut i = 0;
-    while i < return_flat.len() {
-        ctx.extra_locals.push(return_flat[i].copy());
-        ctx.next_wasm_local += 1;
-        i += 1;
-    }
-    let mut k = return_flat.len();
-    while k > 0 {
-        k -= 1;
-        ctx.instructions
-            .push(wasm::Instruction::LocalSet(save_start + k as u32));
-    }
-    // Step 2: drop every in-scope binding.
-    let n = ctx.locals.len();
-    emit_drops_for_locals_range(ctx, 0, n)?;
-    // Step 3/4: produce the wasm return value.
-    let returns_enum = matches!(&return_rt, RType::Enum { .. });
-    if returns_enum {
-        let bytes = byte_size_of(&return_rt, ctx.structs, ctx.enums);
-        let dst = ctx.sret_ptr_local.expect("sret_ptr present for enum returns");
-        emit_memcpy(ctx, dst, save_start, bytes);
-        ctx.instructions.push(wasm::Instruction::LocalGet(dst));
-    } else {
-        let mut k = 0;
-        while k < return_flat.len() {
-            ctx.instructions
-                .push(wasm::Instruction::LocalGet(save_start + k as u32));
-            k += 1;
-        }
-    }
-    // Step 5: restore SP.
-    ctx.instructions
-        .push(wasm::Instruction::LocalGet(ctx.fn_entry_sp_local));
-    ctx.instructions
-        .push(wasm::Instruction::GlobalSet(SP_GLOBAL));
-    // Step 6: wasm Return.
-    ctx.instructions.push(wasm::Instruction::Return);
-    Ok(RType::Never)
-}
 
 // `arr[idx]` in value position — synthesize the equivalent of
 // `*<Index>::index(&arr, idx)`. Resolves the impl via `solve_impl`,
@@ -2678,33 +1518,6 @@ fn codegen_return(ctx: &mut FnCtx, value: Option<&Expr>) -> Result<RType, Error>
 // pointer), and we then load the `Output`'s flat scalars from that
 // address. Caller-context-aware variants for assign/borrow contexts
 // live in `codegen_index_ref` and `codegen_index_assign`.
-fn codegen_index_value(
-    ctx: &mut FnCtx,
-    base: &Expr,
-    idx: &Expr,
-    expr_id: crate::ast::NodeId,
-) -> Result<RType, Error> {
-    let (callee_idx, _ref_ret_rt) = resolve_index_callee(ctx, base, idx, false);
-    let result_ty = ctx.expr_types[expr_id as usize]
-        .as_ref()
-        .expect("typeck recorded the index expr's type")
-        .clone();
-    let result_ty = substitute_rtype(&result_ty, &ctx.env);
-    // Receiver shape: if base is already a `&Self` (e.g. `s: &[T]`
-    // calling `[T]::index(&self)`), pass it through; otherwise take
-    // `&base`.
-    emit_index_recv(ctx, base, false)?;
-    codegen_expr(ctx, idx)?;
-    ctx.instructions.push(wasm::Instruction::Call(callee_idx));
-    // Stack now has an i32 (address of &Output). Load `Output` from
-    // it.
-    let addr_local = ctx.next_wasm_local;
-    ctx.extra_locals.push(wasm::ValType::I32);
-    ctx.next_wasm_local += 1;
-    ctx.instructions.push(wasm::Instruction::LocalSet(addr_local));
-    load_flat_from_memory(ctx, &result_ty, BaseAddr::WasmLocal(addr_local), 0);
-    Ok(result_ty)
-}
 
 // Push the right receiver value for an Index/IndexMut method call.
 // If `base`'s type already matches the method's `&self` shape — i.e.
@@ -2712,104 +1525,11 @@ fn codegen_index_value(
 // through with `codegen_expr`. Otherwise (base is owned `T` or
 // matches in some other ref-permutation) take `&base` / `&mut base`
 // via `codegen_borrow`.
-fn emit_index_recv(ctx: &mut FnCtx, base: &Expr, mutable: bool) -> Result<(), Error> {
-    let base_rt = ctx.expr_types[base.id as usize]
-        .as_ref()
-        .expect("typeck recorded base type")
-        .clone();
-    let base_rt = substitute_rtype(&base_rt, &ctx.env);
-    let already_right_ref = match (&base_rt, mutable) {
-        (RType::Ref { mutable: false, .. }, false) => true,
-        (RType::Ref { mutable: true, .. }, true) => true,
-        // `&mut T` can downgrade to `&T` — pass through for Index.
-        (RType::Ref { mutable: true, .. }, false) => true,
-        _ => false,
-    };
-    if already_right_ref {
-        codegen_expr(ctx, base)?;
-    } else {
-        codegen_borrow(ctx, base, mutable)?;
-    }
-    Ok(())
-}
 
 // Resolve the wasm idx + return type of the appropriate Index /
 // IndexMut method for `base`'s type. `mutable=true` selects
 // IndexMut::index_mut. Used by both value-position indexing and the
 // (future) borrow / assign paths.
-fn resolve_index_callee(
-    ctx: &mut FnCtx,
-    base: &Expr,
-    index: &Expr,
-    mutable: bool,
-) -> (u32, RType) {
-    let base_rt = ctx.expr_types[base.id as usize]
-        .as_ref()
-        .expect("typeck recorded base type")
-        .clone();
-    let base_rt = substitute_rtype(&base_rt, &ctx.env);
-    let lookup_rt = match &base_rt {
-        RType::Ref { inner, .. } => (**inner).clone(),
-        _ => base_rt.clone(),
-    };
-    // Pull the index expression's resolved type — this is the trait
-    // arg for `Index<Idx>` / `IndexMut<Idx>` dispatch (`usize` for
-    // element indexing, `Range<usize>`/`RangeFrom<usize>`/etc. for
-    // slicing).
-    let idx_rt = ctx.expr_types[index.id as usize]
-        .as_ref()
-        .expect("typeck recorded index type")
-        .clone();
-    let idx_rt = substitute_rtype(&idx_rt, &ctx.env);
-    let trait_path: Vec<String> = if mutable {
-        vec!["std".to_string(), "ops".to_string(), "IndexMut".to_string()]
-    } else {
-        vec!["std".to_string(), "ops".to_string(), "Index".to_string()]
-    };
-    let method_name = if mutable { "index_mut" } else { "index" };
-    let resolution = crate::typeck::solve_impl_with_args(
-        &trait_path,
-        &vec![idx_rt],
-        &lookup_rt,
-        ctx.traits,
-        0,
-    )
-    .expect("typeck verified Index/IndexMut impl exists");
-    let cand = crate::typeck::find_trait_impl_method(ctx.funcs, resolution.impl_idx, method_name)
-        .expect("impl has the index/index_mut method");
-    match cand {
-        crate::typeck::MethodCandidate::Direct(i) => {
-            let entry = &ctx.funcs.entries[i];
-            let ret = entry.return_type.clone().expect("index returns a ref");
-            (entry.idx, ret)
-        }
-        crate::typeck::MethodCandidate::Template(i) => {
-            let tmpl = &ctx.funcs.templates[i];
-            let impl_param_count = tmpl.impl_type_param_count;
-            let mut concrete: Vec<RType> = Vec::new();
-            let mut k = 0;
-            while k < impl_param_count {
-                let name = &tmpl.type_params[k];
-                let bound = resolution
-                    .subst
-                    .iter()
-                    .find(|s| s.0 == *name)
-                    .map(|s| s.1.clone())
-                    .expect("impl-param bound by solve_impl");
-                concrete.push(bound);
-                k += 1;
-            }
-            // Index / IndexMut have no method-level type-params.
-            let tmpl_env = build_env(&tmpl.type_params, &concrete);
-            let return_rt = substitute_rtype(
-                tmpl.return_type.as_ref().expect("index returns"),
-                &tmpl_env,
-            );
-            let idx = ctx.mono.intern(i, concrete);
-            (idx, return_rt)
-        }
-    }
-}
 
 // `expr?` codegen. Inner is `Result<T, E>` (an enum); function's
 // return is `Result<U, E>`. Lower as:
@@ -2828,151 +1548,6 @@ fn resolve_index_callee(
 //
 // Lifted directly here (no early desugar) so the `?` token's span is
 // the diagnostic source for any error.
-fn codegen_try(
-    ctx: &mut FnCtx,
-    inner: &Expr,
-    _id: crate::ast::NodeId,
-) -> Result<RType, Error> {
-    use crate::typeck::{IntKind, byte_size_of as bso};
-    // Step 1: codegen the inner Result. It pushes an i32 (the address
-    // of the enum's bytes).
-    let inner_rt = codegen_expr(ctx, inner)?;
-    // Resolve the Result<T, E> shape from the inner type.
-    let (ok_ty, err_ty) = match &inner_rt {
-        RType::Enum { type_args, .. } if type_args.len() == 2 => {
-            (type_args[0].clone(), type_args[1].clone())
-        }
-        _ => unreachable!("typeck verified `?` operand is Result<T, E>"),
-    };
-    // Stash the address.
-    let addr_local = ctx.next_wasm_local;
-    ctx.extra_locals.push(wasm::ValType::I32);
-    ctx.next_wasm_local += 1;
-    ctx.instructions.push(wasm::Instruction::LocalSet(addr_local));
-    // Discriminants: Result is `Ok` = disc 0, `Err` = disc 1 (declaration
-    // order in `lib/std/result.rs`).
-    const OK_DISC: i32 = 0;
-    // Read disc.
-    ctx.instructions.push(wasm::Instruction::LocalGet(addr_local));
-    ctx.instructions.push(wasm::Instruction::I32Load {
-        align: 0,
-        offset: 0,
-    });
-    ctx.instructions.push(wasm::Instruction::I32Const(OK_DISC));
-    ctx.instructions.push(wasm::Instruction::I32Eq);
-    // The Ok-path produces the Ok payload (flat scalars or address);
-    // the Err-path diverges. The if's BlockType is the Ok-payload's
-    // shape.
-    let mut ok_flat: Vec<wasm::ValType> = Vec::new();
-    crate::typeck::flatten_rtype(&ok_ty, ctx.structs, &mut ok_flat);
-    let bt = match ok_flat.len() {
-        0 => wasm::BlockType::Empty,
-        1 => wasm::BlockType::Single(ok_flat[0].copy()),
-        _ => {
-            // Multi-value: register a FuncType.
-            let ft = wasm::FuncType {
-                params: Vec::new(),
-                results: ok_flat.clone(),
-            };
-            let mut found: Option<u32> = None;
-            let mut k = 0;
-            while k < ctx.pending_types.len() {
-                if func_type_eq(&ctx.pending_types[k], &ft) {
-                    found = Some(ctx.pending_types_base + k as u32);
-                    break;
-                }
-                k += 1;
-            }
-            let idx = match found {
-                Some(i) => i,
-                None => {
-                    let i = ctx.pending_types_base + ctx.pending_types.len() as u32;
-                    ctx.pending_types.push(ft);
-                    i
-                }
-            };
-            wasm::BlockType::TypeIdx(idx)
-        }
-    };
-    ctx.instructions.push(wasm::Instruction::If(bt));
-    // ── Then branch (Ok) ──
-    // Read the Ok payload from [addr_local + 4]. The payload is a
-    // tuple-shaped variant `Ok(T)` — single field at offset 4.
-    let ok_bytes = bso(&ok_ty, ctx.structs, ctx.enums);
-    if ok_bytes > 0 {
-        // Push the payload's flat scalars by reading from [addr+4].
-        // Use the existing leaf-loading machinery: we have
-        // `addr_local` and want to load `ok_ty` at offset 4.
-        load_flat_from_memory(ctx, &ok_ty, BaseAddr::WasmLocal(addr_local), 4);
-    }
-    ctx.instructions.push(wasm::Instruction::Else);
-    // ── Else branch (Err) — diverge with `return Err(e)` ──
-    // The function returns Result<U, E>. We allocate a fresh slot,
-    // write disc=Err and copy the Err payload, then memcpy to sret
-    // and Return.
-    let fn_ret_rt = match &ctx.return_rt {
-        Some(rt) => rt.clone(),
-        None => unreachable!("typeck verified function returns Result"),
-    };
-    let fn_ret_bytes = bso(&fn_ret_rt, ctx.structs, ctx.enums);
-    // SP -= fn_ret_bytes
-    ctx.instructions.push(wasm::Instruction::GlobalGet(SP_GLOBAL));
-    ctx.instructions.push(wasm::Instruction::I32Const(fn_ret_bytes as i32));
-    ctx.instructions.push(wasm::Instruction::I32Sub);
-    ctx.instructions.push(wasm::Instruction::GlobalSet(SP_GLOBAL));
-    let new_addr = ctx.next_wasm_local;
-    ctx.extra_locals.push(wasm::ValType::I32);
-    ctx.next_wasm_local += 1;
-    ctx.instructions.push(wasm::Instruction::GlobalGet(SP_GLOBAL));
-    ctx.instructions.push(wasm::Instruction::LocalSet(new_addr));
-    // Store disc = Err at [new_addr + 0]. Err is variant index 1.
-    ctx.instructions.push(wasm::Instruction::LocalGet(new_addr));
-    ctx.instructions.push(wasm::Instruction::I32Const(1));
-    ctx.instructions.push(wasm::Instruction::I32Store {
-        align: 0,
-        offset: 0,
-    });
-    // Copy err payload from [addr_local + 4] to [new_addr + 4].
-    let err_bytes = bso(&err_ty, ctx.structs, ctx.enums);
-    if err_bytes > 0 {
-        // Compute src = addr_local + 4 → temp local; dst = new_addr +
-        // 4 → temp local; emit_memcpy.
-        let src_tmp = ctx.next_wasm_local;
-        ctx.extra_locals.push(wasm::ValType::I32);
-        ctx.next_wasm_local += 1;
-        let dst_tmp = ctx.next_wasm_local;
-        ctx.extra_locals.push(wasm::ValType::I32);
-        ctx.next_wasm_local += 1;
-        ctx.instructions.push(wasm::Instruction::LocalGet(addr_local));
-        ctx.instructions.push(wasm::Instruction::I32Const(4));
-        ctx.instructions.push(wasm::Instruction::I32Add);
-        ctx.instructions.push(wasm::Instruction::LocalSet(src_tmp));
-        ctx.instructions.push(wasm::Instruction::LocalGet(new_addr));
-        ctx.instructions.push(wasm::Instruction::I32Const(4));
-        ctx.instructions.push(wasm::Instruction::I32Add);
-        ctx.instructions.push(wasm::Instruction::LocalSet(dst_tmp));
-        emit_memcpy(ctx, dst_tmp, src_tmp, err_bytes);
-        // Suppress unused.
-        let _ = (src_tmp, dst_tmp);
-    }
-    // Now mirror codegen_return: stash new_addr into a temp shaped
-    // like the function's return (one i32, since the fn returns an
-    // enum via sret), drop in-scope bindings, memcpy to sret, restore
-    // SP, push sret addr, Return.
-    let n = ctx.locals.len();
-    emit_drops_for_locals_range(ctx, 0, n)?;
-    let dst = ctx.sret_ptr_local.expect("sret_ptr present for enum returns");
-    emit_memcpy(ctx, dst, new_addr, fn_ret_bytes);
-    ctx.instructions.push(wasm::Instruction::LocalGet(dst));
-    ctx.instructions
-        .push(wasm::Instruction::LocalGet(ctx.fn_entry_sp_local));
-    ctx.instructions
-        .push(wasm::Instruction::GlobalSet(SP_GLOBAL));
-    ctx.instructions.push(wasm::Instruction::Return);
-    // Close the if/else.
-    ctx.instructions.push(wasm::Instruction::End);
-    Ok(ok_ty)
-}
 
 fn find_loop_frame(ctx: &FnCtx, label: Option<&str>) -> Option<(usize, usize)> {
     match label {
@@ -2997,8 +1572,8 @@ fn emit_drops_for_locals_range(ctx: &mut FnCtx, from: usize, to: usize) -> Resul
     let mut i = to;
     while i > from {
         i -= 1;
-        let rt = ctx.locals[i].rtype.clone();
-        if !crate::typeck::is_drop(&rt, ctx.traits) {
+        let action = ctx.locals[i].drop_action;
+        if matches!(action, crate::layout::DropAction::Skip) {
             continue;
         }
         // Drop requires `&mut binding` — only addressed bindings can be
@@ -3013,50 +1588,27 @@ fn emit_drops_for_locals_range(ctx: &mut FnCtx, from: usize, to: usize) -> Resul
         ) {
             continue;
         }
-        match binding_move_status(&ctx.moved_places, &ctx.locals[i].name) {
-            Some(crate::typeck::MoveStatus::Moved) => continue,
-            Some(crate::typeck::MoveStatus::MaybeMoved) => {
+        let rt = ctx.locals[i].rtype.clone();
+        match action {
+            crate::layout::DropAction::Skip => continue,
+            crate::layout::DropAction::Flagged => {
                 // Flagged drop: `if flag { drop }; end`. The flag was
                 // initialized to 1 at decl, cleared to 0 at every move
                 // site walked through this path, so it correctly
                 // reflects whether the storage still owns its value.
                 let flag_idx = lookup_drop_flag(&ctx.drop_flags, &ctx.locals[i].name)
-                    .expect("MaybeMoved binding must have an allocated drop flag");
+                    .expect("Flagged binding must have an allocated drop flag");
                 ctx.instructions.push(wasm::Instruction::LocalGet(flag_idx));
                 ctx.instructions.push(wasm::Instruction::If(wasm::BlockType::Empty));
                 emit_drop_call_for_local(ctx, i, &rt)?;
                 ctx.instructions.push(wasm::Instruction::End);
             }
-            None => {
+            crate::layout::DropAction::Always => {
                 emit_drop_call_for_local(ctx, i, &rt)?;
             }
         }
     }
     Ok(())
-}
-
-// T4.6: a binding is considered moved (and so should be skipped at
-// scope-end drop time) when borrowck recorded a whole-binding move —
-// i.e., a single-segment path equal to the binding's name. Partial moves
-// (length > 1) leave the parent partially valid; for non-Drop types
-// codegen still emits no drop, and for Drop types borrowck rejects the
-// partial move outright.
-// Returns the recorded move-status for `name` if it shows up as a
-// single-segment whole-binding entry, or None if it's `Init`. This is
-// what `emit_drops_for_locals_range` consults to choose between an
-// unconditional drop, a skipped drop, or (later) a flagged drop.
-fn binding_move_status(
-    moved_places: &Vec<crate::typeck::MovedPlace>,
-    name: &str,
-) -> Option<crate::typeck::MoveStatus> {
-    let mut i = 0;
-    while i < moved_places.len() {
-        if moved_places[i].place.len() == 1 && moved_places[i].place[0] == name {
-            return Some(moved_places[i].status.clone());
-        }
-        i += 1;
-    }
-    None
 }
 
 fn emit_drop_call_for_local(
@@ -3128,141 +1680,6 @@ fn emit_drop_call_for_local(
     Ok(())
 }
 
-fn codegen_let_stmt(ctx: &mut FnCtx, let_stmt: &LetStmt) -> Result<(), Error> {
-    let value_id = let_stmt.value.id as usize;
-    let value_ty = ctx.expr_types[value_id]
-        .as_ref()
-        .expect("typeck recorded the let's type")
-        .clone();
-    // let-else: codegen the value, run the pattern test (using the
-    // existing match/if-let infrastructure); on no-match run the
-    // else-block (which typeck verified diverges); on match the
-    // bindings are written into wasm locals and the function
-    // continues with them in scope.
-    if let Some(else_block) = &let_stmt.else_block {
-        return codegen_let_else(ctx, let_stmt, &value_ty, else_block.as_ref());
-    }
-    // Simple-binding fast path: `let x = e;` / `let mut x = e;`.
-    if let Some((name, _mutable, _name_span)) = crate::ast::let_simple_binding(let_stmt) {
-        return codegen_let_simple_binding(ctx, let_stmt, name, &value_ty);
-    }
-    // Wildcard `let _ = e;` — codegen the expression for its side
-    // effects, drop any flat scalars it produced.
-    if matches!(&let_stmt.pattern.kind, crate::ast::PatternKind::Wildcard) {
-        codegen_expr(ctx, &let_stmt.value)?;
-        let mut vts: Vec<wasm::ValType> = Vec::new();
-        flatten_rtype(&value_ty, ctx.structs, &mut vts);
-        let mut k = 0;
-        while k < vts.len() {
-            ctx.instructions.push(wasm::Instruction::Drop);
-            k += 1;
-        }
-        return Ok(());
-    }
-    // Tuple destructure `let (a, b, …) = e;`. Two paths:
-    //
-    //   (a) Frame-spilled — when escape analysis flagged the let
-    //       value addressed (a `&binding` chain rooted at one of the
-    //       destructured names) or auto-marked it as Drop-bearing
-    //       (any leaf binding's type implements Drop). The whole
-    //       tuple is stored at the let's frame_offset; each element
-    //       binding becomes Storage::Memory at base + sub-offset.
-    //       Drop's scope-end machinery and `&binding` borrows both
-    //       work because each binding has a real address.
-    //
-    //   (b) Wasm-locals fast path — none of the above. Pop the
-    //       value's flat scalars into per-element wasm-local groups
-    //       and register Storage::Local bindings.
-    if let crate::ast::PatternKind::Tuple(elems) = &let_stmt.pattern.kind {
-        let elem_tys = match &value_ty {
-            RType::Tuple(ts) => ts.clone(),
-            _ => unreachable!("typeck verified tuple pattern matches tuple type"),
-        };
-        if elems.len() != elem_tys.len() {
-            unreachable!("typeck verified tuple-pattern arity");
-        }
-        if let Some(base_offset) = ctx.let_offsets[value_id] {
-            codegen_expr(ctx, &let_stmt.value)?;
-            store_flat_to_memory(ctx, &value_ty, BaseAddr::StackPointer, base_offset);
-            let mut elem_offset: u32 = 0;
-            let mut idx = 0;
-            while idx < elems.len() {
-                let elem_size = byte_size_of(&elem_tys[idx], ctx.structs, ctx.enums);
-                match &elems[idx].kind {
-                    crate::ast::PatternKind::Wildcard => {}
-                    crate::ast::PatternKind::Binding { name, .. } => {
-                        ctx.locals.push(LocalBinding {
-                            name: name.clone(),
-                            rtype: elem_tys[idx].clone(),
-                            storage: Storage::Memory {
-                                frame_offset: base_offset + elem_offset,
-                            },
-                        });
-                    }
-                    _ => unimplemented!(
-                        "nested pattern in tuple destructure not yet supported in codegen"
-                    ),
-                }
-                elem_offset += elem_size;
-                idx += 1;
-            }
-            return Ok(());
-        }
-        codegen_expr(ctx, &let_stmt.value)?;
-        // Stack top is the last element's last leaf. Pop into temp
-        // locals in reverse so a "high address = high element"
-        // ordering is preserved.
-        let mut elem_temps: Vec<(u32, u32)> = Vec::new(); // (start, flat_count) per element
-        let mut i = elem_tys.len();
-        while i > 0 {
-            i -= 1;
-            let mut vts: Vec<wasm::ValType> = Vec::new();
-            flatten_rtype(&elem_tys[i], ctx.structs, &mut vts);
-            let start = ctx.next_wasm_local;
-            let mut k = 0;
-            while k < vts.len() {
-                ctx.extra_locals.push(vts[k].copy());
-                ctx.next_wasm_local += 1;
-                k += 1;
-            }
-            // Pop in REVERSE within this element (top = last leaf).
-            let mut j = vts.len();
-            while j > 0 {
-                j -= 1;
-                ctx.instructions.push(wasm::Instruction::LocalSet(start + j as u32));
-            }
-            elem_temps.push((start, vts.len() as u32));
-        }
-        elem_temps.reverse();
-        // For each element pattern, register the binding (or skip
-        // for `_`). Only single-binding / wildcard sub-patterns are
-        // supported at codegen; nested destructure inside tuple
-        // would need recursion (TODO).
-        let mut idx = 0;
-        while idx < elems.len() {
-            let (start, flat_size) = elem_temps[idx];
-            match &elems[idx].kind {
-                crate::ast::PatternKind::Wildcard => {}
-                crate::ast::PatternKind::Binding { name, .. } => {
-                    ctx.locals.push(LocalBinding {
-                        name: name.clone(),
-                        rtype: elem_tys[idx].clone(),
-                        storage: Storage::Local { wasm_start: start, flat_size },
-                    });
-                }
-                _ => unimplemented!(
-                    "nested pattern in tuple destructure not yet supported in codegen"
-                ),
-            }
-            idx += 1;
-        }
-        return Ok(());
-    }
-    unimplemented!(
-        "let-binding pattern not yet supported in codegen: only `let x`, \
-         `let _`, `let mut x`, and tuple destructure of simple bindings work today"
-    );
-}
 
 // `let PAT = EXPR else { … };` lowering. Mirrors `codegen_if_let_expr`
 // but with the polarity flipped (match falls through, no-match
@@ -3280,295 +1697,11 @@ fn codegen_let_stmt(ctx: &mut FnCtx, let_stmt: &LetStmt) -> Result<(), Error> {
 //
 // After the outer Block ends, ctx.locals carries the new bindings,
 // so the rest of the enclosing block sees them.
-fn codegen_let_else(
-    ctx: &mut FnCtx,
-    let_stmt: &LetStmt,
-    value_ty: &RType,
-    else_block: &Block,
-) -> Result<(), Error> {
-    let _ = codegen_expr(ctx, &let_stmt.value)?;
-    let is_enum_scrut = matches!(value_ty, RType::Enum { .. });
-    let needs_ref_spill = !is_enum_scrut && pattern_uses_ref_binding(&let_stmt.pattern);
-    let storage = if needs_ref_spill {
-        spill_match_scrutinee(ctx, value_ty)
-    } else {
-        stash_match_scrutinee(ctx, value_ty)
-    };
-    ctx.instructions
-        .push(wasm::Instruction::Block(wasm::BlockType::Empty));
-    ctx.instructions
-        .push(wasm::Instruction::Block(wasm::BlockType::Empty));
-    codegen_pattern(ctx, &let_stmt.pattern, value_ty, &storage, 0)?;
-    ctx.instructions.push(wasm::Instruction::Br(1));
-    ctx.instructions.push(wasm::Instruction::End);
-    let _ = codegen_unit_block_stmt(ctx, else_block)?;
-    // typeck enforces the else block diverges; emit `unreachable`
-    // as a safety net for the wasm validator (the End below would
-    // otherwise expect control to land at the outer Block's end
-    // with the right shape).
-    ctx.instructions.push(wasm::Instruction::Unreachable);
-    ctx.instructions.push(wasm::Instruction::End);
-    Ok(())
-}
 
 // The pre-pattern simple-binding lowering, factored out so the
 // pattern-driven `codegen_let_stmt` can call it without reading
 // `let_stmt.name` / `let_stmt.mutable` directly.
-fn codegen_let_simple_binding(
-    ctx: &mut FnCtx,
-    let_stmt: &LetStmt,
-    name: &str,
-    value_ty: &RType,
-) -> Result<(), Error> {
-    codegen_expr(ctx, &let_stmt.value)?;
-    let value_id = let_stmt.value.id as usize;
-    let frame_offset_opt = ctx.let_offsets[value_id];
-    match frame_offset_opt {
-        Some(frame_offset) => {
-            store_flat_to_memory(ctx, value_ty, BaseAddr::StackPointer, frame_offset);
-            ctx.locals.push(LocalBinding {
-                name: name.to_string(),
-                rtype: value_ty.clone(),
-                storage: Storage::Memory { frame_offset },
-            });
-        }
-        None => {
-            let mut vts: Vec<wasm::ValType> = Vec::new();
-            flatten_rtype(value_ty, ctx.structs, &mut vts);
-            let flat_size = vts.len() as u32;
-            let start = ctx.next_wasm_local;
-            let mut k = 0;
-            while k < vts.len() {
-                ctx.extra_locals.push(vts[k].copy());
-                ctx.next_wasm_local += 1;
-                k += 1;
-            }
-            let mut k = 0;
-            while k < flat_size {
-                ctx.instructions
-                    .push(wasm::Instruction::LocalSet(start + flat_size - 1 - k));
-                k += 1;
-            }
-            ctx.locals.push(LocalBinding {
-                name: name.to_string(),
-                rtype: value_ty.clone(),
-                storage: Storage::Local { wasm_start: start, flat_size },
-            });
-        }
-    }
-    if needs_drop_flag(&ctx.moved_places, name, value_ty, ctx.traits) {
-        let flag_idx = ctx.next_wasm_local;
-        ctx.extra_locals.push(wasm::ValType::I32);
-        ctx.next_wasm_local += 1;
-        ctx.drop_flags.push((name.to_string(), flag_idx));
-        ctx.instructions.push(wasm::Instruction::I32Const(1));
-        ctx.instructions.push(wasm::Instruction::LocalSet(flag_idx));
-    }
-    Ok(())
-}
 
-fn needs_drop_flag(
-    moved_places: &Vec<crate::typeck::MovedPlace>,
-    name: &str,
-    rt: &RType,
-    traits: &crate::typeck::TraitTable,
-) -> bool {
-    if !crate::typeck::is_drop(rt, traits) {
-        return false;
-    }
-    let mut i = 0;
-    while i < moved_places.len() {
-        let mp = &moved_places[i];
-        if mp.place.len() == 1
-            && mp.place[0] == name
-            && matches!(mp.status, crate::typeck::MoveStatus::MaybeMoved)
-        {
-            return true;
-        }
-        i += 1;
-    }
-    false
-}
-
-fn codegen_assign_stmt(ctx: &mut FnCtx, assign: &AssignStmt) -> Result<(), Error> {
-    if let Some((deref_inner, fields)) = extract_deref_chain(&assign.lhs) {
-        return codegen_deref_assign(ctx, deref_inner, &fields, &assign.rhs);
-    }
-    // `arr[idx] = val` — synthesize the equivalent of
-    // `*<IndexMut>::index_mut(&mut arr, idx) = val`. Codegen the
-    // value, resolve the index_mut callee, push the address, and
-    // store-through.
-    if let ExprKind::Index { base, index, .. } = &assign.lhs.kind {
-        let elem_ty = ctx.expr_types[assign.lhs.id as usize]
-            .as_ref()
-            .expect("typeck recorded LHS index type")
-            .clone();
-        let elem_ty = substitute_rtype(&elem_ty, &ctx.env);
-        // Push rhs value.
-        codegen_expr(ctx, &assign.rhs)?;
-        // Stash flat scalars so we can compute the address afterward.
-        let mut flat: Vec<wasm::ValType> = Vec::new();
-        crate::typeck::flatten_rtype(&elem_ty, ctx.structs, &mut flat);
-        let val_save_start = ctx.next_wasm_local;
-        let mut k = 0;
-        while k < flat.len() {
-            ctx.extra_locals.push(flat[k].copy());
-            ctx.next_wasm_local += 1;
-            k += 1;
-        }
-        let mut k = flat.len();
-        while k > 0 {
-            k -= 1;
-            ctx.instructions
-                .push(wasm::Instruction::LocalSet(val_save_start + k as u32));
-        }
-        // Resolve index_mut and compute the destination address.
-        let (callee_idx, _ret_rt) = resolve_index_callee(ctx, base, index, true);
-        emit_index_recv(ctx, base, true)?;
-        codegen_expr(ctx, index)?;
-        ctx.instructions.push(wasm::Instruction::Call(callee_idx));
-        let addr_local = ctx.next_wasm_local;
-        ctx.extra_locals.push(wasm::ValType::I32);
-        ctx.next_wasm_local += 1;
-        ctx.instructions.push(wasm::Instruction::LocalSet(addr_local));
-        // Store the saved value to that address.
-        let mut k = 0;
-        while k < flat.len() {
-            ctx.instructions
-                .push(wasm::Instruction::LocalGet(val_save_start + k as u32));
-            k += 1;
-        }
-        store_flat_to_memory(ctx, &elem_ty, BaseAddr::WasmLocal(addr_local), 0);
-        return Ok(());
-    }
-    let chain = extract_place(&assign.lhs).expect("typeck verified LHS is a place");
-
-    // Resolve the binding and walk through its rtype to find the chain target.
-    let mut binding_idx: usize = 0;
-    let mut found = false;
-    let mut k = ctx.locals.len();
-    while k > 0 {
-        k -= 1;
-        if ctx.locals[k].name == chain[0] {
-            binding_idx = k;
-            found = true;
-            break;
-        }
-    }
-    if !found {
-        unreachable!("typeck verified the binding exists");
-    }
-
-    let root_ty = ctx.locals[binding_idx].rtype.clone();
-    let through_mut_ref = matches!(&root_ty, RType::Ref { mutable: true, .. });
-
-    // Walk the chain to determine the byte offset and the target field's type.
-    // For root types that are `&mut Struct`, peel off the ref; field offsets
-    // are relative to the pointed-at value.
-    let mut current_ty = if through_mut_ref {
-        match &root_ty {
-            RType::Ref { inner, .. } => (**inner).clone(),
-            _ => unreachable!(),
-        }
-    } else {
-        root_ty.clone()
-    };
-    let mut chain_offset: u32 = 0;
-    let mut i = 1;
-    while i < chain.len() {
-        match &current_ty {
-            RType::Struct { path, type_args, .. } => {
-                let struct_path = path.clone();
-                let struct_args = type_args.clone();
-                let entry = struct_lookup(ctx.structs, &struct_path).expect("resolved struct");
-                let env = make_struct_env(&entry.type_params, &struct_args);
-                let mut field_offset: u32 = 0;
-                let mut found_field = false;
-                let mut j = 0;
-                while j < entry.fields.len() {
-                    let fty = substitute_rtype(&entry.fields[j].ty, &env);
-                    let s = byte_size_of(&fty, ctx.structs, ctx.enums);
-                    if entry.fields[j].name == chain[i] {
-                        chain_offset += field_offset;
-                        current_ty = fty;
-                        found_field = true;
-                        break;
-                    }
-                    field_offset += s;
-                    j += 1;
-                }
-                if !found_field {
-                    unreachable!("typeck verified the field exists");
-                }
-            }
-            RType::Tuple(elems) => {
-                let elems = elems.clone();
-                let idx: usize = chain[i]
-                    .parse()
-                    .expect("typeck verified tuple-index segment");
-                let mut elem_offset: u32 = 0;
-                let mut j = 0;
-                while j < idx {
-                    elem_offset += byte_size_of(&elems[j], ctx.structs, ctx.enums);
-                    j += 1;
-                }
-                chain_offset += elem_offset;
-                current_ty = elems[idx].clone();
-            }
-            _ => unreachable!("typeck verified chain navigates structs/tuples"),
-        }
-        i += 1;
-    }
-
-    // Codegen RHS.
-    codegen_expr(ctx, &assign.rhs)?;
-
-    // Determine the base address for the store.
-    if through_mut_ref {
-        // Read the ref's pointee address and store relative to it. The ref
-        // may itself be spilled (escape analysis is name-based and over-
-        // approximates), so go through the helper.
-        let ref_local = ref_pointee_addr_local(ctx, binding_idx);
-        store_flat_to_memory(
-            ctx,
-            &current_ty,
-            BaseAddr::WasmLocal(ref_local),
-            chain_offset,
-        );
-    } else {
-        match &ctx.locals[binding_idx].storage {
-            Storage::Memory { frame_offset } => {
-                let base_off = *frame_offset + chain_offset;
-                store_flat_to_memory(ctx, &current_ty, BaseAddr::StackPointer, base_off);
-            }
-            Storage::MemoryAt { addr_local } => {
-                store_flat_to_memory(
-                    ctx,
-                    &current_ty,
-                    BaseAddr::WasmLocal(*addr_local),
-                    chain_offset,
-                );
-            }
-            Storage::Local { wasm_start, .. } => {
-                // Non-spilled binding: walk the chain in *flat-scalar* units
-                // (not bytes) to find the destination WASM local range, then
-                // LocalSet each scalar.
-                let flat_chain_off = flat_chain_offset(ctx, &chain, binding_idx);
-                let mut vts: Vec<wasm::ValType> = Vec::new();
-                flatten_rtype(&current_ty, ctx.structs, &mut vts);
-                let flat_size = vts.len() as u32;
-                let start = *wasm_start + flat_chain_off;
-                let mut k = 0;
-                while k < flat_size {
-                    ctx.instructions
-                        .push(wasm::Instruction::LocalSet(start + flat_size - 1 - k));
-                    k += 1;
-                }
-            }
-        }
-    }
-    Ok(())
-}
 
 // For a place chain rooted at locals[binding_idx], walk through fields and
 // return the flat-scalar offset of the chain's tail within the binding's flat
@@ -3627,560 +1760,32 @@ fn flat_chain_offset(ctx: &FnCtx, chain: &Vec<String>, binding_idx: usize) -> u3
 }
 
 // Returns (deref_target, fields) if expr is `*E` or `(*E).f.g.h`.
-fn extract_deref_chain<'a>(expr: &'a Expr) -> Option<(&'a Expr, Vec<String>)> {
-    let mut fields: Vec<String> = Vec::new();
-    let mut current = expr;
-    loop {
-        match &current.kind {
-            ExprKind::Deref(inner) => {
-                let mut reversed: Vec<String> = Vec::new();
-                let mut i = fields.len();
-                while i > 0 {
-                    i -= 1;
-                    reversed.push(fields[i].clone());
-                }
-                return Some((inner.as_ref(), reversed));
-            }
-            ExprKind::FieldAccess(fa) => {
-                fields.push(fa.field.clone());
-                current = &fa.base;
-            }
-            ExprKind::TupleIndex { base, index, .. } => {
-                fields.push(format!("{}", index));
-                current = base;
-            }
-            _ => return None,
-        }
-    }
-}
 
-fn codegen_deref_assign(
-    ctx: &mut FnCtx,
-    deref_inner: &Expr,
-    fields: &Vec<String>,
-    rhs: &Expr,
-) -> Result<(), Error> {
-    // Compute the address: codegen the deref-inner (pushes i32) and stash.
-    let inner_ty_static = ctx.expr_types[deref_inner.id as usize]
-        .as_ref()
-        .expect("typeck recorded inner type")
-        .clone();
-    let inner_ty_static = substitute_rtype(&inner_ty_static, &ctx.env);
-    let pointee = match &inner_ty_static {
-        RType::Ref { inner, .. } | RType::RawPtr { inner, .. } => {
-            // Built-in: codegen the inner to push the i32 address.
-            let _ = codegen_expr(ctx, deref_inner)?;
-            (**inner).clone()
-        }
-        _ => {
-            // Smart-pointer write via DerefMut. Resolve the impl's
-            // `deref_mut` method, push `&mut deref_inner` as recv,
-            // call it — the result is an i32 address of `Target`.
-            let trait_path = vec![
-                "std".to_string(),
-                "ops".to_string(),
-                "DerefMut".to_string(),
-            ];
-            let resolution =
-                crate::typeck::solve_impl(&trait_path, &inner_ty_static, ctx.traits, 0)
-                    .expect("typeck verified DerefMut impl exists");
-            let cand = crate::typeck::find_trait_impl_method(
-                ctx.funcs,
-                resolution.impl_idx,
-                "deref_mut",
-            )
-            .expect("DerefMut impl provides deref_mut");
-            let callee_idx = match cand {
-                crate::typeck::MethodCandidate::Direct(i) => ctx.funcs.entries[i].idx,
-                crate::typeck::MethodCandidate::Template(i) => {
-                    let tmpl = &ctx.funcs.templates[i];
-                    let mut concrete: Vec<RType> = Vec::new();
-                    let mut k = 0;
-                    while k < tmpl.type_params.len() {
-                        let name = &tmpl.type_params[k];
-                        let mut found: Option<RType> = None;
-                        let mut j = 0;
-                        while j < resolution.subst.len() {
-                            if resolution.subst[j].0 == *name {
-                                found = Some(resolution.subst[j].1.clone());
-                                break;
-                            }
-                            j += 1;
-                        }
-                        concrete.push(found.expect("impl param bound by subst"));
-                        k += 1;
-                    }
-                    ctx.mono.intern(i, concrete)
-                }
-            };
-            let target_rt = crate::typeck::find_assoc_binding(
-                ctx.traits,
-                &inner_ty_static,
-                &vec!["std".to_string(), "ops".to_string(), "Deref".to_string()],
-                "Target",
-            )
-            .into_iter()
-            .next()
-            .expect("typeck verified Target binding");
-            codegen_borrow(ctx, deref_inner, true)?;
-            ctx.instructions.push(wasm::Instruction::Call(callee_idx));
-            target_rt
-        }
-    };
-    let addr_local = ctx.next_wasm_local;
-    ctx.extra_locals.push(wasm::ValType::I32);
-    ctx.next_wasm_local += 1;
-    ctx.instructions
-        .push(wasm::Instruction::LocalSet(addr_local));
 
-    // Walk the field chain to compute the byte offset within the pointee and
-    // the target field's type.
-    let mut current_ty = pointee;
-    let mut chain_byte_offset: u32 = 0;
-    let mut i = 0;
-    while i < fields.len() {
-        let (struct_path, struct_args) = match &current_ty {
-            RType::Struct { path, type_args, .. } => (path.clone(), type_args.clone()),
-            _ => unreachable!("typeck verified chain navigates structs"),
-        };
-        let entry = struct_lookup(ctx.structs, &struct_path).expect("resolved struct");
-        let env = make_struct_env(&entry.type_params, &struct_args);
-        let mut field_off: u32 = 0;
-        let mut found = false;
-        let mut j = 0;
-        while j < entry.fields.len() {
-            let fty = substitute_rtype(&entry.fields[j].ty, &env);
-            let s = byte_size_of(&fty, ctx.structs, ctx.enums);
-            if entry.fields[j].name == fields[i] {
-                chain_byte_offset += field_off;
-                current_ty = fty;
-                found = true;
-                break;
-            }
-            field_off += s;
-            j += 1;
-        }
-        if !found {
-            unreachable!("typeck verified the field exists");
-        }
-        i += 1;
-    }
-
-    // Codegen RHS — pushes flat scalars matching current_ty.
-    codegen_expr(ctx, rhs)?;
-
-    // Per-leaf store: stash flat scalars, then push address+value+store.
-    store_flat_to_memory(
-        ctx,
-        &current_ty,
-        BaseAddr::WasmLocal(addr_local),
-        chain_byte_offset,
-    );
-    Ok(())
-}
-
-fn extract_place(expr: &Expr) -> Option<Vec<String>> {
-    let mut chain: Vec<String> = Vec::new();
-    let mut current = expr;
-    loop {
-        match &current.kind {
-            ExprKind::Var(name) => {
-                chain.push(name.clone());
-                let mut reversed: Vec<String> = Vec::new();
-                let mut i = chain.len();
-                while i > 0 {
-                    i -= 1;
-                    reversed.push(chain[i].clone());
-                }
-                return Some(reversed);
-            }
-            ExprKind::FieldAccess(fa) => {
-                chain.push(fa.field.clone());
-                current = &fa.base;
-            }
-            ExprKind::TupleIndex { base, index, .. } => {
-                chain.push(format!("{}", index));
-                current = base;
-            }
-            _ => return None,
-        }
-    }
-}
-
-fn codegen_expr(ctx: &mut FnCtx, expr: &Expr) -> Result<RType, Error> {
-    match &expr.kind {
-        ExprKind::IntLit(n) => {
-            let ty = ctx.expr_types[expr.id as usize]
-                .as_ref()
-                .expect("typeck recorded this literal's type")
-                .clone();
-            emit_int_lit(ctx, &ty, *n, false);
-            Ok(ty)
-        }
-        ExprKind::NegIntLit(n) => {
-            let ty = ctx.expr_types[expr.id as usize]
-                .as_ref()
-                .expect("typeck recorded this literal's type")
-                .clone();
-            emit_int_lit(ctx, &ty, *n, true);
-            Ok(ty)
-        }
-        ExprKind::CharLit(cp) => {
-            // `char` flattens to one i32 — push the codepoint value.
-            ctx.instructions.push(wasm::Instruction::I32Const(*cp as i32));
-            Ok(RType::Char)
-        }
-        ExprKind::StrLit(s) => {
-            // Intern into the module-wide pool; emit `i32.const ptr;
-            // i32.const len` — the fat-ref representation of `&str`.
-            let (addr, len) = ctx.mono.intern_str(s);
-            ctx.instructions
-                .push(wasm::Instruction::I32Const(addr as i32));
-            ctx.instructions
-                .push(wasm::Instruction::I32Const(len as i32));
-            let ty = ctx.expr_types[expr.id as usize]
-                .as_ref()
-                .expect("typeck recorded this literal's type")
-                .clone();
-            Ok(ty)
-        }
-        ExprKind::Var(name) => codegen_var(ctx, name, expr.id),
-        ExprKind::Call(call) => codegen_call(ctx, call, expr.id),
-        ExprKind::StructLit(lit) => codegen_struct_lit(ctx, lit, expr.id),
-        ExprKind::FieldAccess(fa) => codegen_field_access(ctx, fa),
-        ExprKind::Borrow { inner, mutable } => codegen_borrow(ctx, inner, *mutable),
-        ExprKind::Cast { inner, ty: _ } => {
-            let src_ty = codegen_expr(ctx, inner)?;
-            // The cast's resolved target type was recorded by typeck on
-            // this Cast expr's NodeId — using it directly avoids a
-            // re-resolution that would need its own use-scope wiring.
-            let target = ctx.expr_types[expr.id as usize]
-                .as_ref()
-                .expect("typeck recorded the cast's target type")
-                .clone();
-            // Apply the monomorphization env in case the cast target
-            // contains a `Param` (e.g. inside a generic body).
-            let target = substitute_rtype(&target, &ctx.env);
-            // T5: integer-to-integer casts may need wasm conversion ops.
-            // i32-flatten ↔ i64 transitions emit wrap_i64 / extend_i32_*.
-            // Same-flatten kinds (e.g. u8 ↔ i32) are no-ops since pocket-
-            // rust stores all ≤32-bit integers in a wasm i32. Refs/raw
-            // pointers are also i32 → no-op for those.
-            //
-            // `*T as <int>` — raw pointers flatten to i32 (wasm32
-            // address). Treat the source as `usize` (an unsigned i32)
-            // for sizing purposes; widen to i64 when the target is
-            // 64-bit, drop the high half for 8/16-bit targets, etc.
-            match (&src_ty, &target) {
-                (RType::Int(src_k), RType::Int(tgt_k)) => {
-                    emit_int_to_int_cast(ctx, src_k, tgt_k);
-                }
-                (RType::RawPtr { .. }, RType::Int(tgt_k)) => {
-                    emit_int_to_int_cast(ctx, &IntKind::Usize, tgt_k);
-                }
-                // `char` and `u32` share the wasm-i32 representation
-                // and our 4-byte storage. char→int and int→char are
-                // bit-pattern reinterpretations — `as i64`-shaped
-                // widening still needs `extend_i32_u` so we route
-                // through `emit_int_to_int_cast` with the right kind.
-                (RType::Char, RType::Int(tgt_k)) => {
-                    emit_int_to_int_cast(ctx, &IntKind::U32, tgt_k);
-                }
-                (RType::Int(src_k), RType::Char) => {
-                    emit_int_to_int_cast(ctx, src_k, &IntKind::U32);
-                }
-                _ => {}
-            }
-            Ok(target)
-        }
-        ExprKind::Deref(inner) => codegen_deref(ctx, inner),
-        ExprKind::Unsafe(block) => codegen_block_expr(ctx, block.as_ref()),
-        ExprKind::Block(block) => codegen_block_expr(ctx, block.as_ref()),
-        ExprKind::MethodCall(mc) => codegen_method_call(ctx, mc, expr.id),
-        ExprKind::BoolLit(b) => {
-            ctx.instructions.push(wasm::Instruction::I32Const(if *b { 1 } else { 0 }));
-            Ok(RType::Bool)
-        }
-        ExprKind::If(if_expr) => codegen_if_expr(ctx, if_expr, expr.id),
-        ExprKind::Builtin { name, args, .. } => codegen_builtin(ctx, name, args, expr.id),
-        ExprKind::Tuple(elems) => codegen_tuple_lit(ctx, elems),
-        ExprKind::TupleIndex { base, index, .. } => codegen_tuple_index(ctx, base, *index),
-        ExprKind::Match(m) => codegen_match_expr(ctx, m, expr.id),
-        ExprKind::IfLet(il) => codegen_if_let_expr(ctx, il, expr.id),
-        ExprKind::While(w) => codegen_while_expr(ctx, w),
-        ExprKind::For(f) => codegen_for_expr(ctx, f),
-        ExprKind::Break { label, .. } => codegen_break(ctx, label.as_deref()),
-        ExprKind::Continue { label, .. } => codegen_continue(ctx, label.as_deref()),
-        ExprKind::Return { value } => codegen_return(ctx, value.as_deref()),
-        ExprKind::Try { inner, .. } => codegen_try(ctx, inner, expr.id),
-        ExprKind::Index { base, index, .. } => codegen_index_value(ctx, base, index, expr.id),
-        ExprKind::MacroCall { name, args, .. } => codegen_macro_call(ctx, name, args),
-    }
-}
 
 // `panic!(msg)` — codegen the &str arg (pushes ptr, len), call the
 // imported `env.panic` (wasm function index 0), then `unreachable`.
 // The expression's "result" is `!` so wasm validator accepts the
 // dead code that follows.
-fn codegen_macro_call(
-    ctx: &mut FnCtx,
-    name: &str,
-    args: &Vec<Expr>,
-) -> Result<RType, Error> {
-    if name != "panic" {
-        unreachable!("typeck verified macro is `panic!`");
-    }
-    // The arg is `&str` — a 2-i32 fat ref. After codegen the wasm
-    // stack has [ptr, len] which lines up with `env.panic(ptr, len)`.
-    codegen_expr(ctx, &args[0])?;
-    ctx.instructions.push(wasm::Instruction::Call(0));
-    ctx.instructions.push(wasm::Instruction::Unreachable);
-    Ok(RType::Never)
-}
 
 // `(a, b, c)` — codegen each elem in source order, leaving its
 // flat scalars on the wasm stack. The tuple's flat representation
 // is the concatenation; `()` produces no instructions at all.
-fn codegen_tuple_lit(ctx: &mut FnCtx, elems: &Vec<Expr>) -> Result<RType, Error> {
-    let mut elem_tys: Vec<RType> = Vec::new();
-    let mut i = 0;
-    while i < elems.len() {
-        let ty = codegen_expr(ctx, &elems[i])?;
-        elem_tys.push(ty);
-        i += 1;
-    }
-    Ok(RType::Tuple(elem_tys))
-}
 
 // `t.<index>` — analogous to `codegen_field_access`. Try the place-rooted
 // path (chain bottoms at a Var or a chain through &/structs/tuples) for
 // direct memory access; otherwise fall back to evaluating the whole base
 // onto the stack and stash-extracting the element.
-fn codegen_tuple_index(ctx: &mut FnCtx, base: &Expr, index: u32) -> Result<RType, Error> {
-    let chain = {
-        let mut tmp: Vec<String> = Vec::new();
-        tmp.push(format!("{}", index));
-        if collect_place_chain(base, &mut tmp) {
-            let mut reversed: Vec<String> = Vec::new();
-            let mut i = tmp.len();
-            while i > 0 {
-                i -= 1;
-                reversed.push(tmp[i].clone());
-            }
-            Some(reversed)
-        } else {
-            None
-        }
-    };
-    if let Some(chain) = chain {
-        return codegen_place_chain_load(ctx, &chain);
-    }
-    let base_type = codegen_expr(ctx, base)?;
-    extract_tuple_elem_from_stack(ctx, &base_type, index)
-}
 
 // Stack-position twin of `extract_field_from_stack`. The tuple's flat
 // scalars are on the stack in declaration order; we need to keep only
 // the slice belonging to element `index`.
-fn extract_tuple_elem_from_stack(
-    ctx: &mut FnCtx,
-    base_type: &RType,
-    index: u32,
-) -> Result<RType, Error> {
-    let elems: Vec<RType> = match base_type {
-        RType::Tuple(elems) => elems.clone(),
-        RType::Ref { inner, .. } => match inner.as_ref() {
-            RType::Tuple(elems) => elems.clone(),
-            _ => unreachable!("typeck rejects tuple-index on non-tuple"),
-        },
-        _ => unreachable!("typeck rejects tuple-index on non-tuple"),
-    };
-    let mut total_flat: u32 = 0;
-    let mut field_flat_off: u32 = 0;
-    let mut field_valtypes: Vec<wasm::ValType> = Vec::new();
-    let mut field_ty: RType = RType::Int(IntKind::I32);
-    let mut i = 0;
-    while i < elems.len() {
-        let mut vts: Vec<wasm::ValType> = Vec::new();
-        flatten_rtype(&elems[i], ctx.structs, &mut vts);
-        let s = vts.len() as u32;
-        if i as u32 == index {
-            field_flat_off = total_flat;
-            field_valtypes = vts;
-            field_ty = elems[i].clone();
-        }
-        total_flat += s;
-        i += 1;
-    }
-    let field_size = field_valtypes.len() as u32;
-    let drop_top = total_flat - field_flat_off - field_size;
-    let mut i = 0;
-    while i < drop_top {
-        ctx.instructions.push(wasm::Instruction::Drop);
-        i += 1;
-    }
-    let stash_start = ctx.next_wasm_local;
-    let mut k = 0;
-    while k < field_valtypes.len() {
-        ctx.extra_locals.push(field_valtypes[k].copy());
-        ctx.next_wasm_local += 1;
-        k += 1;
-    }
-    let mut k = 0;
-    while k < field_size {
-        ctx.instructions
-            .push(wasm::Instruction::LocalSet(stash_start + field_size - 1 - k));
-        k += 1;
-    }
-    let mut i = 0;
-    while i < field_flat_off {
-        ctx.instructions.push(wasm::Instruction::Drop);
-        i += 1;
-    }
-    let mut k = 0;
-    while k < field_size {
-        ctx.instructions
-            .push(wasm::Instruction::LocalGet(stash_start + k));
-        k += 1;
-    }
-    Ok(field_ty)
-}
 
 // Lower `¤name(args)` to its wasm op(s). Args are codegen'd in order
 // (left-to-right); then the corresponding wasm instruction is
 // emitted. The result type is the same as what typeck returned for
 // this Builtin's NodeId — read it back from `ctx.expr_types` rather
 // than re-deriving from the name (saves a parse).
-fn codegen_builtin(
-    ctx: &mut FnCtx,
-    name: &str,
-    args: &Vec<Expr>,
-    node_id: crate::ast::NodeId,
-) -> Result<RType, Error> {
-    // Typed intrinsics (alloc/free/cast) don't fit the `<int_kind>_<op>`
-    // shape. Dispatch them here so split_builtin_name doesn't need to.
-    match name {
-        "alloc" => return codegen_builtin_alloc(ctx, args, node_id),
-        "free" => return codegen_builtin_free(ctx, args, node_id),
-        "cast" => return codegen_builtin_cast(ctx, args, node_id),
-        "size_of" => return codegen_builtin_size_of(ctx, node_id),
-        "make_slice" => return codegen_builtin_make_slice(ctx, args, node_id),
-        "slice_len" => return codegen_builtin_slice_len(ctx, args, node_id),
-        "slice_ptr" | "slice_mut_ptr" => {
-            return codegen_builtin_slice_ptr(ctx, args, node_id);
-        }
-        // str_len reuses slice_len (same fat-ref shape, same drop-ptr-keep-len).
-        "str_len" => return codegen_builtin_slice_len(ctx, args, node_id),
-        // str_as_bytes / str_as_mut_bytes are 1-arg pure pass-throughs:
-        // `&str`/`&mut str` and `&[u8]`/`&mut [u8]` share the fat-ref
-        // representation, so codegenning the arg already leaves (ptr,
-        // len) on the stack — the result.
-        "str_as_bytes" => return codegen_builtin_passthrough_one(ctx, args, node_id),
-        "str_as_mut_bytes" => return codegen_builtin_passthrough_one(ctx, args, node_id),
-        // make_str / make_mut_str(ptr, len) build a fat ref, exactly
-        // like make_slice / make_mut_slice — codegen is identical.
-        "make_str" => return codegen_builtin_make_slice(ctx, args, node_id),
-        "make_mut_str" => return codegen_builtin_make_slice(ctx, args, node_id),
-        "make_mut_slice" => return codegen_builtin_make_slice(ctx, args, node_id),
-        "ptr_usize_add" => return codegen_builtin_ptr_arith(ctx, args, node_id, PtrArith::Add),
-        "ptr_usize_sub" => return codegen_builtin_ptr_arith(ctx, args, node_id, PtrArith::Sub),
-        "ptr_isize_offset" => {
-            return codegen_builtin_ptr_arith(ctx, args, node_id, PtrArith::Add);
-        }
-        _ => {}
-    }
-    // Codegen each arg in order. Each pushes its flattened scalar(s)
-    // onto the stack. For 128-bit args, that's (low, high) — two i64s
-    // per arg; codegen_builtin_128 takes care of the multi-scalar
-    // unpack. For ≤64-bit, args produce a single scalar.
-    let mut k = 0;
-    while k < args.len() {
-        codegen_expr(ctx, &args[k])?;
-        k += 1;
-    }
-    let (ty_name, op) = split_builtin_name(name)
-        .expect("typeck rejects unknown builtins before codegen");
-    if matches!(ty_name, "u128" | "i128") {
-        let signed = ty_name == "i128";
-        codegen_builtin_128(ctx, op, signed);
-        let ty = ctx.expr_types[node_id as usize]
-            .as_ref()
-            .expect("typeck recorded the builtin's result type")
-            .clone();
-        return Ok(ty);
-    }
-    // Pick the wasm class. bool and ≤32-bit ints use I32 ops; 64-bit
-    // ints use I64 ops. Signed-vs-unsigned matters for div/rem and
-    // for ordered comparisons (lt/le/gt/ge).
-    let is_i64 = matches!(ty_name, "u64" | "i64");
-    let is_signed = matches!(ty_name, "i8" | "i16" | "i32" | "i64" | "isize");
-    let inst = match (is_i64, op) {
-        (false, "add") => wasm::Instruction::I32Add,
-        (false, "sub") => wasm::Instruction::I32Sub,
-        (false, "mul") => wasm::Instruction::I32Mul,
-        (false, "div") => {
-            if is_signed { wasm::Instruction::I32DivS } else { wasm::Instruction::I32DivU }
-        }
-        (false, "rem") => {
-            if is_signed { wasm::Instruction::I32RemS } else { wasm::Instruction::I32RemU }
-        }
-        (false, "and") => wasm::Instruction::I32And,
-        (false, "or") => wasm::Instruction::I32Or,
-        (false, "xor") => wasm::Instruction::I32Xor,
-        (false, "eq") => wasm::Instruction::I32Eq,
-        (false, "ne") => wasm::Instruction::I32Ne,
-        (false, "lt") => {
-            if is_signed { wasm::Instruction::I32LtS } else { wasm::Instruction::I32LtU }
-        }
-        (false, "le") => {
-            if is_signed { wasm::Instruction::I32LeS } else { wasm::Instruction::I32LeU }
-        }
-        (false, "gt") => {
-            if is_signed { wasm::Instruction::I32GtS } else { wasm::Instruction::I32GtU }
-        }
-        (false, "ge") => {
-            if is_signed { wasm::Instruction::I32GeS } else { wasm::Instruction::I32GeU }
-        }
-        (false, "not") => {
-            // Implemented as `i32.eqz` — turns 0 into 1 and any
-            // nonzero (1) into 0.
-            wasm::Instruction::I32Eqz
-        }
-        (true, "add") => wasm::Instruction::I64Add,
-        (true, "sub") => wasm::Instruction::I64Sub,
-        (true, "mul") => wasm::Instruction::I64Mul,
-        (true, "div") => {
-            if is_signed { wasm::Instruction::I64DivS } else { wasm::Instruction::I64DivU }
-        }
-        (true, "rem") => {
-            if is_signed { wasm::Instruction::I64RemS } else { wasm::Instruction::I64RemU }
-        }
-        (true, "and") => wasm::Instruction::I64And,
-        (true, "or") => wasm::Instruction::I64Or,
-        (true, "xor") => wasm::Instruction::I64Xor,
-        (true, "eq") => wasm::Instruction::I64Eq,
-        (true, "ne") => wasm::Instruction::I64Ne,
-        (true, "lt") => {
-            if is_signed { wasm::Instruction::I64LtS } else { wasm::Instruction::I64LtU }
-        }
-        (true, "le") => {
-            if is_signed { wasm::Instruction::I64LeS } else { wasm::Instruction::I64LeU }
-        }
-        (true, "gt") => {
-            if is_signed { wasm::Instruction::I64GtS } else { wasm::Instruction::I64GtU }
-        }
-        (true, "ge") => {
-            if is_signed { wasm::Instruction::I64GeS } else { wasm::Instruction::I64GeU }
-        }
-        _ => unreachable!("unknown builtin (typeck should have rejected): ¤{}", name),
-    };
-    ctx.instructions.push(inst);
-    let ty = ctx.expr_types[node_id as usize]
-        .as_ref()
-        .expect("typeck recorded the builtin's result type")
-        .clone();
-    Ok(ty)
-}
 
 // Lower a 128-bit builtin to a multi-instruction sequence. On entry,
 // the wasm stack carries the two args' flattened forms in source
@@ -4242,152 +1847,38 @@ fn codegen_builtin_128(ctx: &mut FnCtx, op: &str, signed: bool) {
 //   i32.add                 ; stack: [old + n]
 //   global.set __heap_top   ; __heap_top = old + n
 //   local.get result_temp   ; stack: [old]  -- return value
-fn codegen_builtin_alloc(
-    ctx: &mut FnCtx,
-    args: &Vec<Expr>,
-    node_id: crate::ast::NodeId,
-) -> Result<RType, Error> {
-    codegen_expr(ctx, &args[0])?;
-    let n_temp = alloc_i32_local(ctx);
-    let result_temp = alloc_i32_local(ctx);
-    ctx.instructions.push(wasm::Instruction::LocalSet(n_temp));
-    ctx.instructions.push(wasm::Instruction::GlobalGet(HEAP_GLOBAL));
-    ctx.instructions.push(wasm::Instruction::LocalSet(result_temp));
-    ctx.instructions.push(wasm::Instruction::LocalGet(result_temp));
-    ctx.instructions.push(wasm::Instruction::LocalGet(n_temp));
-    ctx.instructions.push(wasm::Instruction::I32Add);
-    ctx.instructions.push(wasm::Instruction::GlobalSet(HEAP_GLOBAL));
-    ctx.instructions.push(wasm::Instruction::LocalGet(result_temp));
-    let ty = ctx.expr_types[node_id as usize]
-        .as_ref()
-        .expect("typeck recorded the builtin's result type")
-        .clone();
-    Ok(ty)
-}
 
 // ¤free(p: *mut u8). No-op stub today — evaluates `p` for its side
 // effects (move tracking, etc.) and discards the address. The heap is
 // pure bump-allocation; freed memory is not reclaimed. Provided as the
 // future hook point for a real allocator.
-fn codegen_builtin_free(
-    ctx: &mut FnCtx,
-    args: &Vec<Expr>,
-    _node_id: crate::ast::NodeId,
-) -> Result<RType, Error> {
-    codegen_expr(ctx, &args[0])?;
-    ctx.instructions.push(wasm::Instruction::Drop);
-    Ok(RType::Tuple(Vec::new()))
-}
 
 // ¤cast::<A, B>(p: *X B) -> *X A (where X is const or mut, preserved).
 // Pure no-op at runtime — raw pointers flatten to a single i32 address
 // regardless of pointee type, so the wasm value passes through
 // unchanged. Typeck has already validated the turbofish args.
-fn codegen_builtin_cast(
-    ctx: &mut FnCtx,
-    args: &Vec<Expr>,
-    node_id: crate::ast::NodeId,
-) -> Result<RType, Error> {
-    codegen_expr(ctx, &args[0])?;
-    let ty = ctx.expr_types[node_id as usize]
-        .as_ref()
-        .expect("typeck recorded the builtin's result type")
-        .clone();
-    Ok(ty)
-}
 
 // `¤slice_ptr::<T>(s: &[T]) -> *const T` and the mut variant
 // `¤slice_mut_ptr::<T>(s: &mut [T]) -> *mut T`. The arg pushes
 // (data_ptr, len); we want `data_ptr` (below `len`) and discard
 // `len` (top). One `drop` does it.
-fn codegen_builtin_slice_ptr(
-    ctx: &mut FnCtx,
-    args: &Vec<Expr>,
-    node_id: crate::ast::NodeId,
-) -> Result<RType, Error> {
-    codegen_expr(ctx, &args[0])?;
-    ctx.instructions.push(wasm::Instruction::Drop);
-    let ty = ctx.expr_types[node_id as usize]
-        .as_ref()
-        .expect("typeck recorded the builtin's result type")
-        .clone();
-    Ok(ty)
-}
 
 // `¤slice_len::<T>(s: &[T]) -> usize`. The arg pushes (data_ptr, len)
 // onto the stack; we want `len` (top) and discard `data_ptr` (below).
 // Stash `len` to a temp local, drop the ptr, reload the temp.
-fn codegen_builtin_slice_len(
-    ctx: &mut FnCtx,
-    args: &Vec<Expr>,
-    _node_id: crate::ast::NodeId,
-) -> Result<RType, Error> {
-    codegen_expr(ctx, &args[0])?;
-    let len_local = ctx.next_wasm_local;
-    ctx.extra_locals.push(wasm::ValType::I32);
-    ctx.next_wasm_local += 1;
-    ctx.instructions.push(wasm::Instruction::LocalSet(len_local));
-    ctx.instructions.push(wasm::Instruction::Drop);
-    ctx.instructions.push(wasm::Instruction::LocalGet(len_local));
-    Ok(RType::Int(IntKind::Usize))
-}
 
 // 1-arg pass-through used by `¤str_as_bytes`: codegen the single arg
 // (which already flattens to the desired result shape) and use the
 // builtin's recorded result type.
-fn codegen_builtin_passthrough_one(
-    ctx: &mut FnCtx,
-    args: &Vec<Expr>,
-    node_id: crate::ast::NodeId,
-) -> Result<RType, Error> {
-    codegen_expr(ctx, &args[0])?;
-    let ty = ctx.expr_types[node_id as usize]
-        .as_ref()
-        .expect("typeck recorded the builtin's result type")
-        .clone();
-    Ok(ty)
-}
 
 // `¤make_slice::<T>(ptr, len) -> &[T]`. Pure no-op at codegen: both
 // args already flatten to one i32, leaving (ptr, len) on the wasm
 // stack — exactly the fat-ref representation of `&[T]`.
-fn codegen_builtin_make_slice(
-    ctx: &mut FnCtx,
-    args: &Vec<Expr>,
-    node_id: crate::ast::NodeId,
-) -> Result<RType, Error> {
-    codegen_expr(ctx, &args[0])?;
-    codegen_expr(ctx, &args[1])?;
-    let ty = ctx.expr_types[node_id as usize]
-        .as_ref()
-        .expect("typeck recorded the builtin's result type")
-        .clone();
-    Ok(ty)
-}
 
 // `¤size_of::<T>() -> usize`. Compile-time-constant: at this point T is
 // concrete (after monomorphization), so we just emit `i32.const
 // byte_size_of(T)`. The result type is `usize`, which flattens to an
 // i32 on wasm32.
-fn codegen_builtin_size_of(
-    ctx: &mut FnCtx,
-    node_id: crate::ast::NodeId,
-) -> Result<RType, Error> {
-    let ts = ctx.builtin_type_targets[node_id as usize]
-        .as_ref()
-        .expect("typeck recorded `¤size_of`'s T");
-    let t = &ts[0];
-    let size = byte_size_of(t, ctx.structs, ctx.enums);
-    ctx.instructions
-        .push(wasm::Instruction::I32Const(size as i32));
-    Ok(RType::Int(IntKind::Usize))
-}
-
-#[derive(Copy, Clone)]
-enum PtrArith {
-    Add,
-    Sub,
-}
 
 // `¤ptr_usize_add(p, n) -> *X T`, `¤ptr_usize_sub(p, n) -> *X T`,
 // `¤ptr_isize_offset(p, n) -> *X T` — byte-wise pointer arithmetic.
@@ -4395,25 +1886,6 @@ enum PtrArith {
 // each lowers to a single `i32.add` / `i32.sub`. Signed offsets use
 // the same unsigned add (two's-complement: `p + (-1i32 as i32)` adds
 // 0xFFFFFFFF, equivalent to `p - 1` in 32-bit arithmetic).
-fn codegen_builtin_ptr_arith(
-    ctx: &mut FnCtx,
-    args: &Vec<Expr>,
-    node_id: crate::ast::NodeId,
-    op: PtrArith,
-) -> Result<RType, Error> {
-    codegen_expr(ctx, &args[0])?;
-    codegen_expr(ctx, &args[1])?;
-    let inst = match op {
-        PtrArith::Add => wasm::Instruction::I32Add,
-        PtrArith::Sub => wasm::Instruction::I32Sub,
-    };
-    ctx.instructions.push(inst);
-    let ty = ctx.expr_types[node_id as usize]
-        .as_ref()
-        .expect("typeck recorded the builtin's result type")
-        .clone();
-    Ok(ty)
-}
 
 fn alloc_i32_local(ctx: &mut FnCtx) -> u32 {
     let idx = ctx.next_wasm_local;
@@ -4574,59 +2046,6 @@ fn split_builtin_name(name: &str) -> Option<(&str, &str)> {
     None
 }
 
-fn codegen_if_expr(
-    ctx: &mut FnCtx,
-    if_expr: &crate::ast::IfExpr,
-    if_node_id: crate::ast::NodeId,
-) -> Result<RType, Error> {
-    // Evaluate the condition (an i32 0/1) onto the stack.
-    let _ = codegen_expr(ctx, &if_expr.cond)?;
-    let result_ty = ctx.expr_types[if_node_id as usize]
-        .as_ref()
-        .expect("typeck recorded the if's type")
-        .clone();
-    let mut flat: Vec<wasm::ValType> = Vec::new();
-    crate::typeck::flatten_rtype(&result_ty, ctx.structs, &mut flat);
-    let bt = match flat.len() {
-        0 => wasm::BlockType::Empty,
-        1 => wasm::BlockType::Single(flat[0]),
-        _ => {
-            // Multi-value `if` — register a FuncType (no params, these
-            // results) and refer to it by index. We dedupe against
-            // `ctx.pending_types`, then return base + idx so the typeidx
-            // is correct after pending types are appended to
-            // `wasm_mod.types` at function-emit-end.
-            let ft = wasm::FuncType {
-                params: Vec::new(),
-                results: flat.clone(),
-            };
-            let mut found: Option<u32> = None;
-            let mut k = 0;
-            while k < ctx.pending_types.len() {
-                if func_type_eq(&ctx.pending_types[k], &ft) {
-                    found = Some(ctx.pending_types_base + k as u32);
-                    break;
-                }
-                k += 1;
-            }
-            let idx = match found {
-                Some(i) => i,
-                None => {
-                    let i = ctx.pending_types_base + ctx.pending_types.len() as u32;
-                    ctx.pending_types.push(ft);
-                    i
-                }
-            };
-            wasm::BlockType::TypeIdx(idx)
-        }
-    };
-    ctx.instructions.push(wasm::Instruction::If(bt));
-    let _ = codegen_block_expr(ctx, if_expr.then_block.as_ref())?;
-    ctx.instructions.push(wasm::Instruction::Else);
-    let _ = codegen_block_expr(ctx, if_expr.else_block.as_ref())?;
-    ctx.instructions.push(wasm::Instruction::End);
-    Ok(result_ty)
-}
 
 // `match scrut { pat => body, … }`. Lowering:
 //
@@ -4647,74 +2066,6 @@ fn codegen_if_expr(
 // goes into wasm locals (one per flat scalar); an enum scrutinee's
 // wasm-stack value is an i32 address, which is saved to a single local
 // and used as the base for `[addr + offset]` byte-addressed reads.
-fn codegen_match_expr(
-    ctx: &mut FnCtx,
-    m: &crate::ast::MatchExpr,
-    match_node_id: crate::ast::NodeId,
-) -> Result<RType, Error> {
-    let result_ty = ctx.expr_types[match_node_id as usize]
-        .as_ref()
-        .expect("typeck recorded the match's type")
-        .clone();
-    let result_ty = substitute_rtype(&result_ty, &ctx.env);
-    let scrut_ty = ctx.expr_types[m.scrutinee.id as usize]
-        .as_ref()
-        .expect("typeck recorded the scrutinee's type")
-        .clone();
-    let scrut_ty = substitute_rtype(&scrut_ty, &ctx.env);
-    // Codegen the scrutinee (pushes its flat scalars or, for enums, its
-    // address). Stash into wasm locals for stable read/re-read.
-    let _ = codegen_expr(ctx, &m.scrutinee)?;
-    // `ref` bindings need an addressable place. For enum scrutinees the
-    // stash is already address-based (Memory). For non-enum scrutinees
-    // we'd normally stash into wasm locals (Locals storage), but those
-    // locals aren't addressable — so if any arm pattern uses `ref`, we
-    // spill the scrutinee to a fresh shadow-stack slot first so every
-    // sub-pattern's storage is Memory and `ref` bindings have a real
-    // address. The function epilogue's saved-SP restore reclaims the
-    // slot at function exit.
-    let is_enum_scrut = matches!(&scrut_ty, RType::Enum { .. });
-    let needs_ref_spill = !is_enum_scrut
-        && m.arms.iter().any(|a| pattern_uses_ref_binding(&a.pattern));
-    let storage = if needs_ref_spill {
-        spill_match_scrutinee(ctx, &scrut_ty)
-    } else {
-        stash_match_scrutinee(ctx, &scrut_ty)
-    };
-    // Compute outer block-type for the unified arm result.
-    let bt = block_type_for(ctx, &result_ty);
-    ctx.instructions.push(wasm::Instruction::Block(bt));
-    let mut i = 0;
-    while i < m.arms.len() {
-        let arm = &m.arms[i];
-        ctx.instructions
-            .push(wasm::Instruction::Block(wasm::BlockType::Empty));
-        // Save locals/scope mark so pattern-introduced bindings clean
-        // up after the arm body.
-        let mark = ctx.locals.len();
-        codegen_pattern(ctx, &arm.pattern, &scrut_ty, &storage, 0)?;
-        // Guard: after pattern match succeeds, evaluate the bool
-        // expression. If false, br to the arm's no-match label so
-        // the next arm gets a chance.
-        if let Some(g) = &arm.guard {
-            let _ = codegen_expr(ctx, g)?;
-            ctx.instructions.push(wasm::Instruction::I32Eqz);
-            ctx.instructions.push(wasm::Instruction::BrIf(0));
-        }
-        // Body produces the result type's flat scalars on the stack.
-        let _ = codegen_expr(ctx, &arm.body)?;
-        ctx.instructions.push(wasm::Instruction::Br(1));
-        ctx.instructions.push(wasm::Instruction::End);
-        ctx.locals.truncate(mark);
-        i += 1;
-    }
-    // After the last arm, exhaustiveness guarantees control would have
-    // already exited — emit `unreachable` so the wasm validator sees
-    // the outer block's expected result type without a fall-through.
-    ctx.instructions.push(wasm::Instruction::Unreachable);
-    ctx.instructions.push(wasm::Instruction::End);
-    Ok(result_ty)
-}
 
 // Where the scrutinee value is parked between arms.
 #[derive(Clone)]
@@ -4740,43 +2091,6 @@ enum PatScrut {
 // pattern check (br 0 on no-match → fall through to the else-block);
 // on match the then-block runs and `br 1`s past the else with its
 // result. The else-block runs only when the inner block fell through.
-fn codegen_if_let_expr(
-    ctx: &mut FnCtx,
-    il: &crate::ast::IfLetExpr,
-    if_let_node_id: crate::ast::NodeId,
-) -> Result<RType, Error> {
-    let result_ty = ctx.expr_types[if_let_node_id as usize]
-        .as_ref()
-        .expect("typeck recorded the if-let's type")
-        .clone();
-    let result_ty = substitute_rtype(&result_ty, &ctx.env);
-    let scrut_ty = ctx.expr_types[il.scrutinee.id as usize]
-        .as_ref()
-        .expect("typeck recorded the scrutinee's type")
-        .clone();
-    let scrut_ty = substitute_rtype(&scrut_ty, &ctx.env);
-    let _ = codegen_expr(ctx, &il.scrutinee)?;
-    let is_enum_scrut = matches!(&scrut_ty, RType::Enum { .. });
-    let needs_ref_spill = !is_enum_scrut && pattern_uses_ref_binding(&il.pattern);
-    let storage = if needs_ref_spill {
-        spill_match_scrutinee(ctx, &scrut_ty)
-    } else {
-        stash_match_scrutinee(ctx, &scrut_ty)
-    };
-    let outer_bt = block_type_for(ctx, &result_ty);
-    ctx.instructions.push(wasm::Instruction::Block(outer_bt));
-    ctx.instructions
-        .push(wasm::Instruction::Block(wasm::BlockType::Empty));
-    let mark = ctx.locals.len();
-    codegen_pattern(ctx, &il.pattern, &scrut_ty, &storage, 0)?;
-    let _ = codegen_block_expr(ctx, il.then_block.as_ref())?;
-    ctx.instructions.push(wasm::Instruction::Br(1));
-    ctx.locals.truncate(mark);
-    ctx.instructions.push(wasm::Instruction::End);
-    let _ = codegen_block_expr(ctx, il.else_block.as_ref())?;
-    ctx.instructions.push(wasm::Instruction::End);
-    Ok(result_ty)
-}
 
 fn pattern_uses_ref_binding(p: &Pattern) -> bool {
     use crate::ast::PatternKind;
@@ -5324,6 +2638,12 @@ fn bind_pattern_ref(
             )
         }
     }
+    let drop_action = crate::layout::compute_drop_action(
+        name,
+        &ref_ty,
+        &ctx.moved_places,
+        ctx.traits,
+    );
     ctx.locals.push(LocalBinding {
         name: name.to_string(),
         rtype: ref_ty,
@@ -5331,6 +2651,7 @@ fn bind_pattern_ref(
             wasm_start: dest,
             flat_size: 1,
         },
+        drop_action,
     });
 }
 
@@ -5364,6 +2685,12 @@ fn bind_pattern_value(
                 ctx.instructions.push(wasm::Instruction::LocalSet(dest));
             }
         }
+        let drop_action = crate::layout::compute_drop_action(
+            name,
+            ty,
+            &ctx.moved_places,
+            ctx.traits,
+        );
         ctx.locals.push(LocalBinding {
             name: name.to_string(),
             rtype: ty.clone(),
@@ -5371,6 +2698,7 @@ fn bind_pattern_value(
                 wasm_start: dest,
                 flat_size: 1,
             },
+            drop_action,
         });
         return;
     }
@@ -5378,8 +2706,11 @@ fn bind_pattern_value(
     // addressed, allocate a shadow-stack slot up front so reads /
     // writes / borrows all share one stable location. Otherwise stash
     // into wasm locals (the fast path).
-    let addressed = (pattern_id as usize) < ctx.pattern_addressed.len()
-        && ctx.pattern_addressed[pattern_id as usize];
+    let addressed = (pattern_id as usize) < ctx.pattern_storage.len()
+        && matches!(
+            ctx.pattern_storage[pattern_id as usize],
+            Some(BindingStorageKind::MemoryAt)
+        );
     if addressed {
         let bytes = byte_size_of(ty, ctx.structs, ctx.enums);
         ctx.instructions
@@ -5425,10 +2756,17 @@ fn bind_pattern_value(
                 }
             }
         }
+        let drop_action = crate::layout::compute_drop_action(
+            name,
+            ty,
+            &ctx.moved_places,
+            ctx.traits,
+        );
         ctx.locals.push(LocalBinding {
             name: name.to_string(),
             rtype: ty.clone(),
             storage: Storage::MemoryAt { addr_local },
+            drop_action,
         });
         return;
     }
@@ -5474,6 +2812,12 @@ fn bind_pattern_value(
             }
         }
     }
+    let drop_action = crate::layout::compute_drop_action(
+        name,
+        ty,
+        &ctx.moved_places,
+        ctx.traits,
+    );
     ctx.locals.push(LocalBinding {
         name: name.to_string(),
         rtype: ty.clone(),
@@ -5481,6 +2825,7 @@ fn bind_pattern_value(
             wasm_start: dest_start,
             flat_size: vts.len() as u32,
         },
+        drop_action,
     });
 }
 
@@ -5704,244 +3049,11 @@ fn val_type_struct_eq(a: &wasm::ValType, b: &wasm::ValType) -> bool {
     )
 }
 
-fn codegen_method_call(
-    ctx: &mut FnCtx,
-    mc: &MethodCall,
-    node_id: crate::ast::NodeId,
-) -> Result<RType, Error> {
-    let res_idx = node_id as usize;
-    // Trait-dispatched calls take a separate path: solve the impl at mono
-    // time, find the right impl method, and emit a direct call to it.
-    let has_trait_dispatch = ctx.method_resolutions[res_idx]
-        .as_ref()
-        .expect("typeck registered this method call")
-        .trait_dispatch
-        .is_some();
-    if has_trait_dispatch {
-        return codegen_trait_method_call(ctx, mc, node_id);
-    }
-    // Match on a copy of the resolution shape to avoid borrowing ctx through
-    // the resolutions vec across our subsequent codegen mutations.
-    let recv_adjust_local = match &ctx.method_resolutions[res_idx]
-        .as_ref()
-        .expect("typeck registered this method call")
-        .recv_adjust
-    {
-        ReceiverAdjust::Move => RecvAdjustLocal::Move,
-        ReceiverAdjust::BorrowImm => RecvAdjustLocal::BorrowImm,
-        ReceiverAdjust::BorrowMut => RecvAdjustLocal::BorrowMut,
-        ReceiverAdjust::ByRef => RecvAdjustLocal::ByRef,
-    };
-    // Determine the wasm idx and return type. For non-template methods, use
-    // the recorded callee_idx directly. For template methods, substitute the
-    // resolution's type_args under our env, intern via MonoState, and compute
-    // the return type from the template's signature.
-    let template_idx_opt = ctx.method_resolutions[res_idx].as_ref().unwrap().template_idx;
-    let (callee_idx, return_rt) = if let Some(template_idx) = template_idx_opt {
-        let raw_args =
-            ctx.method_resolutions[res_idx].as_ref().unwrap().type_args.clone();
-        let concrete = subst_vec(&raw_args, &ctx.env);
-        let return_rt = {
-            let tmpl = &ctx.funcs.templates[template_idx];
-            let tmpl_env = build_env(&tmpl.type_params, &concrete);
-            match &tmpl.return_type {
-                Some(rt) => substitute_rtype(rt, &tmpl_env),
-                None => RType::Tuple(Vec::new()),
-            }
-        };
-        let idx = ctx.mono.intern(template_idx, concrete);
-        (idx, return_rt)
-    } else {
-        let callee_idx = ctx.method_resolutions[res_idx].as_ref().unwrap().callee_idx;
-        let return_rt = {
-            let entry = &ctx.funcs.entries[callee_idx_to_table_idx(ctx, callee_idx)];
-            match &entry.return_type {
-                Some(rt) => rt.clone(),
-                None => RType::Tuple(Vec::new()),
-            }
-        };
-        (callee_idx, return_rt)
-    };
-    // Enum-returning callees use sret: leading i32 is a caller-
-    // allocated destination slot, written by the callee before return
-    // and surfaced as the call's wasm result. Allocate it from the
-    // caller's shadow stack before pushing the receiver/args.
-    let returns_enum = matches!(&return_rt, RType::Enum { .. });
-    if returns_enum {
-        let bytes = byte_size_of(&return_rt, ctx.structs, ctx.enums);
-        ctx.instructions.push(wasm::Instruction::GlobalGet(SP_GLOBAL));
-        ctx.instructions.push(wasm::Instruction::I32Const(bytes as i32));
-        ctx.instructions.push(wasm::Instruction::I32Sub);
-        ctx.instructions.push(wasm::Instruction::GlobalSet(SP_GLOBAL));
-        ctx.instructions.push(wasm::Instruction::GlobalGet(SP_GLOBAL));
-    }
-    // Codegen receiver.
-    match recv_adjust_local {
-        RecvAdjustLocal::Move => {
-            codegen_expr(ctx, &mc.receiver)?;
-        }
-        RecvAdjustLocal::BorrowImm => {
-            codegen_borrow(ctx, &mc.receiver, false)?;
-        }
-        RecvAdjustLocal::BorrowMut => {
-            codegen_borrow(ctx, &mc.receiver, true)?;
-        }
-        RecvAdjustLocal::ByRef => {
-            codegen_expr(ctx, &mc.receiver)?;
-        }
-    }
-    // Codegen remaining args.
-    let mut i = 0;
-    while i < mc.args.len() {
-        codegen_expr(ctx, &mc.args[i])?;
-        i += 1;
-    }
-    ctx.instructions.push(wasm::Instruction::Call(callee_idx));
-    Ok(return_rt)
-}
 
 // Trait-dispatched method call: substitute the recorded recv type
 // against the mono env, run `solve_impl` to find the impl row, look up
 // the method by name, then emit a regular call to its (possibly
 // monomorphized) wasm idx.
-fn codegen_trait_method_call(
-    ctx: &mut FnCtx,
-    mc: &MethodCall,
-    node_id: crate::ast::NodeId,
-) -> Result<RType, Error> {
-    let res_idx = node_id as usize;
-    let td = ctx.method_resolutions[res_idx]
-        .as_ref()
-        .unwrap()
-        .trait_dispatch
-        .as_ref()
-        .map(|t| crate::typeck::TraitDispatch {
-            trait_path: t.trait_path.clone(),
-            trait_args: t.trait_args.clone(),
-            method_name: t.method_name.clone(),
-            recv_type: t.recv_type.clone(),
-        })
-        .unwrap();
-    // Already substituted at the time of mono cloning, but still need to
-    // peel any `Ref` wrapper if the recv type was symbolic ref.
-    let concrete_recv = match &td.recv_type {
-        RType::Ref { inner, .. } => (**inner).clone(),
-        other => other.clone(),
-    };
-    let resolution = match crate::typeck::solve_impl_with_args(&td.trait_path, &td.trait_args, &concrete_recv, ctx.traits, 0)
-    {
-        Some(r) => r,
-        None => unreachable!(
-            "no impl of `{}` for `{}` at mono time — typeck should have caught",
-            crate::typeck::place_to_string(&td.trait_path),
-            crate::typeck::rtype_to_string(&concrete_recv)
-        ),
-    };
-    let cand = match crate::typeck::find_trait_impl_method(
-        ctx.funcs,
-        resolution.impl_idx,
-        &td.method_name,
-    ) {
-        Some(c) => c,
-        None => unreachable!("trait impl row exists but no method by that name"),
-    };
-    let (callee_idx, return_rt) = match cand {
-        crate::typeck::MethodCandidate::Direct(i) => {
-            let entry = &ctx.funcs.entries[i];
-            let ret = match &entry.return_type {
-                Some(rt) => rt.clone(),
-                None => unreachable!(),
-            };
-            (entry.idx, ret)
-        }
-        crate::typeck::MethodCandidate::Template(i) => {
-            let tmpl = &ctx.funcs.templates[i];
-            // T2.5b: a template's type_params are impl-level first, then
-            // method-level. Impl-level slots are bound by `solve_impl`
-            // (`resolution.subst`); method-level slots come from the
-            // MethodResolution's recorded `type_args`, substituted
-            // through this monomorphization's outer env.
-            let impl_param_count = tmpl.impl_type_param_count;
-            let mut concrete: Vec<RType> = Vec::new();
-            let mut k = 0;
-            while k < impl_param_count {
-                let name = &tmpl.type_params[k];
-                let mut found: Option<RType> = None;
-                let mut j = 0;
-                while j < resolution.subst.len() {
-                    if resolution.subst[j].0 == *name {
-                        found = Some(resolution.subst[j].1.clone());
-                        break;
-                    }
-                    j += 1;
-                }
-                concrete.push(found.expect("impl-param not bound by subst"));
-                k += 1;
-            }
-            let method_param_count = tmpl.type_params.len() - impl_param_count;
-            let recorded_type_args =
-                ctx.method_resolutions[res_idx].as_ref().unwrap().type_args.clone();
-            if recorded_type_args.len() != method_param_count {
-                unreachable!(
-                    "type_args length {} doesn't match method-level param count {}",
-                    recorded_type_args.len(),
-                    method_param_count
-                );
-            }
-            let mut k = 0;
-            while k < method_param_count {
-                concrete.push(substitute_rtype(&recorded_type_args[k], &ctx.env));
-                k += 1;
-            }
-            let tmpl_env = build_env(&tmpl.type_params, &concrete);
-            let return_rt = match &tmpl.return_type {
-                Some(rt) => substitute_rtype(rt, &tmpl_env),
-                None => unreachable!(),
-            };
-            let idx = ctx.mono.intern(i, concrete);
-            (idx, return_rt)
-        }
-    };
-    // Sret handling for enum-returning trait methods: same convention
-    // as `codegen_call` / `codegen_method_call` — caller allocates the
-    // dest slot and pushes its address as the leading param.
-    let returns_enum = matches!(&return_rt, RType::Enum { .. });
-    if returns_enum {
-        let bytes = byte_size_of(&return_rt, ctx.structs, ctx.enums);
-        ctx.instructions.push(wasm::Instruction::GlobalGet(SP_GLOBAL));
-        ctx.instructions.push(wasm::Instruction::I32Const(bytes as i32));
-        ctx.instructions.push(wasm::Instruction::I32Sub);
-        ctx.instructions.push(wasm::Instruction::GlobalSet(SP_GLOBAL));
-        ctx.instructions.push(wasm::Instruction::GlobalGet(SP_GLOBAL));
-    }
-    // Codegen receiver per the recorded recv_adjust (derived from the
-    // trait method's declared receiver shape during typeck).
-    let recv_adjust = ctx.method_resolutions[res_idx]
-        .as_ref()
-        .unwrap()
-        .recv_adjust;
-    match recv_adjust {
-        ReceiverAdjust::Move => {
-            codegen_expr(ctx, &mc.receiver)?;
-        }
-        ReceiverAdjust::BorrowImm => {
-            codegen_borrow(ctx, &mc.receiver, false)?;
-        }
-        ReceiverAdjust::BorrowMut => {
-            codegen_borrow(ctx, &mc.receiver, true)?;
-        }
-        ReceiverAdjust::ByRef => {
-            codegen_expr(ctx, &mc.receiver)?;
-        }
-    }
-    let mut i = 0;
-    while i < mc.args.len() {
-        codegen_expr(ctx, &mc.args[i])?;
-        i += 1;
-    }
-    ctx.instructions.push(wasm::Instruction::Call(callee_idx));
-    Ok(return_rt)
-}
 
 enum RecvAdjustLocal {
     Move,
@@ -5952,16 +3064,6 @@ enum RecvAdjustLocal {
 
 // Map a WASM function index back to its FuncTable entry index. They're
 // allocated in lockstep, so equal numerically.
-fn callee_idx_to_table_idx(ctx: &FnCtx, callee_idx: u32) -> usize {
-    let mut i = 0;
-    while i < ctx.funcs.entries.len() {
-        if ctx.funcs.entries[i].idx == callee_idx {
-            return i;
-        }
-        i += 1;
-    }
-    unreachable!("callee_idx must correspond to a registered function");
-}
 
 // Emits wasm conversion ops for an int-to-int `as` cast. Pocket-rust's
 // storage classes: ≤32-bit integers (and usize/isize on wasm32) flatten
@@ -6093,96 +3195,7 @@ fn emit_int_lit(ctx: &mut FnCtx, ty: &RType, value: u64, negative: bool) {
     }
 }
 
-fn codegen_block_expr(ctx: &mut FnCtx, block: &Block) -> Result<RType, Error> {
-    let mark = ctx.locals.len();
-    let mut i = 0;
-    while i < block.stmts.len() {
-        match &block.stmts[i] {
-            Stmt::Let(let_stmt) => codegen_let_stmt(ctx, let_stmt)?,
-            Stmt::Assign(assign) => codegen_assign_stmt(ctx, assign)?,
-            Stmt::Expr(expr) => codegen_expr_stmt(ctx, expr)?,
-            Stmt::Use(_) => {}
-        }
-        i += 1;
-    }
-    let result_ty = match &block.tail {
-        Some(expr) => codegen_expr(ctx, expr)?,
-        // No tail ⇒ block evaluates to `()` (the empty tuple). Nothing
-        // to push on the wasm stack; nothing to save across the drop
-        // sequence below.
-        None => RType::Tuple(Vec::new()),
-    };
-    // T4.5: drop in-scope Drop-typed bindings before yielding the tail
-    // value. Save the tail to fresh locals, emit drops, reload.
-    let n_after = ctx.locals.len();
-    let mut tail_flat: Vec<wasm::ValType> = Vec::new();
-    flatten_rtype(&result_ty, ctx.structs, &mut tail_flat);
-    if !tail_flat.is_empty() {
-        let save_start = ctx.next_wasm_local;
-        let mut i = 0;
-        while i < tail_flat.len() {
-            ctx.extra_locals.push(tail_flat[i].copy());
-            ctx.next_wasm_local += 1;
-            i += 1;
-        }
-        let mut k = tail_flat.len();
-        while k > 0 {
-            k -= 1;
-            ctx.instructions
-                .push(wasm::Instruction::LocalSet(save_start + k as u32));
-        }
-        emit_drops_for_locals_range(ctx, mark, n_after)?;
-        let mut k = 0;
-        while k < tail_flat.len() {
-            ctx.instructions
-                .push(wasm::Instruction::LocalGet(save_start + k as u32));
-            k += 1;
-        }
-    } else {
-        emit_drops_for_locals_range(ctx, mark, n_after)?;
-    }
-    ctx.locals.truncate(mark);
-    Ok(result_ty)
-}
 
-fn codegen_var(ctx: &mut FnCtx, name: &str, node_id: crate::ast::NodeId) -> Result<RType, Error> {
-    let mut i = ctx.locals.len();
-    while i > 0 {
-        i -= 1;
-        if ctx.locals[i].name == *name {
-            let rt = ctx.locals[i].rtype.clone();
-            match &ctx.locals[i].storage {
-                Storage::Local { wasm_start, flat_size } => {
-                    let start = *wasm_start;
-                    let n = *flat_size;
-                    let mut k = 0;
-                    while k < n {
-                        ctx.instructions
-                            .push(wasm::Instruction::LocalGet(start + k));
-                        k += 1;
-                    }
-                }
-                Storage::Memory { frame_offset } => {
-                    load_flat_from_memory(ctx, &rt, BaseAddr::StackPointer, *frame_offset);
-                }
-                Storage::MemoryAt { addr_local } => {
-                    load_flat_from_memory(ctx, &rt, BaseAddr::WasmLocal(*addr_local), 0);
-                }
-            }
-            // If this read is recorded as a whole-binding move site for
-            // a flagged binding, clear the flag so the scope-end drop is
-            // skipped on this path.
-            if is_move_site(&ctx.move_sites, node_id, name) {
-                if let Some(flag_idx) = lookup_drop_flag(&ctx.drop_flags, name) {
-                    ctx.instructions.push(wasm::Instruction::I32Const(0));
-                    ctx.instructions.push(wasm::Instruction::LocalSet(flag_idx));
-                }
-            }
-            return Ok(rt);
-        }
-    }
-    unreachable!("typeck verified the variable exists");
-}
 
 fn is_move_site(
     move_sites: &Vec<(crate::ast::NodeId, String)>,
@@ -6210,83 +3223,6 @@ fn lookup_drop_flag(drop_flags: &Vec<(String, u32)>, name: &str) -> Option<u32> 
     None
 }
 
-fn codegen_call(
-    ctx: &mut FnCtx,
-    call: &Call,
-    node_id: crate::ast::NodeId,
-) -> Result<RType, Error> {
-    let res_idx = node_id as usize;
-    // Snapshot the resolution upfront so we don't keep a borrow of ctx.call_resolutions.
-    let resolution = ctx.call_resolutions[res_idx]
-        .as_ref()
-        .expect("typeck registered this call");
-    let snapshot = match resolution {
-        CallResolution::Direct(idx) => CallResolution::Direct(*idx),
-        CallResolution::Generic { template_idx, type_args } => CallResolution::Generic {
-            template_idx: *template_idx,
-            type_args: type_args.clone(),
-        },
-        CallResolution::Variant { enum_path, disc, type_args } => CallResolution::Variant {
-            enum_path: enum_path.clone(),
-            disc: *disc,
-            type_args: type_args.clone(),
-        },
-    };
-    if let CallResolution::Variant { enum_path, disc, type_args } = &snapshot {
-        return codegen_variant_construction(
-            ctx,
-            &call.args,
-            enum_path,
-            *disc,
-            type_args,
-            None,
-        );
-    }
-    let (func_idx, return_rt) = match &snapshot {
-        CallResolution::Direct(idx) => {
-            let entry = &ctx.funcs.entries[*idx];
-            let rt = match &entry.return_type {
-                Some(rt) => rt.clone(),
-                None => RType::Tuple(Vec::new()),
-            };
-            (entry.idx, rt)
-        }
-        CallResolution::Generic { template_idx, type_args } => {
-            let concrete = subst_vec(type_args, &ctx.env);
-            let template_idx_copy = *template_idx;
-            let return_rt = {
-                let tmpl: &GenericTemplate = &ctx.funcs.templates[template_idx_copy];
-                let tmpl_env = build_env(&tmpl.type_params, &concrete);
-                match &tmpl.return_type {
-                    Some(rt) => substitute_rtype(rt, &tmpl_env),
-                    None => RType::Tuple(Vec::new()),
-                }
-            };
-            let idx = ctx.mono.intern(template_idx_copy, concrete);
-            (idx, return_rt)
-        }
-        CallResolution::Variant { .. } => unreachable!("variant case handled above"),
-    };
-    // Functions returning an enum use sret: the caller allocates a slot
-    // in its own frame for the return value and passes its address as
-    // a leading i32 param. The function writes there before returning.
-    let returns_enum = matches!(&return_rt, RType::Enum { .. });
-    if returns_enum {
-        let bytes = byte_size_of(&return_rt, ctx.structs, ctx.enums);
-        ctx.instructions.push(wasm::Instruction::GlobalGet(SP_GLOBAL));
-        ctx.instructions.push(wasm::Instruction::I32Const(bytes as i32));
-        ctx.instructions.push(wasm::Instruction::I32Sub);
-        ctx.instructions.push(wasm::Instruction::GlobalSet(SP_GLOBAL));
-        ctx.instructions.push(wasm::Instruction::GlobalGet(SP_GLOBAL));
-    }
-    let mut i = 0;
-    while i < call.args.len() {
-        codegen_expr(ctx, &call.args[i])?;
-        i += 1;
-    }
-    ctx.instructions.push(wasm::Instruction::Call(func_idx));
-    Ok(return_rt)
-}
 
 // Lower variant construction (`E::Variant(args)` for tuple variants or
 // `E::Variant { f: e }` for struct variants — same shape from codegen's
@@ -6301,319 +3237,12 @@ fn codegen_call(
 //
 // Returns RType::Enum (with concrete type_args). The wasm stack ends
 // with the address (i32) of the freshly allocated slot.
-fn codegen_variant_construction(
-    ctx: &mut FnCtx,
-    payload_exprs: &Vec<Expr>,
-    enum_path: &Vec<String>,
-    disc: u32,
-    type_args: &Vec<RType>,
-    field_names: Option<&Vec<String>>,
-) -> Result<RType, Error> {
-    let concrete_type_args = subst_vec(type_args, &ctx.env);
-    let enum_ty = RType::Enum {
-        path: enum_path.clone(),
-        type_args: concrete_type_args.clone(),
-        lifetime_args: Vec::new(),
-    };
-    let total_size = byte_size_of(&enum_ty, ctx.structs, ctx.enums);
-    // Payload type list, substituted under the enum's type-args env.
-    let entry = crate::typeck::enum_lookup(ctx.enums, enum_path)
-        .expect("typeck verified the enum exists");
-    let env = build_env(&entry.type_params, &concrete_type_args);
-    let variant = &entry.variants[disc as usize];
-    // Build (declared_offset, payload_type) pairs in payload-declaration
-    // order. For struct variants, also build a name → declared-position
-    // mapping so we can route FieldInit by name.
-    let (payload_offsets, payload_types, struct_field_names): (Vec<u32>, Vec<RType>, Vec<String>) = {
-        let mut offsets: Vec<u32> = Vec::new();
-        let mut types: Vec<RType> = Vec::new();
-        let mut names: Vec<String> = Vec::new();
-        let mut off: u32 = 4; // disc takes the first 4 bytes
-        match &variant.payload {
-            crate::typeck::VariantPayloadResolved::Unit => {}
-            crate::typeck::VariantPayloadResolved::Tuple(types_decl) => {
-                let mut i = 0;
-                while i < types_decl.len() {
-                    let ty = substitute_rtype(&types_decl[i], &env);
-                    offsets.push(off);
-                    off += byte_size_of(&ty, ctx.structs, ctx.enums);
-                    types.push(ty);
-                    i += 1;
-                }
-            }
-            crate::typeck::VariantPayloadResolved::Struct(fields) => {
-                let mut i = 0;
-                while i < fields.len() {
-                    let ty = substitute_rtype(&fields[i].ty, &env);
-                    offsets.push(off);
-                    off += byte_size_of(&ty, ctx.structs, ctx.enums);
-                    types.push(ty);
-                    names.push(fields[i].name.clone());
-                    i += 1;
-                }
-            }
-        }
-        (offsets, types, names)
-    };
-    // Allocate the slot: __sp -= total_size; the new __sp is the address.
-    ctx.instructions
-        .push(wasm::Instruction::GlobalGet(SP_GLOBAL));
-    ctx.instructions
-        .push(wasm::Instruction::I32Const(total_size as i32));
-    ctx.instructions.push(wasm::Instruction::I32Sub);
-    ctx.instructions
-        .push(wasm::Instruction::GlobalSet(SP_GLOBAL));
-    // Cache the address in a wasm local so we can reuse it across
-    // the disc + per-field stores.
-    let addr_local = ctx.next_wasm_local;
-    ctx.extra_locals.push(wasm::ValType::I32);
-    ctx.next_wasm_local += 1;
-    ctx.instructions
-        .push(wasm::Instruction::GlobalGet(SP_GLOBAL));
-    ctx.instructions
-        .push(wasm::Instruction::LocalSet(addr_local));
-    // Store the discriminant at offset 0.
-    ctx.instructions
-        .push(wasm::Instruction::LocalGet(addr_local));
-    ctx.instructions
-        .push(wasm::Instruction::I32Const(disc as i32));
-    ctx.instructions.push(wasm::Instruction::I32Store {
-        align: 2,
-        offset: 0,
-    });
-    // Map each payload_expr to its declared position. For tuple variants
-    // payload_exprs is in declaration order. For struct variants we use
-    // field_names to find each FieldInit's position.
-    if payload_exprs.len() != payload_offsets.len() {
-        unreachable!("typeck verified payload arity");
-    }
-    let mut decl_pos_for_arg: Vec<usize> = Vec::with_capacity(payload_exprs.len());
-    if let Some(names) = field_names {
-        // Struct variant: each payload_exprs[i] corresponds to names[i]
-        // (the order the user wrote them). Map to declared position.
-        let mut i = 0;
-        while i < names.len() {
-            let mut found: Option<usize> = None;
-            let mut k = 0;
-            while k < struct_field_names.len() {
-                if struct_field_names[k] == names[i] {
-                    found = Some(k);
-                    break;
-                }
-                k += 1;
-            }
-            decl_pos_for_arg.push(found.expect("typeck verified field name"));
-            i += 1;
-        }
-    } else {
-        // Tuple variant: positional.
-        let mut i = 0;
-        while i < payload_exprs.len() {
-            decl_pos_for_arg.push(i);
-            i += 1;
-        }
-    }
-    // For each argument: load address, codegen value (pushes flat scalars),
-    // then store-flat-to-memory at the field's offset. We use the existing
-    // `store_flat_to_memory` machinery so multi-scalar fields (u128, structs)
-    // get all their bytes written at the right offsets.
-    let mut i = 0;
-    while i < payload_exprs.len() {
-        let decl_pos = decl_pos_for_arg[i];
-        let off = payload_offsets[decl_pos];
-        let ty = payload_types[decl_pos].clone();
-        // codegen the value — pushes its flat scalars onto the wasm stack.
-        codegen_expr(ctx, &payload_exprs[i])?;
-        // store_flat_to_memory pops the flat scalars and stores them at
-        // base + base_offset. Use the cached addr_local as the base.
-        store_flat_to_memory(ctx, &ty, BaseAddr::WasmLocal(addr_local), off);
-        i += 1;
-    }
-    // Push the address as the result of the construction expression.
-    ctx.instructions
-        .push(wasm::Instruction::LocalGet(addr_local));
-    Ok(enum_ty)
-}
 
-fn codegen_struct_lit(
-    ctx: &mut FnCtx,
-    lit: &StructLit,
-    node_id: crate::ast::NodeId,
-) -> Result<RType, Error> {
-    // Struct-variant construction routes through codegen_struct_lit but
-    // the resolution recorded by typeck distinguishes it. Lower via the
-    // shared variant-construction path; FieldInits map to declared
-    // payload fields by name.
-    if let Some(CallResolution::Variant { enum_path, disc, type_args }) =
-        ctx.call_resolutions[node_id as usize].as_ref()
-    {
-        let enum_path = enum_path.clone();
-        let disc = *disc;
-        let type_args = type_args.clone();
-        let mut payload_exprs: Vec<Expr> = Vec::new();
-        let mut field_names: Vec<String> = Vec::new();
-        let mut i = 0;
-        while i < lit.fields.len() {
-            field_names.push(lit.fields[i].name.clone());
-            payload_exprs.push(lit.fields[i].value.clone());
-            i += 1;
-        }
-        return codegen_variant_construction(
-            ctx,
-            &payload_exprs,
-            &enum_path,
-            disc,
-            &type_args,
-            Some(&field_names),
-        );
-    }
-    // Read the resolved struct type recorded by typeck at this NodeId.
-    // For generic structs, this carries the concrete type_args needed for
-    // layout. Substitute under our env in case those args themselves reference
-    // outer Param entries (mono of mono).
-    let recorded_ty = ctx.expr_types[node_id as usize]
-        .as_ref()
-        .expect("typeck recorded this struct lit's type")
-        .clone();
-    let recorded_ty = substitute_rtype(&recorded_ty, &ctx.env);
-    let (full, struct_args) = match &recorded_ty {
-        RType::Struct { path, type_args, .. } => (path.clone(), type_args.clone()),
-        _ => unreachable!("expr_types entry for a struct literal must be a Struct"),
-    };
 
-    // Field layouts: declaration-order (name, flat_offset, valtypes), with
-    // field types substituted via the struct's type-arg env.
-    struct FieldLayout {
-        name: String,
-        flat_offset: u32,
-        valtypes: Vec<wasm::ValType>,
-    }
-    let layouts: Vec<FieldLayout> = {
-        let entry = struct_lookup(ctx.structs, &full).expect("typeck resolved this struct");
-        let env = make_struct_env(&entry.type_params, &struct_args);
-        let mut out: Vec<FieldLayout> = Vec::new();
-        let mut flat_off: u32 = 0;
-        let mut i = 0;
-        while i < entry.fields.len() {
-            let fty = substitute_rtype(&entry.fields[i].ty, &env);
-            let mut vts: Vec<wasm::ValType> = Vec::new();
-            flatten_rtype(&fty, ctx.structs, &mut vts);
-            let s = vts.len() as u32;
-            out.push(FieldLayout {
-                name: entry.fields[i].name.clone(),
-                flat_offset: flat_off,
-                valtypes: vts,
-            });
-            flat_off += s;
-            i += 1;
-        }
-        out
-    };
-    let total_size: u32 = {
-        let mut s: u32 = 0;
-        let mut i = 0;
-        while i < layouts.len() {
-            s += layouts[i].valtypes.len() as u32;
-            i += 1;
-        }
-        s
-    };
-
-    // Allocate a contiguous block of temp WASM locals to assemble the struct
-    // in declaration order.
-    let temp_start = ctx.next_wasm_local;
-    let mut k = 0;
-    while k < layouts.len() {
-        let mut j = 0;
-        while j < layouts[k].valtypes.len() {
-            ctx.extra_locals.push(layouts[k].valtypes[j].copy());
-            ctx.next_wasm_local += 1;
-            j += 1;
-        }
-        k += 1;
-    }
-
-    // Walk lit fields in source order, drop each value into the right slot.
-    let mut i = 0;
-    while i < lit.fields.len() {
-        codegen_expr(ctx, &lit.fields[i].value)?;
-        let mut layout_idx = 0;
-        while layout_idx < layouts.len() {
-            if layouts[layout_idx].name == lit.fields[i].name {
-                let size = layouts[layout_idx].valtypes.len() as u32;
-                let mut k = 0;
-                while k < size {
-                    ctx.instructions.push(wasm::Instruction::LocalSet(
-                        temp_start + layouts[layout_idx].flat_offset + size - 1 - k,
-                    ));
-                    k += 1;
-                }
-                break;
-            }
-            layout_idx += 1;
-        }
-        i += 1;
-    }
-
-    // Read back in declaration order.
-    let mut i: u32 = 0;
-    while i < total_size {
-        ctx.instructions
-            .push(wasm::Instruction::LocalGet(temp_start + i));
-        i += 1;
-    }
-
-    Ok(RType::Struct {
-        path: full,
-        type_args: struct_args,
-        lifetime_args: Vec::new(),
-    })
-}
-
-fn codegen_field_access(ctx: &mut FnCtx, fa: &FieldAccess) -> Result<RType, Error> {
-    // Try the place-rooted path (Var or Var.field… chain) for direct memory
-    // access without producing the whole base on the stack.
-    let chain = {
-        let mut tmp: Vec<String> = Vec::new();
-        tmp.push(fa.field.clone());
-        if collect_place_chain(&fa.base, &mut tmp) {
-            let mut reversed: Vec<String> = Vec::new();
-            let mut i = tmp.len();
-            while i > 0 {
-                i -= 1;
-                reversed.push(tmp[i].clone());
-            }
-            Some(reversed)
-        } else {
-            None
-        }
-    };
-    if let Some(chain) = chain {
-        return codegen_place_chain_load(ctx, &chain);
-    }
-    codegen_field_access_general(ctx, fa)
-}
 
 // Walk the spine of nested FieldAccess / Var nodes; if it bottoms out at a
 // Var, push the root name and return true. Otherwise return false (and out is
 // in an unspecified state — caller should drop it).
-fn collect_place_chain(expr: &Expr, out: &mut Vec<String>) -> bool {
-    match &expr.kind {
-        ExprKind::Var(name) => {
-            out.push(name.clone());
-            true
-        }
-        ExprKind::FieldAccess(fa) => {
-            out.push(fa.field.clone());
-            collect_place_chain(&fa.base, out)
-        }
-        ExprKind::TupleIndex { base, index, .. } => {
-            out.push(format!("{}", index));
-            collect_place_chain(base, out)
-        }
-        _ => false,
-    }
-}
 
 fn codegen_place_chain_load(
     ctx: &mut FnCtx,
@@ -6714,53 +3343,27 @@ fn codegen_place_chain_load(
                     chain_offset,
                 );
             }
-            Storage::Local { .. } => {
-                // Non-spilled value — fall back to the flat-scalar dance.
-                return codegen_field_access_general_for_chain(ctx, chain, binding_idx);
+            Storage::Local { wasm_start, .. } => {
+                // Non-spilled value: extract the field's flat scalars
+                // directly from the binding's wasm-locals range. The
+                // chain's leaf sits at `flat_chain_offset` scalars past
+                // the start; push exactly its flat width.
+                let flat_off = flat_chain_offset(ctx, chain, binding_idx);
+                let mut leaf_vts: Vec<wasm::ValType> = Vec::new();
+                flatten_rtype(&current_ty, ctx.structs, &mut leaf_vts);
+                let mut k = 0;
+                while k < leaf_vts.len() {
+                    ctx.instructions
+                        .push(wasm::Instruction::LocalGet(*wasm_start + flat_off + k as u32));
+                    k += 1;
+                }
             }
         }
     }
     Ok(current_ty)
 }
 
-fn codegen_field_access_general(ctx: &mut FnCtx, fa: &FieldAccess) -> Result<RType, Error> {
-    // Produce the base value on the stack, then extract the desired field via
-    // the stash-and-restore dance over fresh WASM locals.
-    let base_type = codegen_expr(ctx, &fa.base)?;
-    extract_field_from_stack(ctx, &base_type, &fa.field)
-}
 
-fn codegen_field_access_general_for_chain(
-    ctx: &mut FnCtx,
-    chain: &Vec<String>,
-    binding_idx: usize,
-) -> Result<RType, Error> {
-    // Produce the binding's whole flat value on the stack, then walk the chain
-    // applying extract_field_from_stack at each step.
-    let start = match &ctx.locals[binding_idx].storage {
-        Storage::Local { wasm_start, flat_size } => {
-            let mut k = 0;
-            while k < *flat_size {
-                ctx.instructions
-                    .push(wasm::Instruction::LocalGet(*wasm_start + k));
-                k += 1;
-            }
-            *wasm_start
-        }
-        _ => unreachable!(),
-    };
-    let _ = start;
-    let mut current_ty = ctx.locals[binding_idx].rtype.clone();
-    let mut i = 1;
-    while i < chain.len() {
-        current_ty = match chain[i].parse::<u32>() {
-            Ok(idx) => extract_tuple_elem_from_stack(ctx, &current_ty, idx)?,
-            Err(_) => extract_field_from_stack(ctx, &current_ty, &chain[i])?,
-        };
-        i += 1;
-    }
-    Ok(current_ty)
-}
 
 fn extract_field_from_stack(
     ctx: &mut FnCtx,
@@ -6838,192 +3441,6 @@ fn extract_field_from_stack(
     Ok(field_ty)
 }
 
-fn codegen_borrow(ctx: &mut FnCtx, inner: &Expr, mutable: bool) -> Result<RType, Error> {
-    // `&arr[idx]` / `&mut arr[idx]` — bypass the place-chain
-    // machinery and synthesize the equivalent of
-    // `arr.index(idx)` / `arr.index_mut(idx)`. The method's return
-    // type is already `&Output` / `&mut Output`, which matches what
-    // a borrow is expected to produce.
-    if let ExprKind::Index { base, index, .. } = &inner.kind {
-        let (callee_idx, _ret_rt) = resolve_index_callee(ctx, base, index, mutable);
-        emit_index_recv(ctx, base, mutable)?;
-        codegen_expr(ctx, index)?;
-        ctx.instructions.push(wasm::Instruction::Call(callee_idx));
-        // The wasm result is one i32 — the &Output (or &mut Output).
-        // Recover the pointee type from the typeck's recorded type
-        // for the index expression.
-        let elem_ty = ctx
-            .expr_types[inner.id as usize]
-            .as_ref()
-            .expect("typeck recorded index expr type")
-            .clone();
-        let elem_ty = substitute_rtype(&elem_ty, &ctx.env);
-        return Ok(RType::Ref {
-            inner: Box::new(elem_ty),
-            mutable,
-            lifetime: crate::typeck::LifetimeRepr::Inferred(0),
-        });
-    }
-    // `&*ptr` / `&mut *ptr` is a place borrow (a *re*-borrow, when
-    // `ptr` is a ref; a raw-to-safe transition, when `ptr` is a raw
-    // pointer). The result's address is `ptr`'s value — no value
-    // copy, no fresh slot. Codegen the inner pointer expression
-    // directly and use its i32 as the borrow's address.
-    if let ExprKind::Deref(ptr_expr) = &inner.kind {
-        let ptr_ty = codegen_expr(ctx, ptr_expr)?;
-        let pointee = match ptr_ty {
-            RType::Ref { inner, .. } | RType::RawPtr { inner, .. } => *inner,
-            _ => unreachable!("typeck verified deref target is a ref/raw-ptr"),
-        };
-        return Ok(RType::Ref {
-            inner: Box::new(pointee),
-            mutable,
-            lifetime: crate::typeck::LifetimeRepr::Inferred(0),
-        });
-    }
-    // Non-place inner (e.g. `&42`, `&foo()`): codegen the inner
-    // expression's value, spill to a fresh shadow-stack slot, push
-    // the slot's address. The slot lives until the function exits
-    // (saved-SP epilogue reclaims). This is what a Rust temporary
-    // borrow lowers to.
-    let chain = match extract_place(inner) {
-        Some(c) => c,
-        None => {
-            let inner_ty = codegen_expr(ctx, inner)?;
-            let bytes = byte_size_of(&inner_ty, ctx.structs, ctx.enums);
-            ctx.instructions
-                .push(wasm::Instruction::GlobalGet(SP_GLOBAL));
-            ctx.instructions
-                .push(wasm::Instruction::I32Const(bytes as i32));
-            ctx.instructions.push(wasm::Instruction::I32Sub);
-            ctx.instructions
-                .push(wasm::Instruction::GlobalSet(SP_GLOBAL));
-            let addr_local = ctx.next_wasm_local;
-            ctx.extra_locals.push(wasm::ValType::I32);
-            ctx.next_wasm_local += 1;
-            ctx.instructions
-                .push(wasm::Instruction::GlobalGet(SP_GLOBAL));
-            ctx.instructions.push(wasm::Instruction::LocalSet(addr_local));
-            // The inner's flat scalars are on the wasm stack; store
-            // them at addr_local.
-            store_flat_to_memory(ctx, &inner_ty, BaseAddr::WasmLocal(addr_local), 0);
-            ctx.instructions
-                .push(wasm::Instruction::LocalGet(addr_local));
-            return Ok(RType::Ref {
-                inner: Box::new(inner_ty),
-                mutable,
-                lifetime: crate::typeck::LifetimeRepr::Inferred(0),
-            });
-        }
-    };
-    let mut binding_idx: usize = 0;
-    let mut found = false;
-    let mut k = ctx.locals.len();
-    while k > 0 {
-        k -= 1;
-        if ctx.locals[k].name == chain[0] {
-            binding_idx = k;
-            found = true;
-            break;
-        }
-    }
-    if !found {
-        unreachable!("typeck verified the binding exists");
-    }
-    let root_ty = ctx.locals[binding_idx].rtype.clone();
-    // Borrowing `&r.field…` where r is a ref binding doesn't take r's address —
-    // it takes the *pointee's* field address. The base is r's i32 value, not
-    // SP+frame_offset. (For chain.len() == 1, falls into the SP-relative path
-    // below — `&r` *does* take r's address, producing `&&T`.)
-    let through_ref = matches!(&root_ty, RType::Ref { .. }) && chain.len() >= 2;
-
-    // Walk chain to byte offset + final type.
-    let mut current_ty = if through_ref {
-        match &root_ty {
-            RType::Ref { inner, .. } => (**inner).clone(),
-            _ => unreachable!(),
-        }
-    } else {
-        root_ty.clone()
-    };
-    let mut chain_offset: u32 = 0;
-    let mut i = 1;
-    while i < chain.len() {
-        let (struct_path, struct_args) = match &current_ty {
-            RType::Struct { path, type_args, .. } => (path.clone(), type_args.clone()),
-            _ => unreachable!("typeck verified chain navigates structs"),
-        };
-        let entry = struct_lookup(ctx.structs, &struct_path).expect("resolved struct");
-        let env = make_struct_env(&entry.type_params, &struct_args);
-        let mut field_offset: u32 = 0;
-        let mut j = 0;
-        let mut found_field = false;
-        while j < entry.fields.len() {
-            let fty = substitute_rtype(&entry.fields[j].ty, &env);
-            let s = byte_size_of(&fty, ctx.structs, ctx.enums);
-            if entry.fields[j].name == chain[i] {
-                chain_offset += field_offset;
-                current_ty = fty;
-                found_field = true;
-                break;
-            }
-            field_offset += s;
-            j += 1;
-        }
-        if !found_field {
-            unreachable!("typeck verified the field exists");
-        }
-        i += 1;
-    }
-    if through_ref {
-        // Base address = ref's pointee address (the i32 the ref carries).
-        let base_local = ref_pointee_addr_local(ctx, binding_idx);
-        ctx.instructions
-            .push(wasm::Instruction::LocalGet(base_local));
-        if chain_offset != 0 {
-            ctx.instructions
-                .push(wasm::Instruction::I32Const(chain_offset as i32));
-            ctx.instructions.push(wasm::Instruction::I32Add);
-        }
-    } else {
-        // Let-binding spilled to a fixed frame offset, or a pattern
-        // binding allocated to a shadow-stack slot via MemoryAt.
-        // (Local-storage bindings shouldn't reach here: escape
-        // analysis would have flagged them addressed and forced
-        // spilling at bind time.)
-        match &ctx.locals[binding_idx].storage {
-            Storage::Memory { frame_offset } => {
-                let total = *frame_offset + chain_offset;
-                let fb = ctx.frame_base_local;
-                ctx.instructions
-                    .push(wasm::Instruction::LocalGet(fb));
-                if total != 0 {
-                    ctx.instructions
-                        .push(wasm::Instruction::I32Const(total as i32));
-                    ctx.instructions.push(wasm::Instruction::I32Add);
-                }
-            }
-            Storage::MemoryAt { addr_local } => {
-                ctx.instructions
-                    .push(wasm::Instruction::LocalGet(*addr_local));
-                if chain_offset != 0 {
-                    ctx.instructions
-                        .push(wasm::Instruction::I32Const(chain_offset as i32));
-                    ctx.instructions.push(wasm::Instruction::I32Add);
-                }
-            }
-            Storage::Local { .. } => {
-                unreachable!("escape analysis must have spilled this binding");
-            }
-        }
-    }
-    Ok(RType::Ref {
-        inner: Box::new(current_ty),
-        mutable,
-        // Codegen doesn't track lifetimes — `Inferred(0)` placeholder.
-        lifetime: crate::typeck::LifetimeRepr::Inferred(0),
-    })
-}
 
 // Returns a WASM local whose value is the i32 pointee address held by a ref
 // binding. If the ref is non-spilled (just sits in a local), that's the local
@@ -7059,99 +3476,11 @@ fn ref_pointee_addr_local(ctx: &mut FnCtx, binding_idx: usize) -> u32 {
     }
 }
 
-fn codegen_deref(ctx: &mut FnCtx, inner: &Expr) -> Result<RType, Error> {
-    // Compute the static type of `inner` (without evaluating it
-    // first, so we can dispatch on whether it's a built-in ref/ptr
-    // vs. a smart-pointer that goes through `Deref::deref`).
-    let inner_ty_static = ctx.expr_types[inner.id as usize]
-        .as_ref()
-        .expect("typeck recorded inner type")
-        .clone();
-    let inner_ty_static = substitute_rtype(&inner_ty_static, &ctx.env);
-    match &inner_ty_static {
-        RType::Ref { .. } | RType::RawPtr { .. } => {}
-        _ => return codegen_deref_via_trait(ctx, inner, &inner_ty_static, false),
-    }
-    // Built-in ref/ptr deref: inner produces an i32 address; stash and load.
-    let inner_ty = codegen_expr(ctx, inner)?;
-    let pointee = match &inner_ty {
-        RType::Ref { inner, .. } | RType::RawPtr { inner, .. } => (**inner).clone(),
-        _ => unreachable!("typeck rejects deref of non-reference"),
-    };
-    let addr_local = ctx.next_wasm_local;
-    ctx.extra_locals.push(wasm::ValType::I32);
-    ctx.next_wasm_local += 1;
-    ctx.instructions
-        .push(wasm::Instruction::LocalSet(addr_local));
-    load_flat_from_memory(ctx, &pointee, BaseAddr::WasmLocal(addr_local), 0);
-    Ok(pointee)
-}
 
 // Smart-pointer deref via `Deref::deref(&inner)` (or
 // `DerefMut::deref_mut(&mut inner)` when `mutable` is true). The
 // trait method returns `&Target` / `&mut Target` — an i32 address —
 // from which we then load the Target leaves.
-fn codegen_deref_via_trait(
-    ctx: &mut FnCtx,
-    inner: &Expr,
-    inner_ty_static: &RType,
-    mutable: bool,
-) -> Result<RType, Error> {
-    let trait_path: Vec<String> = if mutable {
-        vec!["std".to_string(), "ops".to_string(), "DerefMut".to_string()]
-    } else {
-        vec!["std".to_string(), "ops".to_string(), "Deref".to_string()]
-    };
-    let method_name = if mutable { "deref_mut" } else { "deref" };
-    let resolution = crate::typeck::solve_impl(&trait_path, inner_ty_static, ctx.traits, 0)
-        .expect("typeck verified Deref impl exists");
-    let cand = crate::typeck::find_trait_impl_method(ctx.funcs, resolution.impl_idx, method_name)
-        .expect("Deref impl provides the trait method");
-    let callee_idx = match cand {
-        crate::typeck::MethodCandidate::Direct(i) => ctx.funcs.entries[i].idx,
-        crate::typeck::MethodCandidate::Template(i) => {
-            let tmpl = &ctx.funcs.templates[i];
-            let mut concrete: Vec<RType> = Vec::new();
-            let mut k = 0;
-            while k < tmpl.type_params.len() {
-                let name = &tmpl.type_params[k];
-                let mut found: Option<RType> = None;
-                let mut j = 0;
-                while j < resolution.subst.len() {
-                    if resolution.subst[j].0 == *name {
-                        found = Some(resolution.subst[j].1.clone());
-                        break;
-                    }
-                    j += 1;
-                }
-                concrete.push(found.expect("impl param bound by subst"));
-                k += 1;
-            }
-            ctx.mono.intern(i, concrete)
-        }
-    };
-    // Resolve the Target type from the impl's binding.
-    let target_rt = crate::typeck::find_assoc_binding(
-        ctx.traits,
-        inner_ty_static,
-        &trait_path,
-        "Target",
-    )
-    .into_iter()
-    .next()
-    .expect("typeck verified Target binding");
-    // Push `&inner` (or `&mut inner`) as the recv, then call.
-    codegen_borrow(ctx, inner, mutable)?;
-    ctx.instructions.push(wasm::Instruction::Call(callee_idx));
-    // Stack: i32 address of Target. Stash and load.
-    let addr_local = ctx.next_wasm_local;
-    ctx.extra_locals.push(wasm::ValType::I32);
-    ctx.next_wasm_local += 1;
-    ctx.instructions
-        .push(wasm::Instruction::LocalSet(addr_local));
-    load_flat_from_memory(ctx, &target_rt, BaseAddr::WasmLocal(addr_local), 0);
-    Ok(target_rt)
-}
 
 // ============================================================================
 // Memory plumbing helpers
@@ -7297,4 +3626,1797 @@ fn load_flat_from_memory(ctx: &mut FnCtx, ty: &RType, base: BaseAddr, base_offse
         ctx.instructions.push(load_instr(&leaves[k], base_offset));
         k += 1;
     }
+}
+
+// ============================================================================
+// Phase 1c step 2: Mono-driven body codegen (initial trivial-only support).
+//
+// Recognized variants: MonoLit (all), Local (lookup against ctx.locals
+// by binding name — same set the AST path uses), Block, Unsafe,
+// Builtin (delegated via a small bridge that lowers args then calls
+// the existing arithmetic emitter), Tuple of length 0 (the unit
+// value). Everything else returns Err so codegen falls back to AST.
+// Broader variant coverage in follow-up turns.
+// ============================================================================
+
+fn mono_codegen_supports(body: &crate::mono::MonoBody) -> bool {
+    let ok = mono_supports_block(&body.body);
+    if !ok && std::env::var("MONO_TRACE_REJECT").is_ok() {
+        let why = first_unsupported_block(&body.body);
+        eprintln!("MONO_REJECT body why={}", why);
+    }
+    ok
+}
+
+fn first_unsupported_block(b: &crate::mono::MonoBlock) -> String {
+    let mut i = 0;
+    while i < b.stmts.len() {
+        if !mono_supports_stmt(&b.stmts[i]) {
+            return first_unsupported_stmt(&b.stmts[i]);
+        }
+        i += 1;
+    }
+    if let Some(t) = &b.tail {
+        if !mono_supports_expr(t) {
+            return first_unsupported_expr(t);
+        }
+    }
+    "<all supported?>".to_string()
+}
+
+fn first_unsupported_stmt(s: &crate::mono::MonoStmt) -> String {
+    use crate::mono::MonoStmt as S;
+    match s {
+        S::Expr(e) => first_unsupported_expr(e),
+        S::Let { value, .. } => first_unsupported_expr(value),
+        S::Assign { place, value, .. } => {
+            if !mono_supports_assign_place(place) {
+                return format!("Assign-place: {}", place_kind_name(place));
+            }
+            first_unsupported_expr(value)
+        }
+        S::LetPattern { pattern, value, .. } => {
+            if !irrefutable_pattern(pattern) {
+                return "LetPattern refutable".to_string();
+            }
+            first_unsupported_expr(value)
+        }
+        _ => "MonoStmt other".to_string(),
+    }
+}
+
+fn place_kind_name(p: &crate::mono::MonoPlace) -> String {
+    use crate::mono::MonoPlaceKind as PK;
+    match &p.kind {
+        PK::Local(_) => "Local".to_string(),
+        PK::Field { base, .. } => format!("Field({})", place_kind_name(base)),
+        PK::TupleIndex { base, .. } => format!("TupleIndex({})", place_kind_name(base)),
+        PK::Deref { inner } => match &inner.kind {
+            crate::mono::MonoExprKind::Local(_, _) => "Deref(Local)".to_string(),
+            other => format!("Deref({})", expr_kind_name(other)),
+        },
+    }
+}
+
+fn expr_kind_name(e: &crate::mono::MonoExprKind) -> &'static str {
+    use crate::mono::MonoExprKind as K;
+    match e {
+        K::Lit(_) => "Lit",
+        K::Local(_, _) => "Local",
+        K::PlaceLoad(_) => "PlaceLoad",
+        K::Borrow { .. } => "Borrow",
+        K::BorrowOfValue { .. } => "BorrowOfValue",
+        K::Call { .. } => "Call",
+        K::MethodCall { .. } => "MethodCall",
+        K::Builtin { .. } => "Builtin",
+        K::StructLit { .. } => "StructLit",
+        K::VariantConstruct { .. } => "VariantConstruct",
+        K::Tuple(_) => "Tuple",
+        K::Cast { .. } => "Cast",
+        K::Match { .. } => "Match",
+        K::Loop { .. } => "Loop",
+        K::Block(_) => "Block",
+        K::Unsafe(_) => "Unsafe",
+        K::Break { .. } => "Break",
+        K::Continue { .. } => "Continue",
+        K::Return { .. } => "Return",
+        K::MacroCall { .. } => "MacroCall",
+    }
+}
+
+fn first_unsupported_expr(e: &crate::mono::MonoExpr) -> String {
+    use crate::mono::MonoExprKind as K;
+    if mono_supports_expr(e) {
+        return "<supported>".to_string();
+    }
+    match &e.kind {
+        K::Lit(_) => "Lit".to_string(),
+        K::Local(_, _) => "Local".to_string(),
+        K::PlaceLoad(p) => format!("PlaceLoad({})", place_kind_name(p)),
+        K::Borrow { place, .. } => format!("Borrow({})", place_kind_name(p_alias(place))),
+        K::BorrowOfValue { value, .. } => format!("BorrowOfValue->{}", first_unsupported_expr(value)),
+        K::Builtin { name, .. } => format!("Builtin({})", name),
+        K::Tuple(elems) => {
+            for el in elems {
+                if !mono_supports_expr(el) {
+                    return format!("Tuple->{}", first_unsupported_expr(el));
+                }
+            }
+            "Tuple".to_string()
+        }
+        K::Call { args, .. } => {
+            for a in args {
+                if !mono_supports_expr(a) {
+                    return format!("Call->{}", first_unsupported_expr(a));
+                }
+            }
+            "Call".to_string()
+        }
+        K::MethodCall { recv, args, .. } => {
+            if !mono_supports_expr(recv) {
+                return format!("MethodCall.recv->{}", first_unsupported_expr(recv));
+            }
+            for a in args {
+                if !mono_supports_expr(a) {
+                    return format!("MethodCall.arg->{}", first_unsupported_expr(a));
+                }
+            }
+            "MethodCall".to_string()
+        }
+        K::StructLit { fields, .. } => {
+            for f in fields {
+                if !mono_supports_expr(f) {
+                    return format!("StructLit->{}", first_unsupported_expr(f));
+                }
+            }
+            "StructLit".to_string()
+        }
+        K::VariantConstruct { payload, .. } => {
+            for p in payload {
+                if !mono_supports_expr(p) {
+                    return format!("VariantConstruct->{}", first_unsupported_expr(p));
+                }
+            }
+            "VariantConstruct".to_string()
+        }
+        K::Match { scrutinee, arms } => {
+            if !mono_supports_expr(scrutinee) {
+                return format!("Match.scrut->{}", first_unsupported_expr(scrutinee));
+            }
+            for arm in arms {
+                if pattern_uses_ref_binding(&arm.pattern) {
+                    return "Match(ref pattern)".to_string();
+                }
+                if let Some(g) = &arm.guard {
+                    if !mono_supports_expr(g) {
+                        return format!("Match.guard->{}", first_unsupported_expr(g));
+                    }
+                }
+                if !mono_supports_expr(&arm.body) {
+                    return format!("Match.body->{}", first_unsupported_expr(&arm.body));
+                }
+            }
+            "Match".to_string()
+        }
+        K::Cast { inner, .. } => format!("Cast->{}", first_unsupported_expr(inner)),
+        K::Block(b) | K::Unsafe(b) => format!("Block->{}", first_unsupported_block(b.as_ref())),
+        K::Loop { body, .. } => format!("Loop->{}", first_unsupported_block(body.as_ref())),
+        K::Break { value, .. } => {
+            if value.is_some() { "Break(value)".to_string() } else { "Break".to_string() }
+        }
+        K::Continue { .. } => "Continue".to_string(),
+        K::Return { .. } => "Return".to_string(),
+        K::MacroCall { name, .. } => format!("MacroCall({})", name),
+    }
+}
+
+fn p_alias(p: &crate::mono::MonoPlace) -> &crate::mono::MonoPlace { p }
+
+fn mono_supports_block(b: &crate::mono::MonoBlock) -> bool {
+    let mut i = 0;
+    while i < b.stmts.len() {
+        if !mono_supports_stmt(&b.stmts[i]) {
+            return false;
+        }
+        i += 1;
+    }
+    match &b.tail {
+        Some(t) => mono_supports_expr(t),
+        None => true,
+    }
+}
+
+fn mono_supports_stmt(s: &crate::mono::MonoStmt) -> bool {
+    match s {
+        crate::mono::MonoStmt::Expr(e) => mono_supports_expr(e),
+        crate::mono::MonoStmt::Let { value, .. } => mono_supports_expr(value),
+        crate::mono::MonoStmt::Assign { place, value, .. } => {
+            mono_supports_assign_place(place) && mono_supports_expr(value)
+        }
+        crate::mono::MonoStmt::LetPattern { pattern, value, else_block, .. } => {
+            // Two shapes:
+            //   - Irrefutable pattern, no else: plain destructure (tuple,
+            //     `let (a, b) = e;`).
+            //   - Refutable pattern + else: `let Some(x) = e else { … };`
+            //     codegen wraps a Block(Block(pattern; Br 1)); else;
+            //     Unreachable; End so the success path falls through
+            //     with bindings in scope.
+            if !mono_supports_expr(value) {
+                return false;
+            }
+            match else_block {
+                None => irrefutable_pattern(pattern),
+                Some(eb) => mono_supports_block(eb.as_ref()),
+            }
+        }
+        _ => false,
+    }
+}
+
+fn irrefutable_pattern(pat: &crate::ast::Pattern) -> bool {
+    use crate::ast::PatternKind;
+    match &pat.kind {
+        PatternKind::Wildcard
+        | PatternKind::Binding { .. } => true,
+        PatternKind::At { inner, .. } => irrefutable_pattern(inner),
+        PatternKind::Tuple(elems) => elems.iter().all(irrefutable_pattern),
+        PatternKind::Ref { inner, .. } => irrefutable_pattern(inner),
+        // Variants/lits/ranges are refutable; struct patterns *might*
+        // be irrefutable (only one variant) but we conservatively
+        // reject. or-patterns are refutable.
+        _ => false,
+    }
+}
+
+// Place support specific to assignment LHS. Same conditions as
+// `mono_supports_place` — codegen_mono_assign now handles all three
+// underlying shapes (Local, Memory/MemoryAt-rooted chain via address
+// path, Storage::Local-rooted chain via flat-offset LocalSet path).
+fn mono_supports_assign_place(p: &crate::mono::MonoPlace) -> bool {
+    mono_supports_place(p)
+}
+
+fn mono_supports_expr(e: &crate::mono::MonoExpr) -> bool {
+    use crate::mono::MonoExprKind as K;
+    match &e.kind {
+        K::Lit(_) => true,
+        K::Local(_, _) => true,
+        K::Block(b) | K::Unsafe(b) => mono_supports_block(b.as_ref()),
+        K::Builtin { name, args, .. } => {
+            if !mono_supports_builtin(name) {
+                return false;
+            }
+            let mut i = 0;
+            while i < args.len() {
+                if !mono_supports_expr(&args[i]) {
+                    return false;
+                }
+                i += 1;
+            }
+            true
+        }
+        K::Tuple(elems) => {
+            let mut i = 0;
+            while i < elems.len() {
+                if !mono_supports_expr(&elems[i]) {
+                    return false;
+                }
+                i += 1;
+            }
+            true
+        }
+        K::Call { args, .. } => {
+            let mut i = 0;
+            while i < args.len() {
+                if !mono_supports_expr(&args[i]) {
+                    return false;
+                }
+                i += 1;
+            }
+            true
+        }
+        K::MethodCall { recv, args, .. } => {
+            if !mono_supports_expr(recv) {
+                return false;
+            }
+            let mut i = 0;
+            while i < args.len() {
+                if !mono_supports_expr(&args[i]) {
+                    return false;
+                }
+                i += 1;
+            }
+            true
+        }
+        K::Borrow { place, .. } => mono_supports_place(place),
+        K::BorrowOfValue { value, .. } => mono_supports_expr(value),
+        K::PlaceLoad(p) => mono_supports_place(p),
+        K::StructLit { fields, .. } => {
+            let mut i = 0;
+            while i < fields.len() {
+                if !mono_supports_expr(&fields[i]) {
+                    return false;
+                }
+                i += 1;
+            }
+            true
+        }
+        K::Cast { inner, .. } => mono_supports_expr(inner),
+        K::VariantConstruct { payload, .. } => {
+            let mut i = 0;
+            while i < payload.len() {
+                if !mono_supports_expr(&payload[i]) {
+                    return false;
+                }
+                i += 1;
+            }
+            true
+        }
+        K::Match { scrutinee, arms } => {
+            if !mono_supports_expr(scrutinee) {
+                return false;
+            }
+            let mut i = 0;
+            while i < arms.len() {
+                let arm = &arms[i];
+                if arm.guard.is_some() {
+                    if let Some(g) = &arm.guard {
+                        if !mono_supports_expr(g) {
+                            return false;
+                        }
+                    }
+                }
+                if !mono_supports_expr(&arm.body) {
+                    return false;
+                }
+                i += 1;
+            }
+            true
+        }
+        // Loop with no break-with-value (the body's tail must be
+        // unit-typed). The post-lowering loop result type is `()` for
+        // the lowered while/for shape; `loop { break X }` (which yields
+        // X) needs a multi-valued BlockType and isn't supported yet.
+        K::Loop { body, .. } => {
+            // Body's stmts and tail (if any) must all be Mono-supported.
+            mono_supports_block(body.as_ref())
+        }
+        // Break / Continue: only no-value forms (typed `!`). `break X`
+        // pairs with a value-producing loop, deferred.
+        K::Break { value, .. } => value.is_none(),
+        K::Continue { .. } => true,
+        K::Return { value } => match value {
+            Some(v) => mono_supports_expr(v),
+            None => true,
+        },
+        K::MacroCall { name, args } => name == "panic" && args.iter().all(mono_supports_expr),
+        _ => false,
+    }
+}
+
+fn mono_supports_place(p: &crate::mono::MonoPlace) -> bool {
+    use crate::mono::MonoPlaceKind as PK;
+    match &p.kind {
+        PK::Local(_) => true,
+        PK::Field { base, .. } | PK::TupleIndex { base, .. } => mono_supports_place(base),
+        // Deref's inner evaluates to the address — codegen
+        // (`emit_place_address`'s Deref arm) lowers `inner` and adds
+        // any accumulated field offset. That works iff `inner`'s value
+        // IS an address: i.e., the inner has type `&T` / `*T` (a single
+        // i32). For value-typed inners (e.g. a Call returning a struct
+        // value), the inner pushes flat scalars instead, and the chain
+        // miscompiles. Gate on inner type being Ref/RawPtr — anything
+        // single-i32 — AND on the inner expr being supported by Mono.
+        PK::Deref { inner } => {
+            if !matches!(&inner.ty, RType::Ref { .. } | RType::RawPtr { .. }) {
+                return false;
+            }
+            mono_supports_expr(inner)
+        }
+    }
+}
+
+fn codegen_mono_block(
+    ctx: &mut FnCtx,
+    block: &crate::mono::MonoBlock,
+) -> Result<(), Error> {
+    // Function-body codegen: emit stmts + tail. No drop emission —
+    // the function epilogue handles drops for ALL ctx.locals
+    // (including these stmts' lets) at function end.
+    let mut i = 0;
+    while i < block.stmts.len() {
+        codegen_mono_stmt(ctx, &block.stmts[i])?;
+        i += 1;
+    }
+    if let Some(tail) = &block.tail {
+        codegen_mono_expr(ctx, tail)?;
+    }
+    Ok(())
+}
+
+// Codegen for a value-producing inner Block expression (mirrors
+// AST's codegen_block_expr). Saves a `mark` of ctx.locals.len() at
+// entry; processes stmts (which may push to ctx.locals); processes
+// tail; then emits drops for any bindings introduced [mark..end] —
+// preserving the tail value across the drops by stashing it to
+// fresh wasm locals. Finally truncates ctx.locals back to `mark`.
+fn codegen_mono_block_expr(
+    ctx: &mut FnCtx,
+    block: &crate::mono::MonoBlock,
+) -> Result<(), Error> {
+    let mark = ctx.locals.len();
+    let mut i = 0;
+    while i < block.stmts.len() {
+        codegen_mono_stmt(ctx, &block.stmts[i])?;
+        i += 1;
+    }
+    let tail_ty = match &block.tail {
+        Some(tail) => {
+            codegen_mono_expr(ctx, tail)?;
+            tail.ty.clone()
+        }
+        None => RType::Tuple(Vec::new()),
+    };
+    // Save tail value to fresh locals before emitting drops.
+    let mut tail_flat: Vec<wasm::ValType> = Vec::new();
+    flatten_rtype(&tail_ty, ctx.structs, &mut tail_flat);
+    if !tail_flat.is_empty() {
+        let save_start = ctx.next_wasm_local;
+        let mut k = 0;
+        while k < tail_flat.len() {
+            ctx.extra_locals.push(tail_flat[k].copy());
+            ctx.next_wasm_local += 1;
+            k += 1;
+        }
+        let mut k = tail_flat.len();
+        while k > 0 {
+            k -= 1;
+            ctx.instructions
+                .push(wasm::Instruction::LocalSet(save_start + k as u32));
+        }
+        emit_drops_for_locals_range(ctx, mark, ctx.locals.len())?;
+        let mut k = 0;
+        while k < tail_flat.len() {
+            ctx.instructions
+                .push(wasm::Instruction::LocalGet(save_start + k as u32));
+            k += 1;
+        }
+    } else {
+        emit_drops_for_locals_range(ctx, mark, ctx.locals.len())?;
+    }
+    ctx.locals.truncate(mark);
+    Ok(())
+}
+
+fn codegen_mono_stmt(
+    ctx: &mut FnCtx,
+    stmt: &crate::mono::MonoStmt,
+) -> Result<(), Error> {
+    match stmt {
+        crate::mono::MonoStmt::Expr(e) => {
+            codegen_mono_expr(ctx, e)?;
+            // Statement-position expr: drop its value if any.
+            let mut vts: Vec<wasm::ValType> = Vec::new();
+            flatten_rtype(&e.ty, ctx.structs, &mut vts);
+            let mut k = 0;
+            while k < vts.len() {
+                ctx.instructions.push(wasm::Instruction::Drop);
+                k += 1;
+            }
+            Ok(())
+        }
+        crate::mono::MonoStmt::Let { binding, value, .. } => {
+            // Look up the binding's MonoLocal info from mono_body.
+            let mono_body = ctx.mono_body
+                .expect("Mono codegen invoked without ctx.mono_body set");
+            let local = &mono_body.locals[*binding as usize];
+            // Pick storage:
+            //   - LetValue(id): use the layout pass's pre-computed
+            //     `let_storage[id]` (Memory if escape-analyzed addressed,
+            //     Local otherwise).
+            //   - Synthesized(_): no AST let_stmt → no `let_storage`
+            //     entry. Conservatively allocate a dynamic shadow-stack
+            //     slot (Memory) so taking `&__synth` works for cases like
+            //     for-loop's `&mut __iter`. Function epilogue restores SP
+            //     so the slot is reclaimed at fn end.
+            //   - Pattern(_): pattern-bound; doesn't appear as a
+            //     MonoStmt::Let (codegen_pattern handles those via
+            //     bind_pattern_value at match-arm time).
+            let storage_kind = match &local.origin {
+                crate::mono::BindingOrigin::LetValue(id) => {
+                    let value_id = *id as usize;
+                    match ctx.let_storage[value_id] {
+                        Some(k) => k,
+                        None => return Err(Error {
+                            file: String::new(),
+                            message: format!(
+                                "codegen_mono_stmt: no let_storage for value_id={}",
+                                value_id
+                            ),
+                            span: value.span.copy(),
+                        }),
+                    }
+                }
+                crate::mono::BindingOrigin::Synthesized(_) => {
+                    let bytes = byte_size_of(&local.ty, ctx.structs, ctx.enums);
+                    ctx.instructions.push(wasm::Instruction::GlobalGet(SP_GLOBAL));
+                    ctx.instructions.push(wasm::Instruction::I32Const(bytes as i32));
+                    ctx.instructions.push(wasm::Instruction::I32Sub);
+                    ctx.instructions.push(wasm::Instruction::GlobalSet(SP_GLOBAL));
+                    let addr_local = ctx.next_wasm_local;
+                    ctx.extra_locals.push(wasm::ValType::I32);
+                    ctx.next_wasm_local += 1;
+                    ctx.instructions.push(wasm::Instruction::GlobalGet(SP_GLOBAL));
+                    ctx.instructions.push(wasm::Instruction::LocalSet(addr_local));
+                    let name = local.name.clone();
+                    let ty = local.ty.clone();
+                    let drop_action = crate::layout::compute_drop_action(
+                        &name, &ty, &ctx.moved_places, ctx.traits,
+                    );
+                    codegen_mono_expr(ctx, value)?;
+                    store_flat_to_memory(ctx, &ty, BaseAddr::WasmLocal(addr_local), 0);
+                    ctx.locals.push(LocalBinding {
+                        name: name.clone(),
+                        rtype: ty.clone(),
+                        storage: Storage::MemoryAt { addr_local },
+                        drop_action,
+                    });
+                    ctx.mono_binding_to_local[*binding as usize] =
+                        Some(ctx.locals.len() as u32 - 1);
+                    if matches!(drop_action, crate::layout::DropAction::Flagged) {
+                        let flag_idx = ctx.next_wasm_local;
+                        ctx.extra_locals.push(wasm::ValType::I32);
+                        ctx.next_wasm_local += 1;
+                        ctx.drop_flags.push((name, flag_idx));
+                        ctx.instructions.push(wasm::Instruction::I32Const(1));
+                        ctx.instructions.push(wasm::Instruction::LocalSet(flag_idx));
+                    }
+                    return Ok(());
+                }
+                _ => return Err(Error {
+                    file: String::new(),
+                    message: format!(
+                        "codegen_mono_stmt: Let binding `{}` has unexpected origin",
+                        local.name
+                    ),
+                    span: value.span.copy(),
+                }),
+            };
+            let name = local.name.clone();
+            let ty = local.ty.clone();
+            // Compute drop_action for the binding.
+            let drop_action = crate::layout::compute_drop_action(
+                &name,
+                &ty,
+                &ctx.moved_places,
+                ctx.traits,
+            );
+            // Emit the value (pushes flat scalars).
+            codegen_mono_expr(ctx, value)?;
+            // Store into the binding's storage and push LocalBinding.
+            // Record BindingId → ctx.locals position so subsequent
+            // Local(binding_id) lookups resolve correctly.
+            match storage_kind {
+                BindingStorageKind::Memory { frame_offset } => {
+                    store_flat_to_memory(ctx, &ty, BaseAddr::StackPointer, frame_offset);
+                    ctx.locals.push(LocalBinding {
+                        name: name.clone(),
+                        rtype: ty.clone(),
+                        storage: Storage::Memory { frame_offset },
+                        drop_action,
+                    });
+                }
+                BindingStorageKind::Local => {
+                    let mut vts: Vec<wasm::ValType> = Vec::new();
+                    flatten_rtype(&ty, ctx.structs, &mut vts);
+                    let flat_size = vts.len() as u32;
+                    let start = ctx.next_wasm_local;
+                    let mut k = 0;
+                    while k < vts.len() {
+                        ctx.extra_locals.push(vts[k].copy());
+                        ctx.next_wasm_local += 1;
+                        k += 1;
+                    }
+                    let mut k = 0;
+                    while k < flat_size {
+                        ctx.instructions
+                            .push(wasm::Instruction::LocalSet(start + flat_size - 1 - k));
+                        k += 1;
+                    }
+                    ctx.locals.push(LocalBinding {
+                        name: name.clone(),
+                        rtype: ty.clone(),
+                        storage: Storage::Local { wasm_start: start, flat_size },
+                        drop_action,
+                    });
+                }
+                BindingStorageKind::MemoryAt => {
+                    return Err(Error {
+                        file: String::new(),
+                        message: "codegen_mono_stmt: Let with MemoryAt storage not yet supported".to_string(),
+                        span: value.span.copy(),
+                    });
+                }
+            }
+            ctx.mono_binding_to_local[*binding as usize] = Some(ctx.locals.len() as u32 - 1);
+            // Drop flag allocation for Flagged bindings.
+            if matches!(drop_action, crate::layout::DropAction::Flagged) {
+                let flag_idx = ctx.next_wasm_local;
+                ctx.extra_locals.push(wasm::ValType::I32);
+                ctx.next_wasm_local += 1;
+                ctx.drop_flags.push((name, flag_idx));
+                ctx.instructions.push(wasm::Instruction::I32Const(1));
+                ctx.instructions.push(wasm::Instruction::LocalSet(flag_idx));
+            }
+            Ok(())
+        }
+        crate::mono::MonoStmt::Assign { place, value, .. } => {
+            codegen_mono_assign(ctx, place, value)
+        }
+        crate::mono::MonoStmt::LetPattern { pattern, value, else_block, .. } => {
+            // Codegen value (pushes flat scalars), stash to wasm
+            // locals for stable read, then reuse codegen_pattern to
+            // bind each leaf into ctx.locals. Map BindingIds (allocated
+            // by lowering's declare_pattern_bindings) to ctx.locals
+            // positions so subsequent Local(BindingId) references
+            // resolve.
+            codegen_mono_expr(ctx, value)?;
+            let value_ty = value.ty.clone();
+            // For ref bindings (`let &x = …` / `let Some(ref x) = …
+            // else { … }`), the binding takes the scrutinee's address —
+            // requires a stable Memory storage. For value bindings,
+            // wasm-locals stash is enough.
+            let is_enum_scrut = matches!(&value_ty, RType::Enum { .. });
+            let needs_ref_spill = !is_enum_scrut && pattern_uses_ref_binding(pattern);
+            let storage = if needs_ref_spill {
+                spill_match_scrutinee(ctx, &value_ty)
+            } else {
+                stash_match_scrutinee(ctx, &value_ty)
+            };
+            let mark = ctx.locals.len();
+            match else_block {
+                None => {
+                    // Irrefutable: no_match_target unused.
+                    codegen_pattern(ctx, pattern, &value_ty, &storage, 0)?;
+                    let mut next_pos: usize = mark;
+                    map_arm_pattern_bindings(ctx, pattern, &mut next_pos);
+                }
+                Some(eb) => {
+                    // Refutable + diverging else, mirroring AST
+                    // codegen_let_else:
+                    //   Block (outer / success target)
+                    //     Block (inner / no-match target)
+                    //       <pattern test>      ; on no-match, Br 0 to inner end
+                    //       Br 1                ; success → outer end
+                    //     End                   ; close inner
+                    //     <else block>          ; diverges
+                    //     Unreachable
+                    //   End                     ; close outer; bindings live
+                    ctx.instructions.push(wasm::Instruction::Block(wasm::BlockType::Empty));
+                    ctx.instructions.push(wasm::Instruction::Block(wasm::BlockType::Empty));
+                    codegen_pattern(ctx, pattern, &value_ty, &storage, 0)?;
+                    ctx.instructions.push(wasm::Instruction::Br(1));
+                    ctx.instructions.push(wasm::Instruction::End); // close inner
+                    // Else block runs and must diverge (typeck-verified).
+                    // Emit it as a value-producing block expr; the value
+                    // (a `!`-typed result, no scalars) is discarded.
+                    codegen_mono_block_expr(ctx, eb.as_ref())?;
+                    ctx.instructions.push(wasm::Instruction::Unreachable);
+                    ctx.instructions.push(wasm::Instruction::End); // close outer
+                    let mut next_pos: usize = mark;
+                    map_arm_pattern_bindings(ctx, pattern, &mut next_pos);
+                }
+            }
+            Ok(())
+        }
+        _ => Err(Error {
+            file: String::new(),
+            message: "codegen_mono_stmt: variant not yet supported".to_string(),
+            span: crate::span::Span::new(
+                crate::span::Pos::new(1, 1),
+                crate::span::Pos::new(1, 1),
+            ),
+        }),
+    }
+}
+
+// Assign a value to a MonoPlace. Three paths:
+//   1. Local-rooted with Storage::Local: write directly via LocalSet.
+//   2. Field/TupleIndex chain bottoming at Local with Storage::Local:
+//      compute flat-scalar offset within the binding, write via LocalSet
+//      to that range.
+//   3. Anything else: get the place's address into a wasm local, then
+//      store_flat_to_memory.
+fn codegen_mono_assign(
+    ctx: &mut FnCtx,
+    place: &crate::mono::MonoPlace,
+    value: &crate::mono::MonoExpr,
+) -> Result<(), Error> {
+    use crate::mono::MonoPlaceKind as PK;
+    // Path 1: simple Local Storage::Local.
+    if let PK::Local(id) = &place.kind {
+        let local_idx = ctx.mono_binding_to_local[*id as usize]
+            .expect("BindingId without ctx.locals mapping") as usize;
+        if let Storage::Local { wasm_start, flat_size } = ctx.locals[local_idx].storage {
+            codegen_mono_expr(ctx, value)?;
+            let mut k = 0;
+            while k < flat_size {
+                ctx.instructions
+                    .push(wasm::Instruction::LocalSet(wasm_start + flat_size - 1 - k));
+                k += 1;
+            }
+            return Ok(());
+        }
+    }
+    // Path 2: Field/TupleIndex chain bottoming at Local Storage::Local.
+    if let Some((wasm_start, flat_off)) = mono_place_to_local_storage_offset(ctx, place) {
+        let mut vts: Vec<wasm::ValType> = Vec::new();
+        flatten_rtype(&place.ty, ctx.structs, &mut vts);
+        let flat_size = vts.len() as u32;
+        codegen_mono_expr(ctx, value)?;
+        let start = wasm_start + flat_off;
+        let mut k = 0;
+        while k < flat_size {
+            ctx.instructions
+                .push(wasm::Instruction::LocalSet(start + flat_size - 1 - k));
+            k += 1;
+        }
+        return Ok(());
+    }
+    // Path 3: general — stash address, store_flat_to_memory.
+    emit_place_address(ctx, place);
+    let addr_local = ctx.next_wasm_local;
+    ctx.extra_locals.push(wasm::ValType::I32);
+    ctx.next_wasm_local += 1;
+    ctx.instructions.push(wasm::Instruction::LocalSet(addr_local));
+    codegen_mono_expr(ctx, value)?;
+    store_flat_to_memory(ctx, &place.ty, BaseAddr::WasmLocal(addr_local), 0);
+    Ok(())
+}
+
+// If `place` is a Field/TupleIndex chain bottoming at a Local-rooted
+// binding with Storage::Local, return `(wasm_start, flat_offset)`
+// where `flat_offset` is the flat-scalar offset of the chain's leaf
+// within the binding's flat representation. Returns None for any
+// other shape (Local-only, chain bottoming at Local Memory/MemoryAt,
+// chain bottoming at Deref).
+fn mono_place_to_local_storage_offset(
+    ctx: &FnCtx,
+    place: &crate::mono::MonoPlace,
+) -> Option<(u32, u32)> {
+    use crate::mono::MonoPlaceKind as PK;
+    // Reject if not a Field/TupleIndex chain.
+    if !matches!(&place.kind, PK::Field { .. } | PK::TupleIndex { .. }) {
+        return None;
+    }
+    // Build chain of names + find root binding.
+    let mut chain_rev: Vec<String> = Vec::new();
+    let mut p = place;
+    loop {
+        match &p.kind {
+            PK::Local(id) => {
+                let local_idx = ctx.mono_binding_to_local[*id as usize]? as usize;
+                let wasm_start = match &ctx.locals[local_idx].storage {
+                    Storage::Local { wasm_start, .. } => *wasm_start,
+                    _ => return None,
+                };
+                chain_rev.push(ctx.locals[local_idx].name.clone());
+                let mut chain: Vec<String> = chain_rev.into_iter().rev().collect();
+                // Move chain[0] (the leaf segment) to the start; we
+                // collected leaf-first then reversed, so chain is now
+                // root-first. flat_chain_offset wants [root, ..., leaf].
+                // Wait — our collection was [field2, field1, root];
+                // reversed gives [root, field1, field2]. That matches
+                // flat_chain_offset's expectation.
+                let _ = &mut chain; // silence "unused mut" if any
+                let flat_off = flat_chain_offset(ctx, &chain, local_idx);
+                return Some((wasm_start, flat_off));
+            }
+            PK::Field { base, field_name, .. } => {
+                chain_rev.push(field_name.clone());
+                p = base;
+            }
+            PK::TupleIndex { base, index, .. } => {
+                chain_rev.push(format!("{}", index));
+                p = base;
+            }
+            PK::Deref { .. } => return None,
+        }
+    }
+}
+
+fn codegen_mono_expr(
+    ctx: &mut FnCtx,
+    expr: &crate::mono::MonoExpr,
+) -> Result<(), Error> {
+    use crate::mono::MonoExprKind as K;
+    match &expr.kind {
+        K::Lit(lit) => codegen_mono_lit(ctx, lit, &expr.ty),
+        K::Local(binding_id, src_node_id) => {
+            // Look up via the BindingId → ctx.locals map. The map is
+            // populated for params at function entry and updated by
+            // Let codegen as bindings come into scope.
+            let local_idx = match ctx.mono_binding_to_local
+                .get(*binding_id as usize)
+                .and_then(|o| *o)
+            {
+                Some(idx) => idx as usize,
+                None => return Err(Error {
+                    file: String::new(),
+                    message: format!(
+                        "codegen_mono_expr: no ctx.locals mapping for BindingId {}",
+                        binding_id
+                    ),
+                    span: expr.span.copy(),
+                }),
+            };
+            emit_local_value_load(ctx, local_idx);
+            // If borrowck recorded a whole-binding move at this read
+            // site (`MaybeMoved` semantics), clear the binding's drop
+            // flag so the scope-end drop is skipped on this path. Synth
+            // Locals (try-op arm bodies, etc.) carry `src_node_id =
+            // u32::MAX` and never match a real move site.
+            if *src_node_id != u32::MAX {
+                let name = ctx.locals[local_idx].name.clone();
+                if is_move_site(&ctx.move_sites, *src_node_id, &name) {
+                    if let Some(flag_idx) = lookup_drop_flag(&ctx.drop_flags, &name) {
+                        ctx.instructions.push(wasm::Instruction::I32Const(0));
+                        ctx.instructions.push(wasm::Instruction::LocalSet(flag_idx));
+                    }
+                }
+            }
+            Ok(())
+        }
+        K::Block(b) | K::Unsafe(b) => codegen_mono_block_expr(ctx, b.as_ref()),
+        K::Builtin { name, type_args, args } => {
+            // Lower args first (each pushes its value onto wasm stack).
+            let mut i = 0;
+            while i < args.len() {
+                codegen_mono_expr(ctx, &args[i])?;
+                i += 1;
+            }
+            emit_simple_builtin(ctx, name, type_args, &expr.ty)
+        }
+        K::Tuple(elems) => {
+            // Empty tuple → unit value (no output). Non-empty: push
+            // each element's value in order; the tuple's flat
+            // representation is the concatenation of element
+            // representations.
+            let mut i = 0;
+            while i < elems.len() {
+                codegen_mono_expr(ctx, &elems[i])?;
+                i += 1;
+            }
+            Ok(())
+        }
+        K::Call { wasm_idx, args } => {
+            // sret allocation for enum-returning callees.
+            let returns_enum = matches!(&expr.ty, RType::Enum { .. });
+            if returns_enum {
+                emit_sret_alloc(ctx, &expr.ty);
+            }
+            let mut i = 0;
+            while i < args.len() {
+                codegen_mono_expr(ctx, &args[i])?;
+                i += 1;
+            }
+            ctx.instructions.push(wasm::Instruction::Call(*wasm_idx));
+            Ok(())
+        }
+        K::MethodCall { wasm_idx, recv_adjust, recv, args } => {
+            let returns_enum = matches!(&expr.ty, RType::Enum { .. });
+            if returns_enum {
+                emit_sret_alloc(ctx, &expr.ty);
+            }
+            // Receiver: codegen the recv expression, possibly with implicit
+            // borrow per recv_adjust. For Move and ByRef, pass through.
+            // For BorrowImm/BorrowMut: prefer to push the recv's place
+            // address. If the recv isn't a place expression and the
+            // borrow is BorrowImm (read-only), materialize the value
+            // into a fresh shadow-stack slot and push its address.
+            // BorrowMut requires the recv to be a real place — typeck
+            // rejects `&mut value-expr` so this case shouldn't arise.
+            match recv_adjust {
+                ReceiverAdjust::Move | ReceiverAdjust::ByRef => {
+                    codegen_mono_expr(ctx, recv)?;
+                }
+                ReceiverAdjust::BorrowImm => {
+                    let mut scratch: Option<crate::mono::MonoPlace> = None;
+                    match mono_expr_as_place(recv, &mut scratch) {
+                        Ok(place) => emit_place_address(ctx, place),
+                        Err(_) => emit_materialize_as_address(ctx, recv)?,
+                    }
+                }
+                ReceiverAdjust::BorrowMut => {
+                    let mut scratch: Option<crate::mono::MonoPlace> = None;
+                    let place = mono_expr_as_place(recv, &mut scratch)?;
+                    emit_place_address(ctx, place);
+                }
+            }
+            let mut i = 0;
+            while i < args.len() {
+                codegen_mono_expr(ctx, &args[i])?;
+                i += 1;
+            }
+            ctx.instructions.push(wasm::Instruction::Call(*wasm_idx));
+            Ok(())
+        }
+        K::Borrow { place, .. } => {
+            emit_place_address(ctx, place);
+            Ok(())
+        }
+        K::BorrowOfValue { value, .. } => {
+            // Materialize the value into a fresh shadow-stack slot,
+            // push the slot's address. Mirrors codegen_borrow's
+            // "non-place inner" path.
+            codegen_mono_expr(ctx, value)?;
+            let bytes = byte_size_of(&value.ty, ctx.structs, ctx.enums);
+            // __sp -= bytes
+            ctx.instructions.push(wasm::Instruction::GlobalGet(SP_GLOBAL));
+            ctx.instructions.push(wasm::Instruction::I32Const(bytes as i32));
+            ctx.instructions.push(wasm::Instruction::I32Sub);
+            ctx.instructions.push(wasm::Instruction::GlobalSet(SP_GLOBAL));
+            // Cache the slot's address.
+            let addr_local = ctx.next_wasm_local;
+            ctx.extra_locals.push(wasm::ValType::I32);
+            ctx.next_wasm_local += 1;
+            ctx.instructions.push(wasm::Instruction::GlobalGet(SP_GLOBAL));
+            ctx.instructions.push(wasm::Instruction::LocalSet(addr_local));
+            // Store value (already on stack) into the slot.
+            store_flat_to_memory(ctx, &value.ty, BaseAddr::WasmLocal(addr_local), 0);
+            // Push the slot's address as the borrow's result.
+            ctx.instructions.push(wasm::Instruction::LocalGet(addr_local));
+            Ok(())
+        }
+        K::PlaceLoad(place) => {
+            codegen_mono_place_load(ctx, place);
+            Ok(())
+        }
+        K::StructLit { fields, .. } => {
+            // Emit each field's value in declared order. The struct's
+            // flat representation is the concatenation of field
+            // representations, so codegenning each field's value pushes
+            // the right scalars in the right order.
+            let mut i = 0;
+            while i < fields.len() {
+                codegen_mono_expr(ctx, &fields[i])?;
+                i += 1;
+            }
+            Ok(())
+        }
+        K::VariantConstruct { enum_path, type_args, disc, payload } => {
+            codegen_mono_variant_construct(ctx, enum_path, type_args, *disc, payload, &expr.ty)
+        }
+        K::Match { scrutinee, arms } => {
+            codegen_mono_match(ctx, scrutinee, arms, &expr.ty)
+        }
+        K::Cast { inner, target } => {
+            let src_ty = inner.ty.clone();
+            codegen_mono_expr(ctx, inner)?;
+            // Mirror codegen_expr's Cast handling: integer/char
+            // conversions emit wasm conversion ops; raw-ptr → int and
+            // vice versa share the i32 representation but route through
+            // emit_int_to_int_cast for width changes.
+            match (&src_ty, target) {
+                (RType::Int(src_k), RType::Int(tgt_k)) => {
+                    emit_int_to_int_cast(ctx, src_k, tgt_k);
+                }
+                (RType::RawPtr { .. }, RType::Int(tgt_k)) => {
+                    emit_int_to_int_cast(ctx, &IntKind::Usize, tgt_k);
+                }
+                (RType::Char, RType::Int(tgt_k)) => {
+                    emit_int_to_int_cast(ctx, &IntKind::U32, tgt_k);
+                }
+                (RType::Int(src_k), RType::Char) => {
+                    emit_int_to_int_cast(ctx, src_k, &IntKind::U32);
+                }
+                (RType::Int(src_k), RType::RawPtr { .. }) => {
+                    emit_int_to_int_cast(ctx, src_k, &IntKind::Usize);
+                }
+                (RType::Bool, RType::Int(tgt_k)) => {
+                    emit_int_to_int_cast(ctx, &IntKind::U32, tgt_k);
+                }
+                (RType::RawPtr { .. }, RType::RawPtr { .. })
+                | (RType::Ref { .. }, RType::RawPtr { .. })
+                | (RType::Ref { .. }, RType::Ref { .. }) => {
+                    // All flatten to i32; no wasm conversion needed.
+                }
+                _ => return Err(Error {
+                    file: String::new(),
+                    message: "codegen_mono_expr: unsupported Cast source/target combination".to_string(),
+                    span: expr.span.copy(),
+                }),
+            }
+            Ok(())
+        }
+        K::Loop { label, body } => {
+            // Mirrors codegen_while_expr's Block(Loop(...)) shape, but
+            // without the cond/eqz/BrIf prefix (a `loop` runs forever
+            // until break). Result type is `()` — `loop { break X; }`
+            // (value-producing) needs multi-valued BlockType and is
+            // gated out by mono_supports_expr.
+            let outer_depth = current_cf_depth(ctx);
+            let locals_at_entry = ctx.locals.len();
+            ctx.instructions.push(wasm::Instruction::Block(wasm::BlockType::Empty));
+            ctx.instructions.push(wasm::Instruction::Loop(wasm::BlockType::Empty));
+            ctx.loops.push(LoopCgFrame {
+                label: label.clone(),
+                break_depth: outer_depth,
+                continue_depth: outer_depth + 1,
+                locals_len_at_entry: locals_at_entry,
+            });
+            // Run body as a block-expr so per-iteration locals get
+            // dropped at the end of each iteration.
+            codegen_mono_block_expr(ctx, body.as_ref())?;
+            ctx.loops.pop();
+            ctx.instructions.push(wasm::Instruction::Br(0));
+            ctx.instructions.push(wasm::Instruction::End); // close Loop
+            ctx.instructions.push(wasm::Instruction::End); // close Block
+            Ok(())
+        }
+        K::Break { label, value } => {
+            if value.is_some() {
+                return Err(Error {
+                    file: String::new(),
+                    message: "codegen_mono_expr: break-with-value not yet supported".to_string(),
+                    span: expr.span.copy(),
+                });
+            }
+            let (frame_idx, locals_at_entry) =
+                find_loop_frame(ctx, label.as_deref())
+                    .expect("typeck verified break has a target");
+            let break_depth = ctx.loops[frame_idx].break_depth;
+            emit_drops_for_locals_range(ctx, locals_at_entry, ctx.locals.len())?;
+            let cur = current_cf_depth(ctx);
+            let br_idx = cur.saturating_sub(break_depth + 1);
+            ctx.instructions.push(wasm::Instruction::Br(br_idx));
+            Ok(())
+        }
+        K::Continue { label } => {
+            let (frame_idx, locals_at_entry) =
+                find_loop_frame(ctx, label.as_deref())
+                    .expect("typeck verified continue has a target");
+            let continue_depth = ctx.loops[frame_idx].continue_depth;
+            emit_drops_for_locals_range(ctx, locals_at_entry, ctx.locals.len())?;
+            let cur = current_cf_depth(ctx);
+            let br_idx = cur.saturating_sub(continue_depth + 1);
+            ctx.instructions.push(wasm::Instruction::Br(br_idx));
+            Ok(())
+        }
+        // `return EXPR;` / `return;`. Mirrors AST `codegen_return`:
+        //   1. codegen the value (or skip for unit)
+        //   2. stash flat scalars into fresh wasm locals (so drops don't
+        //      disturb the value)
+        //   3. drop every in-scope binding (whole `ctx.locals`)
+        //   4. for sret: memcpy bytes to the sret slot, push sret_ptr;
+        //      otherwise push the stashed scalars back
+        //   5. restore SP from `fn_entry_sp_local`
+        //   6. emit wasm `Return`
+        K::Return { value } => {
+            if let Some(v) = value {
+                codegen_mono_expr(ctx, v)?;
+            }
+            let return_flat = ctx.return_flat.clone();
+            let save_start = ctx.next_wasm_local;
+            let mut i = 0;
+            while i < return_flat.len() {
+                ctx.extra_locals.push(return_flat[i].copy());
+                ctx.next_wasm_local += 1;
+                i += 1;
+            }
+            let mut k = return_flat.len();
+            while k > 0 {
+                k -= 1;
+                ctx.instructions
+                    .push(wasm::Instruction::LocalSet(save_start + k as u32));
+            }
+            let n = ctx.locals.len();
+            emit_drops_for_locals_range(ctx, 0, n)?;
+            let returns_enum = matches!(
+                &ctx.return_rt,
+                Some(RType::Enum { .. }),
+            );
+            if returns_enum {
+                let return_rt = ctx.return_rt.clone().expect("return_rt set when returns_enum");
+                let bytes = byte_size_of(&return_rt, ctx.structs, ctx.enums);
+                let dst = ctx.sret_ptr_local
+                    .expect("sret_ptr present for enum returns");
+                emit_memcpy(ctx, dst, save_start, bytes);
+                ctx.instructions.push(wasm::Instruction::LocalGet(dst));
+            } else {
+                let mut k = 0;
+                while k < return_flat.len() {
+                    ctx.instructions
+                        .push(wasm::Instruction::LocalGet(save_start + k as u32));
+                    k += 1;
+                }
+            }
+            ctx.instructions
+                .push(wasm::Instruction::LocalGet(ctx.fn_entry_sp_local));
+            ctx.instructions
+                .push(wasm::Instruction::GlobalSet(SP_GLOBAL));
+            ctx.instructions.push(wasm::Instruction::Return);
+            Ok(())
+        }
+        // `panic!(msg)` — codegen `msg` (an `&str` fat ref pushes ptr,
+        // len), then call the imported `env.panic` (wasm func 0), then
+        // `unreachable`. The expression's "result" is `!`, so the wasm
+        // validator accepts dead code that follows.
+        K::MacroCall { name, args } => {
+            if name != "panic" {
+                return Err(Error {
+                    file: String::new(),
+                    message: format!("codegen_mono_expr: macro `{}!` not yet supported", name),
+                    span: expr.span.copy(),
+                });
+            }
+            codegen_mono_expr(ctx, &args[0])?;
+            ctx.instructions.push(wasm::Instruction::Call(0));
+            ctx.instructions.push(wasm::Instruction::Unreachable);
+            Ok(())
+        }
+        _ => Err(Error {
+            file: String::new(),
+            message: "codegen_mono_expr: variant not yet supported".to_string(),
+            span: expr.span.copy(),
+        }),
+    }
+}
+
+// Codegen a Mono Match expression. Mirrors AST's codegen_match_expr:
+// outer Block carries the unified result type; for each arm an inner
+// Block holds the pattern test + body. Pattern binding leaves get
+// pushed to ctx.locals via codegen_pattern; we walk the pattern in
+// the same order to record BindingId → ctx.locals position so the
+// arm's body's `Local(BindingId)` lookups resolve.
+fn codegen_mono_match(
+    ctx: &mut FnCtx,
+    scrutinee: &crate::mono::MonoExpr,
+    arms: &Vec<crate::mono::MonoArm>,
+    result_ty: &RType,
+) -> Result<(), Error> {
+    let scrut_ty = scrutinee.ty.clone();
+    // Codegen scrutinee value onto the wasm stack.
+    codegen_mono_expr(ctx, scrutinee)?;
+    // Stash to wasm locals (or spill if needed for ref bindings — we
+    // currently reject those in mono_supports, so stash suffices).
+    let is_enum_scrut = matches!(&scrut_ty, RType::Enum { .. });
+    let needs_ref_spill = !is_enum_scrut
+        && arms.iter().any(|a| pattern_uses_ref_binding(&a.pattern));
+    let storage = if needs_ref_spill {
+        spill_match_scrutinee(ctx, &scrut_ty)
+    } else {
+        stash_match_scrutinee(ctx, &scrut_ty)
+    };
+    // Outer Block: result_ty determines block_type for unified arm result.
+    let bt = block_type_for(ctx, result_ty);
+    ctx.instructions.push(wasm::Instruction::Block(bt));
+    let mut i = 0;
+    while i < arms.len() {
+        let arm = &arms[i];
+        ctx.instructions.push(wasm::Instruction::Block(wasm::BlockType::Empty));
+        let mark = ctx.locals.len();
+        // codegen_pattern emits the test (BrIf 0 to no-match) and
+        // pushes pattern bindings to ctx.locals[mark..].
+        codegen_pattern(ctx, &arm.pattern, &scrut_ty, &storage, 0)?;
+        // Map BindingIds (allocated by lowering's
+        // declare_pattern_bindings) to ctx.locals positions in the
+        // same walk order.
+        let mut next_pos: usize = mark;
+        map_arm_pattern_bindings(ctx, &arm.pattern, &mut next_pos);
+        // Optional guard.
+        if let Some(g) = &arm.guard {
+            codegen_mono_expr(ctx, g)?;
+            ctx.instructions.push(wasm::Instruction::I32Eqz);
+            ctx.instructions.push(wasm::Instruction::BrIf(0));
+        }
+        codegen_mono_expr(ctx, &arm.body)?;
+        ctx.instructions.push(wasm::Instruction::Br(1));
+        ctx.instructions.push(wasm::Instruction::End);
+        ctx.locals.truncate(mark);
+        i += 1;
+    }
+    ctx.instructions.push(wasm::Instruction::Unreachable);
+    ctx.instructions.push(wasm::Instruction::End);
+    Ok(())
+}
+
+// Walk an AstPattern in declare_pattern_bindings' order; for each
+// Binding/At leaf, find its BindingId in mono_body.locals (matched by
+// origin = Pattern(pat.id)) and record the mapping to ctx.locals[pos].
+// Increments `pos` for each binding leaf encountered.
+fn map_arm_pattern_bindings(
+    ctx: &mut FnCtx,
+    pat: &crate::ast::Pattern,
+    pos: &mut usize,
+) {
+    use crate::ast::PatternKind;
+    match &pat.kind {
+        PatternKind::Binding { name, .. } | PatternKind::At { name, .. } => {
+            // Look up BindingId. Normal AST patterns: match by `pat.id`
+            // against `BindingOrigin::Pattern(nid)`. Synth-built patterns
+            // (try-op's `Some(__ok_val_0)` / `Err(__err_0)`) carry
+            // `pat.id = 0` and a `Synthesized(name)` origin; fall back
+            // to matching the binding name.
+            let mono_body = ctx.mono_body
+                .expect("Mono codegen invoked without ctx.mono_body");
+            let mut found_id: Option<u32> = None;
+            let mut k = 0;
+            while k < mono_body.locals.len() {
+                if let crate::mono::BindingOrigin::Pattern(nid) = &mono_body.locals[k].origin {
+                    if *nid == pat.id {
+                        found_id = Some(k as u32);
+                        break;
+                    }
+                }
+                k += 1;
+            }
+            if found_id.is_none() {
+                let mut k = 0;
+                while k < mono_body.locals.len() {
+                    if matches!(
+                        &mono_body.locals[k].origin,
+                        crate::mono::BindingOrigin::Synthesized(_),
+                    ) && mono_body.locals[k].name == *name
+                    {
+                        found_id = Some(k as u32);
+                        break;
+                    }
+                    k += 1;
+                }
+            }
+            if let Some(bid) = found_id {
+                ctx.mono_binding_to_local[bid as usize] = Some(*pos as u32);
+            }
+            *pos += 1;
+            if let PatternKind::At { inner, .. } = &pat.kind {
+                map_arm_pattern_bindings(ctx, inner, pos);
+            }
+        }
+        PatternKind::Tuple(elems) | PatternKind::VariantTuple { elems, .. } => {
+            let mut i = 0;
+            while i < elems.len() {
+                map_arm_pattern_bindings(ctx, &elems[i], pos);
+                i += 1;
+            }
+        }
+        PatternKind::VariantStruct { fields, .. } => {
+            let mut i = 0;
+            while i < fields.len() {
+                map_arm_pattern_bindings(ctx, &fields[i].pattern, pos);
+                i += 1;
+            }
+        }
+        PatternKind::Ref { inner, .. } => map_arm_pattern_bindings(ctx, inner, pos),
+        PatternKind::Or(alts) => {
+            // All alts bind the same set; walk first.
+            if !alts.is_empty() {
+                map_arm_pattern_bindings(ctx, &alts[0], pos);
+            }
+        }
+        _ => {}
+    }
+}
+
+// Construct an enum variant value: allocate a shadow-stack slot,
+// write the discriminant + each payload field at its byte offset,
+// push the slot's address as the result. Mirrors AST's
+// codegen_variant_construction for tuple variants. Lowering's
+// `payload` is already in declared order.
+fn codegen_mono_variant_construct(
+    ctx: &mut FnCtx,
+    enum_path: &Vec<String>,
+    type_args: &Vec<RType>,
+    disc: u32,
+    payload: &Vec<crate::mono::MonoExpr>,
+    enum_ty: &RType,
+) -> Result<(), Error> {
+    let total_size = byte_size_of(enum_ty, ctx.structs, ctx.enums);
+    let entry = crate::typeck::enum_lookup(ctx.enums, enum_path)
+        .expect("typeck verified the enum exists");
+    let env = build_env(&entry.type_params, type_args);
+    let variant = &entry.variants[disc as usize];
+    // Compute payload offsets + types in declared order.
+    let mut payload_offsets: Vec<u32> = Vec::new();
+    let mut payload_types: Vec<RType> = Vec::new();
+    let mut off: u32 = 4; // disc takes 4 bytes
+    match &variant.payload {
+        crate::typeck::VariantPayloadResolved::Unit => {}
+        crate::typeck::VariantPayloadResolved::Tuple(types_decl) => {
+            let mut i = 0;
+            while i < types_decl.len() {
+                let ty = substitute_rtype(&types_decl[i], &env);
+                payload_offsets.push(off);
+                off += byte_size_of(&ty, ctx.structs, ctx.enums);
+                payload_types.push(ty);
+                i += 1;
+            }
+        }
+        crate::typeck::VariantPayloadResolved::Struct(fields) => {
+            let mut i = 0;
+            while i < fields.len() {
+                let ty = substitute_rtype(&fields[i].ty, &env);
+                payload_offsets.push(off);
+                off += byte_size_of(&ty, ctx.structs, ctx.enums);
+                payload_types.push(ty);
+                i += 1;
+            }
+        }
+    }
+    // Allocate the slot: __sp -= total_size.
+    ctx.instructions.push(wasm::Instruction::GlobalGet(SP_GLOBAL));
+    ctx.instructions.push(wasm::Instruction::I32Const(total_size as i32));
+    ctx.instructions.push(wasm::Instruction::I32Sub);
+    ctx.instructions.push(wasm::Instruction::GlobalSet(SP_GLOBAL));
+    // Cache the address.
+    let addr_local = ctx.next_wasm_local;
+    ctx.extra_locals.push(wasm::ValType::I32);
+    ctx.next_wasm_local += 1;
+    ctx.instructions.push(wasm::Instruction::GlobalGet(SP_GLOBAL));
+    ctx.instructions.push(wasm::Instruction::LocalSet(addr_local));
+    // Store discriminant at offset 0.
+    ctx.instructions.push(wasm::Instruction::LocalGet(addr_local));
+    ctx.instructions.push(wasm::Instruction::I32Const(disc as i32));
+    ctx.instructions.push(wasm::Instruction::I32Store { align: 2, offset: 0 });
+    // Store each payload field at its offset.
+    if payload.len() != payload_offsets.len() {
+        return Err(Error {
+            file: String::new(),
+            message: format!(
+                "codegen_mono_variant_construct: payload arity {} != declared {}",
+                payload.len(), payload_offsets.len()
+            ),
+            span: crate::span::Span::new(crate::span::Pos::new(1, 1), crate::span::Pos::new(1, 1)),
+        });
+    }
+    let mut i = 0;
+    while i < payload.len() {
+        codegen_mono_expr(ctx, &payload[i])?;
+        store_flat_to_memory(ctx, &payload_types[i], BaseAddr::WasmLocal(addr_local), payload_offsets[i]);
+        i += 1;
+    }
+    // Push the slot's address as the construction's result.
+    ctx.instructions.push(wasm::Instruction::LocalGet(addr_local));
+    Ok(())
+}
+
+// Materialize a value-producing MonoExpr into a fresh shadow-stack
+// slot and push the slot's address as a single i32. Used by autoref
+// MethodCall for non-place BorrowImm receivers.
+fn emit_materialize_as_address(
+    ctx: &mut FnCtx,
+    expr: &crate::mono::MonoExpr,
+) -> Result<(), Error> {
+    codegen_mono_expr(ctx, expr)?;
+    let bytes = byte_size_of(&expr.ty, ctx.structs, ctx.enums);
+    ctx.instructions.push(wasm::Instruction::GlobalGet(SP_GLOBAL));
+    ctx.instructions.push(wasm::Instruction::I32Const(bytes as i32));
+    ctx.instructions.push(wasm::Instruction::I32Sub);
+    ctx.instructions.push(wasm::Instruction::GlobalSet(SP_GLOBAL));
+    let addr_local = ctx.next_wasm_local;
+    ctx.extra_locals.push(wasm::ValType::I32);
+    ctx.next_wasm_local += 1;
+    ctx.instructions.push(wasm::Instruction::GlobalGet(SP_GLOBAL));
+    ctx.instructions.push(wasm::Instruction::LocalSet(addr_local));
+    store_flat_to_memory(ctx, &expr.ty, BaseAddr::WasmLocal(addr_local), 0);
+    ctx.instructions.push(wasm::Instruction::LocalGet(addr_local));
+    Ok(())
+}
+
+// Allocate a shadow-stack slot for an enum return value (sret) and
+// push its address as the leading "sret_addr" Call argument.
+fn emit_sret_alloc(ctx: &mut FnCtx, ty: &RType) {
+    let bytes = byte_size_of(ty, ctx.structs, ctx.enums);
+    ctx.instructions.push(wasm::Instruction::GlobalGet(SP_GLOBAL));
+    ctx.instructions.push(wasm::Instruction::I32Const(bytes as i32));
+    ctx.instructions.push(wasm::Instruction::I32Sub);
+    ctx.instructions.push(wasm::Instruction::GlobalSet(SP_GLOBAL));
+    ctx.instructions.push(wasm::Instruction::GlobalGet(SP_GLOBAL));
+}
+
+// Best-effort: convert a MonoExpr into a MonoPlace if it's a place-form
+// (Local or PlaceLoad). For autoref method receivers, the recv must be
+// a place; lowering produces PlaceLoad(...) for borrowed targets.
+// Borrow the place inside an autoref'd receiver expression. Returns
+// `Ok(&place)` for forms that codegen can address directly:
+//   - `K::Local(id)`   — synthesizes a temporary `Local(id)` place
+//                        (stored on the stack frame).
+//   - `K::PlaceLoad(p)` — borrows the existing place.
+// Any other expression kind isn't a place; the caller falls back to
+// materializing the value via `emit_materialize_as_address`.
+//
+// Returning a borrow (rather than cloning) preserves the inner
+// `MonoExpr` exactly — earlier the clone path swapped non-`Local`
+// Deref-inners (e.g. `MethodCall`, the result of synth-Index lowering)
+// for `Local(0)`, which silently miscompiled `arr[i].method(...)`
+// shapes.
+fn mono_expr_as_place<'a>(
+    e: &'a crate::mono::MonoExpr,
+    scratch: &'a mut Option<crate::mono::MonoPlace>,
+) -> Result<&'a crate::mono::MonoPlace, Error> {
+    use crate::mono::{MonoExprKind, MonoPlace, MonoPlaceKind};
+    match &e.kind {
+        MonoExprKind::Local(id, _) => {
+            *scratch = Some(MonoPlace {
+                kind: MonoPlaceKind::Local(*id),
+                ty: e.ty.clone(),
+                span: e.span.copy(),
+            });
+            Ok(scratch.as_ref().unwrap())
+        }
+        MonoExprKind::PlaceLoad(p) => Ok(p),
+        _ => Err(Error {
+            file: String::new(),
+            message: "codegen_mono_expr: autoref receiver not in place form".to_string(),
+            span: e.span.copy(),
+        }),
+    }
+}
+
+// Push the address of a MonoPlace onto the wasm stack as a single i32.
+fn emit_place_address(ctx: &mut FnCtx, place: &crate::mono::MonoPlace) {
+    use crate::mono::MonoPlaceKind as PK;
+    let mut total_offset: u32 = 0;
+    let mut p = place;
+    // Walk Field/TupleIndex chain accumulating byte offset; bottom out
+    // at Local (push slot/binding address) or Deref (codegen the inner
+    // expr — must produce an i32 address). Auto-deref through refs /
+    // smart pointers is structurally explicit in the IR via
+    // MonoPlaceKind::Deref nodes inserted by lowering. No semantic
+    // inference here.
+    loop {
+        match &p.kind {
+            PK::Local(id) => {
+                let idx = ctx.mono_binding_to_local[*id as usize]
+                    .expect("BindingId without ctx.locals mapping") as usize;
+                match &ctx.locals[idx].storage {
+                    Storage::Memory { frame_offset } => {
+                        let fb = ctx.frame_base_local;
+                        ctx.instructions.push(wasm::Instruction::LocalGet(fb));
+                        let off = *frame_offset + total_offset;
+                        if off != 0 {
+                            ctx.instructions.push(wasm::Instruction::I32Const(off as i32));
+                            ctx.instructions.push(wasm::Instruction::I32Add);
+                        }
+                    }
+                    Storage::MemoryAt { addr_local } => {
+                        ctx.instructions.push(wasm::Instruction::LocalGet(*addr_local));
+                        if total_offset != 0 {
+                            ctx.instructions.push(wasm::Instruction::I32Const(total_offset as i32));
+                            ctx.instructions.push(wasm::Instruction::I32Add);
+                        }
+                    }
+                    Storage::Local { wasm_start, .. } => {
+                        // For ref-typed bindings, the wasm local IS
+                        // the ref pointer. For value-typed bindings,
+                        // escape analysis would have promoted to
+                        // Memory if `&binding.field` were taken, so
+                        // Local + Field-chain shouldn't occur here.
+                        ctx.instructions.push(wasm::Instruction::LocalGet(*wasm_start));
+                        if total_offset != 0 {
+                            ctx.instructions.push(wasm::Instruction::I32Const(total_offset as i32));
+                            ctx.instructions.push(wasm::Instruction::I32Add);
+                        }
+                    }
+                }
+                return;
+            }
+            PK::Field { base, byte_offset, .. } => {
+                total_offset += *byte_offset;
+                p = base;
+            }
+            PK::TupleIndex { base, byte_offset, .. } => {
+                total_offset += *byte_offset;
+                p = base;
+            }
+            PK::Deref { inner } => {
+                // The inner expression evaluates to an address — push
+                // it directly. Then add total_offset for any wrapping
+                // Field/TupleIndex.
+                let _ = codegen_mono_expr(ctx, inner);
+                if total_offset != 0 {
+                    ctx.instructions.push(wasm::Instruction::I32Const(total_offset as i32));
+                    ctx.instructions.push(wasm::Instruction::I32Add);
+                }
+                return;
+            }
+        }
+    }
+}
+
+fn codegen_mono_lit(
+    ctx: &mut FnCtx,
+    lit: &crate::mono::MonoLit,
+    ty: &RType,
+) -> Result<(), Error> {
+    use crate::mono::MonoLit;
+    match lit {
+        MonoLit::Int { magnitude, negated } => {
+            // Reuse the AST emit_int_lit which handles all int widths
+            // (≤32-bit, 64-bit, 128-bit two-half push).
+            emit_int_lit(ctx, ty, *magnitude, *negated);
+            Ok(())
+        }
+        MonoLit::Bool(b) => {
+            ctx.instructions.push(wasm::Instruction::I32Const(if *b { 1 } else { 0 }));
+            Ok(())
+        }
+        MonoLit::Char(c) => {
+            ctx.instructions.push(wasm::Instruction::I32Const(*c as i32));
+            Ok(())
+        }
+        MonoLit::Str(s) => {
+            // Intern via the existing string pool; emit as fat ref.
+            let (addr, len) = ctx.mono.intern_str(s);
+            ctx.instructions.push(wasm::Instruction::I32Const(addr as i32));
+            ctx.instructions.push(wasm::Instruction::I32Const(len as i32));
+            Ok(())
+        }
+    }
+}
+
+// Push the value at a MonoPlace onto the wasm stack as flat scalars.
+// Three cases:
+//   - Local: just LocalGet (works for both value- and ref-typed bindings).
+//   - Field/TupleIndex chain: extract a name chain and delegate to the
+//     existing codegen_place_chain_load, which handles both flat-stored
+//     value bindings (peel field bytes off the flat scalars) and
+//     ref-rooted chains (auto-deref + load).
+//   - Deref: codegen the inner expression as the address, stash, then
+//     load_flat_from_memory.
+fn codegen_mono_place_load(ctx: &mut FnCtx, place: &crate::mono::MonoPlace) {
+    use crate::mono::MonoPlaceKind as PK;
+    match &place.kind {
+        PK::Local(id) => {
+            let idx = ctx.mono_binding_to_local[*id as usize]
+                .expect("BindingId without ctx.locals mapping") as usize;
+            emit_local_value_load(ctx, idx);
+        }
+        PK::Field { .. } | PK::TupleIndex { .. } => {
+            // Build a name chain: [root_name, field/index, …, leaf].
+            let mut chain: Vec<String> = Vec::new();
+            let mut p = place;
+            loop {
+                match &p.kind {
+                    PK::Local(id) => {
+                        let idx = ctx.mono_binding_to_local[*id as usize]
+                            .expect("BindingId without ctx.locals mapping") as usize;
+                        chain.push(ctx.locals[idx].name.clone());
+                        // Reverse — we collected leaf-first, want root-first.
+                        chain.reverse();
+                        let _ = codegen_place_chain_load(ctx, &chain);
+                        return;
+                    }
+                    PK::Field { base, field_name, .. } => {
+                        chain.push(field_name.clone());
+                        p = base;
+                    }
+                    PK::TupleIndex { base, index, .. } => {
+                        chain.push(format!("{}", index));
+                        p = base;
+                    }
+                    PK::Deref { .. } => {
+                        // Chain rooted at a Deref — fall through to
+                        // address-then-load below (rare in practice).
+                        emit_place_address(ctx, place);
+                        let addr_local = ctx.next_wasm_local;
+                        ctx.extra_locals.push(wasm::ValType::I32);
+                        ctx.next_wasm_local += 1;
+                        ctx.instructions.push(wasm::Instruction::LocalSet(addr_local));
+                        load_flat_from_memory(ctx, &place.ty, BaseAddr::WasmLocal(addr_local), 0);
+                        return;
+                    }
+                }
+            }
+        }
+        PK::Deref { .. } => {
+            emit_place_address(ctx, place);
+            let addr_local = ctx.next_wasm_local;
+            ctx.extra_locals.push(wasm::ValType::I32);
+            ctx.next_wasm_local += 1;
+            ctx.instructions.push(wasm::Instruction::LocalSet(addr_local));
+            load_flat_from_memory(ctx, &place.ty, BaseAddr::WasmLocal(addr_local), 0);
+        }
+    }
+}
+
+// Emit a load of a binding's value (no implicit deref through a ref).
+// Mirrors codegen_var's load logic but without move-site clearing,
+// since the Mono path doesn't currently handle move-site annotations.
+fn emit_local_value_load(ctx: &mut FnCtx, idx: usize) {
+    let rt = ctx.locals[idx].rtype.clone();
+    match &ctx.locals[idx].storage {
+        Storage::Local { wasm_start, flat_size } => {
+            let start = *wasm_start;
+            let n = *flat_size;
+            let mut k = 0;
+            while k < n {
+                ctx.instructions.push(wasm::Instruction::LocalGet(start + k));
+                k += 1;
+            }
+        }
+        Storage::Memory { frame_offset } => {
+            load_flat_from_memory(ctx, &rt, BaseAddr::StackPointer, *frame_offset);
+        }
+        Storage::MemoryAt { addr_local } => {
+            load_flat_from_memory(ctx, &rt, BaseAddr::WasmLocal(*addr_local), 0);
+        }
+    }
+}
+
+// True iff the builtin name is in the Mono-path-supported set:
+// `<int_kind>_<op>` for ≤64-bit ints + bool, where the op is one of
+// the simple arithmetic/comparison/bitwise ops. Excludes 128-bit ints
+// (need codegen_builtin_128's multi-instruction sequences) and the
+// non-arith intrinsics (alloc, free, cast, size_of, slice/str
+// helpers, ptr arith). The Mono path will gain those in follow-up
+// turns; for now anything else falls back to AST.
+fn mono_supports_builtin(name: &str) -> bool {
+    match name {
+        "size_of"
+        | "cast"
+        | "alloc"
+        | "free"
+        | "slice_ptr"
+        | "slice_mut_ptr"
+        | "slice_len"
+        | "str_len"
+        | "str_as_bytes"
+        | "str_as_mut_bytes"
+        | "make_slice"
+        | "make_mut_slice"
+        | "make_str"
+        | "make_mut_str"
+        | "ptr_usize_add"
+        | "ptr_usize_sub"
+        | "ptr_isize_offset" => return true,
+        _ => {}
+    }
+    split_builtin_name(name).is_some()
+}
+
+// Emit a wasm op for arithmetic/comparison + typed builtins (args
+// already on stack). Mirrors the dispatch in codegen_builtin. Used
+// only by Mono path; the AST path goes through codegen_builtin
+// directly.
+fn emit_simple_builtin(
+    ctx: &mut FnCtx,
+    name: &str,
+    type_args: &Vec<RType>,
+    _ty: &RType,
+) -> Result<(), Error> {
+    match name {
+        // `¤size_of::<T>()`. Args list is empty (caller emitted nothing).
+        // The size is a compile-time constant of T.
+        "size_of" => {
+            let t = type_args.get(0).expect("¤size_of always has T type-arg");
+            let size = byte_size_of(t, ctx.structs, ctx.enums);
+            ctx.instructions.push(wasm::Instruction::I32Const(size as i32));
+            return Ok(());
+        }
+        // `¤cast::<A, B>(p)` and `¤str_as_bytes(s)` are runtime no-ops:
+        // raw ptrs and (&str / &[u8]) share the same flat repr, so the
+        // arg's already-on-stack scalars are the result. Same for
+        // `make_slice`/`make_str` family — args already arrive as the
+        // (ptr, len) pair the fat-ref expects.
+        "cast"
+        | "str_as_bytes"
+        | "str_as_mut_bytes"
+        | "make_slice"
+        | "make_mut_slice"
+        | "make_str"
+        | "make_mut_str" => return Ok(()),
+        // `¤free(p)` evaluates p (already on stack) and discards.
+        "free" => {
+            ctx.instructions.push(wasm::Instruction::Drop);
+            return Ok(());
+        }
+        // `¤alloc(n)` — bump the heap pointer by n, return the old
+        // value. Stack on entry: [n]. Mirrors codegen_builtin_alloc.
+        "alloc" => {
+            let n_temp = alloc_i32_local(ctx);
+            let result_temp = alloc_i32_local(ctx);
+            ctx.instructions.push(wasm::Instruction::LocalSet(n_temp));
+            ctx.instructions.push(wasm::Instruction::GlobalGet(HEAP_GLOBAL));
+            ctx.instructions.push(wasm::Instruction::LocalSet(result_temp));
+            ctx.instructions.push(wasm::Instruction::LocalGet(result_temp));
+            ctx.instructions.push(wasm::Instruction::LocalGet(n_temp));
+            ctx.instructions.push(wasm::Instruction::I32Add);
+            ctx.instructions.push(wasm::Instruction::GlobalSet(HEAP_GLOBAL));
+            ctx.instructions.push(wasm::Instruction::LocalGet(result_temp));
+            return Ok(());
+        }
+        // Fat-ref decomposition: stack on entry is [ptr, len].
+        "slice_ptr" | "slice_mut_ptr" => {
+            // Want ptr (below); discard len (top).
+            ctx.instructions.push(wasm::Instruction::Drop);
+            return Ok(());
+        }
+        "slice_len" | "str_len" => {
+            // Want len (top); stash, drop ptr, reload.
+            let len_local = alloc_i32_local(ctx);
+            ctx.instructions.push(wasm::Instruction::LocalSet(len_local));
+            ctx.instructions.push(wasm::Instruction::Drop);
+            ctx.instructions.push(wasm::Instruction::LocalGet(len_local));
+            return Ok(());
+        }
+        // Pointer arithmetic: stack on entry is [p, n]; both are i32.
+        "ptr_usize_add" | "ptr_isize_offset" => {
+            ctx.instructions.push(wasm::Instruction::I32Add);
+            return Ok(());
+        }
+        "ptr_usize_sub" => {
+            ctx.instructions.push(wasm::Instruction::I32Sub);
+            return Ok(());
+        }
+        _ => {}
+    }
+    let (ty_name, op) = match split_builtin_name(name) {
+        Some(p) => p,
+        None => return Err(Error {
+            file: String::new(),
+            message: format!("emit_simple_builtin: not a `<int>_<op>` builtin: `{}`", name),
+            span: crate::span::Span::new(
+                crate::span::Pos::new(1, 1),
+                crate::span::Pos::new(1, 1),
+            ),
+        }),
+    };
+    if matches!(ty_name, "u128" | "i128") {
+        // Wide ops (u128/i128) flatten to 2 i64s per arg = 4 i64s on
+        // the stack; codegen_builtin_128 pops them into temps and emits
+        // the multi-instruction sequence (add-with-carry / sub-with-
+        // borrow / two-half eq / signed-vs-unsigned compare). mul/div/
+        // rem fall back to wasm `unreachable` inside that helper —
+        // pocket-rust's bootstrap path doesn't exercise them, and the
+        // proper widening multiply / long division can be added when
+        // there's a caller. (Tracked in the trait-system deferral
+        // ledger.)
+        let signed = ty_name == "i128";
+        codegen_builtin_128(ctx, op, signed);
+        return Ok(());
+    }
+    let is_i64 = matches!(ty_name, "u64" | "i64");
+    let is_signed = matches!(ty_name, "i8" | "i16" | "i32" | "i64" | "isize");
+    let inst = match (is_i64, op) {
+        (false, "add") => wasm::Instruction::I32Add,
+        (false, "sub") => wasm::Instruction::I32Sub,
+        (false, "mul") => wasm::Instruction::I32Mul,
+        (false, "div") => if is_signed { wasm::Instruction::I32DivS } else { wasm::Instruction::I32DivU },
+        (false, "rem") => if is_signed { wasm::Instruction::I32RemS } else { wasm::Instruction::I32RemU },
+        (false, "and") => wasm::Instruction::I32And,
+        (false, "or") => wasm::Instruction::I32Or,
+        (false, "xor") => wasm::Instruction::I32Xor,
+        (false, "eq") => wasm::Instruction::I32Eq,
+        (false, "ne") => wasm::Instruction::I32Ne,
+        (false, "lt") => if is_signed { wasm::Instruction::I32LtS } else { wasm::Instruction::I32LtU },
+        (false, "le") => if is_signed { wasm::Instruction::I32LeS } else { wasm::Instruction::I32LeU },
+        (false, "gt") => if is_signed { wasm::Instruction::I32GtS } else { wasm::Instruction::I32GtU },
+        (false, "ge") => if is_signed { wasm::Instruction::I32GeS } else { wasm::Instruction::I32GeU },
+        (false, "not") => wasm::Instruction::I32Eqz,
+        (true, "add") => wasm::Instruction::I64Add,
+        (true, "sub") => wasm::Instruction::I64Sub,
+        (true, "mul") => wasm::Instruction::I64Mul,
+        (true, "div") => if is_signed { wasm::Instruction::I64DivS } else { wasm::Instruction::I64DivU },
+        (true, "rem") => if is_signed { wasm::Instruction::I64RemS } else { wasm::Instruction::I64RemU },
+        (true, "and") => wasm::Instruction::I64And,
+        (true, "or") => wasm::Instruction::I64Or,
+        (true, "xor") => wasm::Instruction::I64Xor,
+        (true, "eq") => wasm::Instruction::I64Eq,
+        (true, "ne") => wasm::Instruction::I64Ne,
+        (true, "lt") => if is_signed { wasm::Instruction::I64LtS } else { wasm::Instruction::I64LtU },
+        (true, "le") => if is_signed { wasm::Instruction::I64LeS } else { wasm::Instruction::I64LeU },
+        (true, "gt") => if is_signed { wasm::Instruction::I64GtS } else { wasm::Instruction::I64GtU },
+        (true, "ge") => if is_signed { wasm::Instruction::I64GeS } else { wasm::Instruction::I64GeU },
+        _ => return Err(Error {
+            file: String::new(),
+            message: format!("emit_simple_builtin: unknown op `{}_{}`", ty_name, op),
+            span: crate::span::Span::new(
+                crate::span::Pos::new(1, 1),
+                crate::span::Pos::new(1, 1),
+            ),
+        }),
+    };
+    ctx.instructions.push(inst);
+    Ok(())
 }

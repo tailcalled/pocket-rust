@@ -1,7 +1,9 @@
 mod ast;
 mod borrowck;
 mod codegen;
+mod layout;
 mod lexer;
+mod mono;
 mod parser;
 mod safeck;
 mod span;

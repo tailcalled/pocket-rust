@@ -52,6 +52,18 @@ fn place_borrow_through_ref_returns_42() {
     expect_answer("lang/references/place_borrow_through_ref", 42i32);
 }
 
+// `self.field` in value position (recv of `<` whose autoref takes
+// `&self.field`) must produce the right address for non-first fields.
+// Used to silently miscompile in the Mono path: lowering didn't
+// auto-deref the ref-typed self when building the field place, and
+// `emit_place_address` then returned `&self` (treating the field
+// offset as 0) instead of `&self.field`. First-field reads worked by
+// coincidence (offset 0); non-first fields read garbage.
+#[test]
+fn method_compare_self_field_returns_100() {
+    expect_answer("lang/references/method_compare_self_field", 100i32);
+}
+
 #[test]
 fn nll_sequential_borrows_returns_7() {
     expect_answer("lang/references/nll_sequential_borrows", 7i32);

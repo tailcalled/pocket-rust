@@ -14,6 +14,17 @@ fn tuple_destructure_returns_42() {
     expect_answer("lang/let_stmts/tuple_destructure", 42i32);
 }
 
+// Tuple destructure with `&mut binding` on a leaf. Each leaf needs
+// its own addressable storage so writes through the mut ref persist
+// when the leaf is later read by name. Used to silently misbehave in
+// the Mono codegen path: `pattern_addressed[leaf_id]` wasn't being
+// set for destructure bindings, so leaves were stashed in wasm
+// locals while the borrow read a separate frame slot.
+#[test]
+fn tuple_destructure_mut_borrow_returns_129() {
+    expect_answer("lang/let_stmts/tuple_destructure_mut_borrow", 129i32);
+}
+
 // `let _ = expr;` evaluates `expr` for its side effects and drops
 // the value. Useful for explicit unused-result handling.
 #[test]

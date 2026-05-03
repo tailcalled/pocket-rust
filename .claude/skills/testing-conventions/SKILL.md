@@ -13,6 +13,7 @@ Examples and integration tests are organized by **target** (language intrinsic v
 - `examples/std/<feature>/<example>/lib.rs` — example code that exercises an in-language stdlib type/trait (`Copy`, `Drop`, `Num`, the `cmp` traits and operator desugar).
 - `tests/lang.rs` (binary) → `tests/lang/mod.rs` — driver + shared helpers; declares `mod basics; mod structs; mod enums; ...`. Each `tests/lang/<feature>.rs` file holds positive and negative tests for that feature: positive tests call `expect_answer("lang/<feature>/<example>", expected)`; negative tests call `compile_source(inline_src)` and assert the error message contains the expected substring.
 - `tests/std.rs` (binary) → `tests/std/mod.rs` — same shape, with `mod copy; mod drop; mod num; mod cmp;`.
+- `tests/gaps.rs` (binary) → `tests/gaps/mod.rs` — **honestly failing** tests for known partial implementations, soundness holes, and behaviors pocket-rust gets wrong vs rustc. Each test asserts the *correct* behavior; the test fails today because the gap isn't fixed. NOT `#[ignore]`'d, NOT inverted. Each test carries a comment explaining what rustc does, what pocket-rust does, and the shape of the fix. When fixed, the test passes — promote to `tests/lang/` or `tests/std/`. The count of failures is the outstanding-gap budget.
 
 ## Two-level wrapper rationale
 

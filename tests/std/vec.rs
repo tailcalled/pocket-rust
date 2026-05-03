@@ -41,6 +41,17 @@ fn vec_get_mut_modifies_returns_42() {
     expect_answer("std/vec/get_mut_modifies", 42u32);
 }
 
+// `vec[i] += rhs` — Index lowering desugars `vec[i]` to a synth
+// `IndexMut::index_mut(&mut vec, i)` MethodCall (since the outer
+// `add_assign` autoref picks BorrowMut), and codegen extracts the
+// place without flattening away the inner MethodCall. Used to silently
+// miscompile through `mono_expr_as_place`'s clone — see the example's
+// header comment.
+#[test]
+fn vec_index_compound_assign_returns_42() {
+    expect_answer("std/vec/index_compound_assign", 42u32);
+}
+
 #[test]
 fn vec_drop_runs_on_elements_returns_3() {
     expect_answer("std/vec/drop_runs_on_elements", 3u32);

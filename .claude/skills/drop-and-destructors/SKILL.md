@@ -48,14 +48,12 @@ Borrowck snapshots:
 - `FnSymbol.moved_places: Vec<MovedPlace>` — per-place final status.
 - `FnSymbol.move_sites: Vec<(NodeId, name)>` — every whole-binding move site.
 
-Codegen consults both:
-- **Init** (no entry) → unconditional drop at scope end.
-- **Moved** (every path moved it) → no drop emitted.
-- **MaybeMoved** (some paths moved, some didn't) → allocate an i32 wasm local as the drop flag, init `1` at the binding's let-stmt (or fn entry for params), emit `i32.const 0; local.set flag` at every move site listed in `move_sites`, and gate the scope-end drop call with `local.get flag; if; <drop>; end`.
+Codegen consults both via the per-binding `DropAction` precomputed in `layout::compute_drop_action(name, ty, moved_places, traits)`:
+- **Skip** — not Drop-typed OR moved on every path. No drop emitted.
+- **Always** — Drop-typed and never moved (no entry in `moved_places`). Unconditional drop at scope end.
+- **Flagged** — Drop-typed and `MaybeMoved` (moved on some paths). Allocate an i32 wasm local as the drop flag, init `1` at the binding's let-stmt (or fn entry for params), emit `i32.const 0; local.set flag` at every move site listed in `move_sites`, and gate the scope-end drop call with `local.get flag; if; <drop>; end`.
 
-`needs_drop_flag(moved_places, name, rt, traits)` — true iff the binding is Drop AND its `moved_places` entry is `MaybeMoved`. Drives flag-allocation at let-stmt codegen.
-
-`binding_move_status(moved_places, name)` — looks up a binding's whole-binding move status. Returns `None` for `Init`. Drives the skip/unconditional/flagged decision at scope end.
+Every `LocalBinding` carries its precomputed `DropAction` directly (stashed at decl time via `layout::compute_drop_action`). `emit_drops_for_locals_range` reads `ctx.locals[i].drop_action` instead of recomputing `is_drop` + move-status per iteration. Same goes for the let-stmt and param flag-allocation sites — they consult `drop_action` directly.
 
 ## Pattern-bound bindings interaction
 
