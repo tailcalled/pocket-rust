@@ -395,20 +395,20 @@ fn synthesize_enum_impl(
             "Eq",
             &trait_ref.name_span,
         )),
+        "Ord" => Ok(empty_marker_impl(
+            &ed.lifetime_params,
+            &ed.type_params,
+            &ed.name,
+            "Ord",
+            &trait_ref.name_span,
+        )),
         "Clone" => Ok(enum_clone_impl(ed, &trait_ref.name_span)),
         "PartialEq" => Ok(enum_partial_eq_impl(ed, &trait_ref.name_span)),
-        "Ord" | "PartialOrd" => Err(Error {
-            file: file.to_string(),
-            message: format!(
-                "cannot derive `{}` on enums yet — discriminant ordering not implemented",
-                trait_ref.name
-            ),
-            span: trait_ref.name_span.copy(),
-        }),
+        "PartialOrd" => Ok(enum_partial_ord_impl(ed, &trait_ref.name_span)),
         other => Err(Error {
             file: file.to_string(),
             message: format!(
-                "cannot derive `{}`: only Copy, Clone, PartialEq, Eq are supported on enums",
+                "cannot derive `{}`: only Copy, Clone, PartialEq, Eq, PartialOrd, Ord are supported",
                 other
             ),
             span: trait_ref.name_span.copy(),
@@ -921,6 +921,166 @@ fn build_struct_lt_method(sd: &StructDef, other_target: &Type, span: &Span) -> F
         node_count: b.next_id,
         is_pub: false,
         is_unsafe: false,
+    }
+}
+
+// =====================================================================
+// PartialOrd — enum (variant-disc lex order, then payload lex order)
+// =====================================================================
+//
+// `lt(self, other)` becomes a nested match: outer over `self`, inner
+// over `other`. For variant pairs `(V_i, V_j)`:
+//   - `i < j` → return `true`  (V_i is "smaller" by declaration order)
+//   - `i > j` → return `false`
+//   - `i == j` → recurse lexicographically through the variant's
+//                payload (same shape as struct lt: per-position
+//                forward/backward checks with early returns).
+// `le`/`gt`/`ge` derive from `lt` exactly like the struct case.
+fn enum_partial_ord_impl(ed: &EnumDef, span: &Span) -> ImplBlock {
+    let (lifetime_params, type_params) =
+        render_impl_generics(&ed.type_params, &ed.lifetime_params, "PartialOrd", span);
+    let trait_path = mk_path(&["PartialOrd"], Vec::new(), span);
+    let target = target_type_for(&ed.name, &ed.type_params, span);
+    let other_target = self_target_type(&ed.name, &ed.type_params, span);
+    let lt = build_enum_lt_method(ed, &other_target, span);
+    let le = build_simple_partial_ord_companion("le", true, span);
+    let gt = build_simple_partial_ord_companion("gt", false, span);
+    let ge = build_simple_partial_ord_companion("ge", true, span);
+    ImplBlock {
+        lifetime_params,
+        type_params,
+        trait_path: Some(trait_path),
+        target,
+        methods: vec![lt, le, gt, ge],
+        assoc_type_bindings: Vec::new(),
+        span: span.copy(),
+    }
+}
+
+fn build_enum_lt_method(ed: &EnumDef, other_target: &Type, span: &Span) -> Function {
+    let mut b = Builder::new(span.copy());
+    let mut outer_arms: Vec<MatchArm> = Vec::new();
+    let n = ed.variants.len();
+    let mut i = 0;
+    while i < n {
+        let vi = &ed.variants[i];
+        let self_pat = build_variant_pattern_named(&mut b, &ed.name, vi, "a");
+        let mut inner_arms: Vec<MatchArm> = Vec::new();
+        let mut j = 0;
+        while j < n {
+            let vj = &ed.variants[j];
+            let other_pat = build_variant_pattern_named(&mut b, &ed.name, vj, "b");
+            let body = if i < j {
+                b.bool_lit(true)
+            } else if i > j {
+                b.bool_lit(false)
+            } else {
+                build_variant_lt_body(&mut b, vi)
+            };
+            inner_arms.push(MatchArm {
+                pattern: other_pat,
+                guard: None,
+                body,
+                span: span.copy(),
+            });
+            j += 1;
+        }
+        let other_v = b.var("other");
+        let inner_match = b.match_expr(other_v, inner_arms);
+        outer_arms.push(MatchArm {
+            pattern: self_pat,
+            guard: None,
+            body: inner_match,
+            span: span.copy(),
+        });
+        i += 1;
+    }
+    let self_v = b.var("self");
+    let outer_match = b.match_expr(self_v, outer_arms);
+    let body = b.block(Vec::new(), Some(outer_match));
+    Function {
+        name: "lt".to_string(),
+        name_span: span.copy(),
+        lifetime_params: Vec::new(),
+        type_params: Vec::new(),
+        params: vec![mk_self_param(span), mk_other_param(other_target, span)],
+        return_type: Some(mk_bool_type(span)),
+        body,
+        node_count: b.next_id,
+        is_pub: false,
+        is_unsafe: false,
+    }
+}
+
+// For the same-variant arm: lexicographic comparison through payload
+// fields. Same shape as `build_struct_lt_method`'s body — early
+// `return true`/`return false` per field — wrapped in a Block expr so
+// the arm body can carry multiple statements + a tail. Bindings come
+// from `build_variant_pattern_named` (`_a0`/`_b0`/... for tuple
+// variants, `<field>_a`/`<field>_b` for struct variants).
+fn build_variant_lt_body(b: &mut Builder, v: &EnumVariant) -> Expr {
+    match &v.payload {
+        VariantPayload::Unit => b.bool_lit(false),
+        VariantPayload::Tuple(elems) => {
+            if elems.is_empty() {
+                return b.bool_lit(false);
+            }
+            let mut stmts: Vec<Stmt> = Vec::new();
+            let mut i = 0;
+            while i < elems.len() {
+                let a_name = format!("_a{}", i);
+                let b_name = format!("_b{}", i);
+                push_lt_pair_stmts(b, &mut stmts, &a_name, &b_name);
+                i += 1;
+            }
+            let tail = b.bool_lit(false);
+            let block = b.block(stmts, Some(tail));
+            b.expr(ExprKind::Block(Box::new(block)))
+        }
+        VariantPayload::Struct(fields) => {
+            if fields.is_empty() {
+                return b.bool_lit(false);
+            }
+            let mut stmts: Vec<Stmt> = Vec::new();
+            for f in fields {
+                let a_name = format!("{}_a", f.name);
+                let b_name = format!("{}_b", f.name);
+                push_lt_pair_stmts(b, &mut stmts, &a_name, &b_name);
+            }
+            let tail = b.bool_lit(false);
+            let block = b.block(stmts, Some(tail));
+            b.expr(ExprKind::Block(Box::new(block)))
+        }
+    }
+}
+
+// Append the per-position lexicographic ordering pair:
+//   if a.lt(b) { return true; }
+//   if b.lt(a) { return false; }
+// `a` and `b` are already `&T` bindings via match-ergonomics, so the
+// `lt` call doesn't need an explicit `&` on the argument.
+fn push_lt_pair_stmts(b: &mut Builder, stmts: &mut Vec<Stmt>, a_name: &str, b_name: &str) {
+    {
+        let av = b.var(a_name);
+        let bv = b.var(b_name);
+        let lt_call = b.method_call(av, "lt", vec![bv]);
+        let true_lit = b.bool_lit(true);
+        let ret = b.return_expr(Some(true_lit));
+        let then_block = b.block(vec![Stmt::Expr(ret)], None);
+        let else_block = b.block(Vec::new(), None);
+        let if_expr = b.if_then_else(lt_call, then_block, else_block);
+        stmts.push(Stmt::Expr(if_expr));
+    }
+    {
+        let av = b.var(a_name);
+        let bv = b.var(b_name);
+        let lt_call = b.method_call(bv, "lt", vec![av]);
+        let false_lit = b.bool_lit(false);
+        let ret = b.return_expr(Some(false_lit));
+        let then_block = b.block(vec![Stmt::Expr(ret)], None);
+        let else_block = b.block(Vec::new(), None);
+        let if_expr = b.if_then_else(lt_call, then_block, else_block);
+        stmts.push(Stmt::Expr(if_expr));
     }
 }
 

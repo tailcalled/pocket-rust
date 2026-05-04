@@ -41,9 +41,8 @@ fn derive_unknown_trait_rejected() {
 }
 
 #[test]
-fn derive_partial_ord_on_enum_rejected() {
-    let err = compile_source("#[deriving(PartialOrd)] enum E { A, B }");
-    assert!(err.contains("cannot derive `PartialOrd`"), "got: {}", err);
+fn derive_partial_ord_enum_lex_order() {
+    expect_answer("lang/derives/enum_partial_ord", 42u32);
 }
 
 #[test]
