@@ -1,7 +1,7 @@
 use super::{
-    EnumEntry, EnumTable, LifetimeRepr, ReExportTable, RType, StructTable, UseEntry,
-    enum_lookup, int_kind_from_name, is_visible_from, resolve_via_reexports,
-    resolve_via_use_scopes, struct_lookup_resolved, type_defining_module,
+    AliasTable, EnumEntry, EnumTable, LifetimeRepr, ReExportTable, RType, StructTable, UseEntry,
+    alias_lookup, enum_lookup, int_kind_from_name, is_visible_from, resolve_via_reexports,
+    resolve_via_use_scopes, struct_lookup_resolved, substitute_rtype, type_defining_module,
 };
 use crate::ast::{PathSegment, Type, TypeKind};
 use crate::span::{Error, Span};
@@ -64,6 +64,7 @@ pub fn resolve_type(
     current_module: &Vec<String>,
     structs: &StructTable,
     enums: &EnumTable,
+    aliases: &AliasTable,
     self_target: Option<&RType>,
     type_params: &Vec<String>,
     use_scope: &Vec<UseEntry>,
@@ -140,6 +141,7 @@ pub fn resolve_type(
                 |cand| {
                     struct_lookup_resolved(structs, reexports, cand).is_some()
                         || enum_lookup_resolved(enums, reexports, cand).is_some()
+                        || alias_lookup(aliases, cand).is_some()
                 },
             ) {
                 p
@@ -153,6 +155,53 @@ pub fn resolve_type(
                 full
             };
             let last = &path.segments[path.segments.len() - 1];
+            // Type-alias check: if the resolved path matches an alias,
+            // substitute its target. Aliases are fully transparent —
+            // their resolved RType replaces the path here, with the
+            // alias's own type-params bound to the use-site's type-args.
+            // Aliases get checked before struct/enum lookup so a deferred
+            // alias-vs-struct shadowing decision (a future Rust feature)
+            // would only need to flip the lookup order.
+            if let Some(a_entry) = alias_lookup(aliases, &full) {
+                if !is_visible_from(&type_defining_module(&a_entry.path), a_entry.is_pub, current_module) {
+                    return Err(Error {
+                        file: file.to_string(),
+                        message: format!("type alias `{}` is private", place_to_string(&a_entry.path)),
+                        span: path.span.copy(),
+                    });
+                }
+                if a_entry.type_params.len() != last.args.len() {
+                    return Err(Error {
+                        file: file.to_string(),
+                        message: format!(
+                            "wrong number of type arguments for `{}`: expected {}, got {}",
+                            place_to_string(&a_entry.path),
+                            a_entry.type_params.len(),
+                            last.args.len()
+                        ),
+                        span: path.span.copy(),
+                    });
+                }
+                let mut env: Vec<(String, RType)> = Vec::new();
+                let mut i = 0;
+                while i < last.args.len() {
+                    let arg = resolve_type(
+                        &last.args[i],
+                        current_module,
+                        structs,
+                        enums,
+                        aliases,
+                        self_target,
+                        type_params,
+                        use_scope,
+                        reexports,
+                        file,
+                    )?;
+                    env.push((a_entry.type_params[i].clone(), arg));
+                    i += 1;
+                }
+                return Ok(substitute_rtype(&a_entry.target, &env));
+            }
             // Try enum first (so a name shared with a struct in different
             // modules picks the right one through use-scope resolution).
             // In practice struct/enum names live in disjoint namespaces
@@ -194,6 +243,7 @@ pub fn resolve_type(
                         current_module,
                         structs,
                         enums,
+                        aliases,
                         self_target,
                         type_params,
                         use_scope,
@@ -257,6 +307,7 @@ pub fn resolve_type(
                     current_module,
                     structs,
                     enums,
+                    aliases,
                     self_target,
                     type_params,
                     use_scope,
@@ -278,6 +329,7 @@ pub fn resolve_type(
                 current_module,
                 structs,
                 enums,
+                aliases,
                 self_target,
                 type_params,
                 use_scope,
@@ -304,6 +356,7 @@ pub fn resolve_type(
                 current_module,
                 structs,
                 enums,
+                aliases,
                 self_target,
                 type_params,
                 use_scope,
@@ -332,6 +385,7 @@ pub fn resolve_type(
                     current_module,
                     structs,
                     enums,
+                    aliases,
                     self_target,
                     type_params,
                     use_scope,
@@ -348,6 +402,7 @@ pub fn resolve_type(
                 current_module,
                 structs,
                 enums,
+                aliases,
                 self_target,
                 type_params,
                 use_scope,

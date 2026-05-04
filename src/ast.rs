@@ -22,6 +22,24 @@ pub enum Item {
     Impl(ImplBlock),
     Trait(TraitDef),
     Use(UseDecl),
+    TypeAlias(TypeAlias),
+}
+
+// `pub? type Name<'a, T> = TypeExpr;` — a name for an existing type.
+// Generic params on the lhs scope into the target; the alias is fully
+// transparent (typeck resolves uses by substituting the target type
+// with the call-site's type-args, then continuing as if the user had
+// written the target). No new type is introduced — `type Foo = u32`
+// makes `Foo` and `u32` interchangeable, not nominally distinct.
+#[derive(Clone)]
+pub struct TypeAlias {
+    pub name: String,
+    pub name_span: Span,
+    pub lifetime_params: Vec<LifetimeParam>,
+    pub type_params: Vec<TypeParam>,
+    pub target: Type,
+    pub is_pub: bool,
+    pub span: Span,
 }
 
 // `use a::b::c;` / `use a::*;` / `use a::b as c;` / `use a::{b, c::d};`

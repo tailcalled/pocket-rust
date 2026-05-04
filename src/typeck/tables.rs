@@ -138,6 +138,38 @@ pub struct MovedPlace {
     pub status: MoveStatus,
 }
 
+// Type-alias declarations (`pub? type Name<...>? = TypeExpr;`).
+// Registered during typeck setup before the rest of the type pipeline
+// runs, so `resolve_type` can substitute alias references with their
+// (already-resolved) target. Aliases are fully transparent — they
+// don't introduce a nominal type. Generic aliases (with type-params)
+// store the target with `RType::Param(...)` slots that the use site
+// substitutes via the path's type-args.
+pub struct AliasTable {
+    pub entries: Vec<AliasEntry>,
+}
+
+pub struct AliasEntry {
+    pub path: Vec<String>,
+    pub name_span: Span,
+    pub file: String,
+    pub type_params: Vec<String>,
+    pub lifetime_params: Vec<String>,
+    pub target: RType,
+    pub is_pub: bool,
+}
+
+pub fn alias_lookup<'a>(table: &'a AliasTable, path: &Vec<String>) -> Option<&'a AliasEntry> {
+    let mut i = 0;
+    while i < table.entries.len() {
+        if &table.entries[i].path == path {
+            return Some(&table.entries[i]);
+        }
+        i += 1;
+    }
+    None
+}
+
 // Trait declarations registered during the first typeck pass. Trait
 // methods' signatures are stored with `Self` as `RType::Param("Self")` so
 // impl validation can substitute against the impl target.

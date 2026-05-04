@@ -1,12 +1,13 @@
 use super::{
-    EnumEntry, EnumTable, EnumVariantEntry, FnSymbol, FuncTable, GenericTemplate, LifetimeRepr,
-    RType, RTypedField, ReExportTable, StructEntry, StructTable, SupertraitRef, TraitEntry, TraitImplEntry,
-    TraitMethodEntry, TraitReceiverShape, TraitTable, UseEntry, VariantPayloadResolved, copy_trait_path, drop_trait_path,
-    find_elision_source, freshen_inferred_lifetimes, func_lookup,
-    is_copy_with_bounds, is_visible_from, module_use_entries, outer_lifetime, place_to_string,
-    require_no_inferred_lifetimes, resolve_type, resolve_via_use_scopes,
-    rtype_eq, rtype_to_string, segments_to_string, struct_env, struct_lookup, substitute_rtype, supertrait_closure, template_lookup, trait_lookup,
-    trait_lookup_resolved, type_defining_module, validate_named_lifetimes,
+    AliasEntry, AliasTable, EnumEntry, EnumTable, EnumVariantEntry, FnSymbol, FuncTable,
+    GenericTemplate, LifetimeRepr, RType, RTypedField, ReExportTable, StructEntry, StructTable,
+    SupertraitRef, TraitEntry, TraitImplEntry, TraitMethodEntry, TraitReceiverShape, TraitTable,
+    UseEntry, VariantPayloadResolved, copy_trait_path, drop_trait_path, find_elision_source,
+    freshen_inferred_lifetimes, func_lookup, is_copy_with_bounds, is_visible_from,
+    module_use_entries, outer_lifetime, place_to_string, require_no_inferred_lifetimes,
+    resolve_type, resolve_via_use_scopes, rtype_eq, rtype_to_string, segments_to_string,
+    struct_env, struct_lookup, substitute_rtype, supertrait_closure, template_lookup,
+    trait_lookup, trait_lookup_resolved, type_defining_module, validate_named_lifetimes,
 };
 use crate::ast::{Function, Item, Module};
 use crate::span::{Error, Span};
@@ -87,9 +88,71 @@ pub(super) fn collect_trait_names(module: &Module, path: &mut Vec<String>, table
             Item::Enum(_) => {}
             Item::Impl(_) => {}
             Item::Use(_) => {}
+            Item::TypeAlias(_) => {}
         }
         i += 1;
     }
+}
+
+// Walk the module tree and register every `pub? type Name<...>? = T;`
+// alias. Each alias's target gets resolved against the prior aliases
+// (declaration-order only — backward references work, forward ones
+// fail with the standard "unknown type" diagnostic). Runs before
+// struct/enum field resolution so subsequent type lookups see aliases
+// in the path table.
+pub(super) fn resolve_type_aliases(
+    module: &Module,
+    path: &mut Vec<String>,
+    root_crate_name: &str,
+    aliases: &mut AliasTable,
+    structs: &StructTable,
+    enums: &EnumTable,
+    reexports: &ReExportTable,
+) -> Result<(), Error> {
+    let crate_root: &str = root_crate_name;
+    let use_scope = module_use_entries(module, crate_root);
+    let mut i = 0;
+    while i < module.items.len() {
+        match &module.items[i] {
+            Item::TypeAlias(ta) => {
+                let mut full = path.clone();
+                full.push(ta.name.clone());
+                let type_param_names: Vec<String> =
+                    ta.type_params.iter().map(|p| p.name.clone()).collect();
+                let lifetime_param_names: Vec<String> =
+                    ta.lifetime_params.iter().map(|p| p.name.clone()).collect();
+                let target = resolve_type(
+                    &ta.target,
+                    path,
+                    structs,
+                    enums,
+                    aliases,
+                    None,
+                    &type_param_names,
+                    &use_scope,
+                    reexports,
+                    &module.source_file,
+                )?;
+                aliases.entries.push(AliasEntry {
+                    path: full,
+                    name_span: ta.name_span.copy(),
+                    file: module.source_file.clone(),
+                    type_params: type_param_names,
+                    lifetime_params: lifetime_param_names,
+                    target,
+                    is_pub: ta.is_pub,
+                });
+            }
+            Item::Module(m) => {
+                path.push(m.name.clone());
+                resolve_type_aliases(m, path, root_crate_name, aliases, structs, enums, reexports)?;
+                path.pop();
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    Ok(())
 }
 
 // Second pass over trait declarations: resolve each method's full
@@ -100,12 +163,14 @@ pub(super) fn collect_trait_names(module: &Module, path: &mut Vec<String>, table
 pub(super) fn resolve_trait_methods(
     module: &Module,
     path: &mut Vec<String>,
+    root_crate_name: &str,
     traits: &mut TraitTable,
     structs: &StructTable,
     enums: &EnumTable,
+    aliases: &AliasTable,
     reexports: &ReExportTable,
 ) -> Result<(), Error> {
-    let crate_root: &str = if path.is_empty() { "" } else { &path[0] };
+    let crate_root: &str = root_crate_name;
     let use_scope = module_use_entries(module, crate_root);
     let mut i = 0;
     while i < module.items.len() {
@@ -147,6 +212,7 @@ pub(super) fn resolve_trait_methods(
                         path,
                         structs,
                         enums,
+                        aliases,
                         Some(&self_target_for_sup),
                         &trait_type_params_names,
                         traits,
@@ -170,6 +236,7 @@ pub(super) fn resolve_trait_methods(
                             path,
                             structs,
                             enums,
+                            aliases,
                             Some(&self_target),
                             &trait_type_params_names,
                             &use_scope,
@@ -205,6 +272,7 @@ pub(super) fn resolve_trait_methods(
                             path,
                             structs,
                             enums,
+                            aliases,
                             Some(&self_target),
                             &type_params,
                             &use_scope,
@@ -220,6 +288,7 @@ pub(super) fn resolve_trait_methods(
                             path,
                             structs,
                             enums,
+                            aliases,
                             Some(&self_target),
                             &type_params,
                             &use_scope,
@@ -259,7 +328,7 @@ pub(super) fn resolve_trait_methods(
             }
             Item::Module(m) => {
                 path.push(m.name.clone());
-                resolve_trait_methods(m, path, traits, structs, enums, reexports)?;
+                resolve_trait_methods(m, path, root_crate_name, traits, structs, enums, aliases, reexports)?;
                 path.pop();
             }
             Item::Function(_) => {}
@@ -267,6 +336,7 @@ pub(super) fn resolve_trait_methods(
             Item::Enum(_) => {}
             Item::Impl(_) => {}
             Item::Use(_) => {}
+            Item::TypeAlias(_) => {}
         }
         i += 1;
     }
@@ -318,6 +388,7 @@ pub(super) fn collect_struct_names(module: &Module, path: &mut Vec<String>, tabl
             Item::Impl(_) => {}
             Item::Trait(_) => {}
             Item::Use(_) => {}
+            Item::TypeAlias(_) => {}
         }
         i += 1;
     }
@@ -375,6 +446,7 @@ pub(super) fn collect_enum_names(module: &Module, path: &mut Vec<String>, table:
             Item::Impl(_) => {}
             Item::Trait(_) => {}
             Item::Use(_) => {}
+            Item::TypeAlias(_) => {}
         }
         i += 1;
     }
@@ -385,11 +457,13 @@ pub(super) fn collect_enum_names(module: &Module, path: &mut Vec<String>, table:
 pub(super) fn resolve_enum_variants(
     module: &Module,
     path: &mut Vec<String>,
+    root_crate_name: &str,
     table: &mut EnumTable,
     structs: &StructTable,
+    aliases: &AliasTable,
     reexports: &ReExportTable,
 ) -> Result<(), Error> {
-    let crate_root: &str = if path.is_empty() { "" } else { &path[0] };
+    let crate_root: &str = root_crate_name;
     let use_scope = module_use_entries(module, crate_root);
     let mut i = 0;
     while i < module.items.len() {
@@ -417,6 +491,7 @@ pub(super) fn resolve_enum_variants(
                                     path,
                                     structs,
                                     table,
+                                    aliases,
                                     None,
                                     &type_param_names,
                                     &use_scope,
@@ -437,6 +512,7 @@ pub(super) fn resolve_enum_variants(
                                     path,
                                     structs,
                                     table,
+                                    aliases,
                                     None,
                                     &type_param_names,
                                     &use_scope,
@@ -478,7 +554,7 @@ pub(super) fn resolve_enum_variants(
             }
             Item::Module(m) => {
                 path.push(m.name.clone());
-                resolve_enum_variants(m, path, table, structs, reexports)?;
+                resolve_enum_variants(m, path, root_crate_name, table, structs, aliases, reexports)?;
                 path.pop();
             }
             Item::Function(_) => {}
@@ -486,6 +562,7 @@ pub(super) fn resolve_enum_variants(
             Item::Impl(_) => {}
             Item::Trait(_) => {}
             Item::Use(_) => {}
+            Item::TypeAlias(_) => {}
         }
         i += 1;
     }
@@ -495,8 +572,10 @@ pub(super) fn resolve_enum_variants(
 pub(super) fn resolve_struct_fields(
     module: &Module,
     path: &mut Vec<String>,
+    root_crate_name: &str,
     table: &mut StructTable,
     enums: &EnumTable,
+    aliases: &AliasTable,
     reexports: &ReExportTable,
 ) -> Result<(), Error> {
     let mut i = 0;
@@ -516,7 +595,7 @@ pub(super) fn resolve_struct_fields(
                     .map(|p| p.name.clone())
                     .collect();
                 let mut resolved: Vec<RTypedField> = Vec::new();
-                let crate_root: &str = if path.is_empty() { "" } else { &path[0] };
+                let crate_root: &str = root_crate_name;
     let use_scope = module_use_entries(module, crate_root);
                 let mut k = 0;
                 while k < sd.fields.len() {
@@ -525,6 +604,7 @@ pub(super) fn resolve_struct_fields(
                         path,
                         table,
                         enums,
+                        aliases,
                         None,
                         &type_param_names,
                         &use_scope,
@@ -565,7 +645,7 @@ pub(super) fn resolve_struct_fields(
             }
             Item::Module(m) => {
                 path.push(m.name.clone());
-                resolve_struct_fields(m, path, table, enums, reexports)?;
+                resolve_struct_fields(m, path, root_crate_name, table, enums, aliases, reexports)?;
                 path.pop();
             }
             Item::Function(_) => {}
@@ -573,6 +653,7 @@ pub(super) fn resolve_struct_fields(
             Item::Impl(_) => {}
             Item::Trait(_) => {}
             Item::Use(_) => {}
+            Item::TypeAlias(_) => {}
         }
         i += 1;
     }
@@ -582,14 +663,16 @@ pub(super) fn resolve_struct_fields(
 pub(super) fn collect_funcs(
     module: &Module,
     path: &mut Vec<String>,
+    root_crate_name: &str,
     funcs: &mut FuncTable,
     next_idx: &mut u32,
     structs: &StructTable,
     enums: &EnumTable,
+    aliases: &AliasTable,
     traits: &mut TraitTable,
     reexports: &ReExportTable,
 ) -> Result<(), Error> {
-    let crate_root: &str = if path.is_empty() { "" } else { &path[0] };
+    let crate_root: &str = root_crate_name;
     let use_scope = module_use_entries(module, crate_root);
     let mut i = 0;
     while i < module.items.len() {
@@ -608,6 +691,7 @@ pub(super) fn collect_funcs(
                     next_idx,
                     structs,
                     enums,
+                    aliases,
                     traits,
                     &use_scope,
                     reexports,
@@ -616,13 +700,13 @@ pub(super) fn collect_funcs(
             }
             Item::Module(m) => {
                 path.push(m.name.clone());
-                collect_funcs(m, path, funcs, next_idx, structs, enums, traits, reexports)?;
+                collect_funcs(m, path, root_crate_name, funcs, next_idx, structs, enums, aliases, traits, reexports)?;
                 path.pop();
             }
             Item::Struct(_) => {}
             Item::Enum(_) => {}
             Item::Impl(ib) => {
-                let target_rt = resolve_impl_target(ib, path, structs, enums, &use_scope, reexports, &module.source_file)?;
+                let target_rt = resolve_impl_target(ib, path, structs, enums, aliases, &use_scope, reexports, &module.source_file)?;
                 let impl_type_params: Vec<String> =
                     ib.type_params.iter().map(|p| p.name.clone()).collect();
                 let impl_lifetime_params: Vec<String> =
@@ -656,6 +740,7 @@ pub(super) fn collect_funcs(
                             path,
                             structs,
                             enums,
+                            aliases,
                             Some(&target_rt),
                             &impl_type_params,
                             traits,
@@ -679,6 +764,7 @@ pub(super) fn collect_funcs(
                             path,
                             structs,
                             enums,
+                            aliases,
                             traits,
                             &impl_type_params,
                             &use_scope,
@@ -780,6 +866,7 @@ pub(super) fn collect_funcs(
                         next_idx,
                         structs,
                         enums,
+                        aliases,
                         traits,
                         &use_scope,
                         reexports,
@@ -795,6 +882,7 @@ pub(super) fn collect_funcs(
                         path,
                         structs,
                         enums,
+                        aliases,
                         Some(&target_rt),
                         &impl_type_params,
                         traits,
@@ -816,6 +904,7 @@ pub(super) fn collect_funcs(
             }
             Item::Trait(_) => {}
             Item::Use(_) => {}
+            Item::TypeAlias(_) => {}
         }
         i += 1;
     }
@@ -1172,6 +1261,7 @@ pub(super) fn resolve_trait_ref(
     current_module: &Vec<String>,
     structs: &StructTable,
     enums: &EnumTable,
+    aliases: &AliasTable,
     self_target: Option<&RType>,
     type_params: &Vec<String>,
     traits: &TraitTable,
@@ -1221,6 +1311,7 @@ pub(super) fn resolve_trait_ref(
             current_module,
             structs,
             enums,
+            aliases,
             self_target,
             type_params,
             use_scope,
@@ -1752,6 +1843,7 @@ pub(super) fn resolve_and_validate_assoc_bindings(
     current_module: &Vec<String>,
     structs: &StructTable,
     enums: &EnumTable,
+    aliases: &AliasTable,
     traits: &TraitTable,
     impl_type_params: &Vec<String>,
     use_scope: &Vec<UseEntry>,
@@ -1840,6 +1932,7 @@ pub(super) fn resolve_and_validate_assoc_bindings(
                     current_module,
                     structs,
                     enums,
+                    aliases,
                     Some(target_rt),
                     impl_type_params,
                     use_scope,
@@ -1931,6 +2024,7 @@ pub(super) fn resolve_impl_target(
     current_module: &Vec<String>,
     structs: &StructTable,
     enums: &EnumTable,
+    aliases: &AliasTable,
     use_scope: &Vec<UseEntry>,
     reexports: &ReExportTable,
     file: &str,
@@ -1945,6 +2039,7 @@ pub(super) fn resolve_impl_target(
         current_module,
         structs,
         enums,
+        aliases,
         None,
         &impl_param_names,
         use_scope,
@@ -1990,6 +2085,7 @@ pub(super) fn register_function(
     next_idx: &mut u32,
     structs: &StructTable,
     enums: &EnumTable,
+    aliases: &AliasTable,
     traits: &TraitTable,
     use_scope: &Vec<UseEntry>,
     reexports: &ReExportTable,
@@ -2029,6 +2125,7 @@ pub(super) fn register_function(
             current_module,
             structs,
             enums,
+            aliases,
             self_target,
             &type_param_names,
             use_scope,
@@ -2048,6 +2145,7 @@ pub(super) fn register_function(
                 current_module,
                 structs,
                 enums,
+                aliases,
                 self_target,
                 &type_param_names,
                 use_scope,
@@ -2193,6 +2291,7 @@ pub(super) fn register_function(
                     current_module,
                     structs,
                     enums,
+                    aliases,
                     self_target,
                     &type_param_names,
                     use_scope,

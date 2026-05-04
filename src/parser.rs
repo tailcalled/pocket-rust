@@ -3,8 +3,8 @@ use crate::ast::{
     Expr, ExprKind, FieldAccess, FieldInit, FieldPattern, Function, IfExpr, IfLetExpr,
     ImplAssocType, ImplBlock, LetStmt, Lifetime, LifetimeParam, MatchArm, MatchExpr, MethodCall,
     Param, Path, PathSegment, Pattern, PatternKind, Stmt, StructDef, StructField, StructLit,
-    TraitAssocType, TraitBound, TraitDef, TraitMethodSig, Type, TypeKind, TypeParam, UseDecl,
-    UseTree, VariantPayload,
+    TraitAssocType, TraitBound, TraitDef, TraitMethodSig, Type, TypeAlias, TypeKind, TypeParam,
+    UseDecl, UseTree, VariantPayload,
 };
 use crate::lexer::{Token, TokenKind, token_kind_name};
 use crate::span::{Error, Pos, Span};
@@ -17,6 +17,7 @@ pub enum RawItem {
     Impl(ImplBlock),
     Trait(TraitDef),
     Use(UseDecl),
+    TypeAlias(TypeAlias),
 }
 
 // Attach captured `#[deriving(...)]` clauses to the following item.
@@ -122,11 +123,36 @@ impl Parser {
             Ok(RawItem::Trait(self.parse_trait_def_with_vis(is_pub)?))
         } else if self.peek_kind(&TokenKind::Use) {
             Ok(RawItem::Use(self.parse_use_decl_with_vis(is_pub)?))
+        } else if self.peek_kind(&TokenKind::Type) {
+            Ok(RawItem::TypeAlias(self.parse_type_alias_with_vis(is_pub)?))
         } else {
             Err(self.error_at_current(
-                "expected `fn`, `mod`, `struct`, `enum`, `impl`, `trait`, or `use`",
+                "expected `fn`, `mod`, `struct`, `enum`, `impl`, `trait`, `type`, or `use`",
             ))
         }
+    }
+
+    fn parse_type_alias_with_vis(&mut self, is_pub: bool) -> Result<TypeAlias, Error> {
+        let type_span = self.expect(&TokenKind::Type, "`type`")?;
+        let (name, name_span) = self.expect_ident()?;
+        let (lifetime_params, type_params) = if self.peek_kind(&TokenKind::LAngle) {
+            self.parse_generic_params()?
+        } else {
+            (Vec::new(), Vec::new())
+        };
+        self.expect(&TokenKind::Eq, "`=` after type alias name")?;
+        let target = self.parse_type()?;
+        let semi = self.expect(&TokenKind::Semi, "`;` to terminate type alias")?;
+        let span = Span::new(type_span.start, semi.end);
+        Ok(TypeAlias {
+            name,
+            name_span,
+            lifetime_params,
+            type_params,
+            target,
+            is_pub,
+            span,
+        })
     }
 
     // Parse zero-or-more `#[deriving(Trait, Trait, ...)]` attributes

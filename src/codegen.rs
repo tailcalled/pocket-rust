@@ -702,6 +702,7 @@ fn emit_module(
             }
             Item::Trait(_) => {}
             Item::Use(_) => {}
+            Item::TypeAlias(_) => {}
         }
         i += 1;
     }

@@ -284,11 +284,18 @@ pub fn check(
     root: &Module,
     structs: &mut StructTable,
     enums: &mut EnumTable,
+    aliases: &mut AliasTable,
     traits: &mut TraitTable,
     funcs: &mut FuncTable,
     reexports: &mut ReExportTable,
     next_idx: &mut u32,
 ) -> Result<(), Error> {
+    // Crate name is the root module's name, captured once at entry —
+    // empty for the user crate, "std" for the stdlib library, etc. We
+    // thread this through so submodules don't have to infer the crate
+    // root from path[0] (which is wrong for user-crate submodules,
+    // whose path[0] is a submodule name, not the crate name).
+    let root_crate_name: &str = root.name.as_str();
     // Build this crate's re-export entries before any pass that does
     // path resolution, so `pub use` re-exports are visible to lookups.
     let crate_reexports = build_reexport_table(root);
@@ -309,28 +316,39 @@ pub fn check(
     push_root_name(&mut path, root);
     collect_trait_names(root, &mut path, traits);
 
+    // Resolve type aliases before struct/enum field resolution so a
+    // field type can reference an alias. Aliases themselves resolve in
+    // declaration order; an alias whose target references another
+    // alias must come *after* it in source. Cycle detection: not yet
+    // implemented; a simple recursive case would loop. Selfhost's
+    // aliases are all flat (target = primitive), so the gap is
+    // theoretical for now.
     let mut path: Vec<String> = Vec::new();
     push_root_name(&mut path, root);
-    resolve_struct_fields(root, &mut path, structs, enums, reexports)?;
+    resolve_type_aliases(root, &mut path, root_crate_name, aliases, structs, enums, reexports)?;
 
     let mut path: Vec<String> = Vec::new();
     push_root_name(&mut path, root);
-    resolve_enum_variants(root, &mut path, enums, structs, reexports)?;
+    resolve_struct_fields(root, &mut path, root_crate_name, structs, enums, aliases, reexports)?;
 
     let mut path: Vec<String> = Vec::new();
     push_root_name(&mut path, root);
-    resolve_trait_methods(root, &mut path, traits, structs, enums, reexports)?;
+    resolve_enum_variants(root, &mut path, root_crate_name, enums, structs, aliases, reexports)?;
 
     let mut path: Vec<String> = Vec::new();
     push_root_name(&mut path, root);
-    collect_funcs(root, &mut path, funcs, next_idx, structs, enums, traits, reexports)?;
+    resolve_trait_methods(root, &mut path, root_crate_name, traits, structs, enums, aliases, reexports)?;
+
+    let mut path: Vec<String> = Vec::new();
+    push_root_name(&mut path, root);
+    collect_funcs(root, &mut path, root_crate_name, funcs, next_idx, structs, enums, aliases, traits, reexports)?;
 
     validate_supertrait_obligations(traits)?;
 
     let mut path: Vec<String> = Vec::new();
     push_root_name(&mut path, root);
     let mut current_file = root.source_file.clone();
-    check_module(root, &mut path, &mut current_file, structs, enums, traits, funcs, reexports)?;
+    check_module(root, &mut path, root_crate_name, &mut current_file, structs, enums, aliases, traits, funcs, reexports)?;
 
     Ok(())
 }
@@ -1216,6 +1234,7 @@ pub(crate) struct CheckCtx<'a> {
     pub(crate) current_file: &'a str,
     pub(crate) structs: &'a StructTable,
     pub(crate) enums: &'a EnumTable,
+    pub(crate) aliases: &'a AliasTable,
     pub(crate) traits: &'a TraitTable,
     pub(crate) funcs: &'a FuncTable,
     pub(crate) self_target: Option<&'a RType>,
@@ -1252,32 +1271,34 @@ pub(crate) struct CheckCtx<'a> {
 fn check_module(
     module: &Module,
     path: &mut Vec<String>,
+    root_crate_name: &str,
     current_file: &mut String,
     structs: &StructTable,
     enums: &EnumTable,
+    aliases: &AliasTable,
     traits: &TraitTable,
     funcs: &mut FuncTable,
     reexports: &ReExportTable,
 ) -> Result<(), Error> {
     let saved = current_file.clone();
     *current_file = module.source_file.clone();
-    let crate_root: &str = if path.is_empty() { "" } else { &path[0] };
+    let crate_root: &str = root_crate_name;
     let use_scope = module_use_entries(module, crate_root);
     let mut i = 0;
     while i < module.items.len() {
         match &module.items[i] {
             Item::Function(f) => {
-                check_function(f, path, path, None, current_file, structs, enums, traits, funcs, reexports, &use_scope)?
+                check_function(f, path, path, None, current_file, structs, enums, aliases, traits, funcs, reexports, &use_scope)?
             }
             Item::Module(m) => {
                 path.push(m.name.clone());
-                check_module(m, path, current_file, structs, enums, traits, funcs, reexports)?;
+                check_module(m, path, root_crate_name, current_file, structs, enums, aliases, traits, funcs, reexports)?;
                 path.pop();
             }
             Item::Struct(_) => {}
             Item::Enum(_) => {}
             Item::Impl(ib) => {
-                let target_rt = resolve_impl_target(ib, path, structs, enums, &use_scope, reexports, current_file)?;
+                let target_rt = resolve_impl_target(ib, path, structs, enums, aliases, &use_scope, reexports, current_file)?;
                 // Mirror collect_funcs's prefix scheme. Path targets
                 // use the struct name; non-Path trait impls use
                 // `__trait_impl_<idx>`; inherent non-Path impls use
@@ -1337,6 +1358,7 @@ fn check_module(
                         current_file,
                         structs,
                         enums,
+                        aliases,
                         traits,
                         funcs,
                         reexports,
@@ -1347,6 +1369,7 @@ fn check_module(
             }
             Item::Trait(_) => {}
             Item::Use(_) => {}
+            Item::TypeAlias(_) => {}
         }
         i += 1;
     }
@@ -1362,6 +1385,7 @@ fn check_function(
     current_file: &str,
     structs: &StructTable,
     enums: &EnumTable,
+    aliases: &AliasTable,
     traits: &TraitTable,
     funcs: &mut FuncTable,
     reexports: &ReExportTable,
@@ -1422,6 +1446,7 @@ fn check_function(
                         current_module,
                         structs,
                         enums,
+                        aliases,
                         self_target,
                         &type_param_names,
                         module_use_scope,
@@ -1446,6 +1471,7 @@ fn check_function(
             current_module,
             structs,
             enums,
+            aliases,
             self_target,
             &type_param_names,
             module_use_scope,
@@ -1472,6 +1498,7 @@ fn check_function(
                 current_module,
                 structs,
                 enums,
+                aliases,
                 self_target,
                 &type_param_names,
                 module_use_scope,
@@ -1529,6 +1556,7 @@ fn check_function(
             current_file,
             structs,
             enums,
+            aliases,
             traits,
             funcs: &*funcs,
             self_target,
@@ -1997,6 +2025,7 @@ fn check_let_stmt(ctx: &mut CheckCtx, let_stmt: &LetStmt) -> Result<(), Error> {
                 ctx.current_module,
                 ctx.structs,
                 ctx.enums,
+                ctx.aliases,
                 ctx.self_target,
                 ctx.type_params,
                 &ctx.use_scope,
@@ -2169,6 +2198,7 @@ fn check_assign_stmt(ctx: &mut CheckCtx, assign: &AssignStmt) -> Result<(), Erro
         &chain,
         ctx.structs,
         ctx.enums,
+        ctx.aliases,
         ctx.current_file,
         &assign.lhs.span,
     )?;
@@ -2361,6 +2391,7 @@ fn walk_chain_type(
     chain: &Vec<String>,
     structs: &StructTable,
     _enums: &EnumTable,
+    aliases: &AliasTable,
     file: &str,
     span: &Span,
 ) -> Result<InferType, Error> {
@@ -3460,6 +3491,7 @@ fn check_builtin_cast(
         ctx.current_module,
         ctx.structs,
         ctx.enums,
+        ctx.aliases,
         ctx.self_target,
         ctx.type_params,
         &ctx.use_scope,
@@ -3471,6 +3503,7 @@ fn check_builtin_cast(
         ctx.current_module,
         ctx.structs,
         ctx.enums,
+        ctx.aliases,
         ctx.self_target,
         ctx.type_params,
         &ctx.use_scope,
@@ -3712,6 +3745,7 @@ fn check_builtin_slice_ptr(
         ctx.current_module,
         ctx.structs,
         ctx.enums,
+        ctx.aliases,
         ctx.self_target,
         ctx.type_params,
         &ctx.use_scope,
@@ -3773,6 +3807,7 @@ fn check_builtin_slice_len(
         ctx.current_module,
         ctx.structs,
         ctx.enums,
+        ctx.aliases,
         ctx.self_target,
         ctx.type_params,
         &ctx.use_scope,
@@ -3863,6 +3898,7 @@ fn check_builtin_make_slice(
         ctx.current_module,
         ctx.structs,
         ctx.enums,
+        ctx.aliases,
         ctx.self_target,
         ctx.type_params,
         &ctx.use_scope,
@@ -3939,6 +3975,7 @@ fn check_builtin_size_of(
         ctx.current_module,
         ctx.structs,
         ctx.enums,
+        ctx.aliases,
         ctx.self_target,
         ctx.type_params,
         &ctx.use_scope,
@@ -4076,11 +4113,12 @@ use methods::check_method_call;
 
 mod tables;
 pub use tables::{
-    CallResolution, EnumEntry, EnumTable, EnumVariantEntry, FnSymbol, FuncTable, GenericTemplate,
-    MethodResolution, MoveStatus, MovedPlace, PatternErgo, RTypedField, ReceiverAdjust,
-    StructEntry, StructTable, SupertraitRef, TraitDispatch, TraitEntry, TraitImplEntry,
-    TraitMethodEntry, TraitReceiverShape, TraitTable, VariantPayloadResolved, enum_lookup,
-    find_inherent_synth_idx, func_lookup, struct_lookup, template_lookup, trait_lookup,
+    AliasEntry, AliasTable, CallResolution, EnumEntry, EnumTable, EnumVariantEntry, FnSymbol,
+    FuncTable, GenericTemplate, MethodResolution, MoveStatus, MovedPlace, PatternErgo,
+    RTypedField, ReceiverAdjust, StructEntry, StructTable, SupertraitRef, TraitDispatch,
+    TraitEntry, TraitImplEntry, TraitMethodEntry, TraitReceiverShape, TraitTable,
+    VariantPayloadResolved, alias_lookup, enum_lookup, find_inherent_synth_idx, func_lookup,
+    struct_lookup, template_lookup, trait_lookup,
 };
 
 mod traits;
@@ -4095,9 +4133,8 @@ pub(crate) use traits::try_match_against_infer;
 mod setup;
 use setup::{
     collect_enum_names, collect_funcs, collect_struct_names, collect_trait_names,
-    push_root_name, resolve_enum_variants,
-    resolve_impl_target, resolve_struct_fields, resolve_trait_methods,
-    validate_supertrait_obligations,
+    push_root_name, resolve_enum_variants, resolve_impl_target, resolve_struct_fields,
+    resolve_trait_methods, resolve_type_aliases, validate_supertrait_obligations,
 };
 
 // `recv.method(args)` resolution. Type-check the receiver, peel one layer of
@@ -4390,6 +4427,7 @@ fn check_cast(
         ctx.current_module,
         ctx.structs,
         ctx.enums,
+        ctx.aliases,
         ctx.self_target,
         ctx.type_params,
         &ctx.use_scope,
@@ -4648,6 +4686,7 @@ fn check_call(ctx: &mut CheckCtx, call: &Call, call_expr: &Expr) -> Result<Infer
                 ctx.current_module,
                 ctx.structs,
                 ctx.enums,
+                ctx.aliases,
                 ctx.self_target,
                 ctx.type_params,
                 &ctx.use_scope,
@@ -4900,6 +4939,7 @@ fn check_variant_struct_lit(
                 ctx.current_module,
                 ctx.structs,
                 ctx.enums,
+                ctx.aliases,
                 ctx.self_target,
                 ctx.type_params,
                 &ctx.use_scope,
@@ -5086,6 +5126,7 @@ fn check_variant_call(
                 ctx.current_module,
                 ctx.structs,
                 ctx.enums,
+                ctx.aliases,
                 ctx.self_target,
                 ctx.type_params,
                 &ctx.use_scope,
@@ -5272,6 +5313,7 @@ fn check_struct_lit(
             ctx.current_module,
             ctx.structs,
             ctx.enums,
+            ctx.aliases,
             ctx.self_target,
             ctx.type_params,
             &ctx.use_scope,

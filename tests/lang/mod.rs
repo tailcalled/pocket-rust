@@ -227,4 +227,5 @@ mod structs;
 mod traits;
 mod try_op;
 mod tuples;
+mod type_aliases;
 mod while_loops;

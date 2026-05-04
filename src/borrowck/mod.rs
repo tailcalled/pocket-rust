@@ -75,6 +75,7 @@ fn check_module(
             Item::Struct(_) => {}
             Item::Enum(_) => {}
             Item::Use(_) => {}
+            Item::TypeAlias(_) => {}
             Item::Impl(ib) => {
                 let target_name = match &ib.target.kind {
                     crate::ast::TypeKind::Path(p) if p.segments.len() == 1 => {
