@@ -1,6 +1,7 @@
 mod ast;
 mod borrowck;
 mod codegen;
+mod derive;
 mod layout;
 mod lexer;
 mod mono;
@@ -249,6 +250,7 @@ fn resolve_module(
     let source = vfs.get(file_path).expect("file existence checked by caller");
     let tokens = lexer::tokenize(file_path, source)?;
     let raw_items = parser::parse(file_path, tokens)?;
+    let raw_items = derive::expand(file_path, raw_items)?;
     let mut items: Vec<Item> = Vec::new();
     for raw in raw_items {
         match raw {

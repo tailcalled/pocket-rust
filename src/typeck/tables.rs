@@ -93,6 +93,45 @@ pub enum MoveStatus {
     MaybeMoved,
 }
 
+// Per-pattern.id record of "match ergonomics" decisions made by typeck.
+// Default-zero means "no ergonomics applied at this pattern node — mono
+// can lower the AST as written". Mono reads this side table to rebuild
+// the pattern with explicit `&` wrappers and `ref` bindings before
+// codegen sees it.
+//
+// Real Rust's match-ergonomics RFC 2005: when a non-reference pattern
+// matches a `&T`/`&mut T` scrutinee, the reference layer is auto-peeled
+// and the "default binding mode" inside that pattern flips from Move to
+// Ref/RefMut. Pocket-rust mirrors this — typeck records *what* it did
+// here so mono can reify the desugar without re-deriving anything.
+#[derive(Clone, Copy)]
+pub struct PatternErgo {
+    // Number of `&` layers typeck auto-peeled before applying this
+    // pattern. Zero means "pattern matched the scrutinee shape natively"
+    // (the common case). Each peel layer's mutability is encoded in
+    // `peel_mut_bits` (bit 0 = outermost peel).
+    pub peel_layers: u8,
+    pub peel_mut_bits: u8,
+    // For Binding/At patterns: when true, the binding's effective mode
+    // is `&T` or `&mut T` (overriding the AST's `by_ref: false` written
+    // form). False means "use AST as written". `binding_mutable_ref`
+    // selects between `&T` (false) and `&mut T` (true) when the override
+    // is active.
+    pub binding_override_ref: bool,
+    pub binding_mutable_ref: bool,
+}
+
+impl Default for PatternErgo {
+    fn default() -> Self {
+        PatternErgo {
+            peel_layers: 0,
+            peel_mut_bits: 0,
+            binding_override_ref: false,
+            binding_mutable_ref: false,
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct MovedPlace {
     pub place: Vec<String>,
@@ -267,6 +306,10 @@ pub struct FnSymbol {
     // holds the resolved RTypes in the order they appeared in the
     // turbofish. Codegen substitutes through the mono env before use.
     pub builtin_type_targets: Vec<Option<Vec<RType>>>,
+    // Per-pattern.id ergonomics record. Default-zero entries describe
+    // "no ergonomics applied"; non-zero entries tell mono how to rebuild
+    // the pattern with explicit `&`/`ref` before codegen.
+    pub pattern_ergo: Vec<PatternErgo>,
 }
 
 // How a `Call` expression resolves to a callee. For non-generic functions
@@ -343,6 +386,8 @@ pub struct GenericTemplate {
     pub move_sites: Vec<(crate::ast::NodeId, String)>,
     // See FnSymbol.builtin_type_targets.
     pub builtin_type_targets: Vec<Option<Vec<RType>>>,
+    // See FnSymbol.pattern_ergo.
+    pub pattern_ergo: Vec<PatternErgo>,
 }
 
 #[derive(Clone)]

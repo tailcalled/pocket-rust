@@ -26,7 +26,25 @@ Variant references must use a path (`E::A`) — bare-ident patterns are always b
 
 ## Type checking
 
-`check_pattern(ctx, pattern, scrutinee_ty, bindings)` recursively unifies the scrutinee type against the pattern shape, collecting `(name, ty, span, mutable)` bindings into the arm scope. Bindings introduced by Or-patterns must agree across alternatives — checked by walking the first alt's bindings and unifying each subsequent alt's set.
+`check_pattern(ctx, pattern, scrutinee_ty, bindings)` is the public entry; internally it threads a default `BindingMode` (Move/Ref/RefMut) through `check_pattern_with_mode` for match-ergonomics descent (RFC 2005). Each call recursively unifies the scrutinee type against the pattern shape, collecting `(name, ty, span, mutable)` bindings into the arm scope. Bindings introduced by Or-patterns must agree across alternatives — checked by walking the first alt's bindings and unifying each subsequent alt's set.
+
+## Match ergonomics
+
+When a non-reference pattern is matched against a `&T` / `&mut T` scrutinee, `check_pattern_with_mode` auto-peels ref layers and bumps the default binding mode (Move → Ref/RefMut). Bindings descended-to under a non-Move mode bind by reference even when the AST has `by_ref: false`. Explicit `&pat` resets the mode to Move (the user is stripping the ref themselves). Mode bumps are demotion-monotone: once at Ref, peeling another `&mut` keeps the mode at Ref (you can't get exclusive access through an outer shared borrow).
+
+Decisions are recorded per pattern.id in `ctx.pattern_ergo: Vec<PatternErgo>` (see `src/typeck/tables.rs`), finalized into `FnSymbol.pattern_ergo` / `GenericTemplate.pattern_ergo`:
+- `peel_layers: u8` — how many ref layers were auto-peeled at this pattern node.
+- `peel_mut_bits: u8` — bit i set if the i-th outermost peel was `&mut`.
+- `binding_override_ref` / `binding_mutable_ref` — for Binding/At nodes whose effective mode differs from the AST.
+
+The original AST is never mutated — `pattern_ergo` is a side table that downstream passes consult.
+
+**Downstream consumption:**
+- **Borrowck** (`build.rs`): `lower_pattern_test` + `collect_bindings_into` peel the scrutinee place via `Projection::Deref` and strip ref layers off the type, then dispatch the pattern's kind. Binding overrides flow into `PatternBinding.by_ref` / `mutable`.
+- **Mono** (`mono.rs`): `desugar_pattern` walks the AST + `pattern_ergo` and produces a fresh AST pattern with explicit `Ref { ... }` wrappers and `Binding { by_ref: true, ... }`. Codegen sees the explicit-form pattern and uses its existing `Ref` / `ref-binding` paths — no codegen-side ergonomics knowledge required.
+- **Exhaustiveness** (`gather_ref_inner_pats`): non-Ref patterns count as inner ref-pattern coverage when the scrutinee is a reference, so `match o: &Option<u32> { Some(_) => ..., None => ... }` is exhaustive.
+
+Currently covered shapes: `Wildcard`, `Binding`, `At`, `VariantTuple`, `VariantStruct`, `Tuple`, `Or`. `LitInt`/`LitBool`/`Range` don't auto-peel yet (would need the literal-pattern handler to dereference); `match &5 { 5 => ... }` still requires explicit `&5`.
 
 ## Exhaustiveness
 

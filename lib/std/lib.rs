@@ -1,4 +1,5 @@
 pub mod marker;
+pub mod clone;
 pub mod ops;
 pub mod cmp;
 pub mod mem;
@@ -11,6 +12,7 @@ pub mod iter;
 pub mod dummy;
 
 pub use crate::marker::Copy;
+pub use crate::clone::Clone;
 pub use crate::ops::Drop;
 pub use crate::ops::Index;
 pub use crate::ops::IndexMut;

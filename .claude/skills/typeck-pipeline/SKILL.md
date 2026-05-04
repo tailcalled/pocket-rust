@@ -50,7 +50,7 @@ Downstream passes look up by id rather than maintaining source-DFS counters.
 - `path_resolve.rs` — `resolve_type`, `resolve_full_path`, `lookup_variant_path`, `enum_lookup_resolved`, `place_to_string`, `segments_to_string`.
 - `builtins.rs` — `BuiltinSig` + `builtin_signature` for the `¤` intrinsic table.
 - `setup.rs` — every `collect_*`/`resolve_*`/`register_*`/`validate_*` pass that runs before body checking (struct/enum/trait/func collection, supertrait obligation enforcement, generic-impl validation).
-- `methods.rs` — `check_method_call` and the symbolic-bound dispatch path.
+- `methods.rs` — `check_method_call` and the symbolic-bound dispatch path. Receiver typing goes through `check_place_expr` (not the value-position `check_expr`) so the field-access "move out of borrow" gate doesn't fire on receivers that the dispatch will subsequently autoref. The Move-self case (consuming methods on through-ref non-Copy fields) gets caught by borrowck's `move_traverses_borrow` check on `MethodCall` operands instead. That borrowck check is intentionally narrow — it covers the one-projection-on-a-Ref-root case (`o.field.consume()`) and leaves multi-step chains (`(*o).p`, `o.x.p`) as a known gap (see `tests/gaps/borrowck.rs`).
 - `patterns.rs` — `check_pattern`, struct/variant patterns, exhaustiveness (`exhausted`, `pattern_is_irrefutable`).
 - `mod.rs` — entry `pub fn check`, `InferType`/`Subst`, `CheckCtx`, body walking (`check_module`, `check_function`, `check_block`, `check_expr` and the per-construct helpers).
 

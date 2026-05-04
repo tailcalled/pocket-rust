@@ -40,6 +40,12 @@ pub struct CfgBuildCtx<'a> {
     pub param_types: &'a Vec<RType>,
     // Resolved return type (`()` if absent in source).
     pub return_type: &'a RType,
+    // Per-pattern.id ergonomics record from typeck. Borrowck reads
+    // this at every pattern-test site to peel ref layers off the
+    // scrutinee before dispatching the pattern's kind-specific test —
+    // so a `Some(x)` pattern matched against a `&Option<T>` scrutinee
+    // walks through a `Deref` projection first.
+    pub pattern_ergo: &'a Vec<crate::typeck::PatternErgo>,
 }
 
 // Active-loop bookkeeping for break/continue.
@@ -1352,6 +1358,31 @@ impl<'a> Builder<'a> {
         on_match: BlockId,
         on_fail: BlockId,
     ) {
+        // Match-ergonomics: typeck records on each pattern.id how many
+        // `&` layers were auto-peeled before applying the pattern.
+        // Replay those peels here by appending Deref projections to
+        // the scrut place and stripping ref layers off the type before
+        // dispatching the pattern's kind. Ref patterns peel zero
+        // layers (they bind through the ref themselves).
+        let pid = pat.id as usize;
+        let ergo = if pid < self.ctx.pattern_ergo.len() {
+            self.ctx.pattern_ergo[pid]
+        } else {
+            crate::typeck::PatternErgo::default()
+        };
+        let mut peeled_place = scrut_place.clone();
+        let mut peeled_ty = scrut_ty.clone();
+        let mut layer = 0u8;
+        while layer < ergo.peel_layers {
+            peeled_place.projections.push(Projection::Deref);
+            peeled_ty = match peeled_ty {
+                RType::Ref { inner, .. } => (*inner).clone(),
+                _ => break, // type unexpectedly non-ref — fall through
+            };
+            layer += 1;
+        }
+        let scrut_place = &peeled_place;
+        let scrut_ty = &peeled_ty;
         match &pat.kind {
             PatternKind::Wildcard
             | PatternKind::Binding { .. } => {
@@ -1714,6 +1745,29 @@ impl<'a> Builder<'a> {
         scrut_ty: &RType,
         out: &mut Vec<PatternBinding>,
     ) {
+        // Apply match-ergonomics peels. Same logic as
+        // `lower_pattern_test`: append Deref projections to the place
+        // and strip ref layers off the type for each peel layer that
+        // typeck recorded on this pattern.id.
+        let pid = pat.id as usize;
+        let ergo = if pid < self.ctx.pattern_ergo.len() {
+            self.ctx.pattern_ergo[pid]
+        } else {
+            crate::typeck::PatternErgo::default()
+        };
+        let mut peeled_place = scrut_place.clone();
+        let mut peeled_ty = scrut_ty.clone();
+        let mut layer = 0u8;
+        while layer < ergo.peel_layers {
+            peeled_place.projections.push(Projection::Deref);
+            peeled_ty = match peeled_ty {
+                RType::Ref { inner, .. } => (*inner).clone(),
+                _ => break,
+            };
+            layer += 1;
+        }
+        let scrut_place = &peeled_place;
+        let scrut_ty = &peeled_ty;
         match &pat.kind {
             PatternKind::Wildcard
             | PatternKind::LitInt(_)
@@ -1725,12 +1779,22 @@ impl<'a> Builder<'a> {
                 by_ref,
                 mutable,
             } => {
+                // Match-ergonomics override (typeck-recorded) takes
+                // precedence over AST `by_ref`/`mutable`. A non-Move
+                // default binding mode within an auto-peeled scope
+                // turns the binding into `&T` / `&mut T` even though
+                // the user wrote a plain ident.
+                let (eff_by_ref, eff_mutable) = if ergo.binding_override_ref {
+                    (true, ergo.binding_mutable_ref)
+                } else {
+                    (*by_ref, *mutable)
+                };
                 out.push(PatternBinding {
                     name: name.clone(),
                     place: scrut_place.clone(),
                     ty: scrut_ty.clone(),
-                    by_ref: *by_ref,
-                    mutable: *mutable,
+                    by_ref: eff_by_ref,
+                    mutable: eff_mutable,
                     span: name_span.copy(),
                 });
             }

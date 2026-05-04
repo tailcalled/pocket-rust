@@ -773,6 +773,11 @@ fn build_mono_input_for_template<'a>(
         builtin_type_targets,
         moved_places,
         move_sites,
+        // Pattern ergonomics carry through monomorphization unchanged
+        // — auto-peel decisions depend only on the *shape* of the
+        // scrutinee type (ref vs not), and `&T`-vs-`&U` substitutions
+        // preserve that shape.
+        pattern_ergo: tmpl.pattern_ergo.clone(),
         wasm_idx,
         is_export: false, // monomorphic instances are never exported
     }
@@ -899,6 +904,7 @@ fn emit_function(
         builtin_type_targets: clone_btt(&entry.builtin_type_targets),
         moved_places: clone_moved_places(&entry.moved_places),
         move_sites: clone_move_sites(&entry.move_sites),
+        pattern_ergo: entry.pattern_ergo.clone(),
         wasm_idx: entry.idx,
         is_export: current_module.is_empty() && path_prefix.len() == current_module.len(),
     };

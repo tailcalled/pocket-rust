@@ -2,7 +2,7 @@ use super::{
     CheckCtx, InferType,
     LifetimeRepr, MethodCandidate, PendingMethodCall, PendingTraitDispatch,
     RType, ReceiverAdjust, TraitTable,
-    TraitReceiverShape, check_expr,
+    TraitReceiverShape, check_expr, check_place_expr,
     find_lifetime_source, find_method_candidates, infer_substitute, infer_to_string, is_mutable_place, numeric_lit_op_traits_for_method, place_to_string, resolve_type,
     rtype_to_infer, supertrait_closure, trait_lookup, try_match_against_infer,
 };
@@ -415,7 +415,18 @@ pub(super) fn check_method_call(
     mc: &crate::ast::MethodCall,
     call_expr: &Expr,
 ) -> Result<InferType, Error> {
-    let recv_ty = check_expr(ctx, &mc.receiver)?;
+    // Type-check the receiver in *place* mode. The method-dispatch
+    // pipeline below decides whether the receiver gets autoref'd
+    // (`BorrowImm`/`BorrowMut`), reborrowed (`ByRef`), or moved
+    // (`Move`); only the Move case actually consumes the place. The
+    // value-position "move out of borrow" check inside
+    // `check_field_access` would fire too eagerly here — it'd reject
+    // `self.value.clone()` for non-Copy `value` even though `.clone()`
+    // takes `&self` and never moves. By using place-mode typing,
+    // subsequent field-of-ref autoref'd receivers pass; borrowck still
+    // catches genuine moves through-ref via its own move tracking on
+    // `MethodCall { recv_adjust: Move, recv: ... }` sites.
+    let recv_ty = check_place_expr(ctx, &mc.receiver)?;
     let resolved_recv = ctx.subst.substitute(&recv_ty);
     // Lazy projection: when recv is `AssocProj{base, …}` (typically
     // arising from a chained call like `(1 + 2).add(3)`), peel the

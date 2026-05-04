@@ -204,6 +204,7 @@ mod block_exprs;
 mod borrowck;
 mod builtins;
 mod compound_assign;
+mod derives;
 mod enums;
 mod generics;
 mod if_exprs;

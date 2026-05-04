@@ -1,9 +1,10 @@
 use crate::ast::{
-    AssignStmt, AssocConstraint, Block, Call, EnumDef, EnumVariant, Expr, ExprKind, FieldAccess,
-    FieldInit, FieldPattern, Function, IfExpr, IfLetExpr, ImplAssocType, ImplBlock, LetStmt,
-    Lifetime, LifetimeParam, MatchArm, MatchExpr, MethodCall, Param, Path, PathSegment, Pattern,
-    PatternKind, Stmt, StructDef, StructField, StructLit, TraitAssocType, TraitBound, TraitDef,
-    TraitMethodSig, Type, TypeKind, TypeParam, UseDecl, UseTree, VariantPayload,
+    AssignStmt, AssocConstraint, Block, Call, DeriveClause, DeriveTrait, EnumDef, EnumVariant,
+    Expr, ExprKind, FieldAccess, FieldInit, FieldPattern, Function, IfExpr, IfLetExpr,
+    ImplAssocType, ImplBlock, LetStmt, Lifetime, LifetimeParam, MatchArm, MatchExpr, MethodCall,
+    Param, Path, PathSegment, Pattern, PatternKind, Stmt, StructDef, StructField, StructLit,
+    TraitAssocType, TraitBound, TraitDef, TraitMethodSig, Type, TypeKind, TypeParam, UseDecl,
+    UseTree, VariantPayload,
 };
 use crate::lexer::{Token, TokenKind, token_kind_name};
 use crate::span::{Error, Pos, Span};
@@ -16,6 +17,35 @@ pub enum RawItem {
     Impl(ImplBlock),
     Trait(TraitDef),
     Use(UseDecl),
+}
+
+// Attach captured `#[deriving(...)]` clauses to the following item.
+// Only struct and enum decls accept derives; everything else (fn, impl,
+// trait, mod, use) rejects with an explicit diagnostic so misplaced
+// attributes don't silently fall off.
+fn attach_derives(file: &str, item: RawItem, attrs: Vec<DeriveClause>) -> Result<RawItem, Error> {
+    if attrs.is_empty() {
+        return Ok(item);
+    }
+    match item {
+        RawItem::Struct(mut sd) => {
+            sd.derives = attrs;
+            Ok(RawItem::Struct(sd))
+        }
+        RawItem::Enum(mut ed) => {
+            ed.derives = attrs;
+            Ok(RawItem::Enum(ed))
+        }
+        _ => {
+            let span = attrs[0].attr_span.copy();
+            Err(Error {
+                file: file.to_string(),
+                message: "`#[deriving(...)]` is only allowed on `struct` or `enum` declarations"
+                    .to_string(),
+                span,
+            })
+        }
+    }
 }
 
 pub fn parse(file: &str, tokens: Vec<Token>) -> Result<Vec<RawItem>, Error> {
@@ -46,7 +76,15 @@ impl Parser {
     fn parse_items(&mut self) -> Result<Vec<RawItem>, Error> {
         let mut items = Vec::new();
         while self.pos < self.tokens.len() {
-            items.push(self.parse_item()?);
+            // `#[deriving(...)]` only attaches to struct/enum decls — we
+            // collect attributes here and stash them on the def. The
+            // separate `derive_expand` stage between parser and typeck
+            // walks the items list and synthesizes the corresponding
+            // trait impls.
+            let attrs = self.parse_attributes()?;
+            let item = self.parse_item()?;
+            let item = attach_derives(&self.file, item, attrs)?;
+            items.push(item);
         }
         Ok(items)
     }
@@ -89,6 +127,57 @@ impl Parser {
                 "expected `fn`, `mod`, `struct`, `enum`, `impl`, `trait`, or `use`",
             ))
         }
+    }
+
+    // Parse zero-or-more `#[deriving(Trait, Trait, ...)]` attributes
+    // preceding the next item. Returns the captured clauses; an empty
+    // result means no attributes (the common case). The only attribute
+    // recognized is `deriving` — anything else is rejected at parse
+    // time so typos surface immediately.
+    fn parse_attributes(&mut self) -> Result<Vec<DeriveClause>, Error> {
+        let mut out: Vec<DeriveClause> = Vec::new();
+        while self.peek_kind(&TokenKind::Hash) {
+            let hash_span = self.tokens[self.pos].span.copy();
+            self.pos += 1;
+            self.expect(&TokenKind::LBracket, "`[` after `#`")?;
+            let (name, name_span) = self.expect_ident()?;
+            if name != "deriving" {
+                return Err(Error {
+                    file: self.file.clone(),
+                    message: format!(
+                        "unknown attribute `{}` — only `deriving` is supported",
+                        name
+                    ),
+                    span: name_span,
+                });
+            }
+            self.expect(&TokenKind::LParen, "`(` after `deriving`")?;
+            let mut traits: Vec<DeriveTrait> = Vec::new();
+            if !self.peek_kind(&TokenKind::RParen) {
+                let (t_name, t_span) = self.expect_ident()?;
+                traits.push(DeriveTrait { name: t_name, name_span: t_span });
+                while self.peek_kind(&TokenKind::Comma) {
+                    self.pos += 1;
+                    if self.peek_kind(&TokenKind::RParen) {
+                        break;
+                    }
+                    let (t_name, t_span) = self.expect_ident()?;
+                    traits.push(DeriveTrait { name: t_name, name_span: t_span });
+                }
+            }
+            self.expect(&TokenKind::RParen, "`)`")?;
+            let close = self.expect(&TokenKind::RBracket, "`]`")?;
+            let attr_span = Span::new(hash_span.start, close.end);
+            if traits.is_empty() {
+                return Err(Error {
+                    file: self.file.clone(),
+                    message: "`#[deriving(...)]` requires at least one trait".to_string(),
+                    span: attr_span,
+                });
+            }
+            out.push(DeriveClause { traits, attr_span });
+        }
+        Ok(out)
     }
 
     // `use a::b::c;` / `use a::*;` / `use a::b as c;` / `use a::{...};`
@@ -473,6 +562,7 @@ impl Parser {
                 type_params,
                 fields,
                 is_pub,
+                derives: Vec::new(),
             });
         }
         self.expect(&TokenKind::LBrace, "`{` or `;`")?;
@@ -494,6 +584,7 @@ impl Parser {
             type_params,
             fields,
             is_pub,
+            derives: Vec::new(),
         })
     }
 
@@ -543,6 +634,7 @@ impl Parser {
             type_params,
             variants,
             is_pub,
+            derives: Vec::new(),
         })
     }
 
@@ -3154,6 +3246,7 @@ impl Parser {
             (TokenKind::Underscore, TokenKind::Underscore) => true,
             (TokenKind::Pipe, TokenKind::Pipe) => true,
             (TokenKind::At, TokenKind::At) => true,
+            (TokenKind::Hash, TokenKind::Hash) => true,
             (TokenKind::DotDot, TokenKind::DotDot) => true,
             (TokenKind::DotDotEq, TokenKind::DotDotEq) => true,
             (TokenKind::FatArrow, TokenKind::FatArrow) => true,

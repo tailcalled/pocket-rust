@@ -9,21 +9,72 @@ use super::{
 use crate::ast::{Path, Pattern};
 use crate::span::{Error, Span};
 
+// Default binding mode tracked through pattern descent for match
+// ergonomics (real Rust RFC 2005). When a non-reference pattern is
+// matched against a `&T` / `&mut T` scrutinee, we peel one ref layer
+// and bump the mode toward Ref/RefMut. Bindings descended-to under a
+// non-Move mode bind by reference instead of by value. Explicit `&pat`
+// resets mode to Move (the user is stripping the ref themselves).
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum BindingMode {
+    Move,
+    Ref,
+    RefMut,
+}
+
 // Type-check a pattern against `scrutinee_ty`, appending `(name, ty,
 // span)` for every binding the pattern introduces. Recurses into
-// sub-patterns. The final pattern type is `scrutinee_ty` itself
-// (patterns are checked for compatibility, not unified to a different
-// type).
+// sub-patterns.
+//
+// Public entry point — external callers (let-stmt, for-loop, match,
+// if-let) start every pattern walk with the default binding mode
+// `Move`. The internal `check_pattern_with_mode` threads the mode
+// through recursive descent for match-ergonomics auto-peeling.
 pub(super) fn check_pattern(
     ctx: &mut CheckCtx,
     pattern: &Pattern,
     scrutinee_ty: &InferType,
     bindings: &mut Vec<(String, InferType, Span, bool)>,
 ) -> Result<(), Error> {
+    check_pattern_with_mode(ctx, pattern, scrutinee_ty, bindings, BindingMode::Move)
+}
+
+// Match-ergonomics-aware pattern check. `mode` is the "default binding
+// mode" inherited from enclosing peels. When the scrutinee is a
+// reference and the pattern is non-reference, we peel ref layers and
+// bump the mode (Move→Ref/RefMut). Bindings descended-to in non-Move
+// mode bind by reference. Each peel + override is recorded in
+// `ctx.pattern_ergo[pattern.id]` so mono can desugar to explicit
+// `&pat` / `ref name` form before codegen.
+fn check_pattern_with_mode(
+    ctx: &mut CheckCtx,
+    pattern: &Pattern,
+    scrutinee_ty: &InferType,
+    bindings: &mut Vec<(String, InferType, Span, bool)>,
+    mode: BindingMode,
+) -> Result<(), Error> {
     use crate::ast::PatternKind;
-    // Record the resolved scrutinee type at this pattern's NodeId so
-    // codegen can look it up directly without re-inferring.
-    ctx.expr_infer_types[pattern.id as usize] = Some(scrutinee_ty.clone());
+    // Auto-peel reference layers when the pattern shape doesn't itself
+    // bind through a reference. `Ref` patterns opt out — they want the
+    // literal `&T` scrutinee. Each peel layer bumps the mode toward
+    // Ref/RefMut.
+    let (effective_scrut, effective_mode, peel_layers, peel_mut_bits) =
+        if pattern_can_auto_peel(&pattern.kind) {
+            peel_ref_layers(ctx, scrutinee_ty, mode)
+        } else {
+            (scrutinee_ty.clone(), mode, 0, 0)
+        };
+    let pid = pattern.id as usize;
+    if pid < ctx.pattern_ergo.len() {
+        ctx.pattern_ergo[pid].peel_layers = peel_layers;
+        ctx.pattern_ergo[pid].peel_mut_bits = peel_mut_bits;
+    }
+    // Record the post-peel type at this pattern's NodeId. Codegen reads
+    // through `pattern_ergo.peel_layers` to know how many ref layers to
+    // strip from the scrutinee storage; the recorded type is the
+    // pattern's own logical scrutinee.
+    ctx.expr_infer_types[pid] = Some(effective_scrut.clone());
+    let scrutinee_ty = &effective_scrut;
     match &pattern.kind {
         PatternKind::Wildcard => Ok(()),
         PatternKind::LitInt(_) => {
@@ -65,29 +116,48 @@ pub(super) fn check_pattern(
             )
         }
         PatternKind::Binding { name, by_ref, mutable, .. } => {
-            // `name` / `mut name`: bind the matched value by-value;
-            // the binding's type is the scrutinee's type. The
-            // `mutable` flag flows into the local entry so writes
-            // through the binding are allowed only for `mut name`.
-            // `ref name` / `ref mut name`: bind a reference to the
-            // matched place; the binding's type is `&T` / `&mut T`.
-            // The binding itself is non-mut (the ref's mutability is
-            // baked into its type).
-            let binding_ty = if *by_ref {
+            // Three sources of by-ref-ness:
+            //   1. AST `by_ref: true` (user wrote `ref` / `ref mut`).
+            //   2. Default binding mode != Move (match ergonomics).
+            //   3. Otherwise bind by value.
+            // When (1) and (2) conflict, AST wins — the user's explicit
+            // `ref`/`mut` overrides the default mode.
+            let (effective_by_ref, effective_ref_mut) = if *by_ref {
+                (true, *mutable)
+            } else {
+                match effective_mode {
+                    BindingMode::Move => (false, false),
+                    BindingMode::Ref => (true, false),
+                    BindingMode::RefMut => (true, true),
+                }
+            };
+            // Record the override so mono can rebuild the desugared
+            // pattern. Skip when no override happened (AST as-written).
+            if effective_by_ref != *by_ref && pid < ctx.pattern_ergo.len() {
+                ctx.pattern_ergo[pid].binding_override_ref = true;
+                ctx.pattern_ergo[pid].binding_mutable_ref = effective_ref_mut;
+            }
+            let binding_ty = if effective_by_ref {
                 InferType::Ref {
                     inner: Box::new(scrutinee_ty.clone()),
-                    mutable: *mutable,
+                    mutable: effective_ref_mut,
                     lifetime: LifetimeRepr::Inferred(0),
                 }
             } else {
                 scrutinee_ty.clone()
             };
-            let bind_mutable = !*by_ref && *mutable;
+            // `mut name` (by-value mutable binding) only applies when
+            // we actually bind by value. With ergonomics-applied ref
+            // mode, the AST's `mutable` is absorbed into the ref's
+            // mutability (already handled above).
+            let bind_mutable = !effective_by_ref && *mutable;
             bindings.push((name.clone(), binding_ty, pattern.span.copy(), bind_mutable));
             Ok(())
         }
         PatternKind::VariantTuple { path, elems } => {
-            check_variant_tuple_pattern(ctx, path, elems, scrutinee_ty, &pattern.span, bindings)
+            check_variant_tuple_pattern(
+                ctx, path, elems, scrutinee_ty, &pattern.span, bindings, effective_mode,
+            )
         }
         PatternKind::VariantStruct { path, fields, rest } => {
             check_variant_struct_pattern(
@@ -98,6 +168,7 @@ pub(super) fn check_pattern(
                 scrutinee_ty,
                 &pattern.span,
                 bindings,
+                effective_mode,
             )
         }
         PatternKind::Tuple(elems) => {
@@ -124,7 +195,9 @@ pub(super) fn check_pattern(
             )?;
             let mut k = 0;
             while k < elems.len() {
-                check_pattern(ctx, &elems[k], &elem_tys[k], bindings)?;
+                check_pattern_with_mode(
+                    ctx, &elems[k], &elem_tys[k], bindings, effective_mode,
+                )?;
                 k += 1;
             }
             Ok(())
@@ -146,7 +219,16 @@ pub(super) fn check_pattern(
                 &pattern.span,
                 ctx.current_file,
             )?;
-            check_pattern(ctx, inner, &InferType::Var(inner_var), bindings)
+            // Explicit `&pat` resets the default binding mode to Move
+            // — the user is stripping the reference themselves, so any
+            // inherited Ref/RefMut mode no longer applies.
+            check_pattern_with_mode(
+                ctx,
+                inner,
+                &InferType::Var(inner_var),
+                bindings,
+                BindingMode::Move,
+            )
         }
         PatternKind::Or(alts) => {
             if alts.is_empty() {
@@ -161,7 +243,7 @@ pub(super) fn check_pattern(
             // bindings, then check each subsequent alt against the
             // same set.
             let mark = bindings.len();
-            check_pattern(ctx, &alts[0], scrutinee_ty, bindings)?;
+            check_pattern_with_mode(ctx, &alts[0], scrutinee_ty, bindings, effective_mode)?;
             // Snapshot the first alt's bindings (name → type).
             let first_alt_bindings: Vec<(String, InferType, Span, bool)> = bindings[mark..]
                 .iter()
@@ -174,7 +256,7 @@ pub(super) fn check_pattern(
             let mut k = 0;
             while k < alts.len() {
                 let alt_mark = bindings.len();
-                check_pattern(ctx, &alts[k], scrutinee_ty, bindings)?;
+                check_pattern_with_mode(ctx, &alts[k], scrutinee_ty, bindings, effective_mode)?;
                 if bindings.len() - alt_mark != first_alt_bindings.len() {
                     return Err(Error {
                         file: ctx.current_file.to_string(),
@@ -280,8 +362,62 @@ pub(super) fn check_pattern(
                 name_span.copy(),
                 false,
             ));
-            check_pattern(ctx, inner, scrutinee_ty, bindings)
+            check_pattern_with_mode(ctx, inner, scrutinee_ty, bindings, effective_mode)
         }
+    }
+}
+
+// Whether match-ergonomics auto-peeling applies before this pattern
+// kind matches a ref scrutinee. Ref patterns explicitly bind through
+// the ref themselves; they don't peel. Other shapes (variants, tuples,
+// bindings, wildcards) opt in.
+fn pattern_can_auto_peel(kind: &crate::ast::PatternKind) -> bool {
+    use crate::ast::PatternKind;
+    !matches!(kind, PatternKind::Ref { .. })
+}
+
+// Peel ref layers off `scrutinee_ty` while bumping `mode`. Returns the
+// peeled inner type, the new mode, the count of peeled layers, and a
+// bitmask where bit i is set if the i-th outermost peel was `&mut`.
+// Stops at non-ref types, inference vars (we can't tell yet whether
+// they'll resolve to refs), or after a sanity cap of 8 layers.
+fn peel_ref_layers(
+    ctx: &CheckCtx,
+    scrutinee_ty: &InferType,
+    mode: BindingMode,
+) -> (InferType, BindingMode, u8, u8) {
+    let mut current = scrutinee_ty.clone();
+    let mut current_mode = mode;
+    let mut layers: u8 = 0;
+    let mut mut_bits: u8 = 0;
+    while layers < 8 {
+        let resolved = ctx.subst.substitute(&current);
+        match resolved {
+            InferType::Ref { inner, mutable, .. } => {
+                if mutable {
+                    mut_bits |= 1 << layers;
+                }
+                layers += 1;
+                current_mode = bump_mode(current_mode, mutable);
+                current = (*inner).clone();
+            }
+            _ => break,
+        }
+    }
+    (current, current_mode, layers, mut_bits)
+}
+
+// Peel one ref layer's effect on the binding mode. Once the mode is
+// `Ref`, peeling `&mut` keeps it at `Ref` (you can't get exclusive
+// access through an outer shared borrow); peeling further `&` is a
+// no-op. Mirrors the RFC 2005 demotion rule.
+fn bump_mode(current: BindingMode, peeled_mut: bool) -> BindingMode {
+    match (current, peeled_mut) {
+        (BindingMode::Move, false) => BindingMode::Ref,
+        (BindingMode::Move, true) => BindingMode::RefMut,
+        (BindingMode::Ref, _) => BindingMode::Ref,
+        (BindingMode::RefMut, false) => BindingMode::Ref,
+        (BindingMode::RefMut, true) => BindingMode::RefMut,
     }
 }
 
@@ -292,6 +428,7 @@ fn check_variant_tuple_pattern(
     scrutinee_ty: &InferType,
     span: &Span,
     bindings: &mut Vec<(String, InferType, Span, bool)>,
+    mode: BindingMode,
 ) -> Result<(), Error> {
     let raw_segs: Vec<String> = path.segments.iter().map(|s| s.name.clone()).collect();
     let (enum_path, disc) = match lookup_variant_path(
@@ -393,7 +530,7 @@ fn check_variant_tuple_pattern(
             let mut k = 0;
             while k < elems.len() {
                 let expected = infer_substitute(&rtype_to_infer(&payload_types[k]), &env);
-                check_pattern(ctx, &elems[k], &expected, bindings)?;
+                check_pattern_with_mode(ctx, &elems[k], &expected, bindings, mode)?;
                 k += 1;
             }
             Ok(())
@@ -420,6 +557,7 @@ fn check_variant_struct_pattern(
     scrutinee_ty: &InferType,
     span: &Span,
     bindings: &mut Vec<(String, InferType, Span, bool)>,
+    mode: BindingMode,
 ) -> Result<(), Error> {
     let raw_segs: Vec<String> = path.segments.iter().map(|s| s.name.clone()).collect();
     // Try enum-variant resolution first; if that misses, fall through
@@ -436,7 +574,7 @@ fn check_variant_struct_pattern(
         Some(x) => x,
         None => {
             return check_struct_pattern(
-                ctx, path, fields, rest, scrutinee_ty, span, bindings,
+                ctx, path, fields, rest, scrutinee_ty, span, bindings, mode,
             );
         }
     };
@@ -546,7 +684,7 @@ fn check_variant_struct_pattern(
         }
         seen[idx] = true;
         let expected = infer_substitute(&rtype_to_infer(&field_defs[idx].ty), &env);
-        check_pattern(ctx, &fp.pattern, &expected, bindings)?;
+        check_pattern_with_mode(ctx, &fp.pattern, &expected, bindings, mode)?;
         k += 1;
     }
     if !rest {
@@ -579,6 +717,7 @@ fn check_struct_pattern(
     scrutinee_ty: &InferType,
     span: &Span,
     bindings: &mut Vec<(String, InferType, Span, bool)>,
+    mode: BindingMode,
 ) -> Result<(), Error> {
     let raw_segs: Vec<String> = path.segments.iter().map(|s| s.name.clone()).collect();
     let resolved_path = resolve_via_use_scopes(&raw_segs, &ctx.use_scope, |cand| {
@@ -699,7 +838,7 @@ fn check_struct_pattern(
         }
         seen[idx] = true;
         let expected = infer_substitute(&rtype_to_infer(&field_defs[idx].ty), &env);
-        check_pattern(ctx, &fp.pattern, &expected, bindings)?;
+        check_pattern_with_mode(ctx, &fp.pattern, &expected, bindings, mode)?;
         k += 1;
     }
     if !rest {
@@ -1043,7 +1182,12 @@ fn gather_ref_inner_pats<'p>(p: &'p Pattern, out: &mut Vec<&'p Pattern>) {
             }
         }
         PatternKind::At { inner, .. } => gather_ref_inner_pats(inner, out),
-        _ => {}
+        // Match-ergonomics: a non-reference pattern matched against a
+        // `&T` scrutinee auto-peels the reference (typeck records this
+        // in `pattern_ergo`). For exhaustiveness purposes the pattern
+        // itself contributes to coverage of the pointee — same as if
+        // the user had written `&pat`.
+        _ => out.push(p),
     }
 }
 

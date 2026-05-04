@@ -33,6 +33,11 @@ pub struct MonoFnInput<'a> {
     pub builtin_type_targets: Vec<Option<Vec<RType>>>,
     pub moved_places: Vec<MovedPlace>,
     pub move_sites: Vec<(NodeId, String)>,
+    // Per-pattern.id ergonomics record from typeck (auto-peel layer
+    // count + per-Binding mode override). Mono lowering reads this to
+    // produce a desugared AST pattern with explicit `&` wrappers and
+    // `ref` bindings — codegen sees only explicit-form patterns.
+    pub pattern_ergo: Vec<crate::typeck::PatternErgo>,
     pub wasm_idx: u32,
     pub is_export: bool,
 }
@@ -1267,6 +1272,116 @@ fn walk_non_generic(
 
 use crate::ast::Pattern as AstPattern;
 
+// Rebuild an AST pattern with explicit `&` wrappers and `ref` bindings
+// per typeck's match-ergonomics decisions (see `PatternErgo`). The
+// original AST is untouched — this returns a freshly constructed
+// pattern tree that codegen can dispatch on without needing to know
+// about ergonomics. Wrapper Ref nodes get fresh-but-deterministic IDs
+// (the original pattern's id + an offset that is never queried by
+// codegen for non-Binding patterns), so Binding-pattern IDs are
+// preserved and existing pattern_id-keyed lookups continue to work.
+fn desugar_pattern(
+    pattern: &AstPattern,
+    pattern_ergo: &Vec<crate::typeck::PatternErgo>,
+) -> AstPattern {
+    use crate::ast::PatternKind;
+    let pid = pattern.id as usize;
+    let ergo = if pid < pattern_ergo.len() {
+        pattern_ergo[pid]
+    } else {
+        crate::typeck::PatternErgo::default()
+    };
+    // First, recursively desugar children. Then apply this node's
+    // binding override (for Binding/At) or peel wrap.
+    let inner_kind = match &pattern.kind {
+        PatternKind::Wildcard
+        | PatternKind::LitInt(_)
+        | PatternKind::LitBool(_)
+        | PatternKind::Range { .. } => pattern.kind.clone(),
+        PatternKind::Binding { name, name_span, by_ref, mutable } => {
+            let (eff_by_ref, eff_mutable) = if ergo.binding_override_ref {
+                (true, ergo.binding_mutable_ref)
+            } else {
+                (*by_ref, *mutable)
+            };
+            PatternKind::Binding {
+                name: name.clone(),
+                name_span: name_span.copy(),
+                by_ref: eff_by_ref,
+                mutable: eff_mutable,
+            }
+        }
+        PatternKind::At { name, name_span, inner } => PatternKind::At {
+            name: name.clone(),
+            name_span: name_span.copy(),
+            inner: Box::new(desugar_pattern(inner, pattern_ergo)),
+        },
+        PatternKind::VariantTuple { path, elems } => {
+            let new_elems = elems
+                .iter()
+                .map(|e| desugar_pattern(e, pattern_ergo))
+                .collect();
+            PatternKind::VariantTuple { path: path.clone(), elems: new_elems }
+        }
+        PatternKind::VariantStruct { path, fields, rest } => {
+            let new_fields = fields
+                .iter()
+                .map(|fp| crate::ast::FieldPattern {
+                    name: fp.name.clone(),
+                    name_span: fp.name_span.copy(),
+                    pattern: desugar_pattern(&fp.pattern, pattern_ergo),
+                })
+                .collect();
+            PatternKind::VariantStruct {
+                path: path.clone(),
+                fields: new_fields,
+                rest: *rest,
+            }
+        }
+        PatternKind::Tuple(elems) => {
+            let new_elems = elems
+                .iter()
+                .map(|e| desugar_pattern(e, pattern_ergo))
+                .collect();
+            PatternKind::Tuple(new_elems)
+        }
+        PatternKind::Ref { inner, mutable } => PatternKind::Ref {
+            inner: Box::new(desugar_pattern(inner, pattern_ergo)),
+            mutable: *mutable,
+        },
+        PatternKind::Or(alts) => {
+            let new_alts = alts
+                .iter()
+                .map(|a| desugar_pattern(a, pattern_ergo))
+                .collect();
+            PatternKind::Or(new_alts)
+        }
+    };
+    let mut current = AstPattern {
+        kind: inner_kind,
+        span: pattern.span.copy(),
+        id: pattern.id,
+    };
+    // Wrap in N explicit Ref layers (outermost peel = outermost wrap).
+    // Bit i of `peel_mut_bits` (set during peel) tells us whether the
+    // i-th outermost peel was `&mut`. Wrapping reverses: layer 0 (the
+    // outermost) is constructed last so it ends up wrapping everything.
+    let mut layer = ergo.peel_layers;
+    while layer > 0 {
+        layer -= 1;
+        let mutable = (ergo.peel_mut_bits >> layer) & 1 != 0;
+        current = AstPattern {
+            kind: PatternKind::Ref {
+                inner: Box::new(current),
+                mutable,
+            },
+            span: pattern.span.copy(),
+            id: pattern.id, // codegen doesn't query Ref-pattern IDs
+        };
+    }
+    current
+}
+
 // Per-function unique identifier for a binding (param, let, or pattern leaf).
 // Indexes into `MonoBody.locals`. Allocated by the lowering pass in
 // declaration order: params first (0..N), then lets/pattern bindings as
@@ -1708,7 +1823,7 @@ fn lower_stmt(ctx: &mut LowerCtx, stmt: &Stmt) -> Result<Option<MonoStmt>, Error
                 None => None,
             };
             Ok(Some(MonoStmt::LetPattern {
-                pattern: ls.pattern.clone(),
+                pattern: desugar_pattern(&ls.pattern, &ctx.input.pattern_ergo),
                 value,
                 else_block,
                 span: ls.value.span.copy(),
@@ -2272,7 +2387,7 @@ fn lower_expr(ctx: &mut LowerCtx, expr: &Expr) -> Result<MonoExpr, Error> {
                     ctx.scope.pop();
                 }
                 arms.push(MonoArm {
-                    pattern: arm.pattern.clone(),
+                    pattern: desugar_pattern(&arm.pattern, &ctx.input.pattern_ergo),
                     guard,
                     body,
                     span: arm.span.copy(),
@@ -2315,7 +2430,7 @@ fn lower_expr(ctx: &mut LowerCtx, expr: &Expr) -> Result<MonoExpr, Error> {
                 scrutinee,
                 arms: vec![
                     MonoArm {
-                        pattern: il.pattern.clone(),
+                        pattern: desugar_pattern(&il.pattern, &ctx.input.pattern_ergo),
                         guard: None,
                         body: then_body,
                         span: il.then_block.span.copy(),

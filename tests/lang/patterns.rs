@@ -9,6 +9,38 @@ fn match_int_returns_42() {
 }
 
 #[test]
+fn match_ergonomics_auto_peel_variant() {
+    expect_answer("lang/patterns/auto_peel_variant", 42u32);
+}
+
+#[test]
+fn match_ergonomics_auto_peel_struct() {
+    expect_answer("lang/patterns/auto_peel_struct", 42u32);
+}
+
+#[test]
+fn match_ergonomics_auto_peel_tuple() {
+    expect_answer("lang/patterns/auto_peel_tuple", 42u32);
+}
+
+#[test]
+fn match_ergonomics_auto_peel_mut() {
+    expect_answer("lang/patterns/auto_peel_mut", 42u32);
+}
+
+#[test]
+fn match_ergonomics_auto_peel_double() {
+    expect_answer("lang/patterns/auto_peel_double", 42u32);
+}
+
+#[test]
+fn match_ergonomics_explicit_ref_still_works() {
+    // The pre-ergonomics explicit `&pat` form must keep working —
+    // stdlib (option.rs / result.rs) is written in that style.
+    expect_answer("lang/patterns/explicit_ref_resets_mode", 42u32);
+}
+
+#[test]
 fn match_enum_unit_returns_42() {
     expect_answer("lang/patterns/match_enum_unit", 42u32);
 }

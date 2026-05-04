@@ -172,7 +172,7 @@ fn check_function(
     let cfg_move_sites: Vec<(crate::ast::NodeId, String)>;
     {
         let funcs_ro: &FuncTable = &*funcs;
-        let (param_types, expr_types, method_resolutions, call_resolutions, type_params, type_param_bounds) =
+        let (param_types, expr_types, method_resolutions, call_resolutions, type_params, type_param_bounds, pattern_ergo) =
             if let Some(entry) = func_lookup(funcs_ro, &full) {
                 (
                     &entry.param_types,
@@ -181,6 +181,7 @@ fn check_function(
                     &entry.call_resolutions,
                     Vec::<String>::new(),
                     Vec::<Vec<Vec<String>>>::new(),
+                    &entry.pattern_ergo,
                 )
             } else if let Some((_, t)) = template_lookup(funcs_ro, &full) {
                 let mut bounds_clone: Vec<Vec<Vec<String>>> = Vec::new();
@@ -202,6 +203,7 @@ fn check_function(
                     &t.call_resolutions,
                     t.type_params.clone(),
                     bounds_clone,
+                    &t.pattern_ergo,
                 )
             } else {
                 unreachable!("typeck registered this function");
@@ -232,6 +234,7 @@ fn check_function(
             type_param_bounds: &type_param_bounds,
             param_types,
             return_type: &return_ty,
+            pattern_ergo,
         };
         let cfg = build::build(func, &cfg_ctx);
         let move_analysis = moves::analyze(&cfg, traits, current_file);

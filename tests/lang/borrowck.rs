@@ -85,6 +85,28 @@ fn move_out_of_borrow_is_rejected() {
 }
 
 #[test]
+fn move_via_self_consuming_method_is_rejected() {
+    // Method-call receivers are now type-checked in place mode (so
+    // `&self` methods on through-ref non-Copy fields work — that's
+    // what unblocks `derive(Clone)` for generic structs). But a
+    // consuming `fn f(self)` method called on a through-ref non-Copy
+    // field still has to be rejected — borrowck's move tracking on
+    // the MethodCall recv is what catches this case after the typeck
+    // gate was lifted.
+    let err = compile_source(
+        "struct Inner { v: usize }\n\
+         struct Outer { p: Inner }\n\
+         impl Inner { fn consume(self) -> usize { self.v } }\n\
+         fn whoops(o: &Outer) -> usize { o.p.consume() }",
+    );
+    assert!(
+        err.contains("move") || err.contains("borrow"),
+        "expected move/borrow error, got: {}",
+        err,
+    );
+}
+
+#[test]
 fn method_call_borrow_outlives_source_is_rejected() {
     // Borrow returned by `&self -> &u32` method should propagate the
     // receiver's borrow, blocking subsequent moves of the receiver.

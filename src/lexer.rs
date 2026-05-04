@@ -100,6 +100,10 @@ pub enum TokenKind {
     Pipe,
     // `@` — pattern at-binding (`name @ subpattern`).
     At,
+    // `#` — attribute introducer. Currently only used by
+    // `#[deriving(Trait, ...)]` on struct/enum decls; the parser
+    // accepts it nowhere else.
+    Hash,
     // `..` — rest pattern in struct/tuple patterns (`Foo { x, .. }`).
     DotDot,
     // `..=` — inclusive range, used in range patterns (`0..=9`).
@@ -192,6 +196,7 @@ pub fn token_kind_name(t: &TokenKind) -> &'static str {
         TokenKind::Underscore => "`_`",
         TokenKind::Pipe => "`|`",
         TokenKind::At => "`@`",
+        TokenKind::Hash => "`#`",
         TokenKind::DotDot => "`..`",
         TokenKind::DotDotEq => "`..=`",
         TokenKind::FatArrow => "`=>`",
@@ -918,6 +923,9 @@ pub fn tokenize(file: &str, source: &str) -> Result<Vec<Token>, Error> {
             byte_pos += 1;
         } else if b == b'@' {
             push_single(&mut tokens, TokenKind::At, line, &mut col);
+            byte_pos += 1;
+        } else if b == b'#' {
+            push_single(&mut tokens, TokenKind::Hash, line, &mut col);
             byte_pos += 1;
         } else if b == 0xc2 && (byte_pos + 1) < bytes.len() && bytes[byte_pos + 1] == 0xa4 {
             // `¤` U+00A4 — UTF-8 encoded as the two bytes 0xC2 0xA4.

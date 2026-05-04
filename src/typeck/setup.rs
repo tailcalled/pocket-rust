@@ -2232,6 +2232,7 @@ pub(super) fn register_function(
             moved_places: Vec::new(),
             move_sites: Vec::new(),
             builtin_type_targets: Vec::new(),
+            pattern_ergo: Vec::new(),
         });
     } else {
         funcs.entries.push(FnSymbol {
@@ -2251,6 +2252,7 @@ pub(super) fn register_function(
             moved_places: Vec::new(),
             move_sites: Vec::new(),
             builtin_type_targets: Vec::new(),
+            pattern_ergo: Vec::new(),
         });
         *next_idx += 1;
     }

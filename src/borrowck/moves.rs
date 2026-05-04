@@ -18,7 +18,7 @@ use super::cfg::{
     Terminator,
 };
 use crate::span::{Error, Span};
-use crate::typeck::{is_drop, TraitTable};
+use crate::typeck::{is_drop, RType, TraitTable};
 
 #[derive(Clone, PartialEq, Eq)]
 pub enum MoveStatus {
@@ -549,6 +549,32 @@ fn apply_operand(
     match &op.kind {
         OperandKind::Move(place) => {
             check_read(state, place, &op.span, errors, cfg, file);
+            // Move-out-of-borrow check: walk the place's projection
+            // chain and reject moves whose path reaches the tail
+            // through a `&T` / `&mut T` type. Moving a sub-place
+            // reachable only through a borrow would steal data the
+            // borrowed-from owner expects to still hold. Typeck used
+            // to gate this from inside `check_field_access` but the
+            // gate moved here so method receivers (typed in place
+            // mode for autoref) don't get rejected for the autoref
+            // case while the genuine consuming-self case is still
+            // caught.
+            //
+            // Skip when the path goes through a raw-pointer deref —
+            // raw pointers don't carry compile-time ownership info
+            // (the `unsafe` block is the soundness boundary), so a
+            // move out of `*raw` lands in heap territory rather than
+            // the surrounding borrow's region.
+            if !is_through_raw_ptr_deref(place, cfg) && move_traverses_borrow(place, cfg) {
+                errors.push(Error {
+                    file: file.to_string(),
+                    message: format!(
+                        "cannot move out of borrow: `{}` is reachable only through a reference",
+                        place.render(&cfg.locals)
+                    ),
+                    span: op.span.copy(),
+                });
+            }
             // Partial-move-of-Drop check: moving a sub-place of a
             // Drop-typed root would leave a hole the destructor can't
             // run over soundly, so it's rejected.
@@ -635,6 +661,40 @@ fn is_through_raw_ptr_deref(place: &super::cfg::Place, cfg: &Cfg) -> bool {
         cfg.locals[place.root as usize].ty,
         crate::typeck::RType::RawPtr { .. }
     )
+}
+
+// True iff the move's place projects directly off a Ref-typed local
+// via a single Field/TupleIndex step, with no further descent. This
+// is the case the typeck-side `check_field_access` gate used to
+// catch (`r.field` for `r: &T` and non-Copy field type), which got
+// lifted to support method receivers needing autoref. We re-add the
+// catch here in borrowck for the actual Move case.
+//
+// Intentionally narrow:
+//   - Single projection so we don't have to walk through struct
+//     field types (which would require the struct table, not
+//     plumbed into this module).
+//   - Last step must be Field / TupleIndex — a trailing `Deref` is
+//     the raw-pointer-deref pattern (`*self.ptr`) that the existing
+//     `is_through_raw_ptr_deref` exempts and that should not be
+//     rejected here.
+//   - Root must be `Ref`/`RefMut` — moving from inside the borrow's
+//     region.
+//
+// Misses cases like `(*o).p` and `o.x.p` (multi-step). Those weren't
+// caught by the prior typeck gate either; this preserves status quo
+// for them while plugging the immediate hole opened by typing method
+// receivers in place mode.
+fn move_traverses_borrow(place: &Place, cfg: &Cfg) -> bool {
+    use super::cfg::Projection;
+    if place.projections.len() != 1 {
+        return false;
+    }
+    let last = &place.projections[0];
+    if !matches!(last, Projection::Field(_) | Projection::TupleIndex(_)) {
+        return false;
+    }
+    matches!(&cfg.locals[place.root as usize].ty, RType::Ref { .. })
 }
 
 fn check_read(

@@ -1206,6 +1206,11 @@ pub(crate) struct CheckCtx<'a> {
     // codegen (`¤size_of::<T>()`). `None` outside builtin-with-types
     // sites. Finalized into FnSymbol.builtin_type_targets at end-of-fn.
     pub(crate) builtin_type_targets: Vec<Option<Vec<RType>>>,
+    // Per-pattern.id ergonomics record (sized to func.node_count).
+    // Default-zero means "no auto-peel/binding-override at this pattern
+    // node". `check_pattern` writes here when it traverses ref scrutinees
+    // with non-ref patterns or applies a non-Move default binding mode.
+    pub(crate) pattern_ergo: Vec<PatternErgo>,
     pub(crate) subst: Subst,
     pub(crate) current_module: &'a Vec<String>,
     pub(crate) current_file: &'a str,
@@ -1484,17 +1489,19 @@ fn check_function(
     };
 
     let node_count = func.node_count as usize;
-    let (expr_infer_types, lit_constraints, method_resolutions, call_resolutions, builtin_type_targets, subst) = {
+    let (expr_infer_types, lit_constraints, method_resolutions, call_resolutions, builtin_type_targets, pattern_ergo, subst) = {
         let mut method_res: Vec<Option<PendingMethodCall>> = Vec::with_capacity(node_count);
         let mut call_res: Vec<Option<PendingCall>> = Vec::with_capacity(node_count);
         let mut expr_infer: Vec<Option<InferType>> = Vec::with_capacity(node_count);
         let mut btt: Vec<Option<Vec<RType>>> = Vec::with_capacity(node_count);
+        let mut pat_ergo: Vec<PatternErgo> = Vec::with_capacity(node_count);
         let mut i = 0;
         while i < node_count {
             method_res.push(None);
             call_res.push(None);
             expr_infer.push(None);
             btt.push(None);
+            pat_ergo.push(PatternErgo::default());
             i += 1;
         }
         // Initialize the use scope with the module's flattened entries.
@@ -1513,6 +1520,7 @@ fn check_function(
             method_resolutions: method_res,
             call_resolutions: call_res,
             builtin_type_targets: btt,
+            pattern_ergo: pat_ergo,
             subst: Subst {
                 bindings: Vec::new(),
                 is_num_lit: Vec::new(),
@@ -1539,6 +1547,7 @@ fn check_function(
             ctx.method_resolutions,
             ctx.call_resolutions,
             ctx.builtin_type_targets,
+            ctx.pattern_ergo,
             ctx.subst,
         )
     };
@@ -1817,6 +1826,7 @@ fn check_function(
         funcs.entries[e].method_resolutions = method_resolutions;
         funcs.entries[e].call_resolutions = call_resolutions;
         funcs.entries[e].builtin_type_targets = builtin_type_targets;
+        funcs.entries[e].pattern_ergo = pattern_ergo;
     } else {
         let mut t = 0;
         while t < funcs.templates.len() {
@@ -1825,6 +1835,7 @@ fn check_function(
                 funcs.templates[t].method_resolutions = method_resolutions;
                 funcs.templates[t].call_resolutions = call_resolutions;
                 funcs.templates[t].builtin_type_targets = builtin_type_targets;
+                funcs.templates[t].pattern_ergo = pattern_ergo;
                 break;
             }
             t += 1;
@@ -4066,10 +4077,10 @@ use methods::check_method_call;
 mod tables;
 pub use tables::{
     CallResolution, EnumEntry, EnumTable, EnumVariantEntry, FnSymbol, FuncTable, GenericTemplate,
-    MethodResolution, MoveStatus, MovedPlace, RTypedField, ReceiverAdjust, StructEntry,
-    StructTable, SupertraitRef, TraitDispatch, TraitEntry, TraitImplEntry, TraitMethodEntry,
-    TraitReceiverShape, TraitTable, VariantPayloadResolved, enum_lookup, find_inherent_synth_idx,
-    func_lookup, struct_lookup, template_lookup, trait_lookup,
+    MethodResolution, MoveStatus, MovedPlace, PatternErgo, RTypedField, ReceiverAdjust,
+    StructEntry, StructTable, SupertraitRef, TraitDispatch, TraitEntry, TraitImplEntry,
+    TraitMethodEntry, TraitReceiverShape, TraitTable, VariantPayloadResolved, enum_lookup,
+    find_inherent_synth_idx, func_lookup, struct_lookup, template_lookup, trait_lookup,
 };
 
 mod traits;
@@ -4174,7 +4185,7 @@ pub(crate) fn is_mutable_place(ctx: &CheckCtx, expr: &Expr) -> bool {
 // on a place, `Deref` on a value (the value side is a ref/raw-ptr). For any
 // other shape (e.g., `&call()`), falls back to `check_expr` (treats the inner
 // as a value — borrowck won't track such borrows).
-fn check_place_expr(ctx: &mut CheckCtx, expr: &Expr) -> Result<InferType, Error> {
+pub(super) fn check_place_expr(ctx: &mut CheckCtx, expr: &Expr) -> Result<InferType, Error> {
     match &expr.kind {
         ExprKind::Var(_)
         | ExprKind::FieldAccess(_)
