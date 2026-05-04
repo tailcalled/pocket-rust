@@ -51,6 +51,15 @@ pub fn compile_example(dir: &str, entry: &str) -> Vec<u8> {
     module.encode()
 }
 
+pub fn try_compile_example(dir: &str, entry: &str) -> Result<Vec<u8>, String> {
+    let dir_path = format!("examples/{}", dir);
+    let root = Path::new(&dir_path);
+    let mut vfs = Vfs::new();
+    load_dir(root, root, &mut vfs);
+    let libs = vec![load_stdlib()];
+    compile(&libs, &vfs, entry).map(|m| m.encode())
+}
+
 pub fn compile_source(source: &str) -> String {
     let mut vfs = Vfs::new();
     vfs.insert("lib.rs".to_string(), source.to_string());
@@ -100,3 +109,4 @@ where
 }
 
 mod rt1;
+mod rt2;
