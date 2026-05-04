@@ -268,23 +268,30 @@ fn resolve_module(
                 name: child_name,
                 name_span: child_name_span,
             } => {
-                let (nested, sibling) = compute_child_paths(file_path, &child_name);
-                // Prefer the nested path (`<parent_stem>/<child>.rs`) when
-                // it exists. Falls back to the sibling path
-                // (`<child>.rs`) — the original behaviour.
-                let child_path = if vfs.get(&nested).is_some() {
-                    nested
-                } else if vfs.get(&sibling).is_some() {
-                    sibling
-                } else {
-                    return Err(Error {
-                        file: file_path.to_string(),
-                        message: format!(
-                            "module file not found: tried `{}` and `{}`",
-                            nested, sibling
-                        ),
-                        span: child_name_span,
-                    });
+                let candidates = compute_child_paths(file_path, &child_name);
+                let mut chosen: Option<String> = None;
+                for cand in &candidates {
+                    if vfs.get(cand).is_some() {
+                        chosen = Some(cand.clone());
+                        break;
+                    }
+                }
+                let child_path = match chosen {
+                    Some(p) => p,
+                    None => {
+                        let tried: Vec<String> = candidates
+                            .iter()
+                            .map(|c| format!("`{}`", c))
+                            .collect();
+                        return Err(Error {
+                            file: file_path.to_string(),
+                            message: format!(
+                                "module file not found: tried {}",
+                                tried.join(" and ")
+                            ),
+                            span: child_name_span,
+                        });
+                    }
                 };
                 let child = resolve_module(vfs, &child_path, &child_name, child_name_span)?;
                 items.push(Item::Module(child));
@@ -299,41 +306,44 @@ fn resolve_module(
     })
 }
 
-// Two candidate paths for a `mod child;` declared inside `parent_path`:
+// Candidate paths for a `mod child;` declared inside `parent_path`,
+// in preference order. Where the child sits depends on whether the
+// parent file is a "module-as-directory anchor":
 //
-// - `nested`:  `<dir>/<parent_stem>/<child>.rs` — the convention when
-//              the parent file has its own subdirectory of submodules
-//              (e.g. `lib/std/primitive.rs` + `lib/std/primitive/pointer.rs`).
-// - `sibling`: `<dir>/<child>.rs` — the convention when submodules sit
-//              flat next to their parent (e.g. `lib/std/lib.rs` +
-//              `lib/std/marker.rs`). Also used by crate-root files
-//              (`lib.rs`, `main.rs`).
+//   - `mod.rs` — anchors the directory it lives in. `mod child;`
+//                inside `foo/mod.rs` resolves to `foo/child.rs` or
+//                `foo/child/mod.rs` (siblings within `foo/`).
+//   - `lib.rs` / `main.rs` — same, treated as crate-root anchors.
+//                Their submodules sit alongside, not in a `lib/` or
+//                `main/` subdirectory.
+//   - any other file `foo.rs` — children sit in the `foo/`
+//                subdirectory: `foo/child.rs` or `foo/child/mod.rs`.
 //
-// `resolve_module` prefers `nested` when it exists, otherwise tries
-// `sibling`. Both are returned so the error message at the call site
-// can name both candidates.
-fn compute_child_paths(parent_path: &str, child_name: &str) -> (String, String) {
-    let (dir, parent_stem) = match parent_path.rfind('/') {
-        Some(idx) => {
-            let dir = &parent_path[..idx];
-            let file = &parent_path[idx + 1..];
-            let stem = file.strip_suffix(".rs").unwrap_or(file);
-            (dir.to_string(), stem.to_string())
-        }
-        None => {
-            let stem = parent_path.strip_suffix(".rs").unwrap_or(parent_path);
-            ("".to_string(), stem.to_string())
-        }
+// Both flat (`<child>.rs`) and directory (`<child>/mod.rs`) layouts
+// for the child are tried, in that order. The all-candidates list
+// powers the error message when none of the paths exist.
+fn compute_child_paths(parent_path: &str, child_name: &str) -> Vec<String> {
+    let (dir, file) = match parent_path.rfind('/') {
+        Some(idx) => (
+            parent_path[..idx].to_string(),
+            parent_path[idx + 1..].to_string(),
+        ),
+        None => (String::new(), parent_path.to_string()),
     };
-    let nested = if dir.is_empty() {
-        format!("{}/{}.rs", parent_stem, child_name)
+    // Where do this module's children live? `mod.rs` / `lib.rs` /
+    // `main.rs` anchor their directory; anything else carves out a
+    // subdirectory named after their stem.
+    let mod_dir: String = if file == "mod.rs" || file == "lib.rs" || file == "main.rs" {
+        dir.clone()
     } else {
-        format!("{}/{}/{}.rs", dir, parent_stem, child_name)
+        let stem = file.strip_suffix(".rs").unwrap_or(&file).to_string();
+        if dir.is_empty() { stem } else { format!("{}/{}", dir, stem) }
     };
-    let sibling = if dir.is_empty() {
-        format!("{}.rs", child_name)
-    } else {
-        format!("{}/{}.rs", dir, child_name)
+    let prefix = |c: &str| -> String {
+        if mod_dir.is_empty() { c.to_string() } else { format!("{}/{}", mod_dir, c) }
     };
-    (nested, sibling)
+    vec![
+        prefix(&format!("{}.rs", child_name)),
+        prefix(&format!("{}/mod.rs", child_name)),
+    ]
 }

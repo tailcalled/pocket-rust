@@ -87,6 +87,15 @@ fn pub_use_reexport_returns_77() {
     expect_answer("lang/modules/pub_use_reexport", 77i32);
 }
 
+// `mod sub;` resolves to `sub/mod.rs` when no `sub.rs` exists. Tests
+// the Rust-2015-style directory-with-mod.rs convention. `sub/mod.rs`
+// itself anchors the `sub/` directory, so its own `mod inner;`
+// resolves to `sub/inner.rs` (a sibling), not `sub/mod/inner.rs`.
+#[test]
+fn mod_rs_directory_layout_returns_42() {
+    expect_answer("lang/modules/mod_rs_dir", 42u32);
+}
+
 #[test]
 fn private_function_call_from_outside_module_is_rejected() {
     let err = compile_sources(&[
