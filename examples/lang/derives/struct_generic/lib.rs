@@ -1,7 +1,7 @@
 // Derive on a generic struct: the synthesized impl carries
 // `T: Clone` / `T: PartialEq` bounds inherited from each derived trait.
 
-#[deriving(Clone, PartialEq)]
+#[derive(Clone, PartialEq)]
 struct Holder<T> { value: T }
 
 fn answer() -> u32 {

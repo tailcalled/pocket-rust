@@ -1,6 +1,6 @@
 // Derive Clone + PartialEq on an enum with mixed variant payloads.
 
-#[deriving(Clone, PartialEq)]
+#[derive(Clone, PartialEq)]
 enum Shape {
     Empty,
     Pair(u32, u32),

@@ -1,6 +1,6 @@
 // Derive-expansion stage. Sits between the parser and module resolution:
 // walks the parser's `Vec<RawItem>`, finds struct/enum decls carrying
-// `#[deriving(...)]` clauses, and synthesizes the corresponding trait
+// `#[derive(...)]` clauses, and synthesizes the corresponding trait
 // impls as additional `RawItem::Impl` entries inserted right after the
 // target def.
 //
@@ -214,7 +214,7 @@ impl Builder {
 }
 
 // Build a Path with one segment per name and the final segment carrying
-// any type-args. All spans use the deriving-attribute span.
+// any type-args. All spans use the derive-attribute span.
 fn mk_path(segments: &[&str], type_args: Vec<Type>, span: &Span) -> Path {
     let mut segs: Vec<PathSegment> = Vec::new();
     for (i, name) in segments.iter().enumerate() {

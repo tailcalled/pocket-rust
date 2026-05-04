@@ -1,6 +1,6 @@
 // Derive on a unit / zero-field struct.
 
-#[deriving(Copy, Clone, PartialEq, Eq)]
+#[derive(Copy, Clone, PartialEq, Eq)]
 struct Marker {}
 
 fn answer() -> u32 {

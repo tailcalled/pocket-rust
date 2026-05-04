@@ -1,7 +1,7 @@
 // PartialOrd on a struct: lexicographic comparison over fields in
 // declaration order.
 
-#[deriving(PartialEq, PartialOrd)]
+#[derive(PartialEq, PartialOrd)]
 struct Point { x: u32, y: u32 }
 
 fn answer() -> u32 {

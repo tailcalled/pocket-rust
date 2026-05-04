@@ -101,7 +101,7 @@ pub enum TokenKind {
     // `@` — pattern at-binding (`name @ subpattern`).
     At,
     // `#` — attribute introducer. Currently only used by
-    // `#[deriving(Trait, ...)]` on struct/enum decls; the parser
+    // `#[derive(Trait, ...)]` on struct/enum decls; the parser
     // accepts it nowhere else.
     Hash,
     // `..` — rest pattern in struct/tuple patterns (`Foo { x, .. }`).

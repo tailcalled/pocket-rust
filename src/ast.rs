@@ -166,7 +166,7 @@ pub struct StructDef {
     pub type_params: Vec<TypeParam>,
     pub fields: Vec<StructField>,
     pub is_pub: bool,
-    // `#[deriving(Trait1, Trait2)]` clauses captured at parse time. The
+    // `#[derive(Trait1, Trait2)]` clauses captured at parse time. The
     // separate `derive_expand` stage consumes them and synthesizes the
     // corresponding trait impls — typeck never sees this field.
     pub derives: Vec<DeriveClause>,
@@ -196,8 +196,8 @@ pub struct EnumDef {
     pub derives: Vec<DeriveClause>,
 }
 
-// Captured `#[deriving(Trait1, Trait2, ...)]` attribute. One clause per
-// `#[deriving(...)]` literal — multiple attributes flatten into multiple
+// Captured `#[derive(Trait1, Trait2, ...)]` attribute. One clause per
+// `#[derive(...)]` literal — multiple attributes flatten into multiple
 // clauses on the same def.
 #[derive(Clone)]
 pub struct DeriveClause {

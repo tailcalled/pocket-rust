@@ -2,7 +2,7 @@
 // (V0 < V1 < V2). Same-variant values recurse lexicographically through
 // the payload — matches Rust's derive semantics.
 
-#[deriving(PartialEq, PartialOrd)]
+#[derive(PartialEq, PartialOrd)]
 enum E {
     A,
     B(u32),

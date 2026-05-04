@@ -1905,7 +1905,7 @@ fn flat_chain_offset(ctx: &FnCtx, chain: &Vec<String>, binding_idx: usize) -> u3
 // (left-to-right); then the corresponding wasm instruction is
 // emitted. The result type is the same as what typeck returned for
 // this Builtin's NodeId — read it back from `ctx.expr_types` rather
-// than re-deriving from the name (saves a parse).
+// than re-derive from the name (saves a parse).
 
 // Lower a 128-bit builtin to a multi-instruction sequence. On entry,
 // the wasm stack carries the two args' flattened forms in source

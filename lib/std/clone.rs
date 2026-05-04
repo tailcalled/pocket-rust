@@ -1,6 +1,6 @@
 // Clone is the explicit-duplication trait. Distinct from `Copy` (which
 // is implicit bitwise duplication): a Clone impl can do work — heap
-// reallocation, refcount bumps, etc. The `#[deriving(Clone)]` attribute
+// reallocation, refcount bumps, etc. The `#[derive(Clone)]` attribute
 // generates an impl that recursively clones each field.
 
 pub trait Clone {

@@ -2,7 +2,7 @@
 // Cloning produces an equal value; comparing two distinct instances
 // with the same field values returns true.
 
-#[deriving(Clone, PartialEq)]
+#[derive(Clone, PartialEq)]
 struct Pair { a: u32, b: u32 }
 
 fn answer() -> u32 {

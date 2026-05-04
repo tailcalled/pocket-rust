@@ -20,7 +20,7 @@ pub enum RawItem {
     TypeAlias(TypeAlias),
 }
 
-// Attach captured `#[deriving(...)]` clauses to the following item.
+// Attach captured `#[derive(...)]` clauses to the following item.
 // Only struct and enum decls accept derives; everything else (fn, impl,
 // trait, mod, use) rejects with an explicit diagnostic so misplaced
 // attributes don't silently fall off.
@@ -41,7 +41,7 @@ fn attach_derives(file: &str, item: RawItem, attrs: Vec<DeriveClause>) -> Result
             let span = attrs[0].attr_span.copy();
             Err(Error {
                 file: file.to_string(),
-                message: "`#[deriving(...)]` is only allowed on `struct` or `enum` declarations"
+                message: "`#[derive(...)]` is only allowed on `struct` or `enum` declarations"
                     .to_string(),
                 span,
             })
@@ -77,7 +77,7 @@ impl Parser {
     fn parse_items(&mut self) -> Result<Vec<RawItem>, Error> {
         let mut items = Vec::new();
         while self.pos < self.tokens.len() {
-            // `#[deriving(...)]` only attaches to struct/enum decls — we
+            // `#[derive(...)]` only attaches to struct/enum decls — we
             // collect attributes here and stash them on the def. The
             // separate `derive_expand` stage between parser and typeck
             // walks the items list and synthesizes the corresponding
@@ -155,10 +155,10 @@ impl Parser {
         })
     }
 
-    // Parse zero-or-more `#[deriving(Trait, Trait, ...)]` attributes
+    // Parse zero-or-more `#[derive(Trait, Trait, ...)]` attributes
     // preceding the next item. Returns the captured clauses; an empty
     // result means no attributes (the common case). The only attribute
-    // recognized is `deriving` — anything else is rejected at parse
+    // recognized is `derive` — anything else is rejected at parse
     // time so typos surface immediately.
     fn parse_attributes(&mut self) -> Result<Vec<DeriveClause>, Error> {
         let mut out: Vec<DeriveClause> = Vec::new();
@@ -167,17 +167,17 @@ impl Parser {
             self.pos += 1;
             self.expect(&TokenKind::LBracket, "`[` after `#`")?;
             let (name, name_span) = self.expect_ident()?;
-            if name != "deriving" {
+            if name != "derive" {
                 return Err(Error {
                     file: self.file.clone(),
                     message: format!(
-                        "unknown attribute `{}` — only `deriving` is supported",
+                        "unknown attribute `{}` — only `derive` is supported",
                         name
                     ),
                     span: name_span,
                 });
             }
-            self.expect(&TokenKind::LParen, "`(` after `deriving`")?;
+            self.expect(&TokenKind::LParen, "`(` after `derive`")?;
             let mut traits: Vec<DeriveTrait> = Vec::new();
             if !self.peek_kind(&TokenKind::RParen) {
                 let (t_name, t_span) = self.expect_ident()?;
@@ -197,7 +197,7 @@ impl Parser {
             if traits.is_empty() {
                 return Err(Error {
                     file: self.file.clone(),
-                    message: "`#[deriving(...)]` requires at least one trait".to_string(),
+                    message: "`#[derive(...)]` requires at least one trait".to_string(),
                     span: attr_span,
                 });
             }

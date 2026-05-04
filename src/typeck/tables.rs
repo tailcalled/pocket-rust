@@ -103,7 +103,7 @@ pub enum MoveStatus {
 // matches a `&T`/`&mut T` scrutinee, the reference layer is auto-peeled
 // and the "default binding mode" inside that pattern flips from Move to
 // Ref/RefMut. Pocket-rust mirrors this — typeck records *what* it did
-// here so mono can reify the desugar without re-deriving anything.
+// here so mono can reify the desugar without re-derive anything.
 #[derive(Clone, Copy)]
 pub struct PatternErgo {
     // Number of `&` layers typeck auto-peeled before applying this

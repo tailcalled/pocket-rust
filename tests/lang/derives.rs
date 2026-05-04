@@ -1,4 +1,4 @@
-// Tests for `#[deriving(...)]` synthesis. Each test exercises a
+// Tests for `#[derive(...)]` synthesis. Each test exercises a
 // derive against a struct or enum and checks observable behavior of
 // the synthesized impl.
 
@@ -36,7 +36,7 @@ fn derive_unit_struct() {
 
 #[test]
 fn derive_unknown_trait_rejected() {
-    let err = compile_source("#[deriving(Foo)] struct S { x: u32 }");
+    let err = compile_source("#[derive(Foo)] struct S { x: u32 }");
     assert!(err.contains("cannot derive"), "got: {}", err);
 }
 
@@ -47,7 +47,7 @@ fn derive_partial_ord_enum_lex_order() {
 
 #[test]
 fn derive_attribute_on_fn_rejected() {
-    let err = compile_source("#[deriving(Clone)] fn foo() {}");
+    let err = compile_source("#[derive(Clone)] fn foo() {}");
     assert!(
         err.contains("only allowed on `struct` or `enum`"),
         "got: {}",
