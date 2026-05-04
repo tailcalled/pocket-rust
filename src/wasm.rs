@@ -137,6 +137,9 @@ pub enum Instruction {
     I64LeU,
     I64GeS,
     I64GeU,
+    I32Shl,
+    I32ShrS,
+    I32ShrU,
     I32WrapI64,
     I64ExtendI32S,
     I64ExtendI32U,
@@ -540,6 +543,15 @@ fn encode_instruction(out: &mut Vec<u8>, inst: &Instruction) {
         Instruction::I64LeU => out.push(0x58),
         Instruction::I64GeS => out.push(0x59),
         Instruction::I64GeU => out.push(0x5a),
+        Instruction::I32Shl => {
+            out.push(0x74);
+        }
+        Instruction::I32ShrS => {
+            out.push(0x75);
+        }
+        Instruction::I32ShrU => {
+            out.push(0x76);
+        }
         Instruction::I32WrapI64 => {
             out.push(0xa7);
         }

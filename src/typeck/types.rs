@@ -765,12 +765,95 @@ pub fn numeric_lit_op_traits_for_method(
     result
 }
 
-// Whether `t` implements `std::Drop`. Used by codegen to decide whether
-// to emit drop calls at scope end and by impl validation to enforce
-// Drop/Copy mutual exclusion.
+// Whether `t` implements `std::Drop`. The direct-impl question — used
+// by impl validation to enforce Drop/Copy mutual exclusion and inside
+// the aggregate drop walker to decide whether to call the user's
+// `Drop::drop` method on a binding before recursing into its fields.
 pub fn is_drop(t: &RType, traits: &TraitTable) -> bool {
     let drop_path = drop_trait_path();
     solve_impl(&drop_path, t, traits, 0).is_some()
+}
+
+// Whether `t` requires destruction at scope end. True if `t` directly
+// impls Drop, or if any structurally-contained sub-place (struct field,
+// enum variant payload, tuple element) needs_drop. This is what codegen
+// consults to decide whether to emit drop glue for an aggregate that
+// doesn't itself impl Drop but contains Drop fields — e.g.
+// `struct Pair { a: Tracker, b: Tracker }` where `Tracker: Drop` but
+// `Pair` doesn't.
+pub fn needs_drop(
+    t: &RType,
+    structs: &StructTable,
+    enums: &EnumTable,
+    traits: &TraitTable,
+) -> bool {
+    if is_drop(t, traits) {
+        return true;
+    }
+    match t {
+        RType::Struct { path, type_args, .. } => {
+            let entry = match struct_lookup(structs, path) {
+                Some(e) => e,
+                None => return false,
+            };
+            let env = struct_env(&entry.type_params, type_args);
+            let mut i = 0;
+            while i < entry.fields.len() {
+                let fty = substitute_rtype(&entry.fields[i].ty, &env);
+                if needs_drop(&fty, structs, enums, traits) {
+                    return true;
+                }
+                i += 1;
+            }
+            false
+        }
+        RType::Tuple(elems) => {
+            let mut i = 0;
+            while i < elems.len() {
+                if needs_drop(&elems[i], structs, enums, traits) {
+                    return true;
+                }
+                i += 1;
+            }
+            false
+        }
+        RType::Enum { path, type_args, .. } => {
+            let entry = match enum_lookup(enums, path) {
+                Some(e) => e,
+                None => return false,
+            };
+            let env = struct_env(&entry.type_params, type_args);
+            let mut vi = 0;
+            while vi < entry.variants.len() {
+                match &entry.variants[vi].payload {
+                    VariantPayloadResolved::Unit => {}
+                    VariantPayloadResolved::Tuple(elems) => {
+                        let mut i = 0;
+                        while i < elems.len() {
+                            let fty = substitute_rtype(&elems[i], &env);
+                            if needs_drop(&fty, structs, enums, traits) {
+                                return true;
+                            }
+                            i += 1;
+                        }
+                    }
+                    VariantPayloadResolved::Struct(fields) => {
+                        let mut i = 0;
+                        while i < fields.len() {
+                            let fty = substitute_rtype(&fields[i].ty, &env);
+                            if needs_drop(&fty, structs, enums, traits) {
+                                return true;
+                            }
+                            i += 1;
+                        }
+                    }
+                }
+                vi += 1;
+            }
+            false
+        }
+        _ => false,
+    }
 }
 
 pub fn is_raw_ptr(t: &RType) -> bool {

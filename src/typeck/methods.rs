@@ -26,8 +26,6 @@ fn check_method_call_symbolic(
     param_name: String,
     recv_shape: SymRecvShape,
 ) -> Result<InferType, Error> {
-    let recv_through_mut_ref = matches!(recv_shape, SymRecvShape::MutRef);
-    let recv_through_shared_ref = matches!(recv_shape, SymRecvShape::SharedRef);
     // Find the param's index in ctx.type_params.
     let mut idx: Option<usize> = None;
     let mut i = 0;
@@ -316,6 +314,16 @@ fn dispatch_method_through_trait(
                     file: ctx.current_file.to_string(),
                     message: format!(
                         "cannot move out of `&mut {}` to call `{}` (which takes `self` by value)",
+                        param_name, mc.method
+                    ),
+                    span: mc.method_span.copy(),
+                });
+            }
+            if recv_through_shared_ref {
+                return Err(Error {
+                    file: ctx.current_file.to_string(),
+                    message: format!(
+                        "cannot move out of `&{}` to call `{}` (which takes `self` by value)",
                         param_name, mc.method
                     ),
                     span: mc.method_span.copy(),

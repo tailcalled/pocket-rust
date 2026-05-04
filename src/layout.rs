@@ -1,5 +1,5 @@
 use crate::typeck::{
-    EnumTable, MoveStatus, MovedPlace, RType, StructTable, TraitTable, byte_size_of, is_drop,
+    EnumTable, MoveStatus, MovedPlace, RType, StructTable, TraitTable, byte_size_of, needs_drop,
 };
 
 // Per-binding scope-end drop decision. Combines `is_drop(ty)` with the
@@ -21,17 +21,23 @@ pub enum DropAction {
 }
 
 // Compute the per-binding drop action. Centralizes the
-// `is_drop + moved_places lookup` logic so every callsite (param decl,
-// let decl, pattern bind, scope-end emission) makes the same decision.
-// Name-based lookup against `moved_places` matches the existing
-// `binding_move_status` semantics (single-segment whole-binding match).
+// `needs_drop + moved_places lookup` logic so every callsite (param
+// decl, let decl, pattern bind, scope-end emission) makes the same
+// decision. Name-based lookup against `moved_places` matches the
+// existing `binding_move_status` semantics (single-segment whole-
+// binding match). Uses `needs_drop` (not `is_drop`) so aggregates that
+// don't themselves impl Drop but contain Drop fields participate in
+// drop emission — codegen's walker handles the aggregate-vs-direct-Drop
+// dispatch.
 pub fn compute_drop_action(
     name: &str,
     ty: &RType,
     moved_places: &Vec<MovedPlace>,
+    structs: &StructTable,
+    enums: &EnumTable,
     traits: &TraitTable,
 ) -> DropAction {
-    if !is_drop(ty, traits) {
+    if !needs_drop(ty, structs, enums, traits) {
         return DropAction::Skip;
     }
     let mut i = 0;
@@ -134,10 +140,13 @@ pub fn compute_mono_layout(
     walk_block_address(&body.body, &mut addressed);
 
     // Phase 2: Drop-typed bindings are auto-addressed (need an address
-    // for the implicit `Drop::drop(&mut binding)` at scope-end).
+    // for the implicit `Drop::drop(&mut binding)` at scope-end). Uses
+    // `needs_drop` so aggregates with Drop fields also get an address
+    // — the drop walker computes per-field addresses from the
+    // aggregate's base.
     let mut k = 0;
     while k < n {
-        if is_drop(&body.locals[k].ty, traits) {
+        if needs_drop(&body.locals[k].ty, structs, enums, traits) {
             addressed[k] = true;
         }
         k += 1;
@@ -183,13 +192,14 @@ pub fn compute_mono_layout(
             &body.locals[k].name,
             &body.locals[k].ty,
             moved_places,
+            structs,
+            enums,
             traits,
         );
         binding_drop_action.push(action);
         k += 1;
     }
 
-    let _ = enums; // currently unused — byte_size_of takes structs+enums
     MonoLayout {
         binding_storage,
         binding_drop_action,

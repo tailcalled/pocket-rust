@@ -7,7 +7,7 @@ mod types;
 pub use types::{
     IntKind, LifetimeRepr, RType, byte_size_of, copy_trait_path, drop_trait_path, numeric_lit_op_traits_for_method, flatten_rtype,
     int_kind_name, is_copy_with_bounds, is_drop, is_raw_ptr, is_sized,
-    is_variant_payload_uninhabited,
+    is_variant_payload_uninhabited, needs_drop,
     outer_lifetime, rtype_contains_param, rtype_eq, rtype_to_string, substitute_rtype,
 };
 use types::{int_kind_from_name, int_kind_max, int_kind_neg_magnitude, int_kind_signed, struct_env};

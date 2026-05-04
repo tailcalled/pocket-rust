@@ -52,7 +52,7 @@ use super::*;
 #[test]
 fn problem_1_move_self_through_shared_ref_rejected() {
     let err = try_compile_example(
-        "redteaming/rt2_move_self_through_shared_ref",
+        "redteaming/rt2/move_self_through_shared_ref",
         "lib.rs",
     )
     .err()
@@ -87,7 +87,7 @@ fn problem_1_move_self_through_shared_ref_rejected() {
 // narrow value into a wasm-local.
 #[test]
 fn problem_2_narrow_int_arithmetic_does_not_wrap() {
-    expect_answer("redteaming/rt2_narrow_int_add_no_wrap", 42u32);
+    expect_answer("redteaming/rt2/narrow_int_add_no_wrap", 42u32);
 }
 
 // PROBLEM 3: `as` casts within the Narrow32 integer class emit zero
@@ -112,7 +112,7 @@ fn problem_2_narrow_int_arithmetic_does_not_wrap() {
 // be in 0..=255, an invariant problem 2's fix establishes.
 #[test]
 fn problem_3_narrow_int_cast_does_not_truncate() {
-    expect_answer("redteaming/rt2_narrow_int_cast_no_truncate", 42u32);
+    expect_answer("redteaming/rt2/narrow_int_cast_no_truncate", 42u32);
 }
 
 // PROBLEM 4: a layered consequence of problems 2 and 3 — the same
@@ -139,7 +139,7 @@ fn problem_3_narrow_int_cast_does_not_truncate() {
 // the same value.
 #[test]
 fn problem_4_narrow_int_local_vs_memory_storage_diverges() {
-    expect_answer("redteaming/rt2_narrow_int_storage_divergence", 42u32);
+    expect_answer("redteaming/rt2/narrow_int_storage_divergence", 42u32);
 }
 
 // PROBLEM 5: pocket-rust skips drop glue for any aggregate that
@@ -178,5 +178,5 @@ fn problem_4_narrow_int_local_vs_memory_storage_diverges() {
 // leaf. Mirror real Rust's drop order conventions.
 #[test]
 fn problem_5_aggregate_field_drop_glue_missing() {
-    expect_answer("redteaming/rt2_struct_field_drop_glue_missing", 42u32);
+    expect_answer("redteaming/rt2/struct_field_drop_glue_missing", 42u32);
 }

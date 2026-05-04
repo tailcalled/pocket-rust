@@ -5,7 +5,11 @@ description: Use when working on Drop semantics — destructor calls, scope-end 
 
 # Drop machinery (T4 + T4.5 + T4.6 + T4.7)
 
-`pub trait Drop { fn drop(&mut self); }` defined in `lib/std/ops.rs` (re-exported as `std::Drop`). `is_drop(rt, traits)` queries via `solve_impl(drop_trait_path(), rt, ...)` where `drop_trait_path()` returns the canonical `["std", "ops", "Drop"]`.
+`pub trait Drop { fn drop(&mut self); }` defined in `lib/std/ops.rs` (re-exported as `std::Drop`).
+
+Two predicates with different jobs:
+- `is_drop(rt, traits)` — direct-impl question. `solve_impl(drop_trait_path(), rt, ...)` where `drop_trait_path()` returns `["std", "ops", "Drop"]`. Used by impl validation (Drop/Copy mutual exclusion) and inside the drop walker to decide whether to call the user's `Drop::drop` method on a value before recursing into its fields.
+- `needs_drop(rt, structs, enums, traits)` — destruction-required question. True if `is_drop(rt)` OR any structurally contained sub-place (struct field, enum variant payload, tuple element) needs_drop. Used by `compute_drop_action` and by the auto-address pass — aggregates with Drop fields participate in drop emission even when they don't themselves impl Drop.
 
 ## Drop / Copy mutual exclusion
 
@@ -13,7 +17,7 @@ description: Use when working on Drop semantics — destructor calls, scope-end 
 
 ## Address-taken bindings — Drop requires shadow-stack slots
 
-Drop's destructor takes `&mut self`, so the binding must have an address. Codegen marks every Drop-typed binding (lets and function params) as address-taken via `mark_drop_bindings_addressed`, which sets `let_addressed[value_id] = true` (lets) or `param_addressed[idx] = true` (params). Frame layout then allocates a `Storage::Memory { frame_offset }` slot for it.
+Drop's destructor takes `&mut self`, so the binding must have an address. The drop walker also computes per-field addresses by adding byte offsets to the binding's base. Both reasons make every `needs_drop` binding (lets and function params) address-taken — `compute_mono_layout`'s phase-2 pass sets `addressed[binding_id] = true` for any binding whose type satisfies `needs_drop`. Frame layout then allocates a `Storage::Memory { frame_offset }` slot for it.
 
 ## Scope-end drop emission
 
@@ -26,13 +30,20 @@ The function is called from:
 - `Return` codegen (mirrors fn-end: stash value, drop in-scope bindings, restore SP, emit `Return`)
 - `break`/`continue` codegen (drops bindings allocated since the loop boundary)
 
-`emit_drop_call_for_local` handles two storage shapes:
+`emit_drop_call_for_local` materializes the binding's address into a fresh wasm i32 local and hands off to `emit_drop_walker`. Two storage shapes carry an address:
 - `Storage::Memory { frame_offset }` — push `frame_base_local` (post-prologue SP), add offset.
 - `Storage::MemoryAt { addr_local }` — push the addr from the wasm local directly. Used for dynamically-allocated slots from `codegen_pattern` (including pattern bindings auto-addressed for Drop).
 
 Use `frame_base_local`, not live `__sp`: by the time scope-end drops fire, body may have drifted `__sp` via literal-borrow temps, sret slots, or enum construction.
 
-Bindings in `Storage::Local` (wasm locals) silently skip drop emission — Drop bindings should never end up there (the auto-address pass should have marked them).
+`emit_drop_walker(ctx, ty, addr_local)` is the recursive workhorse. Mirrors rustc's `core::ptr::drop_in_place::<T>` synthesis:
+1. If `is_drop(ty)`: resolve the user's `Drop::drop` via `solve_impl` + `find_trait_impl_method` (monomorphizing the impl-method template if needed), push `addr_local`, `Call`. The user's body sees pre-drop field values.
+2. Then walk the value's structure and recurse on each `needs_drop` sub-place:
+   - **Struct / tuple** — declaration-order field walk; per field, allocate a fresh i32 local set to `addr_local + byte_offset` (via `emit_address_at_offset`), recurse with the field's substituted type.
+   - **Enum** — `emit_enum_variant_walker` collects variants whose payload contains any `needs_drop` field; loads disc once into a wasm local; emits a chain of `if disc == N { ... }` blocks (one per walking variant, no else — fall-through is fine). Inside each block, walks the variant's payload by field byte-offset (payload starts at offset 4, after the i32 disc).
+3. Aggregates with no Drop fields produce no walker work — `needs_drop` is false, `compute_drop_action` returns `Skip` upstream.
+
+Bindings in `Storage::Local` (wasm locals) silently skip drop emission — `needs_drop` bindings should never end up there (the layout auto-address pass should have marked them).
 
 ## Move-aware drops (T4.6)
 
@@ -48,12 +59,14 @@ Borrowck snapshots:
 - `FnSymbol.moved_places: Vec<MovedPlace>` — per-place final status.
 - `FnSymbol.move_sites: Vec<(NodeId, name)>` — every whole-binding move site.
 
-Codegen consults both via the per-binding `DropAction` precomputed in `layout::compute_drop_action(name, ty, moved_places, traits)`:
-- **Skip** — not Drop-typed OR moved on every path. No drop emitted.
-- **Always** — Drop-typed and never moved (no entry in `moved_places`). Unconditional drop at scope end.
-- **Flagged** — Drop-typed and `MaybeMoved` (moved on some paths). Allocate an i32 wasm local as the drop flag, init `1` at the binding's let-stmt (or fn entry for params), emit `i32.const 0; local.set flag` at every move site listed in `move_sites`, and gate the scope-end drop call with `local.get flag; if; <drop>; end`.
+Codegen consults both via the per-binding `DropAction` precomputed in `layout::compute_drop_action(name, ty, moved_places, structs, enums, traits)`:
+- **Skip** — `!needs_drop(ty)` OR moved on every path. No drop emitted.
+- **Always** — `needs_drop(ty)` and never moved (no entry in `moved_places`). Unconditional drop at scope end (the walker handles direct-Drop vs aggregate dispatch).
+- **Flagged** — `needs_drop(ty)` and `MaybeMoved` (moved on some paths). Allocate an i32 wasm local as the drop flag, init `1` at the binding's let-stmt (or fn entry for params), emit `i32.const 0; local.set flag` at every move site listed in `move_sites`, and gate the scope-end drop call with `local.get flag; if; <drop>; end`.
 
-Every `LocalBinding` carries its precomputed `DropAction` directly (stashed at decl time via `layout::compute_drop_action`). `emit_drops_for_locals_range` reads `ctx.locals[i].drop_action` instead of recomputing `is_drop` + move-status per iteration. Same goes for the let-stmt and param flag-allocation sites — they consult `drop_action` directly.
+The flag is whole-binding granularity. Pocket-rust does not yet track per-field drop state for partial moves out of `needs_drop` aggregates — fix the partial-move story before relying on it.
+
+Every `LocalBinding` carries its precomputed `DropAction` directly (stashed at decl time via `layout::compute_drop_action`). `emit_drops_for_locals_range` reads `ctx.locals[i].drop_action` instead of recomputing `needs_drop` + move-status per iteration. Same goes for the let-stmt and param flag-allocation sites — they consult `drop_action` directly.
 
 ## Pattern-bound bindings interaction
 

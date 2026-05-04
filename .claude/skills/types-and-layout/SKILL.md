@@ -19,6 +19,10 @@ description: Use when working with type representation, primitive types (int kin
 
 ## WASM flat layout
 
+Codegen groups integer kinds into three classes (`int_kind_class` in `src/codegen.rs`): **Narrow32** (u8/i8/u16/i16/u32/i32/usize/isize) — one wasm `i32`; **Wide64** (u64/i64) — one wasm `i64`; **Wide128** (u128/i128) — two wasm `i64`s (low half on top of stack, then high). Cross-class casts go through `emit_int_to_int_cast` (`I32WrapI64`, `I64ExtendI32S/U`, etc.).
+
+Within Narrow32 the wasm container is wider than the type for u8/i8/u16/i16, so codegen explicitly maintains the **narrow-int width invariant** — the value held in the wasm i32 must already be zero-extended (u8/u16) or sign-extended (i8/i16) from the type's bit width. `emit_narrow_width_fixup` (`I32And` mask for unsigned narrow targets; `I32Shl` + `I32ShrS` shift-pair for signed narrow targets) re-establishes that invariant after every site that can violate it: arithmetic that can carry past the type's bit width (`add` / `sub` / `mul`, plus signed `div` for the i8::MIN/-1 → 128 case) and same-class narrowing casts (e.g. `u32 as u8`). Same-class widening (`u8 as u32`) is a no-op because the source already satisfies the invariant. Bitwise ops, compares, and unsigned `div` / `rem` preserve the invariant on in-range inputs, so they need no fixup. Memory loads naturally re-establish it via `I32Load8U` / `I32Load8S` / `I32Load16U` / `I32Load16S`; memory stores are covered by `I32Store8` / `I32Store16` (silent truncation). Anywhere in `src/codegen.rs` that emits arithmetic on a narrow type without `emit_narrow_width_fixup` afterward is a bug — same root cause as the rt2 problem 2/3/4 family.
+
 `flatten_rtype(rtype, structs, out)` produces the wasm scalar shape:
 - ≤32-bit integers (and usize/isize, since we target wasm32) → 1 `i32`.
 - 64-bit integers → 1 `i64`.

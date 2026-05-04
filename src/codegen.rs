@@ -3,7 +3,8 @@ use crate::layout::BindingStorageKind;
 use crate::span::Error;
 use crate::typeck::{
     CallResolution, FuncTable, GenericTemplate, IntKind, MethodResolution, RType, ReceiverAdjust,
-    StructTable, byte_size_of, flatten_rtype, func_lookup, struct_lookup, substitute_rtype,
+    StructTable, byte_size_of, flatten_rtype, func_lookup, int_kind_name, struct_lookup,
+    substitute_rtype,
 };
 use crate::wasm;
 
@@ -1045,6 +1046,8 @@ fn emit_function_concrete(
             &pname,
             &pty,
             &mono_fn.moved_places,
+            structs,
+            enums,
             traits,
         );
         locals.push(LocalBinding {
@@ -1549,16 +1552,112 @@ fn emit_drop_call_for_local(
     idx: usize,
     rtype: &RType,
 ) -> Result<(), Error> {
+    // Materialize the binding's address into a fresh wasm i32 local,
+    // then hand off to the recursive walker. Two storage shapes carry
+    // an address:
+    //   Storage::Memory   — fixed frame_offset relative to
+    //                       frame_base_local. Use frame_base_local
+    //                       (not live __sp): by the time scope-end
+    //                       drops fire, body may have drifted __sp
+    //                       via literal-borrow temps, sret slots, or
+    //                       enum construction.
+    //   Storage::MemoryAt — addr stashed in a wasm local at the
+    //                       point of binding (used by codegen_pattern
+    //                       for addressed pattern bindings).
+    let addr_local = ctx.next_wasm_local;
+    ctx.extra_locals.push(wasm::ValType::I32);
+    ctx.next_wasm_local += 1;
+    match &ctx.locals[idx].storage {
+        Storage::Memory { frame_offset } => {
+            let off = *frame_offset;
+            ctx.instructions
+                .push(wasm::Instruction::LocalGet(ctx.frame_base_local));
+            if off != 0 {
+                ctx.instructions.push(wasm::Instruction::I32Const(off as i32));
+                ctx.instructions.push(wasm::Instruction::I32Add);
+            }
+        }
+        Storage::MemoryAt { addr_local: src } => {
+            ctx.instructions.push(wasm::Instruction::LocalGet(*src));
+        }
+        _ => unreachable!("Drop binding must be address-marked"),
+    }
+    ctx.instructions.push(wasm::Instruction::LocalSet(addr_local));
+    emit_drop_walker(ctx, rtype, addr_local)
+}
+
+// Recursive scope-end drop emission. Lays out the destruction of a
+// single value in `addr_local` to match Rust's drop-glue semantics:
+// (1) call the user's `Drop::drop` if `ty` directly impls Drop;
+// (2) then drop each contained sub-place that needs_drop, in source
+//     order — struct/tuple fields in declaration order, enum payload
+//     fields after a discriminant dispatch.
+//
+// Mirrors how rustc synthesizes `core::ptr::drop_in_place::<T>`.
+// A type with both a direct Drop impl AND Drop-typed fields runs its
+// own drop body first; the field walker fires afterwards (the user
+// code observes pre-drop field values, then the implicit walker
+// finalizes).
+fn emit_drop_walker(
+    ctx: &mut FnCtx,
+    ty: &RType,
+    addr_local: u32,
+) -> Result<(), Error> {
+    if crate::typeck::is_drop(ty, ctx.traits) {
+        let callee_idx = resolve_drop_method_idx(ctx, ty);
+        ctx.instructions.push(wasm::Instruction::LocalGet(addr_local));
+        ctx.instructions.push(wasm::Instruction::Call(callee_idx));
+    }
+    match ty {
+        RType::Struct { path, type_args, .. } => {
+            let entry = struct_lookup(ctx.structs, path).expect("resolved struct");
+            let env = make_struct_env(&entry.type_params, type_args);
+            let mut byte_off: u32 = 0;
+            let mut i = 0;
+            while i < entry.fields.len() {
+                let fty = substitute_rtype(&entry.fields[i].ty, &env);
+                if crate::typeck::needs_drop(&fty, ctx.structs, ctx.enums, ctx.traits) {
+                    let field_addr = emit_address_at_offset(ctx, addr_local, byte_off);
+                    emit_drop_walker(ctx, &fty, field_addr)?;
+                }
+                byte_off += byte_size_of(&fty, ctx.structs, ctx.enums);
+                i += 1;
+            }
+        }
+        RType::Tuple(elems) => {
+            let mut byte_off: u32 = 0;
+            let mut i = 0;
+            while i < elems.len() {
+                if crate::typeck::needs_drop(&elems[i], ctx.structs, ctx.enums, ctx.traits) {
+                    let elem_addr = emit_address_at_offset(ctx, addr_local, byte_off);
+                    emit_drop_walker(ctx, &elems[i], elem_addr)?;
+                }
+                byte_off += byte_size_of(&elems[i], ctx.structs, ctx.enums);
+                i += 1;
+            }
+        }
+        RType::Enum { path, type_args, .. } => {
+            emit_enum_variant_walker(ctx, path, type_args, addr_local)?;
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+// Resolve `<ty as Drop>::drop` to a wasm function index, monomorphizing
+// the impl-method template against the impl's type-arg substitution
+// when needed. Factored out of the original emit_drop_call_for_local.
+fn resolve_drop_method_idx(ctx: &mut FnCtx, ty: &RType) -> u32 {
     let drop_path = crate::typeck::drop_trait_path();
-    let resolution = crate::typeck::solve_impl(&drop_path, rtype, ctx.traits, 0)
-        .expect("typeck verified Drop impl exists");
+    let resolution = crate::typeck::solve_impl(&drop_path, ty, ctx.traits, 0)
+        .expect("is_drop verified Drop impl exists");
     let cand = crate::typeck::find_trait_impl_method(
         ctx.funcs,
         resolution.impl_idx,
         "drop",
     )
     .expect("Drop impl provides drop method");
-    let callee_idx = match cand {
+    match cand {
         crate::typeck::MethodCandidate::Direct(i) => ctx.funcs.entries[i].idx,
         crate::typeck::MethodCandidate::Template(i) => {
             let tmpl = &ctx.funcs.templates[i];
@@ -1580,36 +1679,117 @@ fn emit_drop_call_for_local(
             }
             ctx.mono.intern(i, concrete)
         }
-    };
-    // Push `&mut binding` — the binding's address in shadow-stack
-    // memory. Two storage shapes carry an address:
-    //   Storage::Memory   — fixed frame_offset relative to
-    //                       frame_base_local. Use frame_base_local
-    //                       (not live __sp): by the time scope-end
-    //                       drops fire, body may have drifted __sp
-    //                       via literal-borrow temps, sret slots, or
-    //                       enum construction.
-    //   Storage::MemoryAt — addr stashed in a wasm local at the
-    //                       point of binding (used by codegen_pattern
-    //                       for addressed pattern bindings, including
-    //                       Drop bindings auto-addressed by
-    //                       auto_address_drop_pattern_bindings).
-    match &ctx.locals[idx].storage {
-        Storage::Memory { frame_offset } => {
-            let off = *frame_offset;
-            ctx.instructions
-                .push(wasm::Instruction::LocalGet(ctx.frame_base_local));
-            if off != 0 {
-                ctx.instructions.push(wasm::Instruction::I32Const(off as i32));
-                ctx.instructions.push(wasm::Instruction::I32Add);
+    }
+}
+
+// Allocate a fresh wasm i32 local holding `addr_local + byte_off`.
+// Used by the drop walker to point at sub-places (struct fields,
+// tuple elements, enum payload fields) without recomputing the base
+// across recursive walker calls.
+fn emit_address_at_offset(ctx: &mut FnCtx, addr_local: u32, byte_off: u32) -> u32 {
+    let dest = ctx.next_wasm_local;
+    ctx.extra_locals.push(wasm::ValType::I32);
+    ctx.next_wasm_local += 1;
+    ctx.instructions.push(wasm::Instruction::LocalGet(addr_local));
+    if byte_off != 0 {
+        ctx.instructions.push(wasm::Instruction::I32Const(byte_off as i32));
+        ctx.instructions.push(wasm::Instruction::I32Add);
+    }
+    ctx.instructions.push(wasm::Instruction::LocalSet(dest));
+    dest
+}
+
+// Drop the active variant's payload of an enum at `addr_local`.
+// Layout reminder: i32 disc at offset 0, payload bytes start at offset
+// 4. Variants whose payload contains no needs_drop field collapse out
+// of the dispatch. If no variant needs walking, we emit nothing —
+// the disc load itself is skipped.
+fn emit_enum_variant_walker(
+    ctx: &mut FnCtx,
+    enum_path: &Vec<String>,
+    type_args: &Vec<RType>,
+    addr_local: u32,
+) -> Result<(), Error> {
+    let entry = crate::typeck::enum_lookup(ctx.enums, enum_path)
+        .expect("resolved enum");
+    let env = make_struct_env(&entry.type_params, type_args);
+    // Collect (disc, payload-with-offsets) for variants that have at
+    // least one needs_drop field; anything else can be safely skipped
+    // when its disc is observed.
+    struct PayloadField {
+        ty: RType,
+        byte_off: u32,
+    }
+    let mut variants_to_walk: Vec<(u32, Vec<PayloadField>)> = Vec::new();
+    let mut vi = 0;
+    while vi < entry.variants.len() {
+        let v = &entry.variants[vi];
+        let mut fields: Vec<PayloadField> = Vec::new();
+        let mut off: u32 = 4;
+        match &v.payload {
+            crate::typeck::VariantPayloadResolved::Unit => {}
+            crate::typeck::VariantPayloadResolved::Tuple(types) => {
+                let mut i = 0;
+                while i < types.len() {
+                    let fty = substitute_rtype(&types[i], &env);
+                    fields.push(PayloadField { ty: fty.clone(), byte_off: off });
+                    off += byte_size_of(&fty, ctx.structs, ctx.enums);
+                    i += 1;
+                }
+            }
+            crate::typeck::VariantPayloadResolved::Struct(decls) => {
+                let mut i = 0;
+                while i < decls.len() {
+                    let fty = substitute_rtype(&decls[i].ty, &env);
+                    fields.push(PayloadField { ty: fty.clone(), byte_off: off });
+                    off += byte_size_of(&fty, ctx.structs, ctx.enums);
+                    i += 1;
+                }
             }
         }
-        Storage::MemoryAt { addr_local } => {
-            ctx.instructions.push(wasm::Instruction::LocalGet(*addr_local));
+        let any_drop = fields.iter().any(|f| {
+            crate::typeck::needs_drop(&f.ty, ctx.structs, ctx.enums, ctx.traits)
+        });
+        if any_drop {
+            variants_to_walk.push((v.disc, fields));
         }
-        _ => unreachable!("Drop binding must be address-marked"),
+        vi += 1;
     }
-    ctx.instructions.push(wasm::Instruction::Call(callee_idx));
+    if variants_to_walk.is_empty() {
+        return Ok(());
+    }
+    // Cache the discriminant in a wasm local so we can compare it
+    // against each variant's disc without re-loading from memory.
+    let disc_local = ctx.next_wasm_local;
+    ctx.extra_locals.push(wasm::ValType::I32);
+    ctx.next_wasm_local += 1;
+    ctx.instructions.push(wasm::Instruction::LocalGet(addr_local));
+    ctx.instructions.push(wasm::Instruction::I32Load { align: 2, offset: 0 });
+    ctx.instructions.push(wasm::Instruction::LocalSet(disc_local));
+    // Emit a chain of `if disc == N { drop payload fields }` blocks.
+    // Variants are independent (only one matches at runtime) so each
+    // is its own If with no Else — falls through to the next when not
+    // matching.
+    let mut wi = 0;
+    while wi < variants_to_walk.len() {
+        let (disc, fields) = &variants_to_walk[wi];
+        ctx.instructions.push(wasm::Instruction::LocalGet(disc_local));
+        ctx.instructions.push(wasm::Instruction::I32Const(*disc as i32));
+        ctx.instructions.push(wasm::Instruction::I32Eq);
+        ctx.instructions
+            .push(wasm::Instruction::If(wasm::BlockType::Empty));
+        let mut fi = 0;
+        while fi < fields.len() {
+            let f = &fields[fi];
+            if crate::typeck::needs_drop(&f.ty, ctx.structs, ctx.enums, ctx.traits) {
+                let field_addr = emit_address_at_offset(ctx, addr_local, f.byte_off);
+                emit_drop_walker(ctx, &f.ty, field_addr)?;
+            }
+            fi += 1;
+        }
+        ctx.instructions.push(wasm::Instruction::End);
+        wi += 1;
+    }
     Ok(())
 }
 
@@ -2577,6 +2757,8 @@ fn bind_pattern_ref(
         name,
         &ref_ty,
         &ctx.moved_places,
+        ctx.structs,
+        ctx.enums,
         ctx.traits,
     );
     ctx.locals.push(LocalBinding {
@@ -2646,6 +2828,8 @@ fn bind_pattern_value(
             name,
             ty,
             &ctx.moved_places,
+            ctx.structs,
+            ctx.enums,
             ctx.traits,
         );
         ctx.locals.push(LocalBinding {
@@ -2716,6 +2900,8 @@ fn bind_pattern_value(
             name,
             ty,
             &ctx.moved_places,
+            ctx.structs,
+            ctx.enums,
             ctx.traits,
         );
         ctx.locals.push(LocalBinding {
@@ -2772,6 +2958,8 @@ fn bind_pattern_value(
         name,
         ty,
         &ctx.moved_places,
+        ctx.structs,
+        ctx.enums,
         ctx.traits,
     );
     ctx.locals.push(LocalBinding {
@@ -3052,8 +3240,30 @@ fn emit_int_to_int_cast(ctx: &mut FnCtx, src: &IntKind, tgt: &IntKind) {
             ctx.instructions.push(wasm::Instruction::Drop);
             ctx.instructions.push(wasm::Instruction::I32WrapI64);
         }
-        // Same class — no wasm op needed.
+        // Same class. For Narrow32→Narrow32 we still have to fix up the
+        // representation when the target's bit width is strictly less
+        // than the source's: u32→u8 must mask to 0xFF, i32→i8 must
+        // sign-extend from 8 bits, etc. Same-class widening (u8→u32,
+        // i8→i32, u16→u32) is a no-op because the source value is
+        // already stored in its narrow-type representation (zero- or
+        // sign-extended to 32 bits — see emit_narrow_width_fixup), so
+        // the bit pattern matches the wider target. Wide64/Wide128
+        // same-class transitions are also no-ops (only one wasm-level
+        // shape per class above 32 bits).
+        (IntClass::Narrow32, IntClass::Narrow32) => {
+            if narrow_bit_width(tgt) < narrow_bit_width(src) {
+                emit_narrow_width_fixup(ctx, int_kind_name(tgt));
+            }
+        }
         _ => {}
+    }
+}
+
+fn narrow_bit_width(k: &IntKind) -> u32 {
+    match k {
+        IntKind::U8 | IntKind::I8 => 8,
+        IntKind::U16 | IntKind::I16 => 16,
+        _ => 32,
     }
 }
 
@@ -3996,6 +4206,8 @@ fn codegen_mono_stmt(
                 &name,
                 &ty,
                 &ctx.moved_places,
+                ctx.structs,
+                ctx.enums,
                 ctx.traits,
             );
             // Emit the value (pushes flat scalars).
@@ -5243,5 +5455,47 @@ fn emit_simple_builtin(
         }),
     };
     ctx.instructions.push(inst);
+    // Narrow-int (u8/i8/u16/i16) results live in a wasm i32 wider than
+    // the source type; arithmetic that can carry past the type's bit
+    // width (add/sub/mul, plus signed div where i8::MIN/-1 yields 128)
+    // would otherwise leak the high bits to subsequent ops. Mask back to
+    // the type's representation: zero-extend for unsigned, sign-extend
+    // for signed. Compares produce bool i32 (already in range), and
+    // bitwise ops with in-range inputs stay in range, so neither needs a
+    // fixup. For 32-bit and wider kinds the wasm representation already
+    // matches the type; the helper is a no-op.
+    if op_can_overflow_narrow(op, is_signed) {
+        emit_narrow_width_fixup(ctx, ty_name);
+    }
     Ok(())
+}
+
+fn op_can_overflow_narrow(op: &str, signed: bool) -> bool {
+    matches!(op, "add" | "sub" | "mul") || (signed && op == "div")
+}
+
+fn emit_narrow_width_fixup(ctx: &mut FnCtx, ty_name: &str) {
+    match ty_name {
+        "u8" => {
+            ctx.instructions.push(wasm::Instruction::I32Const(0xFF));
+            ctx.instructions.push(wasm::Instruction::I32And);
+        }
+        "u16" => {
+            ctx.instructions.push(wasm::Instruction::I32Const(0xFFFF));
+            ctx.instructions.push(wasm::Instruction::I32And);
+        }
+        "i8" => {
+            ctx.instructions.push(wasm::Instruction::I32Const(24));
+            ctx.instructions.push(wasm::Instruction::I32Shl);
+            ctx.instructions.push(wasm::Instruction::I32Const(24));
+            ctx.instructions.push(wasm::Instruction::I32ShrS);
+        }
+        "i16" => {
+            ctx.instructions.push(wasm::Instruction::I32Const(16));
+            ctx.instructions.push(wasm::Instruction::I32Shl);
+            ctx.instructions.push(wasm::Instruction::I32Const(16));
+            ctx.instructions.push(wasm::Instruction::I32ShrS);
+        }
+        _ => {}
+    }
 }

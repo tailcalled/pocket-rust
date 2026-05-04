@@ -41,13 +41,13 @@ After expand, `codegen::emit` iterates `mono_table.entries()` by index — entri
 
 **`src/layout.rs` (`layout::compute_mono_layout`)**: per-mono pass that walks the lowered `MonoBody` and produces `MonoLayout { binding_storage, binding_drop_action, binding_addressed, frame_size }`. Runs from inside `emit_function_concrete` (i.e. after lowering, before byte emission). Four phases:
 1. `walk_block_address(&body.body, &mut addressed)` — walks the Mono IR. Every explicit `Borrow` / `BorrowOfValue` / `MethodCall` with `recv_adjust = BorrowImm/BorrowMut` / index-style synth call marks its root binding as addressed. The Mono IR makes every address-taking site syntactically visible (lowering already inserted the explicit `Deref` / synth `MethodCall` / `Borrow` shapes), so the walker doesn't infer anything — it just visits.
-2. Drop-typed bindings auto-addressed: `is_drop(local.ty, traits) → addressed[binding_id] = true` (for the implicit `Drop::drop(&mut binding)` at scope-end).
+2. Drop-typed bindings auto-addressed: `needs_drop(local.ty, structs, enums, traits) → addressed[binding_id] = true` (for `Drop::drop(&mut binding)` at scope-end and for the per-field address arithmetic the drop walker performs on aggregates with Drop fields).
 3. Per-binding `BindingStorageKind` selection in BindingId order. Params + lets + non-pattern addressed bindings get `Memory { frame_offset }` (offsets allocated in BindingId order); pattern leaves and synthesized bindings get `MemoryAt` (codegen allocates the addr_local at bind/emission time, no fixed frame slot); unaddressed → `Local`.
 4. Per-binding `DropAction` via `compute_drop_action`.
 
 `BindingStorageKind` is the *decision* layout makes; codegen fills in emission-time details (`wasm_start` for `Local`, `addr_local` for `MemoryAt`). Codegen reads `ctx.binding_storage[binding_id]` (BindingId-keyed) directly — single source of truth, no NodeId-based caches. `layout.frame_size` is what the prologue subtracts from `__sp`. Param storage is the prefix `binding_storage[..param_count]` since lowering declares params first.
 
-Per-binding `DropAction` (also in `src/layout.rs`) is computed via `compute_drop_action(name, ty, moved_places, traits)` at every `LocalBinding` decl site and stashed on the binding directly. Codegen's drop emission (`emit_drops_for_locals_range`) and flag-allocation paths read `LocalBinding.drop_action` instead of recomputing `is_drop` + move-status — the decision lives in one place. See the `drop-and-destructors` skill for the action variants.
+Per-binding `DropAction` (also in `src/layout.rs`) is computed via `compute_drop_action(name, ty, moved_places, structs, enums, traits)` at every `LocalBinding` decl site and stashed on the binding directly. Codegen's drop emission (`emit_drops_for_locals_range`) and flag-allocation paths read `LocalBinding.drop_action` instead of recomputing `needs_drop` + move-status — the decision lives in one place. See the `drop-and-destructors` skill for the action variants.
 
 ## Shadow stack — real pointers in linear memory
 
