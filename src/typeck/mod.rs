@@ -425,7 +425,17 @@ pub fn register_synthesized_closure_impl(
         reexports,
         source_file,
     )?;
-    let impl_type_params: Vec<String> = Vec::new();
+    // Synthesized closure impls inherit the enclosing fn's type-
+    // params (via `ImplBlock.type_params`). Without this propagation,
+    // a closure inside `fn helper<T>(...)` would synthesize an impl
+    // with no type-params, and the method body's `T` references would
+    // fail to resolve at the synthesized method's typeck — see rt3
+    // problem 5.
+    let impl_type_params: Vec<String> = ib
+        .type_params
+        .iter()
+        .map(|p| p.name.clone())
+        .collect();
     // Phase 2B: synthesized closure impls carry a `'cap` lifetime
     // parameter when the struct has any non-Copy capture fields. Read
     // it from the ImplBlock AST that `closure_lower::synthesize_impl_for_closure`
@@ -437,7 +447,11 @@ pub fn register_synthesized_closure_impl(
         .iter()
         .map(|p| p.name.clone())
         .collect();
-    let impl_type_param_bounds: Vec<Vec<Vec<String>>> = Vec::new();
+    let impl_type_param_bounds: Vec<Vec<Vec<String>>> = ib
+        .type_params
+        .iter()
+        .map(|_| Vec::new())
+        .collect();
 
     // Resolve the trait ref (Fn) and validate the impl shape against
     // the trait's declared methods + assoc types.
@@ -699,7 +713,7 @@ fn push_closure_struct(structs: &mut StructTable, ci: &ClosureInfo) {
         path: ci.synthesized_struct_path.clone(),
         name_span: ci.body_span.copy(),
         file: ci.source_file.clone(),
-        type_params: Vec::new(),
+        type_params: ci.enclosing_type_params.clone(),
         lifetime_params,
         fields,
         is_pub: false,
@@ -1680,6 +1694,10 @@ pub(crate) struct PendingClosure {
     pub is_move: bool,
     pub body_span: Span,
     pub captures: Vec<PendingCapture>,
+    // Snapshot of the enclosing fn's type-params at closure-checking
+    // time — propagated through to ClosureInfo so synthesis can build
+    // a generic struct + impl. See `ClosureInfo.enclosing_type_params`.
+    pub enclosing_type_params: Vec<String>,
 }
 
 fn check_module(
@@ -2347,6 +2365,7 @@ fn check_function(
                     body_span: pc.body_span.copy(),
                     source_file: current_file.to_string(),
                     body_mutates_capture,
+                    enclosing_type_params: pc.enclosing_type_params.clone(),
                 }));
             }
             None => closures_final.push(None),
@@ -3082,6 +3101,31 @@ fn walk_chain_type(
     Ok(current)
 }
 
+// Closure-capture detection. Called from every binding-resolution site
+// (value-position `Var`, place-position `Var`) so the rules stay in
+// one place. For each enclosing closure scope whose `local_barrier`
+// sits above `binding_idx`, push a `PendingCapture` (deduplicated by
+// name; first-reference order preserved). Capture mode (Copy by-value
+// vs Ref via `&'cap T`) is decided at end-of-fn finalize.
+fn record_capture_if_needed(ctx: &mut CheckCtx, name: &str, binding_idx: usize) {
+    let binding_ty = ctx.locals[binding_idx].ty.clone();
+    let mut sc = 0;
+    while sc < ctx.closure_scopes.len() {
+        if ctx.closure_scopes[sc].local_barrier > binding_idx {
+            let scope = &mut ctx.closure_scopes[sc];
+            let already = scope.captures.iter().any(|c| c.binding_name == name);
+            if !already {
+                scope.captures.push(PendingCapture {
+                    binding_name: name.to_string(),
+                    captured_ty: binding_ty.clone(),
+                    mutated: false,
+                });
+            }
+        }
+        sc += 1;
+    }
+}
+
 pub(crate) fn check_expr(ctx: &mut CheckCtx, expr: &Expr) -> Result<InferType, Error> {
     let ty = check_expr_inner(ctx, expr)?;
     // Record the resolved InferType under this Expr's NodeId. Finalized to
@@ -3128,44 +3172,13 @@ fn check_expr_inner(ctx: &mut CheckCtx, expr: &Expr) -> Result<InferType, Error>
                 i -= 1;
                 if ctx.locals[i].name == *name {
                     let binding_ty = ctx.locals[i].ty.clone();
-                    // Closure capture detection: if any enclosing
-                    // closure scope has its barrier above `i`, this
-                    // Var crosses into outer-binding territory. Phase
-                    // 2A records the capture in each crossed scope so
-                    // the lowering pass can synthesize a struct field
-                    // per capture and rewrite the body's `Var(name)`
-                    // into a `self.<name>` field access. Captures are
-                    // restricted to Copy types in phase 2A — non-Copy
-                    // capture support follows in phase 2B (requires
-                    // adding a struct lifetime param for `&'cap T`
-                    // fields). The `move` keyword and FnMut/FnOnce
-                    // mode inference land in phase 3.
-                    let mut sc = 0;
-                    while sc < ctx.closure_scopes.len() {
-                        if ctx.closure_scopes[sc].local_barrier > i {
-                            // Record the capture (deduplicated by
-                            // name; first-reference order preserved).
-                            // Capture mode (Copy by-value vs Ref via
-                            // `&'cap T`) is decided at end-of-fn
-                            // finalize against `is_copy`. The body's
-                            // `Var(name)` is rewritten by lowering to
-                            // either `self.<name>` (Copy) or
-                            // `*self.<name>` (Ref).
-                            let scope = &mut ctx.closure_scopes[sc];
-                            let already = scope
-                                .captures
-                                .iter()
-                                .any(|c| c.binding_name == *name);
-                            if !already {
-                                scope.captures.push(PendingCapture {
-                                    binding_name: name.clone(),
-                                    captured_ty: binding_ty.clone(),
-                                    mutated: false,
-                                });
-                            }
-                        }
-                        sc += 1;
-                    }
+                    // Closure capture detection — records into every
+                    // enclosing closure scope whose barrier sits above
+                    // this binding's local idx. Place-position Var
+                    // lookups (`check_place_inner::Var`) call the same
+                    // helper so capture recording is uniform across
+                    // value and place positions.
+                    record_capture_if_needed(ctx, name, i);
                     return Ok(binding_ty);
                 }
             }
@@ -3434,6 +3447,7 @@ fn check_closure(
 
     // Record on the side table — finalized into ClosureInfo at end of
     // the enclosing function's typeck.
+    let enclosing_type_params: Vec<String> = ctx.type_params.clone();
     ctx.closure_records[closure_expr.id as usize] = Some(PendingClosure {
         synthesized_struct_path: struct_path.clone(),
         param_types: param_infer,
@@ -3441,12 +3455,22 @@ fn check_closure(
         is_move: closure.is_move,
         body_span: closure.body.span.copy(),
         captures: scope.captures,
+        enclosing_type_params: enclosing_type_params.clone(),
     });
 
-    // Closure expression's type is the synthesized unit struct.
+    // Closure expression's type is the synthesized struct, generic
+    // over the enclosing fn's type-params (so `__closure_42<T>`
+    // inside `fn helper<T>(...)`). Each enclosing type-param is
+    // passed through as `InferType::Param(name)` so substitution at
+    // monomorphization time reaches into the synthesized struct's
+    // fields and impl methods.
+    let type_args: Vec<InferType> = enclosing_type_params
+        .iter()
+        .map(|n| InferType::Param(n.clone()))
+        .collect();
     Ok(InferType::Struct {
         path: struct_path,
-        type_args: Vec::new(),
+        type_args,
         lifetime_args: Vec::new(),
     })
 }
@@ -5049,7 +5073,11 @@ fn check_place_inner(ctx: &mut CheckCtx, expr: &Expr) -> Result<InferType, Error
             while i > 0 {
                 i -= 1;
                 if ctx.locals[i].name == *name {
-                    return Ok(ctx.locals[i].ty.clone());
+                    let binding_ty = ctx.locals[i].ty.clone();
+                    // Place-position Var must record captures the same
+                    // way value-position does — see rt3 problem 3.
+                    record_capture_if_needed(ctx, name, i);
+                    return Ok(binding_ty);
                 }
             }
             Err(Error {
@@ -5465,12 +5493,19 @@ fn check_bare_closure_call(
 }
 
 fn check_call(ctx: &mut CheckCtx, call: &Call, call_expr: &Expr) -> Result<InferType, Error> {
-    // Bare-call sugar for closures: when the callee is a single-
-    // segment path resolving to a local of synthesized closure type
-    // (`__closure_<id>`), dispatch as `local.call((args,))` instead
-    // of the usual function-path resolution. The `bare_closure_calls`
-    // side table records the binding name so mono can lower the Call
-    // as a MethodCall MonoExpr without AST mutation.
+    // Single-segment callee resolution — locals shadow functions.
+    // When the callee is `name(...)` with no path qualification or
+    // generic args, AND a local named `name` exists, route by the
+    // local's type instead of falling through to the function table:
+    //   * synthesized closure struct → bare-call sugar via
+    //     `check_bare_closure_call` (records into `bare_closure_calls`
+    //     so mono lowers as `local.call((args,))`).
+    //   * any other type → `expected function, found <ty>` (matches
+    //     rustc E0618). Without this, a `let foo: u32 = …; foo(5)`
+    //     would silently call a fn named `foo` if one exists in
+    //     scope — see rt3 problem 1.
+    // Variant constructors and fn-table lookup only run when no local
+    // with that name exists.
     if call.callee.segments.len() == 1
         && call.callee.segments[0].args.is_empty()
         && call.callee.segments[0].lifetime_args.is_empty()
@@ -5497,6 +5532,15 @@ fn check_call(ctx: &mut CheckCtx, call: &Call, call_expr: &Expr) -> Result<Infer
             if is_closure {
                 return check_bare_closure_call(ctx, call, call_expr, name, ty);
             }
+            return Err(Error {
+                file: ctx.current_file.to_string(),
+                message: format!(
+                    "expected function, found local `{}` of type `{}`",
+                    name,
+                    infer_to_string(&resolved),
+                ),
+                span: call_expr.span.copy(),
+            });
         }
     }
     // Use-table resolution first: an explicit import or matching glob

@@ -78,6 +78,13 @@ fn walk_module(
                 let mut full = path.clone();
                 full.push(f.name.clone());
                 process_fn(f, &full, &module.source_file, &mut new_items, funcs)?;
+                // For generic functions, the template stores its own
+                // clone of the body (taken at setup time). Mono reads
+                // from the template, not from module.items, so we
+                // sync the rewritten body back. Without this, generic
+                // fns containing closures still have unrewritten
+                // `ExprKind::Closure` nodes when mono walks them.
+                sync_template_body(funcs, &full, f);
             }
             Item::Impl(ib) => {
                 let target_seg = match &ib.target.kind {
@@ -94,6 +101,7 @@ fn walk_module(
                     }
                     full.push(ib.methods[k].name.clone());
                     process_fn(&mut ib.methods[k], &full, &module.source_file, &mut new_items, funcs)?;
+                    sync_template_body(funcs, &full, &ib.methods[k]);
                     k += 1;
                 }
             }
@@ -157,6 +165,21 @@ fn process_fn(
     }
     rewrite_block(&mut func.body, &closures, source_file, out)?;
     Ok(())
+}
+
+// Copy a freshly-rewritten function body back into the matching
+// `GenericTemplate.func` so monomorphization sees the lowered
+// closure-free AST. No-op when no template at this path (non-generic
+// fn — mono reads the AST directly from `module.items`).
+fn sync_template_body(funcs: &mut FuncTable, fn_path: &Vec<String>, src: &crate::ast::Function) {
+    let mut t = 0;
+    while t < funcs.templates.len() {
+        if &funcs.templates[t].path == fn_path {
+            funcs.templates[t].func = src.clone();
+            return;
+        }
+        t += 1;
+    }
 }
 
 fn lookup_fn_closures(funcs: &FuncTable, fn_path: &Vec<String>) -> Vec<Option<ClosureInfo>> {
@@ -325,7 +348,15 @@ fn rewrite_expr(
                 k += 1;
             }
         }
-        ExprKind::Closure(_) => {} // handled below
+        ExprKind::Closure(c) => {
+            // Recurse into the closure's own body so nested closures
+            // get rewritten (with their own synthesized impls pushed
+            // to `out`) BEFORE the outer rewrite below consumes
+            // `closure.body`. Without this, the outer's
+            // `clone_expr_fresh_ids` walk hits a nested
+            // `ExprKind::Closure` and panics — see rt3 problem 4.
+            rewrite_expr(&mut c.body, closures, source_file, out)?;
+        }
     }
     // Now check if this expression itself is a closure, and if so,
     // rewrite it.
@@ -365,16 +396,43 @@ fn rewrite_expr(
             out.push(Item::Impl(ib));
         }
         let _ = closure;
-        // Replace the expression with `__closure_<id> {}` (empty struct
-        // literal of the synthesized unit struct).
+        // Replace the expression with `__closure_<id> {}` (or
+        // `__closure_<id>::<T, U> {}` when the enclosing fn has
+        // type-params — see ClosureInfo.enclosing_type_params). The
+        // type-args go on the LAST segment of the path so the typeck
+        // re-check at the closure expression site resolves the struct
+        // and binds the params correctly.
+        let last_idx = info.synthesized_struct_path.len().saturating_sub(1);
         let synth_path_segments: Vec<PathSegment> = info
             .synthesized_struct_path
             .iter()
-            .map(|s| PathSegment {
-                name: s.clone(),
-                span: expr.span.copy(),
-                lifetime_args: Vec::new(),
-                args: Vec::new(),
+            .enumerate()
+            .map(|(i, s)| {
+                let args = if i == last_idx {
+                    info.enclosing_type_params
+                        .iter()
+                        .map(|n| Type {
+                            kind: TypeKind::Path(Path {
+                                segments: vec![PathSegment {
+                                    name: n.clone(),
+                                    span: expr.span.copy(),
+                                    lifetime_args: Vec::new(),
+                                    args: Vec::new(),
+                                }],
+                                span: expr.span.copy(),
+                            }),
+                            span: expr.span.copy(),
+                        })
+                        .collect()
+                } else {
+                    Vec::new()
+                };
+                PathSegment {
+                    name: s.clone(),
+                    span: expr.span.copy(),
+                    lifetime_args: Vec::new(),
+                    args,
+                }
             })
             .collect();
         let synth_path = Path {
@@ -539,22 +597,47 @@ fn synthesize_impl_for_closure(
         span: span.copy(),
     };
 
-    // Target: `__closure_<id>` (path-qualified to its module). When the
-    // synthesized struct carries a `'cap` lifetime parameter (because
-    // at least one capture is by-ref), the impl's target supplies a
-    // single lifetime arg referencing the impl's `'cap` parameter.
+    // Target: `__closure_<id><T, U>` (with the enclosing fn's type-
+    // params propagated; empty list when the enclosing fn is non-
+    // generic). When the synthesized struct carries a `'cap` lifetime
+    // parameter (because at least one capture is by-ref), the impl's
+    // target also supplies a `'cap` lifetime arg referencing the
+    // impl's `'cap` parameter.
     let needs_cap_lifetime = info
         .captures
         .iter()
         .any(|c| !matches!(c.mode, CaptureMode::Move));
+    let last_target_idx = info.synthesized_struct_path.len().saturating_sub(1);
     let mut target_segments: Vec<PathSegment> = info
         .synthesized_struct_path
         .iter()
-        .map(|s| PathSegment {
-            name: s.clone(),
-            span: span.copy(),
-            lifetime_args: Vec::new(),
-            args: Vec::new(),
+        .enumerate()
+        .map(|(i, s)| {
+            let args = if i == last_target_idx {
+                info.enclosing_type_params
+                    .iter()
+                    .map(|n| Type {
+                        kind: TypeKind::Path(Path {
+                            segments: vec![PathSegment {
+                                name: n.clone(),
+                                span: span.copy(),
+                                lifetime_args: Vec::new(),
+                                args: Vec::new(),
+                            }],
+                            span: span.copy(),
+                        }),
+                        span: span.copy(),
+                    })
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            PathSegment {
+                name: s.clone(),
+                span: span.copy(),
+                lifetime_args: Vec::new(),
+                args,
+            }
         })
         .collect();
     if needs_cap_lifetime {
@@ -579,6 +662,19 @@ fn synthesize_impl_for_closure(
     } else {
         Vec::new()
     };
+    // Impl-side type-params mirror the enclosing fn's. With them on
+    // the impl, the target's type-args (`__closure_<id><T>`) and the
+    // method body's `T` references both resolve at the impl's scope.
+    let impl_type_params: Vec<crate::ast::TypeParam> = info
+        .enclosing_type_params
+        .iter()
+        .map(|n| crate::ast::TypeParam {
+            name: n.clone(),
+            name_span: span.copy(),
+            bounds: Vec::new(),
+            default: None,
+        })
+        .collect();
 
     // Self-param shape per family: `&self` for Fn, `&mut self` for
     // FnMut, owned `self` for FnOnce. Mirrors the trait method's
@@ -752,7 +848,7 @@ fn synthesize_impl_for_closure(
 
     Ok(ImplBlock {
         lifetime_params: impl_lifetime_params,
-        type_params: Vec::new(),
+        type_params: impl_type_params,
         trait_path: Some(trait_path),
         target: target_ty,
         methods: vec![method],
@@ -792,33 +888,53 @@ fn mk_expr(alloc: &mut NodeIdAllocator, kind: ExprKind, span: &Span) -> Expr {
 // would mis-rewrite the inner reference, but no in-tree closure trips
 // that case yet.
 fn clone_expr_fresh_ids(e: &Expr, alloc: &mut NodeIdAllocator, captures: &[(String, CaptureMode)], recv_name: &str) -> Expr {
-    // `Var(name)` for a captured outer binding becomes
-    // `self.<name>` (Move/Copy capture) or `*self.<name>` (Ref/RefMut
-    // capture, where the field is `&T`/`&mut T` and we deref to the
-    // underlying place).
+    clone_expr_fresh_ids_scoped(e, alloc, captures, recv_name, &Vec::new())
+}
+
+// Scope-aware capture rewrite. `shadowed` carries the names introduced
+// by inner `let`-bindings, match-arm patterns, if-let / let-else
+// patterns, for-loop patterns, and any other binding-introducing
+// construct between the outer `Var(name)` site and the captured outer
+// binding. When a `Var(name)` matches both `captures` AND `shadowed`,
+// the inner shadow wins — the rewrite is skipped and the Var is
+// preserved so typeck resolves it to the inner local. Without this,
+// the rewrite is purely lexical (every Var matching a capture name
+// becomes `self.<name>`) and inner shadows silently swap in the
+// captured value — see rt3 problem 2.
+fn clone_expr_fresh_ids_scoped(
+    e: &Expr,
+    alloc: &mut NodeIdAllocator,
+    captures: &[(String, CaptureMode)],
+    recv_name: &str,
+    shadowed: &Vec<String>,
+) -> Expr {
     if let ExprKind::Var(name) = &e.kind {
-        if let Some((_, mode)) = captures.iter().find(|(n, _)| n == name) {
-            let self_var = mk_expr(alloc, ExprKind::Var(recv_name.to_string()), &e.span);
-            let field_access = Expr {
-                kind: ExprKind::FieldAccess(FieldAccess {
-                    base: Box::new(self_var),
-                    field: name.clone(),
-                    field_span: e.span.copy(),
-                }),
-                span: e.span.copy(),
-                id: alloc.alloc(),
-            };
-            let kind = match mode {
-                CaptureMode::Move => return field_access,
-                CaptureMode::Ref | CaptureMode::RefMut => {
-                    ExprKind::Deref(Box::new(field_access))
-                }
-            };
-            return Expr {
-                kind,
-                span: e.span.copy(),
-                id: alloc.alloc(),
-            };
+        // Inner shadow wins over captured outer binding.
+        let is_shadowed = shadowed.iter().any(|s| s == name);
+        if !is_shadowed {
+            if let Some((_, mode)) = captures.iter().find(|(n, _)| n == name) {
+                let self_var = mk_expr(alloc, ExprKind::Var(recv_name.to_string()), &e.span);
+                let field_access = Expr {
+                    kind: ExprKind::FieldAccess(FieldAccess {
+                        base: Box::new(self_var),
+                        field: name.clone(),
+                        field_span: e.span.copy(),
+                    }),
+                    span: e.span.copy(),
+                    id: alloc.alloc(),
+                };
+                let kind = match mode {
+                    CaptureMode::Move => return field_access,
+                    CaptureMode::Ref | CaptureMode::RefMut => {
+                        ExprKind::Deref(Box::new(field_access))
+                    }
+                };
+                return Expr {
+                    kind,
+                    span: e.span.copy(),
+                    id: alloc.alloc(),
+                };
+            }
         }
     }
     let kind = match &e.kind {
@@ -829,99 +945,142 @@ fn clone_expr_fresh_ids(e: &Expr, alloc: &mut NodeIdAllocator, captures: &[(Stri
         ExprKind::CharLit(c) => ExprKind::CharLit(*c),
         ExprKind::Var(n) => ExprKind::Var(n.clone()),
         ExprKind::Borrow { inner, mutable } => ExprKind::Borrow {
-            inner: Box::new(clone_expr_fresh_ids(inner, alloc, captures, recv_name)),
+            inner: Box::new(clone_expr_fresh_ids_scoped(inner, alloc, captures, recv_name, shadowed)),
             mutable: *mutable,
         },
         ExprKind::Cast { inner, ty } => ExprKind::Cast {
-            inner: Box::new(clone_expr_fresh_ids(inner, alloc, captures, recv_name)),
+            inner: Box::new(clone_expr_fresh_ids_scoped(inner, alloc, captures, recv_name, shadowed)),
             ty: ty.clone(),
         },
-        ExprKind::Deref(inner) => ExprKind::Deref(Box::new(clone_expr_fresh_ids(inner, alloc, captures, recv_name))),
-        ExprKind::Block(b) => ExprKind::Block(Box::new(clone_block_fresh_ids(b, alloc, captures, recv_name))),
-        ExprKind::Unsafe(b) => ExprKind::Unsafe(Box::new(clone_block_fresh_ids(b, alloc, captures, recv_name))),
+        ExprKind::Deref(inner) => ExprKind::Deref(Box::new(clone_expr_fresh_ids_scoped(inner, alloc, captures, recv_name, shadowed))),
+        ExprKind::Block(b) => ExprKind::Block(Box::new(clone_block_fresh_ids_scoped(b, alloc, captures, recv_name, shadowed))),
+        ExprKind::Unsafe(b) => ExprKind::Unsafe(Box::new(clone_block_fresh_ids_scoped(b, alloc, captures, recv_name, shadowed))),
         ExprKind::FieldAccess(fa) => ExprKind::FieldAccess(FieldAccess {
-            base: Box::new(clone_expr_fresh_ids(&fa.base, alloc, captures, recv_name)),
+            base: Box::new(clone_expr_fresh_ids_scoped(&fa.base, alloc, captures, recv_name, shadowed)),
             field: fa.field.clone(),
             field_span: fa.field_span.copy(),
         }),
         ExprKind::TupleIndex { base, index, index_span } => ExprKind::TupleIndex {
-            base: Box::new(clone_expr_fresh_ids(base, alloc, captures, recv_name)),
+            base: Box::new(clone_expr_fresh_ids_scoped(base, alloc, captures, recv_name, shadowed)),
             index: *index,
             index_span: index_span.copy(),
         },
-        ExprKind::Tuple(elems) => ExprKind::Tuple(
-            elems
-                .iter()
-                .map(|e| clone_expr_fresh_ids(e, alloc, captures, recv_name))
-                .collect(),
-        ),
-        ExprKind::Builtin { name, name_span, type_args, args } => ExprKind::Builtin {
-            name: name.clone(),
-            name_span: name_span.copy(),
-            type_args: type_args.clone(),
-            args: args.iter().map(|a| clone_expr_fresh_ids(a, alloc, captures, recv_name)).collect(),
-        },
-        ExprKind::Call(c) => ExprKind::Call(Call {
-            callee: c.callee.clone(),
-            args: c.args.iter().map(|a| clone_expr_fresh_ids(a, alloc, captures, recv_name)).collect(),
-        }),
-        ExprKind::MethodCall(mc) => ExprKind::MethodCall(MethodCall {
-            receiver: Box::new(clone_expr_fresh_ids(&mc.receiver, alloc, captures, recv_name)),
-            method: mc.method.clone(),
-            method_span: mc.method_span.copy(),
-            turbofish_args: mc.turbofish_args.clone(),
-            args: mc.args.iter().map(|a| clone_expr_fresh_ids(a, alloc, captures, recv_name)).collect(),
-        }),
-        ExprKind::StructLit(lit) => ExprKind::StructLit(StructLit {
-            path: lit.path.clone(),
-            fields: lit
-                .fields
-                .iter()
-                .map(|f| FieldInit {
-                    name: f.name.clone(),
-                    name_span: f.name_span.copy(),
-                    value: clone_expr_fresh_ids(&f.value, alloc, captures, recv_name),
-                })
-                .collect(),
-        }),
+        ExprKind::Tuple(elems) => {
+            let mut out: Vec<Expr> = Vec::new();
+            let mut i = 0;
+            while i < elems.len() {
+                out.push(clone_expr_fresh_ids_scoped(&elems[i], alloc, captures, recv_name, shadowed));
+                i += 1;
+            }
+            ExprKind::Tuple(out)
+        }
+        ExprKind::Builtin { name, name_span, type_args, args } => {
+            let mut out: Vec<Expr> = Vec::new();
+            let mut i = 0;
+            while i < args.len() {
+                out.push(clone_expr_fresh_ids_scoped(&args[i], alloc, captures, recv_name, shadowed));
+                i += 1;
+            }
+            ExprKind::Builtin {
+                name: name.clone(),
+                name_span: name_span.copy(),
+                type_args: type_args.clone(),
+                args: out,
+            }
+        }
+        ExprKind::Call(c) => {
+            let mut out: Vec<Expr> = Vec::new();
+            let mut i = 0;
+            while i < c.args.len() {
+                out.push(clone_expr_fresh_ids_scoped(&c.args[i], alloc, captures, recv_name, shadowed));
+                i += 1;
+            }
+            ExprKind::Call(Call { callee: c.callee.clone(), args: out })
+        }
+        ExprKind::MethodCall(mc) => {
+            let mut out: Vec<Expr> = Vec::new();
+            let mut i = 0;
+            while i < mc.args.len() {
+                out.push(clone_expr_fresh_ids_scoped(&mc.args[i], alloc, captures, recv_name, shadowed));
+                i += 1;
+            }
+            ExprKind::MethodCall(MethodCall {
+                receiver: Box::new(clone_expr_fresh_ids_scoped(&mc.receiver, alloc, captures, recv_name, shadowed)),
+                method: mc.method.clone(),
+                method_span: mc.method_span.copy(),
+                turbofish_args: mc.turbofish_args.clone(),
+                args: out,
+            })
+        }
+        ExprKind::StructLit(lit) => {
+            let mut out: Vec<FieldInit> = Vec::new();
+            let mut i = 0;
+            while i < lit.fields.len() {
+                out.push(FieldInit {
+                    name: lit.fields[i].name.clone(),
+                    name_span: lit.fields[i].name_span.copy(),
+                    value: clone_expr_fresh_ids_scoped(&lit.fields[i].value, alloc, captures, recv_name, shadowed),
+                });
+                i += 1;
+            }
+            ExprKind::StructLit(StructLit { path: lit.path.clone(), fields: out })
+        }
         ExprKind::If(ie) => ExprKind::If(IfExpr {
-            cond: Box::new(clone_expr_fresh_ids(&ie.cond, alloc, captures, recv_name)),
-            then_block: Box::new(clone_block_fresh_ids(&ie.then_block, alloc, captures, recv_name)),
-            else_block: Box::new(clone_block_fresh_ids(&ie.else_block, alloc, captures, recv_name)),
+            cond: Box::new(clone_expr_fresh_ids_scoped(&ie.cond, alloc, captures, recv_name, shadowed)),
+            then_block: Box::new(clone_block_fresh_ids_scoped(&ie.then_block, alloc, captures, recv_name, shadowed)),
+            else_block: Box::new(clone_block_fresh_ids_scoped(&ie.else_block, alloc, captures, recv_name, shadowed)),
         }),
-        ExprKind::IfLet(il) => ExprKind::IfLet(IfLetExpr {
-            pattern: clone_pattern_fresh_ids(&il.pattern, alloc),
-            scrutinee: Box::new(clone_expr_fresh_ids(&il.scrutinee, alloc, captures, recv_name)),
-            then_block: Box::new(clone_block_fresh_ids(&il.then_block, alloc, captures, recv_name)),
-            else_block: Box::new(clone_block_fresh_ids(&il.else_block, alloc, captures, recv_name)),
-        }),
-        ExprKind::Match(m) => ExprKind::Match(MatchExpr {
-            scrutinee: Box::new(clone_expr_fresh_ids(&m.scrutinee, alloc, captures, recv_name)),
-            arms: m
-                .arms
-                .iter()
-                .map(|a| MatchArm {
+        ExprKind::IfLet(il) => {
+            // The pattern's bindings shadow captured names inside
+            // `then_block`. The `else_block` runs with the original
+            // shadow set (no pattern bindings there).
+            let mut inner = shadowed.clone();
+            collect_pattern_bindings(&il.pattern, &mut inner);
+            ExprKind::IfLet(IfLetExpr {
+                pattern: clone_pattern_fresh_ids(&il.pattern, alloc),
+                scrutinee: Box::new(clone_expr_fresh_ids_scoped(&il.scrutinee, alloc, captures, recv_name, shadowed)),
+                then_block: Box::new(clone_block_fresh_ids_scoped(&il.then_block, alloc, captures, recv_name, &inner)),
+                else_block: Box::new(clone_block_fresh_ids_scoped(&il.else_block, alloc, captures, recv_name, shadowed)),
+            })
+        }
+        ExprKind::Match(m) => {
+            let mut arms: Vec<MatchArm> = Vec::new();
+            let mut i = 0;
+            while i < m.arms.len() {
+                let a = &m.arms[i];
+                let mut inner = shadowed.clone();
+                collect_pattern_bindings(&a.pattern, &mut inner);
+                arms.push(MatchArm {
                     pattern: clone_pattern_fresh_ids(&a.pattern, alloc),
-                    guard: a.guard.as_ref().map(|g| clone_expr_fresh_ids(g, alloc, captures, recv_name)),
-                    body: clone_expr_fresh_ids(&a.body, alloc, captures, recv_name),
+                    guard: a.guard.as_ref().map(|g| clone_expr_fresh_ids_scoped(g, alloc, captures, recv_name, &inner)),
+                    body: clone_expr_fresh_ids_scoped(&a.body, alloc, captures, recv_name, &inner),
                     span: a.span.copy(),
-                })
-                .collect(),
-            span: m.span.copy(),
-        }),
+                });
+                i += 1;
+            }
+            ExprKind::Match(MatchExpr {
+                scrutinee: Box::new(clone_expr_fresh_ids_scoped(&m.scrutinee, alloc, captures, recv_name, shadowed)),
+                arms,
+                span: m.span.copy(),
+            })
+        }
         ExprKind::While(w) => ExprKind::While(WhileExpr {
             label: w.label.clone(),
             label_span: w.label_span.as_ref().map(|s| s.copy()),
-            cond: Box::new(clone_expr_fresh_ids(&w.cond, alloc, captures, recv_name)),
-            body: Box::new(clone_block_fresh_ids(&w.body, alloc, captures, recv_name)),
+            cond: Box::new(clone_expr_fresh_ids_scoped(&w.cond, alloc, captures, recv_name, shadowed)),
+            body: Box::new(clone_block_fresh_ids_scoped(&w.body, alloc, captures, recv_name, shadowed)),
         }),
-        ExprKind::For(f) => ExprKind::For(ForLoop {
-            label: f.label.clone(),
-            label_span: f.label_span.as_ref().map(|s| s.copy()),
-            pattern: clone_pattern_fresh_ids(&f.pattern, alloc),
-            iter: Box::new(clone_expr_fresh_ids(&f.iter, alloc, captures, recv_name)),
-            body: Box::new(clone_block_fresh_ids(&f.body, alloc, captures, recv_name)),
-        }),
+        ExprKind::For(f) => {
+            let mut inner = shadowed.clone();
+            collect_pattern_bindings(&f.pattern, &mut inner);
+            ExprKind::For(ForLoop {
+                label: f.label.clone(),
+                label_span: f.label_span.as_ref().map(|s| s.copy()),
+                pattern: clone_pattern_fresh_ids(&f.pattern, alloc),
+                iter: Box::new(clone_expr_fresh_ids_scoped(&f.iter, alloc, captures, recv_name, shadowed)),
+                body: Box::new(clone_block_fresh_ids_scoped(&f.body, alloc, captures, recv_name, &inner)),
+            })
+        }
         ExprKind::Break { label, label_span } => ExprKind::Break {
             label: label.clone(),
             label_span: label_span.as_ref().map(|s| s.copy()),
@@ -931,22 +1090,30 @@ fn clone_expr_fresh_ids(e: &Expr, alloc: &mut NodeIdAllocator, captures: &[(Stri
             label_span: label_span.as_ref().map(|s| s.copy()),
         },
         ExprKind::Return { value } => ExprKind::Return {
-            value: value.as_ref().map(|v| Box::new(clone_expr_fresh_ids(v, alloc, captures, recv_name))),
+            value: value.as_ref().map(|v| Box::new(clone_expr_fresh_ids_scoped(v, alloc, captures, recv_name, shadowed))),
         },
         ExprKind::Try { inner, question_span } => ExprKind::Try {
-            inner: Box::new(clone_expr_fresh_ids(inner, alloc, captures, recv_name)),
+            inner: Box::new(clone_expr_fresh_ids_scoped(inner, alloc, captures, recv_name, shadowed)),
             question_span: question_span.copy(),
         },
         ExprKind::Index { base, index, bracket_span } => ExprKind::Index {
-            base: Box::new(clone_expr_fresh_ids(base, alloc, captures, recv_name)),
-            index: Box::new(clone_expr_fresh_ids(index, alloc, captures, recv_name)),
+            base: Box::new(clone_expr_fresh_ids_scoped(base, alloc, captures, recv_name, shadowed)),
+            index: Box::new(clone_expr_fresh_ids_scoped(index, alloc, captures, recv_name, shadowed)),
             bracket_span: bracket_span.copy(),
         },
-        ExprKind::MacroCall { name, name_span, args } => ExprKind::MacroCall {
-            name: name.clone(),
-            name_span: name_span.copy(),
-            args: args.iter().map(|a| clone_expr_fresh_ids(a, alloc, captures, recv_name)).collect(),
-        },
+        ExprKind::MacroCall { name, name_span, args } => {
+            let mut out: Vec<Expr> = Vec::new();
+            let mut i = 0;
+            while i < args.len() {
+                out.push(clone_expr_fresh_ids_scoped(&args[i], alloc, captures, recv_name, shadowed));
+                i += 1;
+            }
+            ExprKind::MacroCall {
+                name: name.clone(),
+                name_span: name_span.copy(),
+                args: out,
+            }
+        }
         ExprKind::Closure(_) => {
             // Inner closures should already have been rewritten by
             // `rewrite_expr` before we cloned this body. If we reach
@@ -963,31 +1130,95 @@ fn clone_expr_fresh_ids(e: &Expr, alloc: &mut NodeIdAllocator, captures: &[(Stri
 }
 
 fn clone_block_fresh_ids(b: &Block, alloc: &mut NodeIdAllocator, captures: &[(String, CaptureMode)], recv_name: &str) -> Block {
+    clone_block_fresh_ids_scoped(b, alloc, captures, recv_name, &Vec::new())
+}
+
+fn clone_block_fresh_ids_scoped(
+    b: &Block,
+    alloc: &mut NodeIdAllocator,
+    captures: &[(String, CaptureMode)],
+    recv_name: &str,
+    shadowed: &Vec<String>,
+) -> Block {
+    // A `let` introduces names visible to subsequent stmts and the
+    // tail expression. The let's RHS still uses the OUTER shadow set
+    // (the binding isn't in scope until after the let). We track
+    // additions in `local` and pass it forward.
+    let mut local = shadowed.clone();
     let mut stmts: Vec<Stmt> = Vec::new();
     let mut i = 0;
     while i < b.stmts.len() {
-        stmts.push(clone_stmt_fresh_ids(&b.stmts[i], alloc, captures, recv_name));
+        match &b.stmts[i] {
+            Stmt::Let(ls) => {
+                let value = clone_expr_fresh_ids_scoped(&ls.value, alloc, captures, recv_name, &local);
+                let else_block = ls.else_block.as_ref().map(|eb| {
+                    Box::new(clone_block_fresh_ids_scoped(eb, alloc, captures, recv_name, &local))
+                });
+                let pattern = clone_pattern_fresh_ids(&ls.pattern, alloc);
+                // Bring the let's pattern bindings into scope for the
+                // remainder of the block.
+                collect_pattern_bindings(&ls.pattern, &mut local);
+                stmts.push(Stmt::Let(LetStmt {
+                    pattern,
+                    ty: ls.ty.clone(),
+                    value,
+                    else_block,
+                }));
+            }
+            Stmt::Assign(a) => stmts.push(Stmt::Assign(AssignStmt {
+                lhs: clone_expr_fresh_ids_scoped(&a.lhs, alloc, captures, recv_name, &local),
+                rhs: clone_expr_fresh_ids_scoped(&a.rhs, alloc, captures, recv_name, &local),
+                span: a.span.copy(),
+            })),
+            Stmt::Expr(e) => stmts.push(Stmt::Expr(clone_expr_fresh_ids_scoped(e, alloc, captures, recv_name, &local))),
+            Stmt::Use(u) => stmts.push(Stmt::Use(u.clone())),
+        }
         i += 1;
     }
-    let tail = b.tail.as_ref().map(|e| clone_expr_fresh_ids(e, alloc, captures, recv_name));
+    let tail = b.tail.as_ref().map(|e| clone_expr_fresh_ids_scoped(e, alloc, captures, recv_name, &local));
     Block { stmts, tail, span: b.span.copy() }
 }
 
-fn clone_stmt_fresh_ids(s: &Stmt, alloc: &mut NodeIdAllocator, captures: &[(String, CaptureMode)], recv_name: &str) -> Stmt {
-    match s {
-        Stmt::Let(ls) => Stmt::Let(LetStmt {
-            pattern: clone_pattern_fresh_ids(&ls.pattern, alloc),
-            ty: ls.ty.clone(),
-            value: clone_expr_fresh_ids(&ls.value, alloc, captures, recv_name),
-            else_block: ls.else_block.as_ref().map(|eb| Box::new(clone_block_fresh_ids(eb, alloc, captures, recv_name))),
-        }),
-        Stmt::Assign(a) => Stmt::Assign(AssignStmt {
-            lhs: clone_expr_fresh_ids(&a.lhs, alloc, captures, recv_name),
-            rhs: clone_expr_fresh_ids(&a.rhs, alloc, captures, recv_name),
-            span: a.span.copy(),
-        }),
-        Stmt::Expr(e) => Stmt::Expr(clone_expr_fresh_ids(e, alloc, captures, recv_name)),
-        Stmt::Use(u) => Stmt::Use(u.clone()),
+// Walk a pattern and append every binding name it introduces. Used
+// by the scope-aware capture rewrite to extend the `shadowed` set
+// across `let` / match-arm / if-let / for-loop boundaries.
+fn collect_pattern_bindings(p: &Pattern, out: &mut Vec<String>) {
+    match &p.kind {
+        PatternKind::Wildcard | PatternKind::LitInt(_) | PatternKind::LitBool(_) | PatternKind::Range { .. } => {}
+        PatternKind::Binding { name, .. } => out.push(name.clone()),
+        PatternKind::At { name, inner, .. } => {
+            out.push(name.clone());
+            collect_pattern_bindings(inner, out);
+        }
+        PatternKind::VariantTuple { elems, .. } => {
+            let mut i = 0;
+            while i < elems.len() {
+                collect_pattern_bindings(&elems[i], out);
+                i += 1;
+            }
+        }
+        PatternKind::VariantStruct { fields, .. } => {
+            let mut i = 0;
+            while i < fields.len() {
+                collect_pattern_bindings(&fields[i].pattern, out);
+                i += 1;
+            }
+        }
+        PatternKind::Tuple(elems) => {
+            let mut i = 0;
+            while i < elems.len() {
+                collect_pattern_bindings(&elems[i], out);
+                i += 1;
+            }
+        }
+        PatternKind::Ref { inner, .. } => collect_pattern_bindings(inner, out),
+        PatternKind::Or(alts) => {
+            // All alternatives bind the same set in well-formed Rust;
+            // walking the first is sufficient.
+            if !alts.is_empty() {
+                collect_pattern_bindings(&alts[0], out);
+            }
+        }
     }
 }
 

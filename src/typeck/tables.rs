@@ -42,6 +42,14 @@ pub struct ClosureInfo {
     // `Fn` impl (which would dispatch via `&self` and so couldn't
     // mutate captured values) and synthesize only `FnMut` + `FnOnce`.
     pub body_mutates_capture: bool,
+    // Type-parameters of the enclosing function, copied at closure-
+    // typeck time. The synthesized struct + impl carry these so that
+    // a closure inside `fn helper<T>(x: T)` synthesizes `struct
+    // __closure_<id><T>` and `impl<T> Fn<(T,)> for __closure_<id><T>`,
+    // letting `T` references in the closure body resolve when the
+    // synthesized method is re-typed. Empty for closures inside
+    // non-generic functions.
+    pub enclosing_type_params: Vec<String>,
 }
 
 #[derive(Clone)]

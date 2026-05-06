@@ -91,11 +91,13 @@ The capture is recorded with `mutated: true` even on first observation in the LH
 
 `PendingCapture { binding_name, captured_ty, mutated: bool }`.
 
+Capture-record helper `record_capture_if_needed(ctx, name, idx)` is the single source of truth for the barrier check — both value-position `Var` (`check_expr_inner`) and place-position `Var` (`check_place_inner`) call it. Without sharing, place-position uses (method-call receiver, `&captured`, deref base, assignment LHS) silently skip capture recording and synthesis sees zero captures.
+
 ### Call dispatch
 
 **`f.call((args,))`** — when receiver is a synthesized closure struct, `check_method_call` routes to `check_closure_method_call` (special-case before normal candidate lookup). Looks up the closure's recorded signature in `ctx.closure_records` (current fn) or `funcs.{entries,templates}[*].closures` (cross-fn) by struct path match, type-checks the args tuple against `Tuple(param_types)`, populates `MethodResolution.trait_dispatch` (trait_path = `std::ops::Fn`, trait_args = `[Tuple(P0, ...)]`, recv_type = closure struct). Codegen's `solve_impl_with_args` resolves the impl row at emit time.
 
-**`f(args)`** — `check_call`'s top branch detects single-segment-path callee resolving to a local of synthesized closure type, dispatches to `check_bare_closure_call`. Same trait_dispatch shape as `.call(...)`, plus records the binding name on `bare_closure_calls[id]` so mono can lower the Call as a MethodCall MonoExpr (closure local as recv, args wrapped in `MonoExprKind::Tuple`).
+**`f(args)`** — `check_call`'s top branch detects a single-segment-path callee. **Locals shadow functions**: when a local with that name exists, route by the local's type (closure → bare-call dispatch via `check_bare_closure_call`, anything else → `expected function, found <ty>` matching rustc E0618). Function-table / variant lookups only fire when no local with that name exists. Without local-first resolution, `let foo: u32 = …; foo(5)` silently calls a fn named `foo` if one is in scope. Same trait_dispatch shape as `.call(...)`, plus records the binding name on `bare_closure_calls[id]` so mono can lower the Call as a MethodCall MonoExpr (closure local as recv, args wrapped in `MonoExprKind::Tuple`).
 
 Recv-adjust per family + receiver shape:
 | method | owned recv | `&` recv | `&mut` recv |
@@ -128,7 +130,8 @@ pub struct ClosureInfo {
     captures: Vec<CaptureInfo>,
     body_span: Span,
     source_file: String,
-    body_mutates_capture: bool,    // drives Fn-skip in synthesis
+    body_mutates_capture: bool,        // drives Fn-skip in synthesis
+    enclosing_type_params: Vec<String>, // enclosing fn's type-params; threaded into struct + impl
 }
 
 pub struct CaptureInfo { binding_name, captured_ty, mode }
@@ -160,6 +163,10 @@ Method body: `let p0 = __args.0; let p1 = __args.1; ...; <closure body>` — bod
 - `Ref` mode → `*self.<name>` (Deref of FieldAccess)
 - `RefMut` mode → `*self.<name>` (same — write through `&mut T` works)
 
+The rewrite is **scope-aware**: `clone_expr_fresh_ids_scoped` threads a `shadowed: &Vec<String>` set through the deep-clone, extending it at every binding-introducing boundary (`let`, match-arm pattern, if-let / for-loop pattern, let-else). When a `Var(name)` is in both `captures` AND `shadowed`, the inner binding wins and the rewrite is skipped. `collect_pattern_bindings` walks a Pattern and accumulates every introduced name (Binding, At, VariantTuple/Struct elems, Tuple, Ref, first arm of Or). Without scope tracking, an inner `let x = ...` shadowing a captured `x` would silently swap in the captured value.
+
+**Nested closures**: `rewrite_expr` recurses into the children-walk's `ExprKind::Closure` arm BEFORE the late consume-and-replace pass at the bottom. This guarantees inner closures get rewritten (their own synth impls pushed to `out`) before the outer's `clone_expr_fresh_ids_scoped` walks the body — the cloner panics on `ExprKind::Closure`, so nested closures must already be replaced with struct-lits when it runs.
+
 For FnOnce when `body_mutates_capture`: receiver name in rewrite is `__closure_self`, body is wrapped in `{ let mut __closure_self = self; <body> }`.
 
 ### Synth span uniqueness
@@ -169,6 +176,20 @@ All Fn-family impls for the same closure share `info.body_span`. `find_trait_imp
 ### AST item ordering vs FnSymbol idx
 
 Synthesized impls get registered (FnSymbol idx assigned) during the new_items loop, then appended to `module.items` in the SAME order so codegen's emission order = registration order. Reverse ordering would desync `FnSymbol.idx` from the wasm function index codegen actually assigns — call sites would then dispatch through the wrong wasm idx.
+
+### Generic enclosing fns
+
+`ClosureInfo.enclosing_type_params` carries the enclosing fn's type-params (snapshot of `ctx.type_params` at `check_closure` time). Three downstream consumers thread them through:
+- `push_closure_struct` → `StructEntry.type_params` so `__closure_<id>` is generic over the enclosing T.
+- `rewrite_expr` (closure expression site) → struct-lit's last path segment carries `args = [Type::Path(T), ...]` so the typeck re-check at the closure expression site binds the type-args.
+- `synthesize_impl_for_closure` → `ImplBlock.type_params` and target's last segment's `args` so the synthesized impl is `impl<T> Fn<(T,)> for __closure_<id><T>`.
+- `register_synthesized_closure_impl` reads `ib.type_params` (not hardcoded empty) so the impl-method's body resolves `T` against the impl's type-param scope.
+
+Without all four, a closure inside `fn helper<T>(...)` errors `unknown type: T` when the synthesized method's body is re-typed.
+
+### Template body sync after lowering
+
+`GenericTemplate.func` is a clone of the AST taken at typeck setup time; mono reads from this clone, not from `module.items`. After `process_fn` rewrites a function body in-place, `sync_template_body` copies the updated body back into the matching template. Without sync, generic functions containing closures still have unrewritten `ExprKind::Closure` nodes when mono walks them, panicking at the `unreachable!` in `walk_expr`.
 
 ## Open work
 
