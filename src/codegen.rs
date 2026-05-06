@@ -3920,6 +3920,7 @@ fn mono_supports_stmt(s: &crate::mono::MonoStmt) -> bool {
     match s {
         crate::mono::MonoStmt::Expr(e) => mono_supports_expr(e),
         crate::mono::MonoStmt::Let { value, .. } => mono_supports_expr(value),
+        crate::mono::MonoStmt::LetUninit { .. } => true,
         crate::mono::MonoStmt::Assign { place, value, .. } => {
             mono_supports_assign_place(place) && mono_supports_expr(value)
         }
@@ -4292,6 +4293,99 @@ fn codegen_mono_stmt(
                 ctx.next_wasm_local += 1;
                 ctx.drop_flags.push((name, flag_idx));
                 ctx.instructions.push(wasm::Instruction::I32Const(1));
+                ctx.instructions.push(wasm::Instruction::LocalSet(flag_idx));
+            }
+            Ok(())
+        }
+        crate::mono::MonoStmt::LetUninit { binding, .. } => {
+            // `let x: T;` — allocate the binding's storage but emit
+            // no value. Borrowck has guaranteed that no subsequent
+            // path reads `x` before its first assignment.
+            //
+            // For Memory storage we reserve the frame slot at layout
+            // time; nothing to emit here. For Local storage we
+            // allocate fresh wasm locals (default-zero-initialized,
+            // safe even though we don't promise the bytes are
+            // meaningful). For MemoryAt we still bump __sp so the
+            // dynamic slot is reserved. In all cases we register the
+            // LocalBinding so subsequent assignments / reads (after
+            // assign) resolve.
+            let mono_body = ctx.mono_body
+                .expect("Mono codegen invoked without ctx.mono_body set");
+            let local = &mono_body.locals[*binding as usize];
+            let storage_kind = ctx.binding_storage[*binding as usize];
+            let name = local.name.clone();
+            let ty = local.ty.clone();
+            let drop_action = crate::layout::compute_drop_action(
+                &name,
+                &ty,
+                &ctx.moved_places,
+                ctx.structs,
+                ctx.enums,
+                ctx.traits,
+            );
+            match storage_kind {
+                BindingStorageKind::Memory { frame_offset } => {
+                    ctx.locals.push(LocalBinding {
+                        name: name.clone(),
+                        rtype: ty.clone(),
+                        storage: Storage::Memory { frame_offset },
+                        drop_action,
+                    });
+                }
+                BindingStorageKind::Local => {
+                    let mut vts: Vec<wasm::ValType> = Vec::new();
+                    flatten_rtype(&ty, ctx.structs, &mut vts);
+                    let flat_size = vts.len() as u32;
+                    let start = ctx.next_wasm_local;
+                    let mut k = 0;
+                    while k < vts.len() {
+                        ctx.extra_locals.push(vts[k].copy());
+                        ctx.next_wasm_local += 1;
+                        k += 1;
+                    }
+                    ctx.locals.push(LocalBinding {
+                        name: name.clone(),
+                        rtype: ty.clone(),
+                        storage: Storage::Local { wasm_start: start, flat_size },
+                        drop_action,
+                    });
+                }
+                BindingStorageKind::MemoryAt => {
+                    let bytes = byte_size_of(&ty, ctx.structs, ctx.enums);
+                    ctx.instructions.push(wasm::Instruction::GlobalGet(SP_GLOBAL));
+                    ctx.instructions.push(wasm::Instruction::I32Const(bytes as i32));
+                    ctx.instructions.push(wasm::Instruction::I32Sub);
+                    ctx.instructions.push(wasm::Instruction::GlobalSet(SP_GLOBAL));
+                    let addr_local = ctx.next_wasm_local;
+                    ctx.extra_locals.push(wasm::ValType::I32);
+                    ctx.next_wasm_local += 1;
+                    ctx.instructions.push(wasm::Instruction::GlobalGet(SP_GLOBAL));
+                    ctx.instructions.push(wasm::Instruction::LocalSet(addr_local));
+                    ctx.locals.push(LocalBinding {
+                        name: name.clone(),
+                        rtype: ty.clone(),
+                        storage: Storage::MemoryAt { addr_local },
+                        drop_action,
+                    });
+                }
+            }
+            ctx.mono_binding_to_local[*binding as usize] = Some(ctx.locals.len() as u32 - 1);
+            // Drop-flag handling: borrowck's snapshot maps `Uninit`
+            // at scope-end to `Moved`, so a never-assigned binding
+            // gets DropAction::None (no flag, no drop). When the
+            // binding IS assigned later, its scope-end status is
+            // Init → DropAction::Unconditional (no flag needed).
+            // The Flagged path (assigned on some paths only) would
+            // need flag-init=0 + set-on-assign — not yet wired here;
+            // gap-tested.
+            if matches!(drop_action, crate::layout::DropAction::Flagged) {
+                let flag_idx = ctx.next_wasm_local;
+                ctx.extra_locals.push(wasm::ValType::I32);
+                ctx.next_wasm_local += 1;
+                ctx.drop_flags.push((name, flag_idx));
+                // Initial flag = 0 (binding starts uninitialized).
+                ctx.instructions.push(wasm::Instruction::I32Const(0));
                 ctx.instructions.push(wasm::Instruction::LocalSet(flag_idx));
             }
             Ok(())

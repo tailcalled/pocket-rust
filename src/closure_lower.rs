@@ -225,7 +225,9 @@ fn rewrite_stmt(
 ) -> Result<(), Error> {
     match stmt {
         Stmt::Let(ls) => {
-            rewrite_expr(&mut ls.value, closures, source_file, out)?;
+            if let Some(v) = &mut ls.value {
+                rewrite_expr(v, closures, source_file, out)?;
+            }
             if let Some(eb) = &mut ls.else_block {
                 rewrite_block(eb, closures, source_file, out)?;
             }
@@ -754,7 +756,7 @@ fn synthesize_impl_for_closure(
         stmts.push(Stmt::Let(LetStmt {
             pattern: pat,
             ty: None,
-            value: tuple_idx,
+            value: Some(tuple_idx),
             else_block: None,
         }));
         idx += 1;
@@ -802,7 +804,7 @@ fn synthesize_impl_for_closure(
         stmts.push(Stmt::Let(LetStmt {
             pattern: pat,
             ty: None,
-            value: self_var,
+            value: Some(self_var),
             else_block: None,
         }));
     }
@@ -1150,7 +1152,9 @@ fn clone_block_fresh_ids_scoped(
     while i < b.stmts.len() {
         match &b.stmts[i] {
             Stmt::Let(ls) => {
-                let value = clone_expr_fresh_ids_scoped(&ls.value, alloc, captures, recv_name, &local);
+                let value = ls.value.as_ref().map(|v| {
+                    clone_expr_fresh_ids_scoped(v, alloc, captures, recv_name, &local)
+                });
                 let else_block = ls.else_block.as_ref().map(|eb| {
                     Box::new(clone_block_fresh_ids_scoped(eb, alloc, captures, recv_name, &local))
                 });

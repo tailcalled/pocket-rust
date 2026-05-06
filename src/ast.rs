@@ -361,12 +361,22 @@ pub struct LetStmt {
     // (i.e. let-else).
     pub pattern: Pattern,
     pub ty: Option<Type>,
-    pub value: Expr,
+    // `None` for declared-but-uninitialized `let x: T;`. Typeck
+    // requires `ty: Some(_)` and a single `Binding` pattern (no
+    // destructure / wildcard / refutable / let-else) when `value` is
+    // `None`. Borrowck seeds the binding's place into the move-state
+    // lattice as `Moved`, so any read before the first assignment is
+    // rejected with an "uninitialized" diagnostic; an assignment
+    // returns it to `Init`. Codegen emits no initializer — the stack
+    // slot is allocated by frame layout and left uninitialized.
+    pub value: Option<Expr>,
     // `let PAT = EXPR else { … };` — when `Some`, the pattern may be
     // refutable; if it doesn't match `EXPR`, the else block runs.
     // The else block must diverge (`return`, `break`, `continue`,
     // `panic!()`, …) so control flow can't fall through past a
-    // mismatched binding.
+    // mismatched binding. Mutually exclusive with `value: None`
+    // (an uninit `let` cannot have an else block — there's nothing
+    // to test).
     pub else_block: Option<Box<Block>>,
 }
 

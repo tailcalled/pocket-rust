@@ -132,7 +132,11 @@ fn walk_block(state: &mut SafeState, block: &Block) -> Result<(), Error> {
     let mut i = 0;
     while i < block.stmts.len() {
         match &block.stmts[i] {
-            Stmt::Let(let_stmt) => walk_expr(state, &let_stmt.value)?,
+            Stmt::Let(let_stmt) => {
+                if let Some(v) = &let_stmt.value {
+                    walk_expr(state, v)?;
+                }
+            }
             Stmt::Assign(assign) => {
                 walk_expr(state, &assign.lhs)?;
                 walk_expr(state, &assign.rhs)?;

@@ -294,18 +294,20 @@ fn walk_let(
     funcs: &FuncTable,
     table: &mut MonoTable,
 ) {
-    walk_expr(
-        &ls.value,
-        expr_types,
-        method_resolutions,
-        call_resolutions,
-        env,
-        structs,
-        enums,
-        traits,
-        funcs,
-        table,
-    );
+    if let Some(value) = &ls.value {
+        walk_expr(
+            value,
+            expr_types,
+            method_resolutions,
+            call_resolutions,
+            env,
+            structs,
+            enums,
+            traits,
+            funcs,
+            table,
+        );
+    }
     // Walk the let-else divergent block too.
     if let Some(else_block) = &ls.else_block {
         walk_block(
@@ -322,7 +324,13 @@ fn walk_let(
         );
     }
     // The let's value type may be Drop — register Drop::drop for it.
-    if let Some(ty) = &expr_types[ls.value.id as usize] {
+    // For uninit `let x: T;`, the binding's type is recorded on the
+    // pattern instead (no value expr exists).
+    let value_ty: Option<&RType> = ls
+        .value
+        .as_ref()
+        .and_then(|v| expr_types[v.id as usize].as_ref());
+    if let Some(ty) = value_ty {
         let concrete = substitute_rtype(ty, env);
         register_drop_mono(&concrete, traits, funcs, table);
         // Walk pattern bindings to register Drop monos for any
@@ -1602,6 +1610,16 @@ pub enum MonoStmt {
         value: MonoExpr,
         span: Span,
     },
+    // `let x: T;` — declared but uninitialized. Allocates storage
+    // for the binding (so subsequent assignments can write into it)
+    // and pushes it onto codegen's locals, but emits no value.
+    // Borrowck has already proven the binding isn't read before its
+    // first assignment; codegen leaves the slot's bytes
+    // uninitialized.
+    LetUninit {
+        binding: BindingId,
+        span: Span,
+    },
     // Pattern destructuring let: `let (a, b) = e;` (irrefutable) or
     // `let Some(x) = e else { … };` (refutable + diverging else block).
     // The pattern's binding leaves stay scoped after the stmt — codegen
@@ -1808,7 +1826,34 @@ fn lower_stmt(ctx: &mut LowerCtx, stmt: &Stmt) -> Result<Option<MonoStmt>, Error
             Ok(Some(MonoStmt::Expr(me)))
         }
         Stmt::Let(ls) => {
-            let value = lower_expr(ctx, &ls.value)?;
+            // Uninit `let x: T;` (no value): typeck has already
+            // validated single-Binding pattern + present annotation
+            // and recorded the resolved type at `pattern.id` (via
+            // `check_pattern`). Allocate the binding and emit a
+            // `LetUninit`. Borrowck enforces "no read before
+            // assign"; codegen reserves storage but emits no value.
+            if ls.value.is_none() {
+                let (name, _mutable, _name_span) = crate::ast::let_simple_binding(ls)
+                    .expect("typeck enforces single Binding for uninit let");
+                let pat_id = ls.pattern.id as usize;
+                let ty_rt = ctx.input.expr_types.get(pat_id)
+                    .and_then(|o| o.as_ref())
+                    .cloned()
+                    .expect("typeck records uninit let pattern type at pattern.id");
+                // `input.expr_types` is already substituted at
+                // monomorphization input-build time; no env needed.
+                let binding = ctx.declare_binding(
+                    name.to_string(),
+                    ty_rt,
+                    BindingOrigin::LetValue,
+                );
+                return Ok(Some(MonoStmt::LetUninit {
+                    binding,
+                    span: ls.pattern.span.copy(),
+                }));
+            }
+            let value_expr = ls.value.as_ref().expect("just checked is_some");
+            let value = lower_expr(ctx, value_expr)?;
             // Simple-binding fast path: bare `let x = e;`.
             if let Some((name, _mutable, _name_span)) = crate::ast::let_simple_binding(ls) {
                 let ty = value.ty.clone();
@@ -1817,7 +1862,7 @@ fn lower_stmt(ctx: &mut LowerCtx, stmt: &Stmt) -> Result<Option<MonoStmt>, Error
                     ty,
                     BindingOrigin::LetValue,
                 );
-                return Ok(Some(MonoStmt::Let { binding, value, span: ls.value.span.copy() }));
+                return Ok(Some(MonoStmt::Let { binding, value, span: value_expr.span.copy() }));
             }
             // Complex pattern (tuple destructure, let-else, etc.):
             // allocate BindingIds for each binding leaf so subsequent
@@ -1834,7 +1879,7 @@ fn lower_stmt(ctx: &mut LowerCtx, stmt: &Stmt) -> Result<Option<MonoStmt>, Error
                 pattern: desugar_pattern(&ls.pattern, &ctx.input.pattern_ergo),
                 value,
                 else_block,
-                span: ls.value.span.copy(),
+                span: value_expr.span.copy(),
             }))
         }
         Stmt::Assign(a) => {

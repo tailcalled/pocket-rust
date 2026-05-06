@@ -219,7 +219,7 @@ fn transfer_stmt_backward(stmt: &CfgStmt, state: &mut Vec<LocalId>) {
         CfgStmtKind::Drop(place) => {
             insert_local(state, place.root);
         }
-        CfgStmtKind::StorageLive(_) | CfgStmtKind::StorageDead(_) => {}
+        CfgStmtKind::StorageLive(_) | CfgStmtKind::StorageDead(_) | CfgStmtKind::Uninit(_) => {}
     }
 }
 
@@ -369,7 +369,7 @@ fn apply_stmt(stmt: &CfgStmt, cfg: &Cfg, state: &mut BorrowSet, errors: &mut Vec
             // Drop is a write — calls destructor, which mutates.
             check_write(place, state, &stmt.span, errors, cfg, file);
         }
-        CfgStmtKind::StorageLive(_) | CfgStmtKind::StorageDead(_) => {}
+        CfgStmtKind::StorageLive(_) | CfgStmtKind::StorageDead(_) | CfgStmtKind::Uninit(_) => {}
     }
 }
 

@@ -217,6 +217,13 @@ pub enum CfgStmtKind {
     // `StorageDead(local)` — the local exits scope; its storage may be
     // reused. Inserted at the end of the local's containing block.
     StorageDead(LocalId),
+    // Uninitialized declaration marker — emitted by `lower_let` for
+    // `let x: T;` (no initializer) right after the local's
+    // `StorageLive`. Move dataflow seeds the local's place as
+    // `Moved` at this point so any read before the first assignment
+    // is rejected; `state.init(place)` on a subsequent `Assign`
+    // returns it to `Init`.
+    Uninit(LocalId),
 }
 
 pub enum Terminator {

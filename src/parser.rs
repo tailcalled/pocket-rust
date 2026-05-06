@@ -1618,17 +1618,26 @@ impl Parser {
         } else {
             None
         };
-        self.expect(&TokenKind::Eq, "`=`")?;
-        let value = self.parse_expr()?;
-        // `let PAT = EXPR else { … };` (let-else). The else block
-        // must diverge — that's enforced at typeck via the block's
-        // type unifying with `!`.
-        let else_block = if self.peek_kind(&TokenKind::Else) {
+        // `let PAT: TYPE;` — declared but uninitialized. The `=` is
+        // optional; when absent, no initializer expression follows
+        // and (per typeck) the type annotation is required and the
+        // pattern must be a single `Binding`.
+        let (value, else_block) = if self.peek_kind(&TokenKind::Eq) {
             self.pos += 1;
-            let blk = self.parse_block()?;
-            Some(Box::new(blk))
+            let v = self.parse_expr()?;
+            // `let PAT = EXPR else { … };` (let-else). The else
+            // block must diverge — enforced at typeck via the
+            // block's type unifying with `!`.
+            let eb = if self.peek_kind(&TokenKind::Else) {
+                self.pos += 1;
+                let blk = self.parse_block()?;
+                Some(Box::new(blk))
+            } else {
+                None
+            };
+            (Some(v), eb)
         } else {
-            None
+            (None, None)
         };
         self.expect(&TokenKind::Semi, "`;`")?;
         Ok(Stmt::Let(LetStmt {
@@ -3132,7 +3141,7 @@ impl Parser {
         let let_stmt = Stmt::Let(LetStmt {
             pattern: pat,
             ty: None,
-            value: new_call,
+            value: Some(new_call),
             else_block: None,
         });
         let mut stmts: Vec<Stmt> = vec![let_stmt];

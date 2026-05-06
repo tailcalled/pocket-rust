@@ -42,6 +42,30 @@ fn move_through_explicit_deref_then_field_is_rejected() {
     );
 }
 
+// Diagnostic-quality gap. `let x: u32; if b { x = 1 }; x` reads `x`
+// at a join point where one path initialized it and the other left
+// it uninitialized. rustc says "use of possibly-uninitialized variable
+// `x`". Pocket-rust currently says "`x` was already moved (on some
+// paths)" because the move-state lattice widens `Uninit ⊔ Init` to
+// `MaybeMoved` rather than carrying a distinct `MaybeUninit` state.
+//
+// Fix: extend `MoveStatus` with a `MaybeUninit` variant; widen
+// `Uninit ⊔ Init` to `MaybeUninit` and `Uninit ⊔ MaybeMoved` to
+// `MaybeMoved` (move wins over uninit since "moved" implies
+// "previously initialized"); plumb the variant through `check_read`'s
+// message switch.
+#[test]
+fn partially_initialized_let_diagnostic_is_uninit_not_moved() {
+    let err = compile_source(
+        "fn answer(b: bool) -> u32 { let x: u32; if b { x = 1u32; } x }",
+    );
+    assert!(
+        err.contains("uninitialized"),
+        "expected possibly-uninitialized diagnostic, got: {}",
+        err
+    );
+}
+
 #[test]
 fn borrow_of_temp_in_tuple_outliving_statement_is_rejected() {
     let err = compile_source(

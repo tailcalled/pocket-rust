@@ -166,7 +166,7 @@ fn transfer_stmt(stmt: &CfgStmt, state: &mut LiveSet) {
         CfgStmtKind::Drop(place) => {
             state.insert(place.root);
         }
-        CfgStmtKind::StorageLive(_) | CfgStmtKind::StorageDead(_) => {}
+        CfgStmtKind::StorageLive(_) | CfgStmtKind::StorageDead(_) | CfgStmtKind::Uninit(_) => {}
     }
 }
 

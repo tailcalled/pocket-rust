@@ -294,6 +294,10 @@ fn build_moved_places(
                 moves::MoveStatus::MaybeMoved => {
                     crate::typeck::MoveStatus::MaybeMoved
                 }
+                // Uninit at scope-end means the binding was never
+                // assigned (so its slot's bytes are garbage) — codegen
+                // must skip Drop, same as Moved.
+                moves::MoveStatus::Uninit => crate::typeck::MoveStatus::Moved,
             };
             out.push(MovedPlace {
                 place: vec![name.clone()],

@@ -224,6 +224,9 @@ fn walk_block_address(block: &MonoBlock, addressed: &mut Vec<bool>) {
 fn walk_stmt_address(stmt: &MonoStmt, addressed: &mut Vec<bool>) {
     match stmt {
         MonoStmt::Let { value, .. } => walk_expr_address(value, addressed),
+        // Uninit lets have no value to walk; the binding is addressed
+        // only if subsequent assignments / borrows demand it.
+        MonoStmt::LetUninit { .. } => {}
         MonoStmt::LetPattern { value, .. } => walk_expr_address(value, addressed),
         MonoStmt::Assign { place, value, .. } => {
             walk_place_address(place, addressed);

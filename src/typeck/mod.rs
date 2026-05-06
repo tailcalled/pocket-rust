@@ -1576,6 +1576,14 @@ pub(crate) struct LocalEntry {
     name: String,
     ty: InferType,
     mutable: bool,
+    // Bound by `let x: T;` (no initializer). The mutability check
+    // for assignment-statements treats such bindings as if they were
+    // declared `mut` so the deferred initializer assignment goes
+    // through (and any subsequent ones too — pocket-rust doesn't
+    // enforce Rust's "single first-init for non-mut" rule, accepting
+    // a strict superset). Borrowck's move-state lattice still
+    // rejects reads before the first assignment.
+    declared_uninit: bool,
 }
 
 pub(crate) struct CheckCtx<'a> {
@@ -1920,6 +1928,7 @@ fn check_function(
             name: func.params[k].name.clone(),
             ty: rtype_to_infer(&rt),
             mutable: false,
+            declared_uninit: false,
         });
         k += 1;
     }
@@ -2558,7 +2567,70 @@ fn tail_span_or_block(block: &Block) -> Span {
 }
 
 fn check_let_stmt(ctx: &mut CheckCtx, let_stmt: &LetStmt) -> Result<(), Error> {
-    let value_ty = check_expr(ctx, &let_stmt.value)?;
+    // `let x: T;` (no initializer): require an explicit type
+    // annotation (no value to infer from), require a single
+    // `Binding` pattern (destructure / wildcard / refutable patterns
+    // need a value to drive the match), and forbid let-else (there's
+    // nothing to test). Borrowck seeds the binding as Moved so reads
+    // before the first assignment error.
+    if let_stmt.value.is_none() {
+        if let_stmt.else_block.is_some() {
+            return Err(Error {
+                file: ctx.current_file.to_string(),
+                message: "uninitialized `let` cannot have an `else` block".to_string(),
+                span: let_stmt.pattern.span.copy(),
+            });
+        }
+        let annotation = match &let_stmt.ty {
+            Some(t) => t,
+            None => {
+                return Err(Error {
+                    file: ctx.current_file.to_string(),
+                    message: "type annotation needed for uninitialized `let` binding".to_string(),
+                    span: let_stmt.pattern.span.copy(),
+                });
+            }
+        };
+        if crate::ast::let_simple_binding(let_stmt).is_none() {
+            return Err(Error {
+                file: ctx.current_file.to_string(),
+                message: "uninitialized `let` requires a single binding pattern (destructuring / wildcard / refutable patterns need an initializer)".to_string(),
+                span: let_stmt.pattern.span.copy(),
+            });
+        }
+        let annot_rt = resolve_type(
+            annotation,
+            ctx.current_module,
+            ctx.structs,
+            ctx.enums,
+            ctx.aliases,
+            ctx.self_target,
+            ctx.type_params,
+            &ctx.use_scope,
+            ctx.reexports,
+            ctx.current_file,
+        )?;
+        let annot_infer = rtype_to_infer(&annot_rt);
+        // Reuse the pattern path so the binding lands in locals AND
+        // its resolved type is recorded under pattern.id (mono reads
+        // it from `expr_types[pat.id]` to allocate the binding's
+        // storage at lowering time).
+        let mut bindings: Vec<(String, InferType, Span, bool)> = Vec::new();
+        check_pattern(ctx, &let_stmt.pattern, &annot_infer, &mut bindings)?;
+        let mut k = 0;
+        while k < bindings.len() {
+            ctx.locals.push(LocalEntry {
+                name: bindings[k].0.clone(),
+                ty: bindings[k].1.clone(),
+                mutable: bindings[k].3,
+                declared_uninit: true,
+            });
+            k += 1;
+        }
+        return Ok(());
+    }
+    let value_expr = let_stmt.value.as_ref().expect("just checked is_some");
+    let value_ty = check_expr(ctx, value_expr)?;
     let final_ty = match &let_stmt.ty {
         Some(annotation) => {
             let annot_rt = resolve_type(
@@ -2580,7 +2652,7 @@ fn check_let_stmt(ctx: &mut CheckCtx, let_stmt: &LetStmt) -> Result<(), Error> {
                 ctx.traits,
                 ctx.type_params,
                 ctx.type_param_bounds,
-                &let_stmt.value.span,
+                &value_expr.span,
                 ctx.current_file,
             )?;
             annot_infer
@@ -2590,7 +2662,7 @@ fn check_let_stmt(ctx: &mut CheckCtx, let_stmt: &LetStmt) -> Result<(), Error> {
     // Overwrite the recorded type at the value expr's id with the
     // final type (in case an annotation pinned it down). Codegen
     // reads expr_types[value.id] to size the binding's storage.
-    ctx.expr_infer_types[let_stmt.value.id as usize] = Some(final_ty.clone());
+    ctx.expr_infer_types[value_expr.id as usize] = Some(final_ty.clone());
     // Type-check the pattern against the value's type and collect
     // bindings into `ctx.locals` so subsequent statements can see
     // them. Refutable patterns require `else` (let-else); the
@@ -2638,6 +2710,7 @@ fn check_let_stmt(ctx: &mut CheckCtx, let_stmt: &LetStmt) -> Result<(), Error> {
             name: bindings[k].0.clone(),
             ty: bindings[k].1.clone(),
             mutable: bindings[k].3,
+            declared_uninit: false,
         });
         k += 1;
     }
@@ -2769,7 +2842,13 @@ fn check_assign_stmt(ctx: &mut CheckCtx, assign: &AssignStmt) -> Result<(), Erro
     let root_is_mut_ref = matches!(root_resolved, InferType::Ref { mutable: true, .. });
     let root_is_shared_ref = matches!(root_resolved, InferType::Ref { mutable: false, .. });
     if chain.len() == 1 {
-        if !ctx.locals[idx].mutable {
+        // Bindings declared via `let x: T;` (uninitialized) accept
+        // an assignment without `mut`: the first assignment is an
+        // initialization. Pocket-rust's mut-check stays simple — it
+        // doesn't enforce Rust's "exactly-one assign for non-mut",
+        // accepting a strict superset (the borrowck move-state
+        // lattice rejects reads-before-init either way).
+        if !ctx.locals[idx].mutable && !ctx.locals[idx].declared_uninit {
             return Err(Error {
                 file: ctx.current_file.to_string(),
                 message: format!(
@@ -3422,6 +3501,7 @@ fn check_closure(
             name: closure.params[k].name.clone(),
             ty: param_infer[k].clone(),
             mutable: false,
+            declared_uninit: false,
         });
         k += 1;
     }
@@ -3891,6 +3971,7 @@ fn check_for_expr(
             name: bindings[k].0.clone(),
             ty: bindings[k].1.clone(),
             mutable: bindings[k].3,
+            declared_uninit: false,
         });
         k += 1;
     }
@@ -4032,6 +4113,7 @@ fn check_match_expr(
                 name: bindings[k].0.clone(),
                 ty: bindings[k].1.clone(),
                 mutable: bindings[k].3,
+                declared_uninit: false,
             });
             k += 1;
         }
@@ -4102,6 +4184,7 @@ fn check_if_let_expr(
             name: bindings[k].0.clone(),
             ty: bindings[k].1.clone(),
             mutable: bindings[k].3,
+            declared_uninit: false,
         });
         k += 1;
     }

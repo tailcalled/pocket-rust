@@ -136,6 +136,96 @@ fn assignment_to_immutable_binding_is_rejected() {
     );
 }
 
+// `let x: T;` (no initializer) — declaration only. Borrowck seeds
+// the binding as `Uninit`; an assignment clears it back to `Init`,
+// then a read passes.
+#[test]
+fn uninit_then_assign_returns_99() {
+    expect_answer("lang/let_stmts/uninit_then_assign", 99u32);
+}
+
+// Uninit let + if/else assigning on every path → join point is
+// Init, so the trailing read is accepted.
+#[test]
+fn uninit_assign_in_both_branches_returns_42() {
+    expect_answer("lang/let_stmts/uninit_assign_in_both_branches", 42u32);
+}
+
+// Negative: read before any assignment errors via the
+// move-state lattice's `Uninit` state.
+#[test]
+fn uninit_read_before_assign_is_rejected() {
+    let err = compile_source(
+        "fn answer() -> u32 { let x: u32; x }",
+    );
+    assert!(
+        err.contains("uninitialized") && err.contains("`x`"),
+        "expected uninit-read diagnostic, got: {}",
+        err
+    );
+}
+
+// Negative: assignment on only one branch leaves the join in
+// MaybeMoved state; the trailing read errors. (Today the diagnostic
+// reuses the moved-on-some-paths message; richer "maybe-uninit"
+// wording is a future polish.)
+#[test]
+fn uninit_assign_in_only_one_branch_is_rejected() {
+    let err = compile_source(
+        "fn answer(b: bool) -> u32 { let x: u32; if b { x = 1u32; } x }",
+    );
+    assert!(
+        err.contains("`x` was already moved") || err.contains("uninitialized"),
+        "expected possibly-uninit error on one-armed assignment, got: {}",
+        err
+    );
+}
+
+// Negative: type annotation is required when there's no value to
+// infer from.
+#[test]
+fn uninit_without_type_annotation_is_rejected() {
+    let err = compile_source(
+        "fn answer() -> u32 { let x; x = 1u32; x }",
+    );
+    assert!(
+        err.contains("type annotation needed"),
+        "expected missing-annotation error, got: {}",
+        err
+    );
+}
+
+// Negative: tuple destructure has nothing to destructure when the
+// initializer is absent.
+#[test]
+fn uninit_with_destructure_pattern_is_rejected() {
+    let err = compile_source(
+        "fn answer() -> u32 { let (a, b): (u32, u32); a + b }",
+    );
+    assert!(
+        err.contains("single binding pattern"),
+        "expected destructure-rejection error, got: {}",
+        err
+    );
+}
+
+// Negative: an uninit let with a let-else block is meaningless —
+// no scrutinee to test against.
+#[test]
+fn uninit_with_else_block_is_rejected() {
+    // Parser rejects this earlier (else is only consumed when `=`
+    // is present), so the user-visible failure is "expected `;`,
+    // got `else`".
+    let err = compile_source(
+        "fn answer() -> u32 { let x: u32 else { return 0u32; }; 0u32 }",
+    );
+    assert!(
+        err.contains("expected `;`") || err.contains("else"),
+        "expected parse-error on uninit + else, got: {}",
+        err
+    );
+}
+
 #[test]
 fn tailless_block_assigned_to_typed_let_is_rejected() {
     // Tail-less blocks evaluate to `()`; binding one to a `usize`-typed

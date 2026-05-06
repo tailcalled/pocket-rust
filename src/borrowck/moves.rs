@@ -24,6 +24,13 @@ use crate::typeck::{is_drop, RType, TraitTable};
 pub enum MoveStatus {
     Moved,
     MaybeMoved,
+    // Place was declared uninitialized (`let x: T;`) and not yet
+    // assigned on the current path. Behaves like `Moved` for the
+    // dataflow (reads error, an assignment via `init()` clears it),
+    // but produces a distinct "use of uninitialized" diagnostic and
+    // — critically — a snapshot of `Uninit` at scope-end means the
+    // binding was never in Init memory, so codegen must skip Drop.
+    Uninit,
 }
 
 #[derive(Clone)]
@@ -109,7 +116,12 @@ impl MoveSet {
 fn max_status(a: &MoveStatus, b: &MoveStatus) -> MoveStatus {
     if matches!(a, MoveStatus::Moved) || matches!(b, MoveStatus::Moved) {
         MoveStatus::Moved
+    } else if matches!(a, MoveStatus::Uninit) && matches!(b, MoveStatus::Uninit) {
+        MoveStatus::Uninit
     } else {
+        // Mixing Uninit with MaybeMoved (or two MaybeMoveds) yields
+        // MaybeMoved — the place is "non-Init on at least one path,"
+        // and the maybe-init shape captures that loosely.
         MoveStatus::MaybeMoved
     }
 }
@@ -358,6 +370,12 @@ fn apply_stmt_state_only(stmt: &CfgStmt, state: &mut MoveSet) {
             apply_rvalue_state_only(rvalue, state);
             state.init(place);
         }
+        CfgStmtKind::Uninit(local) => {
+            state.mark(
+                Place { root: *local, projections: Vec::new() },
+                MoveStatus::Uninit,
+            );
+        }
         _ => {}
     }
 }
@@ -460,6 +478,12 @@ fn apply_stmt(
         }
         CfgStmtKind::Drop(place) => {
             check_read(state, place, &stmt.span, errors, cfg, file);
+        }
+        CfgStmtKind::Uninit(local) => {
+            state.mark(
+                Place { root: *local, projections: Vec::new() },
+                MoveStatus::Uninit,
+            );
         }
         CfgStmtKind::StorageLive(_) | CfgStmtKind::StorageDead(_) => {}
     }
@@ -710,6 +734,7 @@ fn check_read(
         let msg = match status {
             MoveStatus::Moved => format!("{} was already moved", rendered),
             MoveStatus::MaybeMoved => format!("{} was already moved (on some paths)", rendered),
+            MoveStatus::Uninit => format!("use of uninitialized binding {}", rendered),
         };
         errors.push(Error {
             file: file.to_string(),

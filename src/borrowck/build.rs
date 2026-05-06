@@ -247,7 +247,30 @@ impl<'a> Builder<'a> {
     }
 
     fn lower_let(&mut self, ls: &LetStmt) {
-        let ty = self.expr_type(ls.value.id);
+        // `let x: T;` (uninit): typeck has already validated the
+        // single-Binding pattern + present annotation. The binding's
+        // type is recorded by typeck at `pattern.id`. Emit
+        // StorageLive + Uninit so the move dataflow marks the
+        // place as Moved at the let-stmt; reads before the first
+        // assignment surface as "use of uninitialized" diagnostics.
+        if ls.value.is_none() {
+            let (name, mutable, name_span) = crate::ast::let_simple_binding(ls)
+                .expect("typeck enforces single Binding for uninit let");
+            let ty = self.expr_type(ls.pattern.id);
+            let id = self.alloc_local(
+                Some(name.to_string()),
+                ty,
+                name_span.copy(),
+                mutable,
+                false,
+            );
+            self.push_stmt(CfgStmtKind::StorageLive(id), name_span.copy());
+            self.push_stmt(CfgStmtKind::Uninit(id), name_span.copy());
+            self.bind_name(name, id);
+            return;
+        }
+        let value_expr = ls.value.as_ref().expect("just checked is_some");
+        let ty = self.expr_type(value_expr.id);
         // Simple-binding fast path: `let x = e;` / `let mut x = e;`.
         // Tuple/struct destructure and let-else go through the
         // pattern-binding path below.
@@ -261,7 +284,7 @@ impl<'a> Builder<'a> {
             );
             self.push_stmt(CfgStmtKind::StorageLive(id), name_span.copy());
             let place = local_place(id);
-            self.lower_expr_into(&ls.value, place);
+            self.lower_expr_into(value_expr, place);
             self.bind_name(name, id);
             return;
         }
@@ -269,9 +292,9 @@ impl<'a> Builder<'a> {
         // the pattern to bind sub-places. (let-else, tuple destructure,
         // wildcard `let _ = e;`, etc.) Note: we rely on typeck having
         // rejected refutable patterns without a let-else.
-        let scrut = self.alloc_temp(ty.clone(), ls.value.span.copy());
-        self.push_stmt(CfgStmtKind::StorageLive(scrut), ls.value.span.copy());
-        self.lower_expr_into(&ls.value, local_place(scrut));
+        let scrut = self.alloc_temp(ty.clone(), value_expr.span.copy());
+        self.push_stmt(CfgStmtKind::StorageLive(scrut), value_expr.span.copy());
+        self.lower_expr_into(value_expr, local_place(scrut));
         let scrut_place = local_place(scrut);
         // For let-else: emit a pattern test; on no-match, lower the
         // else-block (which must diverge per typeck) so we never fall
