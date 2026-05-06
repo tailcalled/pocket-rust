@@ -1411,7 +1411,7 @@ pub(super) fn resolve_trait_path(
 // methods — every trait method has an impl method by name, and there are
 // no extra methods that the trait doesn't declare. Method-signature
 // equality is left for T2.
-fn validate_trait_impl(
+pub(super) fn validate_trait_impl(
     ib: &crate::ast::ImplBlock,
     trait_full: &Vec<String>,
     traits: &TraitTable,
@@ -1482,7 +1482,7 @@ fn validate_trait_impl(
 // before `rtype_eq`. Arities (param count and method-level type-param
 // count) must match. Receivers are not dropped from the comparison; the
 // trait's receiver shape is also enforced separately.
-fn validate_trait_impl_signatures(
+pub(super) fn validate_trait_impl_signatures(
     ib: &crate::ast::ImplBlock,
     trait_full: &Vec<String>,
     trait_args: &Vec<RType>,
@@ -1743,7 +1743,7 @@ fn validate_copy_impl(
 // Register a `(trait_path, target_pattern)` row. Rejects exact-pattern
 // duplicates: a second `impl T for Pat` where Pat's RType is `rtype_eq`
 // to a prior one.
-fn register_trait_impl(
+pub(super) fn register_trait_impl(
     ib: &crate::ast::ImplBlock,
     trait_full: &Vec<String>,
     trait_args: Vec<RType>,
@@ -2231,34 +2231,73 @@ pub(super) fn register_function(
     // Combine impl-level + fn-level type-param bounds in the same order
     // as `type_param_names`.
     let mut type_param_bounds: Vec<Vec<Vec<String>>> = Vec::new();
+    // Parallel to `type_param_bounds`: positional trait-args at each
+    // bound site. Stays empty for impl-level bound rows (impl bounds
+    // don't carry args today). Used by bidirectional inference at
+    // call sites to read `(P,)` out of an `F: Fn(P) -> R` bound.
+    let mut type_param_bound_args: Vec<Vec<Vec<RType>>> = Vec::new();
     let mut i = 0;
     while i < impl_type_param_bounds.len() {
         let mut row: Vec<Vec<String>> = Vec::new();
+        let mut row_args: Vec<Vec<RType>> = Vec::new();
         let mut j = 0;
         while j < impl_type_param_bounds[i].len() {
             row.push(impl_type_param_bounds[i][j].clone());
+            row_args.push(Vec::new());
             j += 1;
         }
         type_param_bounds.push(row);
+        type_param_bound_args.push(row_args);
         i += 1;
     }
     let mut i = 0;
     while i < f.type_params.len() {
         let mut row: Vec<Vec<String>> = Vec::new();
+        let mut row_args: Vec<Vec<RType>> = Vec::new();
         let mut j = 0;
         while j < f.type_params[i].bounds.len() {
-            let resolved = resolve_trait_path(
-                &f.type_params[i].bounds[j].path,
+            let bound = &f.type_params[i].bounds[j];
+            let (resolved_path, resolved_args) = resolve_trait_ref(
+                &bound.path,
                 current_module,
+                structs,
+                enums,
+                aliases,
+                self_target,
+                &type_param_names,
                 traits,
                 use_scope,
                 reexports,
                 source_file,
             )?;
-            row.push(resolved);
+            // Validate Named lifetimes in the bound's resolved trait
+            // args against the enclosing fn/impl's lifetime params
+            // PLUS the bound's own `for<'a, 'b>` HRTB lifetimes. This
+            // catches an undeclared `'a` in `fn f<F: Fn(&'a u32) ->
+            // ...>` while accepting `fn f<F: for<'a> Fn(&'a u32) ->
+            // ...>` (where `'a` is bound by the HRTB declaration).
+            let mut bound_lifetime_scope = lifetime_param_names.clone();
+            let mut h = 0;
+            while h < bound.hrtb_lifetime_params.len() {
+                bound_lifetime_scope.push(bound.hrtb_lifetime_params[h].name.clone());
+                h += 1;
+            }
+            let mut a = 0;
+            while a < resolved_args.len() {
+                crate::typeck::validate_named_lifetimes(
+                    &resolved_args[a],
+                    &bound_lifetime_scope,
+                    &bound.path.span,
+                    source_file,
+                )?;
+                a += 1;
+            }
+            row.push(resolved_path);
+            row_args.push(resolved_args);
             j += 1;
         }
         type_param_bounds.push(row);
+        type_param_bound_args.push(row_args);
         i += 1;
     }
     // Per-type-param `Trait<Name = T, ...>` constraints. Aligned to
@@ -2312,6 +2351,7 @@ pub(super) fn register_function(
             path: full,
             type_params: type_param_names,
             type_param_bounds,
+            type_param_bound_args,
             type_param_bound_assoc,
             impl_type_param_count: impl_type_params.len(),
             func: f.clone(),
@@ -2332,6 +2372,8 @@ pub(super) fn register_function(
             move_sites: Vec::new(),
             builtin_type_targets: Vec::new(),
             pattern_ergo: Vec::new(),
+            closures: Vec::new(),
+            bare_closure_calls: Vec::new(),
         });
     } else {
         funcs.entries.push(FnSymbol {
@@ -2352,6 +2394,8 @@ pub(super) fn register_function(
             move_sites: Vec::new(),
             builtin_type_targets: Vec::new(),
             pattern_ergo: Vec::new(),
+            closures: Vec::new(),
+            bare_closure_calls: Vec::new(),
         });
         *next_idx += 1;
     }

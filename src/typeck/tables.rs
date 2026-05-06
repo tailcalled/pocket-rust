@@ -1,6 +1,65 @@
 use super::{LifetimeRepr, RType};
 use crate::span::Span;
 
+// Per-closure information populated by typeck and consumed by the
+// post-typeck lowering pass. Indexed on `FnSymbol.closures` /
+// `GenericTemplate.closures` by the closure expression's `Expr.id`
+// — `Some(_)` only at closure expression sites; `None` elsewhere.
+//
+// The lowering pass reads `synthesized_struct_path` to know the unit
+// struct it should attach impl(s) to, then emits `impl Fn<(..)> for
+// __closure_<id>` (and FnMut/FnOnce mirrors when capture analysis
+// allows them) using `param_types` / `return_type`. The body the
+// lowering moves into the `call`/`call_mut`/`call_once` method is the
+// original `Closure.body` Expr — typeck has already validated it.
+//
+// `captures` is empty in phase 1 (non-capturing). When phase 2 lands,
+// it carries one `CaptureInfo` per outer binding referenced from the
+// body — used by lowering to add struct fields and rewrite
+// `Var(captured_name)` → `(*)?self.<binding_name>` inside the impl
+// method body.
+#[derive(Clone)]
+pub struct ClosureInfo {
+    // Path of the synthesized unit struct that represents this closure's
+    // type. Allocated by typeck (`__closure_<crate_counter>`) and fed
+    // through to the lowering pass which generates the matching
+    // `Item::Struct` and `Item::Impl` nodes.
+    pub synthesized_struct_path: Vec<String>,
+    pub param_types: Vec<RType>,
+    pub return_type: RType,
+    pub is_move: bool,
+    // Empty for phase 1 (non-capturing). Phase 2 fills in one entry per
+    // binding the body references from outside the closure's param
+    // scope, with the resolved `captured_ty` and inferred `mode`.
+    pub captures: Vec<CaptureInfo>,
+    pub body_span: Span,
+    // Source file containing the closure expression. Used by post-typeck
+    // struct registration to populate StructEntry.file, and by the
+    // lowering pass to attach the synthesized impl to the right module.
+    pub source_file: String,
+    // True when the body mutates any captured binding (assignment,
+    // compound-assign, `&mut`-borrow). Lowering uses this to skip the
+    // `Fn` impl (which would dispatch via `&self` and so couldn't
+    // mutate captured values) and synthesize only `FnMut` + `FnOnce`.
+    pub body_mutates_capture: bool,
+}
+
+#[derive(Clone)]
+pub struct CaptureInfo {
+    pub binding_name: String,
+    // Type stored on the synthesized struct's field — `T` for owned/Copy
+    // captures, `&T` for shared borrows, `&mut T` for unique borrows.
+    pub captured_ty: RType,
+    pub mode: CaptureMode,
+}
+
+#[derive(Clone, Copy)]
+pub enum CaptureMode {
+    Ref,
+    RefMut,
+    Move,
+}
+
 #[derive(Clone)]
 pub struct RTypedField {
     pub name: String,
@@ -342,6 +401,18 @@ pub struct FnSymbol {
     // "no ergonomics applied"; non-zero entries tell mono how to rebuild
     // the pattern with explicit `&`/`ref` before codegen.
     pub pattern_ergo: Vec<PatternErgo>,
+    // Per-NodeId closure info (sized to func.node_count). `Some(_)` at
+    // each `ExprKind::Closure` site, `None` elsewhere. Populated during
+    // typeck of the closure expression and consumed by the post-typeck
+    // closure-lowering pass.
+    pub closures: Vec<Option<ClosureInfo>>,
+    // Per-NodeId bare-closure-call info (sized to func.node_count).
+    // `Some(binding_name)` at `ExprKind::Call` sites where the callee
+    // resolved to a local of closure type — typeck dispatched it as
+    // `local.call((args,))` and mono lowers it as a `MethodCall`
+    // MonoExpr using the binding's local + a synthesized args tuple.
+    // None elsewhere.
+    pub bare_closure_calls: Vec<Option<String>>,
 }
 
 // How a `Call` expression resolves to a callee. For non-generic functions
@@ -380,6 +451,15 @@ pub struct GenericTemplate {
     // type-param. Used by symbolic trait-method dispatch in generic
     // bodies (`fn f<T: Show>(t: T) { t.show() }`).
     pub type_param_bounds: Vec<Vec<Vec<String>>>,
+    // Per type-param, parallel to `type_param_bounds`: positional
+    // trait-args at each bound site (resolved against the bound's
+    // trait_type_params arity). Indexed `[param_idx][bound_idx]` →
+    // `Vec<RType>`. Empty inner Vec when the bound is a non-generic
+    // trait. Populated alongside `type_param_bounds` during setup;
+    // used by bidirectional inference to read e.g. the `(u32,)` tuple
+    // out of an `F: Fn(u32) -> u32` bound when a closure expression
+    // is the matching call-site argument.
+    pub type_param_bound_args: Vec<Vec<Vec<RType>>>,
     // Per type-param `Trait<Name = X, ...>` constraints, parallel to
     // `type_param_bounds`. Indexed `[param_idx][bound_idx][k]` →
     // `(assoc_name, ConcreteType)`. Empty vectors when no constraints.
@@ -420,6 +500,10 @@ pub struct GenericTemplate {
     pub builtin_type_targets: Vec<Option<Vec<RType>>>,
     // See FnSymbol.pattern_ergo.
     pub pattern_ergo: Vec<PatternErgo>,
+    // See FnSymbol.closures.
+    pub closures: Vec<Option<ClosureInfo>>,
+    // See FnSymbol.bare_closure_calls.
+    pub bare_closure_calls: Vec<Option<String>>,
 }
 
 #[derive(Clone)]
@@ -471,6 +555,12 @@ pub struct FuncTable {
     // `(file, span)` lets later passes recover the same idx via
     // `find_inherent_synth_idx`.
     pub inherent_synth_specs: Vec<(String, crate::span::Span)>,
+    // Monotonically increasing counter used by typeck to allocate a
+    // unique idx per closure expression. The closure's synthesized
+    // struct path is `<enclosing_module>::__closure_<idx>`. Counter is
+    // shared across all libraries/crates so paths never collide; reset
+    // is unnecessary.
+    pub closure_counter: u32,
 }
 
 pub fn find_inherent_synth_idx(

@@ -148,6 +148,11 @@ pub struct TraitBound {
     // trait's associated types to a specific type at the bound site.
     // Empty for plain `Trait` bounds.
     pub assoc_constraints: Vec<AssocConstraint>,
+    // `for<'a, 'b>` HRTB lifetime params declared at the bound. Empty
+    // for ordinary bounds. The lifetimes are in scope inside this
+    // bound's path/args/assoc-constraint types only — they do not
+    // leak out to the enclosing fn/impl's lifetime scope.
+    pub hrtb_lifetime_params: Vec<LifetimeParam>,
 }
 
 // `Name = Type` inside a `Trait<…>` bound.
@@ -512,6 +517,41 @@ pub enum ExprKind {
         name_span: Span,
         args: Vec<Expr>,
     },
+    // `|args| body` or `move |args| body` — closure expression. Each
+    // closure has an anonymous nominal type (synthesized at typeck) and
+    // implements one of `Fn` / `FnMut` / `FnOnce` based on what its body
+    // does to its captures. Args may carry optional explicit type
+    // annotations; missing annotations are inferred from the call-site
+    // bound's `Fn(Args)` tuple. The body extends as far right as the
+    // surrounding expression context allows (lowest precedence —
+    // `|x| x + 1` is `|x| (x + 1)`). Detailed semantics live in the
+    // `closures-and-fn-traits` skill.
+    Closure(Closure),
+}
+
+#[derive(Clone)]
+pub struct Closure {
+    pub params: Vec<ClosureParam>,
+    // Optional `-> T` annotation on the body's return type. None means
+    // the body's natural type (inferred).
+    pub return_type: Option<Type>,
+    pub body: Box<Expr>,
+    // `move |x| ...` — force every capture to be by-value (owned/Copy)
+    // regardless of how the body uses it. Without `move`, capture mode
+    // per binding is inferred from body usage.
+    pub is_move: bool,
+    // Whole-closure span: from `|` (or `move`) through end of body.
+    pub span: Span,
+}
+
+#[derive(Clone)]
+pub struct ClosureParam {
+    pub name: String,
+    pub name_span: Span,
+    // None when the param's type is left to inference. When `Some`, used
+    // as the param's declared type and also unified against the
+    // surrounding `Fn(...)` bound's slot.
+    pub ty: Option<Type>,
 }
 
 // Variant construction reuses the existing nodes:

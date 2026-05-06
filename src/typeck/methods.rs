@@ -9,6 +9,21 @@ use super::{
 use crate::ast::Expr;
 use crate::span::Error;
 
+// Walk a method-call receiver looking for a root `Var(name)`. Returns
+// the binding name when the receiver is `Var` directly, a
+// `FieldAccess` chain rooted at a Var, a `TupleIndex` chain rooted at
+// a Var, or a `Deref` chain rooted at a Var. Returns None for
+// anything else (literal call results, struct lits, etc.).
+fn extract_root_var_name(expr: &Expr) -> Option<&str> {
+    match &expr.kind {
+        crate::ast::ExprKind::Var(name) => Some(name.as_str()),
+        crate::ast::ExprKind::FieldAccess(fa) => extract_root_var_name(&fa.base),
+        crate::ast::ExprKind::TupleIndex { base, .. } => extract_root_var_name(base),
+        crate::ast::ExprKind::Deref(inner) => extract_root_var_name(inner),
+        _ => None,
+    }
+}
+
 // Shape of a receiver passed through symbolic (Param-bound) dispatch:
 // owned `T`, `&T`, or `&mut T`. Drives the recv-adjust derivation
 // against the trait method's declared receiver shape.
@@ -17,6 +32,219 @@ enum SymRecvShape {
     Owned,
     SharedRef,
     MutRef,
+}
+
+// Shape of a closure-typed receiver. Used to derive the `recv_adjust`
+// for `f.call(...)` / `f.call_mut(...)` / `f.call_once(...)` against
+// the corresponding Fn-family method's declared receiver shape.
+#[derive(Clone, Copy)]
+enum ClosureRecvKind {
+    Owned,
+    SharedRef,
+    MutRef,
+}
+
+// True iff `path`'s last segment is a synthesized closure struct name
+// (`__closure_<idx>`). Recognized by prefix because the closure-lowering
+// pass uses an opaque counter — no other items use this prefix.
+fn is_closure_struct_path(path: &Vec<String>) -> bool {
+    path.last()
+        .map(|s| s.starts_with("__closure_"))
+        .unwrap_or(false)
+}
+
+// If `resolved` (or its inner ref pointee) is a synthesized closure
+// struct type, return the struct's InferType plus how the original
+// receiver was shaped. Returns None for non-closure receivers.
+fn extract_closure_recv(resolved: &InferType) -> Option<(InferType, ClosureRecvKind)> {
+    match resolved {
+        InferType::Struct { path, .. } if is_closure_struct_path(path) => {
+            Some((resolved.clone(), ClosureRecvKind::Owned))
+        }
+        InferType::Ref { inner, mutable, .. } => match inner.as_ref() {
+            InferType::Struct { path, .. } if is_closure_struct_path(path) => {
+                let kind = if *mutable {
+                    ClosureRecvKind::MutRef
+                } else {
+                    ClosureRecvKind::SharedRef
+                };
+                Some(((**inner).clone(), kind))
+            }
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+// Look up the closure's recorded signature (param InferTypes + return
+// InferType) by matching the receiver's struct path against entries in
+// the current function's `closure_records` and (for closures defined
+// in previously-checked functions) `funcs.entries[*].closures` /
+// `funcs.templates[*].closures`. Returns None if no match — the caller
+// then falls through to ordinary dispatch which will surface a
+// "no method" diagnostic.
+fn lookup_closure_signature(
+    recv: &InferType,
+    ctx: &CheckCtx,
+) -> Option<(Vec<InferType>, InferType)> {
+    let target_path = match recv {
+        InferType::Struct { path, .. } => path.clone(),
+        _ => return None,
+    };
+    // First check the current function's pending records — covers the
+    // common case `let f = |...|...; f.call(...)` where both the
+    // closure and its call live in the same function body.
+    let mut i = 0;
+    while i < ctx.closure_records.len() {
+        if let Some(pc) = &ctx.closure_records[i] {
+            if pc.synthesized_struct_path == target_path {
+                return Some((pc.param_types.clone(), pc.return_type.clone()));
+            }
+        }
+        i += 1;
+    }
+    // Fall through to closures recorded on already-checked functions
+    // (closures-as-args / cross-function use cases). These entries
+    // store finalized RTypes, which we lift back into InferTypes.
+    let mut e = 0;
+    while e < ctx.funcs.entries.len() {
+        let mut k = 0;
+        while k < ctx.funcs.entries[e].closures.len() {
+            if let Some(ci) = &ctx.funcs.entries[e].closures[k] {
+                if ci.synthesized_struct_path == target_path {
+                    let params: Vec<InferType> =
+                        ci.param_types.iter().map(rtype_to_infer).collect();
+                    let ret = rtype_to_infer(&ci.return_type);
+                    return Some((params, ret));
+                }
+            }
+            k += 1;
+        }
+        e += 1;
+    }
+    let mut t = 0;
+    while t < ctx.funcs.templates.len() {
+        let mut k = 0;
+        while k < ctx.funcs.templates[t].closures.len() {
+            if let Some(ci) = &ctx.funcs.templates[t].closures[k] {
+                if ci.synthesized_struct_path == target_path {
+                    let params: Vec<InferType> =
+                        ci.param_types.iter().map(rtype_to_infer).collect();
+                    let ret = rtype_to_infer(&ci.return_type);
+                    return Some((params, ret));
+                }
+            }
+            k += 1;
+        }
+        t += 1;
+    }
+    None
+}
+
+// Closure-call dispatch. Already-validated: `mc.method` is one of
+// `call` / `call_mut` / `call_once` and the receiver is a synthesized
+// closure struct. Manually checks args against the closure's param
+// tuple (Tuple of recorded param_types), populates a deferred
+// trait_dispatch on the MethodResolution so codegen resolves the
+// synth impl at emit time, and returns the closure's recorded return
+// type directly (avoids surfacing `Self::Output` as an unresolved
+// AssocProj at the call site, which would prevent inference from
+// flowing through the call's result).
+fn check_closure_method_call(
+    ctx: &mut CheckCtx,
+    mc: &crate::ast::MethodCall,
+    call_expr: &Expr,
+    recv_struct_infer: InferType,
+    recv_kind: ClosureRecvKind,
+    closure_param_types: Vec<InferType>,
+    closure_return_type: InferType,
+) -> Result<InferType, Error> {
+    if mc.args.len() != 1 {
+        return Err(Error {
+            file: ctx.current_file.to_string(),
+            message: format!(
+                "wrong number of arguments to `{}`: expected 1 (an args tuple), got {}",
+                mc.method,
+                mc.args.len()
+            ),
+            span: call_expr.span.copy(),
+        });
+    }
+    let expected_args_tuple = InferType::Tuple(closure_param_types);
+    let arg_ty = check_expr(ctx, &mc.args[0])?;
+    ctx.subst.unify(
+        &arg_ty,
+        &expected_args_tuple,
+        ctx.traits,
+        ctx.type_params,
+        ctx.type_param_bounds,
+        &mc.args[0].span,
+        ctx.current_file,
+    )?;
+    let trait_path: Vec<String> = vec![
+        "std".to_string(),
+        "ops".to_string(),
+        match mc.method.as_str() {
+            "call" => "Fn".to_string(),
+            "call_mut" => "FnMut".to_string(),
+            "call_once" => "FnOnce".to_string(),
+            _ => unreachable!(),
+        },
+    ];
+    let recv_adjust = match (mc.method.as_str(), recv_kind) {
+        ("call", ClosureRecvKind::Owned) => ReceiverAdjust::BorrowImm,
+        ("call", ClosureRecvKind::SharedRef) | ("call", ClosureRecvKind::MutRef) => {
+            ReceiverAdjust::ByRef
+        }
+        ("call_mut", ClosureRecvKind::Owned) => ReceiverAdjust::BorrowMut,
+        ("call_mut", ClosureRecvKind::MutRef) => ReceiverAdjust::ByRef,
+        ("call_mut", ClosureRecvKind::SharedRef) => {
+            return Err(Error {
+                file: ctx.current_file.to_string(),
+                message:
+                    "cannot call `&mut self` method `call_mut` on a `&_` closure receiver"
+                        .to_string(),
+                span: mc.method_span.copy(),
+            });
+        }
+        ("call_once", ClosureRecvKind::Owned) => ReceiverAdjust::Move,
+        ("call_once", ClosureRecvKind::SharedRef)
+        | ("call_once", ClosureRecvKind::MutRef) => {
+            return Err(Error {
+                file: ctx.current_file.to_string(),
+                message: "cannot move out of borrow to call `call_once`".to_string(),
+                span: mc.method_span.copy(),
+            });
+        }
+        _ => unreachable!(),
+    };
+    ctx.method_resolutions[call_expr.id as usize] = Some(PendingMethodCall {
+        callee_idx: 0,
+        callee_path: Vec::new(),
+        recv_adjust,
+        ret_borrows_receiver: false,
+        template_idx: None,
+        type_arg_infers: Vec::new(),
+        trait_dispatch: Some(PendingTraitDispatch {
+            trait_path,
+            trait_arg_infers: vec![expected_args_tuple],
+            method_name: mc.method.clone(),
+            recv_type_infer: recv_struct_infer,
+            dispatch_span: call_expr.span.copy(),
+        }),
+    });
+    // The closure's return type may still be an unresolved
+    // `AssocProj` (e.g. `<?int as Add>::Output` for an unannotated
+    // `|x| x + 1` body). Substitute through current bindings, then
+    // concretize so the caller sees a concrete type and downstream
+    // inference can proceed.
+    let substituted = ctx.subst.substitute(&closure_return_type);
+    Ok(crate::typeck::infer_concretize_assoc_proj(
+        &substituted,
+        ctx.traits,
+        ctx.type_params,
+        ctx.type_param_bound_assoc,
+    ))
 }
 
 fn check_method_call_symbolic(
@@ -474,6 +702,37 @@ pub(super) fn check_method_call(
         }
     }
     let resolved_recv = peeled;
+    // Closure call dispatch: when the method name is one of the Fn-
+    // family methods AND the receiver type is a synthesized closure
+    // struct (`__closure_<id>` registered by `check_closure`), bypass
+    // the normal candidate lookup and dispatch through the recorded
+    // `ClosureInfo`. The synthesized `Fn::call` impl is registered by
+    // `closure_lower::lower` (running between typeck and borrowck), so
+    // at the time `check_method_call` runs the impl isn't yet in
+    // `traits.impls` — but we already know the closure's param/return
+    // types from the side table populated by `check_closure`, so we
+    // can build the `MethodResolution.trait_dispatch` directly.
+    // `solve_impl_with_args` resolves the actual impl row at codegen
+    // time once `closure_lower` has registered it.
+    if matches!(mc.method.as_str(), "call" | "call_mut" | "call_once") {
+        if let Some((recv_struct_infer, recv_kind)) =
+            extract_closure_recv(&resolved_recv)
+        {
+            if let Some((param_types, return_type)) =
+                lookup_closure_signature(&recv_struct_infer, ctx)
+            {
+                return check_closure_method_call(
+                    ctx,
+                    mc,
+                    call_expr,
+                    recv_struct_infer,
+                    recv_kind,
+                    param_types,
+                    return_type,
+                );
+            }
+        }
+    }
     // T2: handle symbolic dispatch when recv is `Param(T)` — find the
     // method via T's trait bounds.
     if let InferType::Param(name) = &resolved_recv {
@@ -980,6 +1239,29 @@ pub(super) fn check_method_call(
     // recv_adjust was already determined by which level of the
     // candidate-self-type chain matched.
     let recv_adjust = chosen_adjust;
+    // Closure-mutation propagation: when the call's `recv_adjust` is
+    // `BorrowMut` (the method takes `&mut self` — covers compound-
+    // assign desugars `x += rhs` → `x.add_assign(rhs)` and explicit
+    // `recv.method_taking_mut_self()`), and the recv's root is a
+    // captured binding, upgrade the capture to RefMut. Drives the
+    // FnMut-only synthesis for closures whose body mutates captures
+    // through methods.
+    if matches!(recv_adjust, ReceiverAdjust::BorrowMut) {
+        if let Some(root_name) = extract_root_var_name(&mc.receiver) {
+            let mut idx: Option<usize> = None;
+            let mut i = ctx.locals.len();
+            while i > 0 {
+                i -= 1;
+                if ctx.locals[i].name == root_name {
+                    idx = Some(i);
+                    break;
+                }
+            }
+            if let Some(idx) = idx {
+                crate::typeck::upgrade_capture_to_ref_mut(ctx, root_name, idx);
+            }
+        }
+    }
     let expected_arg_count = mp_param_types.len() - 1;
     if mc.args.len() != expected_arg_count {
         return Err(Error {

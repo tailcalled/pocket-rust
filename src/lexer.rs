@@ -11,6 +11,7 @@ pub enum TokenKind {
     Struct,
     Let,
     Mut,
+    Move,
     Const,
     As,
     Unsafe,
@@ -133,6 +134,7 @@ pub fn token_kind_name(t: &TokenKind) -> &'static str {
         TokenKind::Struct => "`struct`",
         TokenKind::Let => "`let`",
         TokenKind::Mut => "`mut`",
+        TokenKind::Move => "`move`",
         TokenKind::Const => "`const`",
         TokenKind::As => "`as`",
         TokenKind::Unsafe => "`unsafe`",
@@ -256,6 +258,11 @@ pub fn tokenize(file: &str, source: &str) -> Result<Vec<Token>, Error> {
             } else if text == "mut" {
                 tokens.push(Token {
                     kind: TokenKind::Mut,
+                    span,
+                });
+            } else if text == "move" {
+                tokens.push(Token {
+                    kind: TokenKind::Move,
                     span,
                 });
             } else if text == "const" {

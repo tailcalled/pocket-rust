@@ -64,3 +64,4 @@ Feature-specific knowledge under `.claude/skills/<name>/SKILL.md`, loaded on-dem
 - `stdlib-layout` — `lib/std/` contents.
 - `wasm-encoding` — `src/wasm.rs` sections + helpers.
 - `testing-conventions` — `examples/`/`tests/` layout, `expect_answer`/`compile_source` helpers, naming.
+- `closures-and-fn-traits` — closure expression syntax, `Fn`/`FnMut`/`FnOnce` family, `Fn(T) -> R` sugar, HRTB. Currently parser-only; semantic synthesis is open work.

@@ -2,6 +2,25 @@ pub trait Drop {
     fn drop(&mut self);
 }
 
+// Call traits — `Fn: FnMut: FnOnce` supertrait chain (Rust standard).
+// FnOnce declares `Output`; FnMut/Fn inherit via supertrait
+// resolution. The closure-lowering pass synthesizes the appropriate
+// impl set per closure: read-only non-`move` closures get all three
+// impls (Fn + FnMut + FnOnce); `move` closures get FnOnce only.
+// Direct call syntax `f(a, b)` desugars to `<F as Fn>::call(&f, (a,
+// b))` (or `call_mut`/`call_once` per the bound's strongest available
+// trait — phase 3C will plumb that ranking).
+pub trait FnOnce<Args> {
+    type Output;
+    fn call_once(self, args: Args) -> Self::Output;
+}
+pub trait FnMut<Args>: FnOnce<Args> {
+    fn call_mut(&mut self, args: Args) -> Self::Output;
+}
+pub trait Fn<Args>: FnMut<Args> {
+    fn call(&self, args: Args) -> Self::Output;
+}
+
 // Indexing read: `arr[idx]` desugars at typeck/codegen to
 // `*Index::index(&arr, idx)`. The associated `Output` lets each impl
 // pick what it returns (the element type for `Idx = usize`, a

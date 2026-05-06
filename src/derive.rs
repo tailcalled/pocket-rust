@@ -279,6 +279,7 @@ fn render_impl_generics(
             bounds.push(TraitBound {
                 path: bound_path.clone(),
                 assoc_constraints: Vec::new(),
+                hrtb_lifetime_params: Vec::new(),
             });
             TypeParam {
                 name: tp.name.clone(),

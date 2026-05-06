@@ -779,6 +779,9 @@ impl<'a> Builder<'a> {
                     node_id: Some(expr.id),
                 })
             }
+            ExprKind::Closure(_) => {
+                unreachable!("closure expressions rejected at typeck before borrowck")
+            }
         }
     }
 

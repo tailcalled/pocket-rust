@@ -249,6 +249,9 @@ fn walk_expr(state: &mut SafeState, expr: &Expr) -> Result<(), Error> {
             }
             Ok(())
         }
+        ExprKind::Closure(_) => {
+            unreachable!("closure expressions rejected at typeck before safeck")
+        }
     }
 }
 

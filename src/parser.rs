@@ -1,10 +1,10 @@
 use crate::ast::{
-    AssignStmt, AssocConstraint, Block, Call, DeriveClause, DeriveTrait, EnumDef, EnumVariant,
-    Expr, ExprKind, FieldAccess, FieldInit, FieldPattern, Function, IfExpr, IfLetExpr,
-    ImplAssocType, ImplBlock, LetStmt, Lifetime, LifetimeParam, MatchArm, MatchExpr, MethodCall,
-    Param, Path, PathSegment, Pattern, PatternKind, Stmt, StructDef, StructField, StructLit,
-    TraitAssocType, TraitBound, TraitDef, TraitMethodSig, Type, TypeAlias, TypeKind, TypeParam,
-    UseDecl, UseTree, VariantPayload,
+    AssignStmt, AssocConstraint, Block, Call, Closure, ClosureParam, DeriveClause, DeriveTrait,
+    EnumDef, EnumVariant, Expr, ExprKind, FieldAccess, FieldInit, FieldPattern, Function, IfExpr,
+    IfLetExpr, ImplAssocType, ImplBlock, LetStmt, Lifetime, LifetimeParam, MatchArm, MatchExpr,
+    MethodCall, Param, Path, PathSegment, Pattern, PatternKind, Stmt, StructDef, StructField,
+    StructLit, TraitAssocType, TraitBound, TraitDef, TraitMethodSig, Type, TypeAlias, TypeKind,
+    TypeParam, UseDecl, UseTree, VariantPayload,
 };
 use crate::lexer::{Token, TokenKind, token_kind_name};
 use crate::span::{Error, Pos, Span};
@@ -1148,9 +1148,87 @@ impl Parser {
         // first; assoc-type constraints (`Name = Type`) follow. Each
         // entry is disambiguated by peeking: an `IDENT =` pair is an
         // assoc constraint; anything else is a type-arg expression.
+        //
+        // Optional HRTB prefix: `for<'a, 'b> Path<…>`. Lifetimes here
+        // scope only into the bound's own path / args / assoc-constraint
+        // types — they don't leak to the enclosing fn/impl scope. Used
+        // for closure bounds like `for<'a> Fn(&'a T) -> R`.
+        //
+        // Parenthesized sugar: `Path(T1, T2) -> R` rewrites to
+        // `Path<(T1, T2), Output = R>`. Used by Fn/FnMut/FnOnce. The
+        // tuple is built from the parens' contents; an absent `-> R`
+        // defaults to `()` (matching Rust). `<…>` and `(…)` are
+        // mutually exclusive — `Fn<(T,)>(U)` is a parse error.
+        let mut hrtb_lifetime_params: Vec<LifetimeParam> = Vec::new();
+        if self.peek_kind(&TokenKind::For) {
+            self.pos += 1;
+            self.expect(&TokenKind::LAngle, "`<`")?;
+            if !self.peek_kind(&TokenKind::RAngle) {
+                let (name, name_span) = self.expect_lifetime()?;
+                hrtb_lifetime_params.push(LifetimeParam { name, name_span });
+                while self.peek_kind(&TokenKind::Comma) {
+                    self.pos += 1;
+                    if self.peek_kind(&TokenKind::RAngle) {
+                        break;
+                    }
+                    let (name, name_span) = self.expect_lifetime()?;
+                    hrtb_lifetime_params.push(LifetimeParam { name, name_span });
+                }
+            }
+            self.expect(&TokenKind::RAngle, "`>`")?;
+        }
         let mut path = self.parse_path()?;
         let mut trait_type_args: Vec<Type> = Vec::new();
         let mut assoc_constraints: Vec<AssocConstraint> = Vec::new();
+        if self.peek_kind(&TokenKind::LParen) {
+            let lparen_span = self.tokens[self.pos].span.copy();
+            self.pos += 1;
+            let mut elem_tys: Vec<Type> = Vec::new();
+            if !self.peek_kind(&TokenKind::RParen) {
+                elem_tys.push(self.parse_type()?);
+                while self.peek_kind(&TokenKind::Comma) {
+                    self.pos += 1;
+                    if self.peek_kind(&TokenKind::RParen) {
+                        break;
+                    }
+                    elem_tys.push(self.parse_type()?);
+                }
+            }
+            let rparen_span = self.expect(&TokenKind::RParen, "`)`")?;
+            let tuple_span = Span::new(lparen_span.start.copy(), rparen_span.end.copy());
+            let tuple_ty = Type {
+                kind: TypeKind::Tuple(elem_tys),
+                span: tuple_span,
+            };
+            trait_type_args.push(tuple_ty);
+            let (output_ty, output_span) = if self.peek_kind(&TokenKind::Arrow) {
+                let arrow_span = self.tokens[self.pos].span.copy();
+                self.pos += 1;
+                let ty = self.parse_type()?;
+                let span = Span::new(arrow_span.start.copy(), ty.span.end.copy());
+                (ty, span)
+            } else {
+                let unit_span = rparen_span.copy();
+                (
+                    Type {
+                        kind: TypeKind::Tuple(Vec::new()),
+                        span: unit_span.copy(),
+                    },
+                    unit_span,
+                )
+            };
+            assoc_constraints.push(AssocConstraint {
+                name: "Output".to_string(),
+                name_span: output_span,
+                ty: output_ty,
+            });
+            // Parenthesized sugar precludes `<…>`.
+            if !trait_type_args.is_empty() {
+                let last = path.segments.len() - 1;
+                path.segments[last].args = trait_type_args;
+            }
+            return Ok(TraitBound { path, assoc_constraints, hrtb_lifetime_params });
+        }
         if self.peek_kind(&TokenKind::LAngle) {
             self.pos += 1;
             while !self.peek_kind(&TokenKind::RAngle) {
@@ -1189,7 +1267,7 @@ impl Parser {
             let last = path.segments.len() - 1;
             path.segments[last].args = trait_type_args;
         }
-        Ok(TraitBound { path, assoc_constraints })
+        Ok(TraitBound { path, assoc_constraints, hrtb_lifetime_params })
     }
 
     fn parse_params(&mut self) -> Result<Vec<Param>, Error> {
@@ -2132,6 +2210,90 @@ impl Parser {
         Ok(expr)
     }
 
+    // Closure expression: `|p1, p2| body`, `|p: T| body`, `|| body`,
+    // `move |...| body`. Each param is `name` or `name: T` (no patterns
+    // yet — single-binding only); both arg-type annotations and the
+    // body's `-> R` annotation are optional. With explicit `-> R`, the
+    // body must be a brace block. The body extends right via parse_expr,
+    // so `|x| x + 1 + 2` reads as `|x| (x + 1 + 2)`.
+    fn parse_closure(&mut self) -> Result<Expr, Error> {
+        let start_span = self.tokens[self.pos].span.copy();
+        let is_move = if self.peek_kind(&TokenKind::Move) {
+            self.pos += 1;
+            true
+        } else {
+            false
+        };
+        let mut params: Vec<ClosureParam> = Vec::new();
+        if self.peek_kind(&TokenKind::OrOr) {
+            // Empty arg list — `||` is one token here.
+            self.pos += 1;
+        } else {
+            self.expect(&TokenKind::Pipe, "`|`")?;
+            if !self.peek_kind(&TokenKind::Pipe) {
+                params.push(self.parse_closure_param()?);
+                while self.peek_kind(&TokenKind::Comma) {
+                    self.pos += 1;
+                    if self.peek_kind(&TokenKind::Pipe) {
+                        break;
+                    }
+                    params.push(self.parse_closure_param()?);
+                }
+            }
+            self.expect(&TokenKind::Pipe, "`|`")?;
+        }
+        let return_type = if self.peek_kind(&TokenKind::Arrow) {
+            self.pos += 1;
+            Some(self.parse_type()?)
+        } else {
+            None
+        };
+        // With an explicit `-> R`, Rust requires a brace block body so
+        // there's no precedence question about where the body ends.
+        let body = if return_type.is_some() {
+            if !self.peek_kind(&TokenKind::LBrace) {
+                let span = if self.pos < self.tokens.len() {
+                    self.tokens[self.pos].span.copy()
+                } else {
+                    self.eof_span()
+                };
+                return Err(Error {
+                    file: self.file.clone(),
+                    message: "closure body must be a `{ … }` block when an explicit `-> R` return type is given".to_string(),
+                    span,
+                });
+            }
+            self.parse_block_expr()?
+        } else {
+            self.parse_expr()?
+        };
+        let end = body.span.end.copy();
+        let span = Span::new(start_span.start.copy(), end);
+        let id = self.alloc_node_id();
+        Ok(Expr {
+            kind: ExprKind::Closure(Closure {
+                params,
+                return_type,
+                body: Box::new(body),
+                is_move,
+                span: span.copy(),
+            }),
+            span,
+            id,
+        })
+    }
+
+    fn parse_closure_param(&mut self) -> Result<ClosureParam, Error> {
+        let (name, name_span) = self.expect_ident()?;
+        let ty = if self.peek_kind(&TokenKind::Colon) {
+            self.pos += 1;
+            Some(self.parse_type()?)
+        } else {
+            None
+        };
+        Ok(ClosureParam { name, name_span, ty })
+    }
+
     fn parse_atom(&mut self) -> Result<Expr, Error> {
         if self.pos >= self.tokens.len() {
             return Err(Error {
@@ -2139,6 +2301,17 @@ impl Parser {
                 message: "expected expression, got end of input".to_string(),
                 span: self.eof_span(),
             });
+        }
+        // Closure expressions: `|args| body`, `move |args| body`, `||
+        // body`, `move || body`. Detected by leading `|` (Pipe) or `||`
+        // (OrOr) — `OrOr` only at the start of an atom can't be the
+        // logical-or operator (which always has a left operand). The
+        // `move` keyword is a closure prefix here.
+        if matches!(
+            &self.tokens[self.pos].kind,
+            TokenKind::Pipe | TokenKind::OrOr | TokenKind::Move
+        ) {
+            return self.parse_closure();
         }
         match &self.tokens[self.pos].kind {
             TokenKind::IntLit(_) => self.parse_int_lit(),
@@ -3225,6 +3398,7 @@ impl Parser {
             (TokenKind::Star, TokenKind::Star) => true,
             (TokenKind::Let, TokenKind::Let) => true,
             (TokenKind::Mut, TokenKind::Mut) => true,
+            (TokenKind::Move, TokenKind::Move) => true,
             (TokenKind::Const, TokenKind::Const) => true,
             (TokenKind::As, TokenKind::As) => true,
             (TokenKind::Unsafe, TokenKind::Unsafe) => true,

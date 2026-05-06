@@ -1,14 +1,15 @@
 use crate::ast::{
-    AssignStmt, Block, Call, Expr, ExprKind, FieldAccess, Function, Item, LetStmt, Module, Stmt, StructLit, Type,
+    AssignStmt, Block, Call, Closure, Expr, ExprKind, FieldAccess, Function, Item, LetStmt,
+    Module, Stmt, StructLit, Type,
 };
 use crate::span::{Error, Span};
 
 mod types;
 pub use types::{
-    IntKind, LifetimeRepr, RType, byte_size_of, copy_trait_path, drop_trait_path, numeric_lit_op_traits_for_method, flatten_rtype,
-    int_kind_name, is_copy_with_bounds, is_drop, is_raw_ptr, is_sized,
-    is_variant_payload_uninhabited, needs_drop,
-    outer_lifetime, rtype_contains_param, rtype_eq, rtype_to_string, substitute_rtype,
+    IntKind, LifetimeRepr, RType, byte_size_of, copy_trait_path, drop_trait_path,
+    numeric_lit_op_traits_for_method, flatten_rtype, int_kind_name, is_copy, is_copy_with_bounds,
+    is_drop, is_raw_ptr, is_sized, is_variant_payload_uninhabited, needs_drop, outer_lifetime,
+    rtype_contains_param, rtype_eq, rtype_to_string, substitute_rtype,
 };
 use types::{int_kind_from_name, int_kind_max, int_kind_neg_magnitude, int_kind_signed, struct_env};
 
@@ -350,7 +351,359 @@ pub fn check(
     let mut current_file = root.source_file.clone();
     check_module(root, &mut path, root_crate_name, &mut current_file, structs, enums, aliases, traits, funcs, reexports)?;
 
+    // Register a unit `StructEntry` for each closure discovered during
+    // typeck so borrowck/codegen can look up the synthesized type. The
+    // matching `Item::Struct` + `Item::Impl Fn<...>` AST nodes are
+    // emitted by the closure-lowering pass run after typeck — see the
+    // `closures-and-fn-traits` skill.
+    register_closure_structs(structs, funcs);
+
     Ok(())
+}
+
+fn register_closure_structs(structs: &mut StructTable, funcs: &FuncTable) {
+    let mut e = 0;
+    while e < funcs.entries.len() {
+        let entry = &funcs.entries[e];
+        let mut i = 0;
+        while i < entry.closures.len() {
+            if let Some(ci) = &entry.closures[i] {
+                push_closure_struct(structs, ci);
+            }
+            i += 1;
+        }
+        e += 1;
+    }
+    let mut t = 0;
+    while t < funcs.templates.len() {
+        let tmpl = &funcs.templates[t];
+        let mut i = 0;
+        while i < tmpl.closures.len() {
+            if let Some(ci) = &tmpl.closures[i] {
+                push_closure_struct(structs, ci);
+            }
+            i += 1;
+        }
+        t += 1;
+    }
+}
+
+// Register a synthesized closure impl — entry point used by
+// `closure_lower::lower` to install the post-typeck `impl Fn<(...)> for
+// __closure_<id>` AST node into the typeck tables. Mirrors the
+// per-impl steps performed by `setup::collect_funcs` (resolve target,
+// resolve trait ref, register impl row, register impl method, validate
+// signatures), then runs `check_function` on the synthesized method
+// body so its expr_types/method_resolutions/etc are populated for
+// codegen.
+pub fn register_synthesized_closure_impl(
+    ib: &crate::ast::ImplBlock,
+    parent_module_path: &Vec<String>,
+    source_file: &str,
+    structs: &mut StructTable,
+    enums: &mut EnumTable,
+    aliases: &mut AliasTable,
+    traits: &mut TraitTable,
+    funcs: &mut FuncTable,
+    reexports: &mut ReExportTable,
+    next_idx: &mut u32,
+) -> Result<(), Error> {
+    // Use scope is empty — the synthesized impl uses fully-qualified
+    // paths (`std::ops::Fn`, the closure's own struct path) so no
+    // resolution against an enclosing module's `use` declarations is
+    // needed.
+    let use_scope: Vec<use_scope::UseEntry> = Vec::new();
+    // Resolve the impl's target (a unit struct registered at end of
+    // typeck::check via `register_closure_structs`).
+    let target_rt = setup::resolve_impl_target(
+        ib,
+        parent_module_path,
+        structs,
+        enums,
+        aliases,
+        &use_scope,
+        reexports,
+        source_file,
+    )?;
+    let impl_type_params: Vec<String> = Vec::new();
+    // Phase 2B: synthesized closure impls carry a `'cap` lifetime
+    // parameter when the struct has any non-Copy capture fields. Read
+    // it from the ImplBlock AST that `closure_lower::synthesize_impl_for_closure`
+    // built — propagating to the param-types validation so the
+    // `&self: &__closure_<id><'cap>` recv type's `'cap` arg passes
+    // `validate_named_lifetimes`.
+    let impl_lifetime_params: Vec<String> = ib
+        .lifetime_params
+        .iter()
+        .map(|p| p.name.clone())
+        .collect();
+    let impl_type_param_bounds: Vec<Vec<Vec<String>>> = Vec::new();
+
+    // Resolve the trait ref (Fn) and validate the impl shape against
+    // the trait's declared methods + assoc types.
+    let trait_path_node = ib.trait_path.as_ref().expect(
+        "synthesized closure impls always carry a trait_path",
+    );
+    let (trait_full, trait_args) = setup::resolve_trait_ref(
+        trait_path_node,
+        parent_module_path,
+        structs,
+        enums,
+        aliases,
+        Some(&target_rt),
+        &impl_type_params,
+        traits,
+        &use_scope,
+        reexports,
+        source_file,
+    )?;
+    setup::validate_trait_impl(ib, &trait_full, traits, source_file)?;
+    let assoc_bindings = setup::resolve_and_validate_assoc_bindings(
+        ib,
+        &trait_full,
+        &target_rt,
+        parent_module_path,
+        structs,
+        enums,
+        aliases,
+        traits,
+        &impl_type_params,
+        &use_scope,
+        reexports,
+        source_file,
+    )?;
+
+    let trait_impl_idx = traits.impls.len();
+    setup::register_trait_impl(
+        ib,
+        &trait_full,
+        trait_args,
+        target_rt.clone(),
+        &impl_type_params,
+        &impl_lifetime_params,
+        &impl_type_param_bounds,
+        assoc_bindings,
+        traits,
+        source_file,
+    )?;
+
+    // Method-path prefix mirrors what `setup::collect_funcs` produces
+    // for a Path-target trait impl: `<parent_module>::<target_first_segment>`.
+    // Closure structs aren't generic-trait impls so no
+    // `__trait_impl_<idx>` segment.
+    let target_first_seg = match &ib.target.kind {
+        crate::ast::TypeKind::Path(p) if !p.segments.is_empty() => {
+            p.segments[0].name.clone()
+        }
+        _ => {
+            return Err(Error {
+                file: source_file.to_string(),
+                message: "internal: closure impl target must be a Path".to_string(),
+                span: ib.span.copy(),
+            });
+        }
+    };
+    let mut method_prefix = parent_module_path.clone();
+    method_prefix.push(target_first_seg);
+    // Generic-trait impls (whose trait carries positional args, e.g.
+    // `Fn<(P0,)>`) need a per-row `__trait_impl_<idx>` segment so
+    // multiple impls of the same trait family on the same target can
+    // coexist. Mirrors the scheme `setup::collect_funcs` uses for
+    // ordinary trait impls and the lookup `borrowck::check_module`
+    // does at every Item::Impl walk.
+    let trait_is_generic = !traits.impls[trait_impl_idx].trait_args.is_empty();
+    if trait_is_generic {
+        method_prefix.push(format!("__trait_impl_{}", trait_impl_idx));
+    }
+
+    // Register the call method.
+    let mut k = 0;
+    while k < ib.methods.len() {
+        setup::register_function(
+            &ib.methods[k],
+            parent_module_path,
+            &method_prefix,
+            Some(&target_rt),
+            &impl_type_params,
+            &impl_lifetime_params,
+            &impl_type_param_bounds,
+            Some(trait_impl_idx),
+            funcs,
+            next_idx,
+            structs,
+            enums,
+            aliases,
+            traits,
+            &use_scope,
+            reexports,
+            source_file,
+        )?;
+        k += 1;
+    }
+
+    // Validate that the impl's method signatures match the trait's.
+    setup::validate_trait_impl_signatures(
+        ib,
+        &trait_full,
+        &traits.impls[trait_impl_idx].trait_args,
+        &target_rt,
+        &method_prefix,
+        funcs,
+        traits,
+        source_file,
+    )?;
+
+    // Type-check each method body. `check_function` reads the
+    // already-registered FnSymbol/Template, so registration above must
+    // come first.
+    let mut k = 0;
+    while k < ib.methods.len() {
+        check_function(
+            &ib.methods[k],
+            parent_module_path,
+            &method_prefix,
+            Some(&target_rt),
+            source_file,
+            structs,
+            enums,
+            aliases,
+            traits,
+            funcs,
+            reexports,
+            &use_scope,
+        )?;
+        k += 1;
+    }
+    Ok(())
+}
+
+// Look up the `Fn`-family bound on a generic param, if one exists,
+// and extract its expected closure signature (param types + return
+// type). Returns None when the param has no Fn/FnMut/FnOnce bound, or
+// the bound's args/Output aren't fully concrete (any inference would
+// need to flow the other direction).
+//
+// The bound `Fn(P0, P1) -> R` is stored as `(["std", "ops", "Fn"],
+// [Tuple([P0, P1])])` for the path/args, plus `("Output", R)` in the
+// assoc-constraints list. We unwrap the tuple's elements to give the
+// closure's expected per-param types.
+fn lookup_fn_bound_signature(
+    param_name: &str,
+    type_params: &Vec<String>,
+    bound_paths: &Vec<Vec<Vec<String>>>,
+    bound_args: &Vec<Vec<Vec<RType>>>,
+    bound_assoc: &Vec<Vec<Vec<(String, RType)>>>,
+) -> Option<(Vec<InferType>, InferType)> {
+    let mut idx: Option<usize> = None;
+    let mut i = 0;
+    while i < type_params.len() {
+        if type_params[i] == param_name {
+            idx = Some(i);
+            break;
+        }
+        i += 1;
+    }
+    let idx = idx?;
+    if idx >= bound_paths.len() {
+        return None;
+    }
+    let bounds = &bound_paths[idx];
+    let args_rows = bound_args.get(idx);
+    let assoc_rows = bound_assoc.get(idx);
+    let mut b = 0;
+    while b < bounds.len() {
+        let path = &bounds[b];
+        let is_fn_family = path.len() == 3
+            && path[0] == "std"
+            && path[1] == "ops"
+            && (path[2] == "Fn" || path[2] == "FnMut" || path[2] == "FnOnce");
+        if is_fn_family {
+            // Args: positional bound arg 0 is the (P0, P1, ...) tuple.
+            let trait_args = args_rows.and_then(|r| r.get(b))?;
+            if trait_args.is_empty() {
+                return None;
+            }
+            let params: Vec<InferType> = match &trait_args[0] {
+                RType::Tuple(elems) => elems.iter().map(rtype_to_infer).collect(),
+                _ => return None,
+            };
+            // Output: assoc-constraint binding for "Output".
+            let return_ty = assoc_rows
+                .and_then(|r| r.get(b))
+                .and_then(|constraints| {
+                    constraints
+                        .iter()
+                        .find(|(name, _)| name == "Output")
+                        .map(|(_, rt)| rtype_to_infer(rt))
+                })?;
+            return Some((params, return_ty));
+        }
+        b += 1;
+    }
+    None
+}
+
+fn push_closure_struct(structs: &mut StructTable, ci: &ClosureInfo) {
+    // Skip if already registered (defensive — shouldn't happen given
+    // unique per-counter idx, but guards against re-runs).
+    let mut k = 0;
+    while k < structs.entries.len() {
+        if structs.entries[k].path == ci.synthesized_struct_path {
+            return;
+        }
+        k += 1;
+    }
+    // One field per capture, in first-reference order. Copy captures
+    // (`CaptureMode::Move`) become value-typed fields; non-Copy
+    // captures (`CaptureMode::Ref`) become `&'cap T` fields and the
+    // synthesized struct gets a `'cap` lifetime parameter so the field
+    // type passes pocket-rust's "refs in struct fields require a
+    // named lifetime" check.
+    let mut fields: Vec<RTypedField> = Vec::new();
+    let mut needs_cap_lifetime = false;
+    let mut i = 0;
+    while i < ci.captures.len() {
+        let ty = match ci.captures[i].mode {
+            CaptureMode::Move => ci.captures[i].captured_ty.clone(),
+            CaptureMode::Ref => {
+                needs_cap_lifetime = true;
+                RType::Ref {
+                    inner: Box::new(ci.captures[i].captured_ty.clone()),
+                    mutable: false,
+                    lifetime: LifetimeRepr::Named("cap".to_string()),
+                }
+            }
+            CaptureMode::RefMut => {
+                needs_cap_lifetime = true;
+                RType::Ref {
+                    inner: Box::new(ci.captures[i].captured_ty.clone()),
+                    mutable: true,
+                    lifetime: LifetimeRepr::Named("cap".to_string()),
+                }
+            }
+        };
+        fields.push(RTypedField {
+            name: ci.captures[i].binding_name.clone(),
+            name_span: ci.body_span.copy(),
+            ty,
+            is_pub: false,
+        });
+        i += 1;
+    }
+    let lifetime_params = if needs_cap_lifetime {
+        vec!["cap".to_string()]
+    } else {
+        Vec::new()
+    };
+    structs.entries.push(StructEntry {
+        path: ci.synthesized_struct_path.clone(),
+        name_span: ci.body_span.copy(),
+        file: ci.source_file.clone(),
+        type_params: Vec::new(),
+        lifetime_params,
+        fields,
+        is_pub: false,
+    });
 }
 
 
@@ -1236,7 +1589,7 @@ pub(crate) struct CheckCtx<'a> {
     pub(crate) enums: &'a EnumTable,
     pub(crate) aliases: &'a AliasTable,
     pub(crate) traits: &'a TraitTable,
-    pub(crate) funcs: &'a FuncTable,
+    pub(crate) funcs: &'a mut FuncTable,
     pub(crate) self_target: Option<&'a RType>,
     pub(crate) type_params: &'a Vec<String>,
     pub(crate) reexports: &'a ReExportTable,
@@ -1266,6 +1619,67 @@ pub(crate) struct CheckCtx<'a> {
     // the same E as the inner Result. `None` only for tail-less fns
     // (return type `()` is `Some(Tuple([]))`).
     pub(crate) fn_return_rt: Option<RType>,
+    // Per-NodeId pending closure record (sized to func.node_count).
+    // `Some(_)` at each `ExprKind::Closure` site, `None` elsewhere.
+    // Holds InferTypes during body check; finalized into RType-bearing
+    // `ClosureInfo` and stored on FnSymbol/GenericTemplate.closures at
+    // end-of-fn.
+    pub(crate) closure_records: Vec<Option<PendingClosure>>,
+    // Stack of enclosing closure scopes (innermost-last). Each frame
+    // records the locals-stack length captured when the closure was
+    // entered (the "capture barrier") plus the synthesized struct path
+    // assigned to that closure. Var lookups consult the innermost
+    // frame: if the resolved local has idx `< local_barrier`, the
+    // lookup crosses the barrier and is treated as a capture (rejected
+    // in phase 1; recorded in phase 2).
+    pub(crate) closure_scopes: Vec<ClosureScope>,
+    // Bidirectional inference: when a closure expression is a call
+    // argument and the corresponding parameter has a `Fn(A) -> R`
+    // bound, the call-site stashes (param_types, return_type) here
+    // keyed by the closure's NodeId. `check_closure` consumes the
+    // entry on entry, using the stashed types as expected_signature
+    // (instead of fresh inference vars) for params/return. Lifted by
+    // `check_closure` after consumption.
+    pub(crate) expected_closure_signatures: Vec<Option<(Vec<InferType>, InferType)>>,
+    // Per-NodeId bare-closure-call records. `Some(binding_name)` when
+    // the call's callee resolved to a local of closure type;
+    // finalized into FnSymbol/Template's `bare_closure_calls` so mono
+    // can lower these as MethodCall MonoExprs without AST mutation.
+    pub(crate) bare_closure_calls: Vec<Option<String>>,
+}
+
+pub(crate) struct ClosureScope {
+    pub local_barrier: usize,
+    pub node_id: u32,
+    pub synthesized_struct_path: Vec<String>,
+    // Bindings the body referenced from outside `local_barrier`.
+    // Captures are deduplicated by name and recorded in first-reference
+    // order — the lowering pass uses this order to lay out struct
+    // fields and to populate the struct literal at the closure
+    // expression site.
+    pub captures: Vec<PendingCapture>,
+}
+
+#[derive(Clone)]
+pub(crate) struct PendingCapture {
+    pub binding_name: String,
+    pub captured_ty: InferType,
+    // Set when typeck observes any mutation of the captured binding
+    // inside the closure body (assignment, compound-assign,
+    // `&mut`-borrow). Drives capture-mode upgrade `Ref → RefMut` and
+    // makes lowering skip the `Fn` impl (only FnMut + FnOnce
+    // synthesized).
+    pub mutated: bool,
+}
+
+#[derive(Clone)]
+pub(crate) struct PendingClosure {
+    pub synthesized_struct_path: Vec<String>,
+    pub param_types: Vec<InferType>,
+    pub return_type: InferType,
+    pub is_move: bool,
+    pub body_span: Span,
+    pub captures: Vec<PendingCapture>,
 }
 
 fn check_module(
@@ -1516,7 +1930,7 @@ fn check_function(
     };
 
     let node_count = func.node_count as usize;
-    let (expr_infer_types, lit_constraints, method_resolutions, call_resolutions, builtin_type_targets, pattern_ergo, subst) = {
+    let (expr_infer_types, lit_constraints, method_resolutions, call_resolutions, builtin_type_targets, pattern_ergo, closure_records, bare_closure_calls, subst) = {
         let mut method_res: Vec<Option<PendingMethodCall>> = Vec::with_capacity(node_count);
         let mut call_res: Vec<Option<PendingCall>> = Vec::with_capacity(node_count);
         let mut expr_infer: Vec<Option<InferType>> = Vec::with_capacity(node_count);
@@ -1558,7 +1972,7 @@ fn check_function(
             enums,
             aliases,
             traits,
-            funcs: &*funcs,
+            funcs: &mut *funcs,
             self_target,
             type_params: &type_param_names,
             type_param_bounds: &type_param_bounds,
@@ -1567,6 +1981,10 @@ fn check_function(
             use_scope: initial_use_scope,
             loop_labels: Vec::new(),
             fn_return_rt: return_rt.clone(),
+            closure_records: vec![None; func.node_count as usize],
+            closure_scopes: Vec::new(),
+            expected_closure_signatures: vec![None; func.node_count as usize],
+            bare_closure_calls: vec![None; func.node_count as usize],
         };
         check_block(&mut ctx, &func.body, &return_rt)?;
         (
@@ -1576,6 +1994,8 @@ fn check_function(
             ctx.call_resolutions,
             ctx.builtin_type_targets,
             ctx.pattern_ergo,
+            ctx.closure_records,
+            ctx.bare_closure_calls,
             ctx.subst,
         )
     };
@@ -1733,7 +2153,29 @@ fn check_function(
                             }
                             q += 1;
                         }
-                        if needs_validation {
+                        // Skip the impl-existence check when the
+                        // receiver is a synthesized closure struct: the
+                        // matching `Fn`/`FnMut`/`FnOnce` impl is
+                        // registered by `closure_lower` after typeck
+                        // finishes, so the impl genuinely doesn't exist
+                        // yet at this point. Codegen calls
+                        // `solve_impl_with_args` later (with the impl
+                        // registered) to pick the row.
+                        let recv_is_closure = match &recv_type {
+                            RType::Struct { path, .. } => path
+                                .last()
+                                .map(|s| s.starts_with("__closure_"))
+                                .unwrap_or(false),
+                            RType::Ref { inner, .. } => match inner.as_ref() {
+                                RType::Struct { path, .. } => path
+                                    .last()
+                                    .map(|s| s.starts_with("__closure_"))
+                                    .unwrap_or(false),
+                                _ => false,
+                            },
+                            _ => false,
+                        };
+                        if needs_validation && !recv_is_closure {
                             let recv_for_solve = match &recv_type {
                                 RType::Ref { inner, .. } => (**inner).clone(),
                                 other => other.clone(),
@@ -1837,6 +2279,82 @@ fn check_function(
     }
     let call_resolutions = call_resolutions_final;
 
+    // Finalize per-closure records (per-NodeId).
+    let mut closures_final: Vec<Option<ClosureInfo>> = Vec::with_capacity(node_count);
+    let mut i = 0;
+    while i < closure_records.len() {
+        match &closure_records[i] {
+            Some(pc) => {
+                let mut param_types: Vec<RType> = Vec::new();
+                let mut k = 0;
+                while k < pc.param_types.len() {
+                    param_types.push(subst.finalize(&pc.param_types[k]));
+                    k += 1;
+                }
+                let return_raw = subst.finalize(&pc.return_type);
+                // The body type may end up as an `AssocProj` (e.g.
+                // `<Self as Add>::Output` for an unannotated `|x| x + 1`
+                // closure where dispatch went through the symbolic
+                // num-lit path). Concretize against the *enclosing*
+                // function's bounds so `Self::Output` collapses to
+                // `Self` for the operator traits whose `Output =
+                // Self` invariant `assoc_always_equals_self`
+                // recognizes — gives us the resolved integer kind
+                // (defaulting to i32) for closure return types.
+                let return_type = concretize_assoc_proj_with_bounds(
+                    &return_raw,
+                    traits,
+                    &Vec::new(),
+                    &Vec::new(),
+                );
+                let mut captures: Vec<CaptureInfo> = Vec::new();
+                let body_mutates_capture =
+                    pc.captures.iter().any(|cap| cap.mutated);
+                let mut c = 0;
+                while c < pc.captures.len() {
+                    let captured_ty = subst.finalize(&pc.captures[c].captured_ty);
+                    // Capture mode:
+                    //   `move`     → Move (owned in struct)
+                    //   mutated    → RefMut (`&'cap mut T`) — even
+                    //                for Copy, so mutations write
+                    //                back to the outer binding
+                    //                (matches Rust's `|| x += 1`
+                    //                capture-by-mut-ref semantics).
+                    //   read-only  → Move (Copy) | Ref (non-Copy)
+                    let captured_is_copy = is_copy(&captured_ty, traits);
+                    let mode = if pc.is_move {
+                        CaptureMode::Move
+                    } else if pc.captures[c].mutated {
+                        CaptureMode::RefMut
+                    } else if captured_is_copy {
+                        CaptureMode::Move
+                    } else {
+                        CaptureMode::Ref
+                    };
+                    captures.push(CaptureInfo {
+                        binding_name: pc.captures[c].binding_name.clone(),
+                        captured_ty,
+                        mode,
+                    });
+                    c += 1;
+                }
+                closures_final.push(Some(ClosureInfo {
+                    synthesized_struct_path: pc.synthesized_struct_path.clone(),
+                    param_types,
+                    return_type,
+                    is_move: pc.is_move,
+                    captures,
+                    body_span: pc.body_span.copy(),
+                    source_file: current_file.to_string(),
+                    body_mutates_capture,
+                }));
+            }
+            None => closures_final.push(None),
+        }
+        i += 1;
+    }
+    let closures = closures_final;
+
     // Store on the FnSymbol or GenericTemplate.
     let mut full = path_prefix.clone();
     full.push(func.name.clone());
@@ -1855,6 +2373,8 @@ fn check_function(
         funcs.entries[e].call_resolutions = call_resolutions;
         funcs.entries[e].builtin_type_targets = builtin_type_targets;
         funcs.entries[e].pattern_ergo = pattern_ergo;
+        funcs.entries[e].closures = closures;
+        funcs.entries[e].bare_closure_calls = bare_closure_calls;
     } else {
         let mut t = 0;
         while t < funcs.templates.len() {
@@ -1864,6 +2384,8 @@ fn check_function(
                 funcs.templates[t].call_resolutions = call_resolutions;
                 funcs.templates[t].builtin_type_targets = builtin_type_targets;
                 funcs.templates[t].pattern_ergo = pattern_ergo;
+                funcs.templates[t].closures = closures;
+                funcs.templates[t].bare_closure_calls = bare_closure_calls;
                 break;
             }
             t += 1;
@@ -2104,6 +2626,66 @@ fn check_let_stmt(ctx: &mut CheckCtx, let_stmt: &LetStmt) -> Result<(), Error> {
 }
 
 
+// Upgrade any matching capture entry on enclosing closure scopes to
+// `RefMut`. Called when typeck observes a mutation of `binding_name`
+// at the local-stack idx `binding_idx`. If the binding is below an
+// enclosing closure's capture barrier, that closure is now known to
+// mutate the capture — bumps mode `Ref` → `RefMut` (and synthesis
+// will skip the `Fn` impl).
+// Find the root binding name of a place-shaped expression. Walks
+// through `FieldAccess`, `TupleIndex`, and `Deref` chains to the
+// innermost `Var(name)`. Returns `None` for anything else (call
+// results, struct lits, …) — those can't be place expressions in
+// pocket-rust, so a borrow over them isn't a binding-mutation
+// observation.
+fn root_var_name_of_place(expr: &Expr) -> Option<&str> {
+    match &expr.kind {
+        ExprKind::Var(name) => Some(name.as_str()),
+        ExprKind::FieldAccess(fa) => root_var_name_of_place(&fa.base),
+        ExprKind::TupleIndex { base, .. } => root_var_name_of_place(base),
+        ExprKind::Deref(inner) => root_var_name_of_place(inner),
+        _ => None,
+    }
+}
+
+pub(crate) fn upgrade_capture_to_ref_mut(
+    ctx: &mut CheckCtx,
+    binding_name: &str,
+    binding_idx: usize,
+) {
+    let binding_ty = ctx.locals[binding_idx].ty.clone();
+    let mut sc = 0;
+    while sc < ctx.closure_scopes.len() {
+        if ctx.closure_scopes[sc].local_barrier > binding_idx {
+            let scope = &mut ctx.closure_scopes[sc];
+            let mut found = false;
+            let mut k = 0;
+            while k < scope.captures.len() {
+                if scope.captures[k].binding_name == binding_name {
+                    scope.captures[k].mutated = true;
+                    found = true;
+                    break;
+                }
+                k += 1;
+            }
+            // Mutating use as the LHS of an assignment is the
+            // *first* observation of the capture in
+            // `check_assign_stmt` (the Var-lookup-via-rhs hasn't run
+            // yet at this point in the assignment-statement check).
+            // Record the capture with `mutated: true` so the
+            // finalize step picks `RefMut` mode.
+            if !found {
+                scope.captures.push(PendingCapture {
+                    binding_name: binding_name.to_string(),
+                    captured_ty: binding_ty.clone(),
+                    mutated: true,
+                });
+            }
+        }
+        sc += 1;
+    }
+}
+
 fn check_assign_stmt(ctx: &mut CheckCtx, assign: &AssignStmt) -> Result<(), Error> {
     // Two flavors of LHS:
     //   1. Var-rooted chain: `x` or `x.f.g.h`.
@@ -2159,6 +2741,11 @@ fn check_assign_stmt(ctx: &mut CheckCtx, assign: &AssignStmt) -> Result<(), Erro
             });
         }
     };
+    // Closure capture-mode upgrade: assignment to a captured binding
+    // marks the capture as `RefMut` (so the synthesized struct's
+    // field type becomes `&'cap mut T` and the closure no longer
+    // qualifies for `Fn` — only `FnMut` + `FnOnce` get synthesized).
+    upgrade_capture_to_ref_mut(ctx, &chain[0], idx);
     let root_resolved = ctx.subst.substitute(&ctx.locals[idx].ty);
     let root_is_mut_ref = matches!(root_resolved, InferType::Ref { mutable: true, .. });
     let root_is_shared_ref = matches!(root_resolved, InferType::Ref { mutable: false, .. });
@@ -2250,8 +2837,11 @@ fn check_deref_rooted_assign(
 ) -> Result<(), Error> {
     // The root must type as `&mut T` or `*mut T` — otherwise the deref isn't
     // assignable. (We don't allow whole-place assignment through `*const T`
-    // or `&T`, matching Rust.)
-    let root_infer = check_expr(ctx, root_expr)?;
+    // or `&T`, matching Rust.) Use place-mode typing on the root so a
+    // FieldAccess root with a non-Copy ref-typed field (e.g. a closure
+    // struct's `&mut u32` capture field accessed via `*self.counter =
+    // ...`) doesn't trip the value-position move-out-of-borrow check.
+    let root_infer = check_place_expr(ctx, root_expr)?;
     let resolved = ctx.subst.substitute(&root_infer);
     let inner_infer = match resolved {
         InferType::Ref { inner, mutable: true, .. } => *inner,
@@ -2537,7 +3127,46 @@ fn check_expr_inner(ctx: &mut CheckCtx, expr: &Expr) -> Result<InferType, Error>
             while i > 0 {
                 i -= 1;
                 if ctx.locals[i].name == *name {
-                    return Ok(ctx.locals[i].ty.clone());
+                    let binding_ty = ctx.locals[i].ty.clone();
+                    // Closure capture detection: if any enclosing
+                    // closure scope has its barrier above `i`, this
+                    // Var crosses into outer-binding territory. Phase
+                    // 2A records the capture in each crossed scope so
+                    // the lowering pass can synthesize a struct field
+                    // per capture and rewrite the body's `Var(name)`
+                    // into a `self.<name>` field access. Captures are
+                    // restricted to Copy types in phase 2A — non-Copy
+                    // capture support follows in phase 2B (requires
+                    // adding a struct lifetime param for `&'cap T`
+                    // fields). The `move` keyword and FnMut/FnOnce
+                    // mode inference land in phase 3.
+                    let mut sc = 0;
+                    while sc < ctx.closure_scopes.len() {
+                        if ctx.closure_scopes[sc].local_barrier > i {
+                            // Record the capture (deduplicated by
+                            // name; first-reference order preserved).
+                            // Capture mode (Copy by-value vs Ref via
+                            // `&'cap T`) is decided at end-of-fn
+                            // finalize against `is_copy`. The body's
+                            // `Var(name)` is rewritten by lowering to
+                            // either `self.<name>` (Copy) or
+                            // `*self.<name>` (Ref).
+                            let scope = &mut ctx.closure_scopes[sc];
+                            let already = scope
+                                .captures
+                                .iter()
+                                .any(|c| c.binding_name == *name);
+                            if !already {
+                                scope.captures.push(PendingCapture {
+                                    binding_name: name.clone(),
+                                    captured_ty: binding_ty.clone(),
+                                    mutated: false,
+                                });
+                            }
+                        }
+                        sc += 1;
+                    }
+                    return Ok(binding_ty);
                 }
             }
             Err(Error {
@@ -2554,6 +3183,28 @@ fn check_expr_inner(ctx: &mut CheckCtx, expr: &Expr) -> Result<InferType, Error>
             // place doesn't move out, so the "Copy through ref" check that
             // applies to value-position field access doesn't fire here.
             let inner_ty = check_place_expr(ctx, inner)?;
+            // Closure capture-mode upgrade: `&mut Var(captured)` is
+            // a mutation observation. Walk the inner to find a root
+            // Var; if it's a captured binding, upgrade the capture's
+            // mode to RefMut. (Shared `&Var(captured)` doesn't
+            // upgrade — read-only borrow leaves the closure FnMut-
+            // free.)
+            if *mutable {
+                if let Some(root_name) = root_var_name_of_place(inner) {
+                    let mut idx: Option<usize> = None;
+                    let mut i = ctx.locals.len();
+                    while i > 0 {
+                        i -= 1;
+                        if ctx.locals[i].name == root_name {
+                            idx = Some(i);
+                            break;
+                        }
+                    }
+                    if let Some(idx) = idx {
+                        upgrade_capture_to_ref_mut(ctx, root_name, idx);
+                    }
+                }
+            }
             // Phase B: borrow expressions get an `Inferred(0)` placeholder
             // lifetime; refining this into per-borrow fresh lifetimes is
             // Phase C's job.
@@ -2642,7 +3293,162 @@ fn check_expr_inner(ctx: &mut CheckCtx, expr: &Expr) -> Result<InferType, Error>
         ExprKind::MacroCall { name, name_span, args } => {
             check_macro_call(ctx, name, name_span, args)
         }
+        ExprKind::Closure(closure) => check_closure(ctx, closure, expr),
     }
+}
+
+// `|p1, p2| body` (and `move |...|`) — a closure expression. Type-checks
+// the body in a fresh nested scope with each closure param bound to
+// either the user's annotated type or a fresh inference variable.
+// Outer-binding references are detected via the `closure_scopes` capture
+// barrier and rejected in phase 1 with a "closures cannot yet capture"
+// error. The expression's type is the synthesized unit struct
+// `__closure_<idx>` (registered in StructTable on the fly so other
+// typeck pieces — let-binding inference, expr_types finalization — see
+// a real struct path). The post-typeck lowering pass reads the side
+// table populated here to emit the matching `Item::Struct` and
+// `Item::Impl Fn<...>` AST nodes that codegen consumes.
+fn check_closure(
+    ctx: &mut CheckCtx,
+    closure: &Closure,
+    closure_expr: &Expr,
+) -> Result<InferType, Error> {
+    // Allocate a unique struct path. Counter lives on FuncTable so it
+    // persists across functions/modules within the same compile() run.
+    let idx = ctx.funcs.closure_counter;
+    ctx.funcs.closure_counter += 1;
+    let mut struct_path: Vec<String> = ctx.current_module.clone();
+    struct_path.push(format!("__closure_{}", idx));
+
+    // Bidirectional inference: if the call site stashed an expected
+    // signature for this closure (via a `Fn(A) -> R` bound on the
+    // matching parameter), use it as the source of param/return
+    // types. Annotations still override per-param. Without an
+    // expected signature we fall back to an integer-class inference
+    // var per unannotated param (the num-lit dispatch covers
+    // arithmetic-using bodies; non-numeric closures still need
+    // annotations in this fallback path).
+    let expected = ctx
+        .expected_closure_signatures
+        .get(closure_expr.id as usize)
+        .and_then(|o| o.clone());
+    // Mark the slot consumed so nested closures or repeated visits
+    // don't reuse it.
+    if (closure_expr.id as usize) < ctx.expected_closure_signatures.len() {
+        ctx.expected_closure_signatures[closure_expr.id as usize] = None;
+    }
+    let mut param_infer: Vec<InferType> = Vec::new();
+    let mut k = 0;
+    while k < closure.params.len() {
+        let it = match &closure.params[k].ty {
+            Some(t) => {
+                let rt = path_resolve::resolve_type(
+                    t,
+                    ctx.current_module,
+                    ctx.structs,
+                    ctx.enums,
+                    ctx.aliases,
+                    ctx.self_target,
+                    ctx.type_params,
+                    &ctx.use_scope,
+                    ctx.reexports,
+                    ctx.current_file,
+                )?;
+                rtype_to_infer(&rt)
+            }
+            None => match &expected {
+                Some((expected_params, _)) if k < expected_params.len() => {
+                    expected_params[k].clone()
+                }
+                _ => InferType::Var(ctx.subst.fresh_int()),
+            },
+        };
+        param_infer.push(it);
+        k += 1;
+    }
+
+    // Resolve the optional `-> R` return type into an InferType. With
+    // no annotation, allocate a fresh var the body's inferred type will
+    // be unified against.
+    let return_infer: InferType = match &closure.return_type {
+        Some(t) => {
+            let rt = path_resolve::resolve_type(
+                t,
+                ctx.current_module,
+                ctx.structs,
+                ctx.enums,
+                ctx.aliases,
+                ctx.self_target,
+                ctx.type_params,
+                &ctx.use_scope,
+                ctx.reexports,
+                ctx.current_file,
+            )?;
+            rtype_to_infer(&rt)
+        }
+        None => match &expected {
+            Some((_, expected_return)) => expected_return.clone(),
+            None => InferType::Var(ctx.subst.fresh_var()),
+        },
+    };
+
+    // Push a closure scope frame so Var lookups inside the body can
+    // detect captures via the locals barrier.
+    let local_barrier = ctx.locals.len();
+    ctx.closure_scopes.push(ClosureScope {
+        local_barrier,
+        node_id: closure_expr.id,
+        synthesized_struct_path: struct_path.clone(),
+        captures: Vec::new(),
+    });
+
+    // Push closure params into locals.
+    let mut k = 0;
+    while k < closure.params.len() {
+        ctx.locals.push(LocalEntry {
+            name: closure.params[k].name.clone(),
+            ty: param_infer[k].clone(),
+            mutable: false,
+        });
+        k += 1;
+    }
+
+    // Type-check the body. Body's inferred type unifies against the
+    // (annotated or fresh-var) return type so call-site context can
+    // pin both ends.
+    let body_ty = check_expr(ctx, &closure.body)?;
+    ctx.subst.unify(
+        &body_ty,
+        &return_infer,
+        ctx.traits,
+        ctx.type_params,
+        ctx.type_param_bounds,
+        &closure.body.span,
+        ctx.current_file,
+    )?;
+
+    // Pop scope and locals — capture the scope frame's recorded
+    // captures before discarding it.
+    ctx.locals.truncate(local_barrier);
+    let scope = ctx.closure_scopes.pop().expect("just pushed");
+
+    // Record on the side table — finalized into ClosureInfo at end of
+    // the enclosing function's typeck.
+    ctx.closure_records[closure_expr.id as usize] = Some(PendingClosure {
+        synthesized_struct_path: struct_path.clone(),
+        param_types: param_infer,
+        return_type: return_infer,
+        is_move: closure.is_move,
+        body_span: closure.body.span.copy(),
+        captures: scope.captures,
+    });
+
+    // Closure expression's type is the synthesized unit struct.
+    Ok(InferType::Struct {
+        path: struct_path,
+        type_args: Vec::new(),
+        lifetime_args: Vec::new(),
+    })
 }
 
 // `panic!(msg: &str)` is the only macro recognized so far. Type-checks
@@ -4113,12 +4919,12 @@ use methods::check_method_call;
 
 mod tables;
 pub use tables::{
-    AliasEntry, AliasTable, CallResolution, EnumEntry, EnumTable, EnumVariantEntry, FnSymbol,
-    FuncTable, GenericTemplate, MethodResolution, MoveStatus, MovedPlace, PatternErgo,
-    RTypedField, ReceiverAdjust, StructEntry, StructTable, SupertraitRef, TraitDispatch,
-    TraitEntry, TraitImplEntry, TraitMethodEntry, TraitReceiverShape, TraitTable,
-    VariantPayloadResolved, alias_lookup, enum_lookup, find_inherent_synth_idx, func_lookup,
-    struct_lookup, template_lookup, trait_lookup,
+    AliasEntry, AliasTable, CallResolution, CaptureInfo, CaptureMode, ClosureInfo, EnumEntry,
+    EnumTable, EnumVariantEntry, FnSymbol, FuncTable, GenericTemplate, MethodResolution,
+    MoveStatus, MovedPlace, PatternErgo, RTypedField, ReceiverAdjust, StructEntry, StructTable,
+    SupertraitRef, TraitDispatch, TraitEntry, TraitImplEntry, TraitMethodEntry,
+    TraitReceiverShape, TraitTable, VariantPayloadResolved, alias_lookup, enum_lookup,
+    find_inherent_synth_idx, func_lookup, struct_lookup, template_lookup, trait_lookup,
 };
 
 mod traits;
@@ -4299,8 +5105,13 @@ fn check_place_inner(ctx: &mut CheckCtx, expr: &Expr) -> Result<InferType, Error
         }
         ExprKind::Deref(inner) => {
             // The inner of a Deref is a value (a ref or raw-ptr that holds
-            // the place's address). Use check_expr to type-check the value.
-            let inner_ty = check_expr(ctx, inner)?;
+            // the place's address). Use place-mode typing so a ref-typed
+            // FieldAccess inner (e.g. `*self.counter` for a closure's
+            // RefMut capture field of type `&mut u32`) doesn't trip the
+            // value-position move-out-of-borrow check on the field; the
+            // field-access-on-ref-of-non-Copy-field rule only applies to
+            // value-position reads.
+            let inner_ty = check_place_expr(ctx, inner)?;
             let resolved = ctx.subst.substitute(&inner_ty);
             match resolved {
                 InferType::Ref { inner, .. } => Ok(*inner),
@@ -4374,7 +5185,14 @@ fn check_place_inner(ctx: &mut CheckCtx, expr: &Expr) -> Result<InferType, Error
 }
 
 fn check_deref(ctx: &mut CheckCtx, inner: &Expr, deref_expr: &Expr) -> Result<InferType, Error> {
-    let inner_ty = check_expr(ctx, inner)?;
+    // Use place-expression typing for the inner: for chains like
+    // `Var` / `FieldAccess` / `Deref` / `TupleIndex`, this avoids the
+    // value-position "move out of borrow on non-Copy field" check
+    // that would otherwise reject `*self.<ref_field>` patterns
+    // (which are how RefMut closure captures get derefed in
+    // synthesized impl bodies). Non-place inners (e.g. `*foo()`)
+    // fall back to value-position check_expr inside check_place_expr.
+    let inner_ty = check_place_expr(ctx, inner)?;
     let resolved = ctx.subst.substitute(&inner_ty);
     match resolved {
         InferType::Ref { inner, .. } => Ok(*inner),
@@ -4509,7 +5327,178 @@ fn check_cast(
     Ok(rtype_to_infer(&target))
 }
 
+// Dispatch a bare `f(args)` call where `f` is a local of synthesized
+// closure type. Replicates the structure of `check_closure_method_call`
+// (in methods.rs) but takes the original `Call` (no `.call` method) +
+// resolves to the same `Fn::call` trait dispatch. Records the
+// callee's binding name on `ctx.bare_closure_calls[id]` so mono knows
+// to lower this Call as a MethodCall MonoExpr.
+fn check_bare_closure_call(
+    ctx: &mut CheckCtx,
+    call: &Call,
+    call_expr: &Expr,
+    binding_name: String,
+    binding_ty: InferType,
+) -> Result<InferType, Error> {
+    // Look up the closure's recorded signature.
+    let target_path = match ctx.subst.substitute(&binding_ty) {
+        InferType::Struct { path, .. } => path,
+        _ => {
+            return Err(Error {
+                file: ctx.current_file.to_string(),
+                message: format!("internal: bare-call recv `{}` is not a struct", binding_name),
+                span: call_expr.span.copy(),
+            });
+        }
+    };
+    let mut signature: Option<(Vec<InferType>, InferType)> = None;
+    let mut i = 0;
+    while i < ctx.closure_records.len() {
+        if let Some(pc) = &ctx.closure_records[i] {
+            if pc.synthesized_struct_path == target_path {
+                signature = Some((pc.param_types.clone(), pc.return_type.clone()));
+                break;
+            }
+        }
+        i += 1;
+    }
+    if signature.is_none() {
+        let mut e = 0;
+        while e < ctx.funcs.entries.len() {
+            let mut k = 0;
+            while k < ctx.funcs.entries[e].closures.len() {
+                if let Some(ci) = &ctx.funcs.entries[e].closures[k] {
+                    if ci.synthesized_struct_path == target_path {
+                        let params: Vec<InferType> =
+                            ci.param_types.iter().map(rtype_to_infer).collect();
+                        let ret = rtype_to_infer(&ci.return_type);
+                        signature = Some((params, ret));
+                        break;
+                    }
+                }
+                k += 1;
+            }
+            if signature.is_some() {
+                break;
+            }
+            e += 1;
+        }
+    }
+    let (param_types, return_type) = match signature {
+        Some(s) => s,
+        None => {
+            return Err(Error {
+                file: ctx.current_file.to_string(),
+                message: format!(
+                    "internal: no closure record for `{}`",
+                    place_to_string(&target_path)
+                ),
+                span: call_expr.span.copy(),
+            });
+        }
+    };
+    if call.args.len() != param_types.len() {
+        return Err(Error {
+            file: ctx.current_file.to_string(),
+            message: format!(
+                "wrong number of arguments to closure `{}`: expected {}, got {}",
+                binding_name,
+                param_types.len(),
+                call.args.len()
+            ),
+            span: call_expr.span.copy(),
+        });
+    }
+    // Type-check each arg, unifying with the closure's stored param
+    // types.
+    let mut k = 0;
+    while k < call.args.len() {
+        let arg_ty = check_expr(ctx, &call.args[k])?;
+        ctx.subst.unify(
+            &arg_ty,
+            &param_types[k],
+            ctx.traits,
+            ctx.type_params,
+            ctx.type_param_bounds,
+            &call.args[k].span,
+            ctx.current_file,
+        )?;
+        k += 1;
+    }
+    // Trait dispatch: Fn::call(&self, (args,)) -> Output.
+    let trait_path: Vec<String> = vec![
+        "std".to_string(),
+        "ops".to_string(),
+        "Fn".to_string(),
+    ];
+    let args_tuple = InferType::Tuple(param_types.clone());
+    let recv_struct_infer = InferType::Struct {
+        path: target_path,
+        type_args: Vec::new(),
+        lifetime_args: Vec::new(),
+    };
+    ctx.method_resolutions[call_expr.id as usize] = Some(PendingMethodCall {
+        callee_idx: 0,
+        callee_path: Vec::new(),
+        recv_adjust: ReceiverAdjust::BorrowImm,
+        ret_borrows_receiver: false,
+        template_idx: None,
+        type_arg_infers: Vec::new(),
+        trait_dispatch: Some(PendingTraitDispatch {
+            trait_path,
+            trait_arg_infers: vec![args_tuple],
+            method_name: "call".to_string(),
+            recv_type_infer: recv_struct_infer,
+            dispatch_span: call_expr.span.copy(),
+        }),
+    });
+    if (call_expr.id as usize) < ctx.bare_closure_calls.len() {
+        ctx.bare_closure_calls[call_expr.id as usize] = Some(binding_name);
+    }
+    let substituted = ctx.subst.substitute(&return_type);
+    Ok(infer_concretize_assoc_proj(
+        &substituted,
+        ctx.traits,
+        ctx.type_params,
+        ctx.type_param_bound_assoc,
+    ))
+}
+
 fn check_call(ctx: &mut CheckCtx, call: &Call, call_expr: &Expr) -> Result<InferType, Error> {
+    // Bare-call sugar for closures: when the callee is a single-
+    // segment path resolving to a local of synthesized closure type
+    // (`__closure_<id>`), dispatch as `local.call((args,))` instead
+    // of the usual function-path resolution. The `bare_closure_calls`
+    // side table records the binding name so mono can lower the Call
+    // as a MethodCall MonoExpr without AST mutation.
+    if call.callee.segments.len() == 1
+        && call.callee.segments[0].args.is_empty()
+        && call.callee.segments[0].lifetime_args.is_empty()
+    {
+        let name = call.callee.segments[0].name.clone();
+        let mut local_ty: Option<InferType> = None;
+        let mut i = ctx.locals.len();
+        while i > 0 {
+            i -= 1;
+            if ctx.locals[i].name == name {
+                local_ty = Some(ctx.locals[i].ty.clone());
+                break;
+            }
+        }
+        if let Some(ty) = local_ty {
+            let resolved = ctx.subst.substitute(&ty);
+            let is_closure = match &resolved {
+                InferType::Struct { path, .. } => path
+                    .last()
+                    .map(|s| s.starts_with("__closure_"))
+                    .unwrap_or(false),
+                _ => false,
+            };
+            if is_closure {
+                return check_bare_closure_call(ctx, call, call_expr, name, ty);
+            }
+        }
+    }
     // Use-table resolution first: an explicit import or matching glob
     // takes precedence over module-relative path lookup, so
     // `use std::dummy::id; id(7)` resolves to `["std","dummy","id"]`
@@ -4645,6 +5634,14 @@ fn check_call(ctx: &mut CheckCtx, call: &Call, call_expr: &Expr) -> Result<Infer
         let tmpl_return_type: Option<RType> = ctx.funcs.templates[template_idx]
             .return_type
             .clone();
+        // Snapshot bounds + bound-trait-args for bidirectional
+        // inference into closure args.
+        let tmpl_bound_paths_for_inference: Vec<Vec<Vec<String>>> =
+            ctx.funcs.templates[template_idx].type_param_bounds.clone();
+        let tmpl_bound_args_for_inference: Vec<Vec<Vec<RType>>> =
+            ctx.funcs.templates[template_idx].type_param_bound_args.clone();
+        let tmpl_bound_assoc_for_inference: Vec<Vec<Vec<(String, RType)>>> =
+            ctx.funcs.templates[template_idx].type_param_bound_assoc.clone();
         if !last_seg_args.is_empty() && last_seg_args.len() != tmpl_type_params.len() {
             return Err(Error {
                 file: ctx.current_file.to_string(),
@@ -4721,6 +5718,30 @@ fn check_call(ctx: &mut CheckCtx, call: &Call, call_expr: &Expr) -> Result<Infer
         });
         let mut i = 0;
         while i < call.args.len() {
+            // Bidirectional inference into closure args: if this arg
+            // is a closure expression and the corresponding param's
+            // template type is `Param("F")` whose bound is one of
+            // `Fn`/`FnMut`/`FnOnce` with a concrete `(P,) -> R`
+            // signature, stash the (params, return) on the side table
+            // so `check_closure` adopts those types instead of fresh
+            // vars.
+            if matches!(call.args[i].kind, ExprKind::Closure(_)) {
+                if let RType::Param(param_name) = &tmpl_param_types[i] {
+                    if let Some((expected_params, expected_return)) = lookup_fn_bound_signature(
+                        param_name,
+                        &tmpl_type_params,
+                        &tmpl_bound_paths_for_inference,
+                        &tmpl_bound_args_for_inference,
+                        &tmpl_bound_assoc_for_inference,
+                    ) {
+                        let id = call.args[i].id as usize;
+                        if id < ctx.expected_closure_signatures.len() {
+                            ctx.expected_closure_signatures[id] =
+                                Some((expected_params, expected_return));
+                        }
+                    }
+                }
+            }
             let arg_ty = check_expr(ctx, &call.args[i])?;
             ctx.subst.unify(
                 &arg_ty,
@@ -4765,6 +5786,25 @@ fn check_call(ctx: &mut CheckCtx, call: &Call, call_expr: &Expr) -> Result<Infer
             }
             let inferred = ctx.subst.substitute(&InferType::Var(var_ids[p]));
             let inferred_rt = infer_to_rtype_for_check(&inferred);
+            // Skip the assoc-constraint check for synthesized closure
+            // struct types — their `Fn`/`FnMut`/`FnOnce` impl is
+            // registered post-typeck by `closure_lower::lower`, so
+            // the impl's `Output` binding isn't yet visible. The
+            // body-check enforces the closure's actual return type
+            // matches what bidirectional inference flowed in, so the
+            // bound is satisfied by construction once the impl
+            // lands.
+            let recv_is_closure = matches!(
+                &inferred_rt,
+                RType::Struct { path, .. } if path
+                    .last()
+                    .map(|s| s.starts_with("__closure_"))
+                    .unwrap_or(false)
+            );
+            if recv_is_closure {
+                p += 1;
+                continue;
+            }
             let mut b = 0;
             while b < tmpl_bounds[p].len() {
                 let trait_path = &tmpl_bounds[p][b];

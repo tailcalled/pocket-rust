@@ -779,6 +779,7 @@ fn build_mono_input_for_template<'a>(
         // scrutinee type (ref vs not), and `&T`-vs-`&U` substitutions
         // preserve that shape.
         pattern_ergo: tmpl.pattern_ergo.clone(),
+        bare_closure_calls: tmpl.bare_closure_calls.clone(),
         wasm_idx,
         is_export: false, // monomorphic instances are never exported
     }
@@ -906,6 +907,7 @@ fn emit_function(
         moved_places: clone_moved_places(&entry.moved_places),
         move_sites: clone_move_sites(&entry.move_sites),
         pattern_ergo: entry.pattern_ergo.clone(),
+        bare_closure_calls: entry.bare_closure_calls.clone(),
         wasm_idx: entry.idx,
         is_export: current_module.is_empty() && path_prefix.len() == current_module.len(),
     };

@@ -59,3 +59,16 @@ fn add_inference_through_tuple_block_is_accepted() {
          }",
     );
 }
+
+// Calls where both the body and the args are unconstrained num-lit
+// Vars (e.g. `let f = |x| x + 1; f.call((5,)) as u32`) leave the
+// AssocProj `<?int as Add>::Output` unresolved at typeck — defaulting
+// to i32 happens at end-of-fn finalize, too late for the surrounding
+// cast. Fix would propagate the cast's expected type back into the
+// closure's return-var, or pin the int-default at the call site.
+#[test]
+fn closure_call_with_default_int_can_cast_is_accepted() {
+    let _ = compile_inline(
+        "pub fn answer() -> u32 { let f = |x| x + 1; f.call((5,)) as u32 }",
+    );
+}

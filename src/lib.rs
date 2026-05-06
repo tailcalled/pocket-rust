@@ -1,5 +1,6 @@
 mod ast;
 mod borrowck;
+mod closure_lower;
 mod codegen;
 mod derive;
 mod layout;
@@ -98,6 +99,7 @@ pub fn compile(
         entries: Vec::new(),
         templates: Vec::new(),
         inherent_synth_specs: Vec::new(),
+        closure_counter: 0,
     };
     let mut wasm_mod = wasm::Module::new();
     // Reserve a host-imported `env.panic(ptr: i32, len: i32)`
@@ -176,6 +178,9 @@ pub fn compile(
         if let Err(e) = typeck::check(&lib_root, &mut structs, &mut enums, &mut aliases, &mut traits, &mut funcs, &mut reexports, &mut next_idx) {
             return Err(span::format_error(&e));
         }
+        if let Err(e) = closure_lower::lower(&mut lib_root, &mut structs, &mut enums, &mut aliases, &mut traits, &mut funcs, &mut reexports, &mut next_idx) {
+            return Err(span::format_error(&e));
+        }
         if let Err(e) = borrowck::check(&lib_root, &structs, &enums, &traits, &mut funcs) {
             return Err(span::format_error(&e));
         }
@@ -197,6 +202,9 @@ pub fn compile(
     // exclude.
     inject_preludes(&mut user_root, libraries, None);
     if let Err(e) = typeck::check(&user_root, &mut structs, &mut enums, &mut aliases, &mut traits, &mut funcs, &mut reexports, &mut next_idx) {
+        return Err(span::format_error(&e));
+    }
+    if let Err(e) = closure_lower::lower(&mut user_root, &mut structs, &mut enums, &mut aliases, &mut traits, &mut funcs, &mut reexports, &mut next_idx) {
         return Err(span::format_error(&e));
     }
     if let Err(e) = borrowck::check(&user_root, &structs, &enums, &traits, &mut funcs) {

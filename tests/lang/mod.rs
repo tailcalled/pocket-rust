@@ -203,6 +203,7 @@ mod basics;
 mod block_exprs;
 mod borrowck;
 mod builtins;
+mod closures;
 mod compound_assign;
 mod derives;
 mod enums;

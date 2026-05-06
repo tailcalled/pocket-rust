@@ -38,6 +38,11 @@ pub struct MonoFnInput<'a> {
     // produce a desugared AST pattern with explicit `&` wrappers and
     // `ref` bindings — codegen sees only explicit-form patterns.
     pub pattern_ergo: Vec<crate::typeck::PatternErgo>,
+    // Per-NodeId bare-closure-call records — see FnSymbol.
+    // `bare_closure_calls`. mono consults this when lowering
+    // ExprKind::Call to detect closure-bare-calls and rewrite as a
+    // MethodCall MonoExpr.
+    pub bare_closure_calls: Vec<Option<String>>,
     pub wasm_idx: u32,
     pub is_export: bool,
 }
@@ -869,6 +874,9 @@ fn walk_expr(
                 );
                 i += 1;
             }
+        }
+        ExprKind::Closure(_) => {
+            unreachable!("closure expressions rejected at typeck before mono")
         }
     }
 }
@@ -2103,6 +2111,77 @@ fn lower_expr(ctx: &mut LowerCtx, expr: &Expr) -> Result<MonoExpr, Error> {
             MonoExprKind::MacroCall { name: name.clone(), args: out_args }
         }
         ExprKind::Call(c) => {
+            // Bare-closure-call sugar: typeck recorded the callee
+            // binding name on `bare_closure_calls[id]` when this Call
+            // dispatched as `local.call((args,))`. Lower as a
+            // MethodCall MonoExpr — recv is the closure local, args
+            // is a single-element vec wrapping a tuple of the
+            // original args. The trait_dispatch on
+            // method_resolutions[id] points codegen at the
+            // synthesized `Fn::call` impl method registered post-
+            // typeck by `closure_lower::lower`.
+            if let Some(binding_name) =
+                ctx.input.bare_closure_calls.get(expr.id as usize).and_then(|o| o.as_ref())
+            {
+                let recv_binding = ctx.lookup(binding_name).ok_or_else(|| Error {
+                    file: String::new(),
+                    message: format!(
+                        "lower_to_mono: bare-closure-call recv `{}` not in scope",
+                        binding_name
+                    ),
+                    span: span.copy(),
+                })?;
+                let mut tuple_elems: Vec<MonoExpr> = Vec::new();
+                let mut tuple_elem_types: Vec<RType> = Vec::new();
+                let mut i = 0;
+                while i < c.args.len() {
+                    let lowered = lower_expr(ctx, &c.args[i])?;
+                    tuple_elem_types.push(lowered.ty.clone());
+                    tuple_elems.push(lowered);
+                    i += 1;
+                }
+                let args_tuple_ty = RType::Tuple(tuple_elem_types);
+                let args_tuple = MonoExpr {
+                    kind: MonoExprKind::Tuple(tuple_elems),
+                    ty: args_tuple_ty,
+                    span: span.copy(),
+                };
+                // Resolve the wasm idx via trait_dispatch on the
+                // matching method_resolutions entry (typeck populated
+                // it during check_bare_closure_call).
+                let mr = ctx.input.method_resolutions[expr.id as usize]
+                    .as_ref()
+                    .ok_or_else(|| Error {
+                        file: String::new(),
+                        message: "lower_to_mono: bare-closure-call missing method_resolution"
+                            .to_string(),
+                        span: span.copy(),
+                    })?;
+                let td = mr.trait_dispatch.as_ref().ok_or_else(|| Error {
+                    file: String::new(),
+                    message: "lower_to_mono: bare-closure-call missing trait_dispatch"
+                        .to_string(),
+                    span: span.copy(),
+                })?;
+                let wasm_idx = resolve_trait_dispatch_method(
+                    ctx,
+                    td,
+                    &mr.type_args,
+                    &span,
+                )?;
+                let recv_ty = ctx.locals[recv_binding as usize].ty.clone();
+                let recv_expr = MonoExpr {
+                    kind: MonoExprKind::Local(recv_binding, expr.id),
+                    ty: recv_ty,
+                    span: span.copy(),
+                };
+                MonoExprKind::MethodCall {
+                    wasm_idx,
+                    recv_adjust: mr.recv_adjust,
+                    recv: Box::new(recv_expr),
+                    args: vec![args_tuple],
+                }
+            } else {
             // Lower args first.
             let mut out_args = Vec::new();
             let mut i = 0;
@@ -2148,6 +2227,7 @@ fn lower_expr(ctx: &mut LowerCtx, expr: &Expr) -> Result<MonoExpr, Error> {
                         payload: out_args,
                     }
                 }
+            }
             }
         }
         ExprKind::MethodCall(mc) => {
@@ -2447,6 +2527,9 @@ fn lower_expr(ctx: &mut LowerCtx, expr: &Expr) -> Result<MonoExpr, Error> {
         ExprKind::For(f) => lower_for(ctx, f, &ty, &span)?,
         ExprKind::Try { inner, question_span } => {
             lower_try(ctx, inner, &ty, question_span, &span)?
+        }
+        ExprKind::Closure(_) => {
+            unreachable!("closure expressions rejected at typeck before mono")
         }
     };
     Ok(MonoExpr { kind, ty, span: expr.span.copy() })
