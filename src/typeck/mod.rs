@@ -2567,12 +2567,14 @@ fn tail_span_or_block(block: &Block) -> Span {
 }
 
 fn check_let_stmt(ctx: &mut CheckCtx, let_stmt: &LetStmt) -> Result<(), Error> {
-    // `let x: T;` (no initializer): require an explicit type
-    // annotation (no value to infer from), require a single
+    // `let x: T;` / `let x;` (no initializer): require a single
     // `Binding` pattern (destructure / wildcard / refutable patterns
     // need a value to drive the match), and forbid let-else (there's
-    // nothing to test). Borrowck seeds the binding as Moved so reads
-    // before the first assignment error.
+    // nothing to test). The annotation is optional — when absent we
+    // seed the binding's type with a fresh inference variable, which
+    // a later assignment/use can pin via unification. Borrowck seeds
+    // the binding as Uninit so reads before the first assignment
+    // error.
     if let_stmt.value.is_none() {
         if let_stmt.else_block.is_some() {
             return Err(Error {
@@ -2581,16 +2583,6 @@ fn check_let_stmt(ctx: &mut CheckCtx, let_stmt: &LetStmt) -> Result<(), Error> {
                 span: let_stmt.pattern.span.copy(),
             });
         }
-        let annotation = match &let_stmt.ty {
-            Some(t) => t,
-            None => {
-                return Err(Error {
-                    file: ctx.current_file.to_string(),
-                    message: "type annotation needed for uninitialized `let` binding".to_string(),
-                    span: let_stmt.pattern.span.copy(),
-                });
-            }
-        };
         if crate::ast::let_simple_binding(let_stmt).is_none() {
             return Err(Error {
                 file: ctx.current_file.to_string(),
@@ -2598,25 +2590,30 @@ fn check_let_stmt(ctx: &mut CheckCtx, let_stmt: &LetStmt) -> Result<(), Error> {
                 span: let_stmt.pattern.span.copy(),
             });
         }
-        let annot_rt = resolve_type(
-            annotation,
-            ctx.current_module,
-            ctx.structs,
-            ctx.enums,
-            ctx.aliases,
-            ctx.self_target,
-            ctx.type_params,
-            &ctx.use_scope,
-            ctx.reexports,
-            ctx.current_file,
-        )?;
-        let annot_infer = rtype_to_infer(&annot_rt);
+        let binding_infer = match &let_stmt.ty {
+            Some(annotation) => {
+                let annot_rt = resolve_type(
+                    annotation,
+                    ctx.current_module,
+                    ctx.structs,
+                    ctx.enums,
+                    ctx.aliases,
+                    ctx.self_target,
+                    ctx.type_params,
+                    &ctx.use_scope,
+                    ctx.reexports,
+                    ctx.current_file,
+                )?;
+                rtype_to_infer(&annot_rt)
+            }
+            None => InferType::Var(ctx.subst.fresh_var()),
+        };
         // Reuse the pattern path so the binding lands in locals AND
         // its resolved type is recorded under pattern.id (mono reads
         // it from `expr_types[pat.id]` to allocate the binding's
         // storage at lowering time).
         let mut bindings: Vec<(String, InferType, Span, bool)> = Vec::new();
-        check_pattern(ctx, &let_stmt.pattern, &annot_infer, &mut bindings)?;
+        check_pattern(ctx, &let_stmt.pattern, &binding_infer, &mut bindings)?;
         let mut k = 0;
         while k < bindings.len() {
             ctx.locals.push(LocalEntry {

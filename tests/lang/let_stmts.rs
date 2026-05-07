@@ -181,18 +181,13 @@ fn uninit_assign_in_only_one_branch_is_rejected() {
     );
 }
 
-// Negative: type annotation is required when there's no value to
-// infer from.
+// `let x;` — no annotation, no initializer. The binding's type is
+// inferred from the later assignment via a fresh InferType::Var that
+// typeck seeds when neither annotation nor value is present, and the
+// assignment unifies with the RHS's type.
 #[test]
-fn uninit_without_type_annotation_is_rejected() {
-    let err = compile_source(
-        "fn answer() -> u32 { let x; x = 1u32; x }",
-    );
-    assert!(
-        err.contains("type annotation needed"),
-        "expected missing-annotation error, got: {}",
-        err
-    );
+fn uninit_no_annotation_returns_99() {
+    expect_answer("lang/let_stmts/uninit_no_annotation", 99u32);
 }
 
 // Negative: tuple destructure has nothing to destructure when the
