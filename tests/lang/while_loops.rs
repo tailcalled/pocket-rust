@@ -2,6 +2,28 @@
 
 use super::*;
 
+// `while let PAT = scrut { body }` — desugared at parse time to
+// `while true { if let PAT = scrut { body } else { break; } }`. Each
+// iteration re-evaluates the scrutinee; loop exits on first non-match.
+#[test]
+fn while_let_option_returns_42() {
+    expect_answer("lang/while_loops/while_let_option", 42u32);
+}
+
+// `break` inside the while-let body exits the synthesized loop just
+// like a regular while.
+#[test]
+fn while_let_break_returns_42() {
+    expect_answer("lang/while_loops/while_let_break", 42u32);
+}
+
+// Labeled while-let: label propagates onto the synthesized WhileExpr
+// so a nested `break 'outer` exits the labeled loop.
+#[test]
+fn while_let_labeled_returns_42() {
+    expect_answer("lang/while_loops/while_let_labeled", 42u32);
+}
+
 #[test]
 fn while_simple_count_returns_5() {
     expect_answer("lang/while_loops/while_simple_count", 5u32);

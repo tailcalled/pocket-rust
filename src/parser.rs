@@ -2800,13 +2800,90 @@ impl Parser {
     }
 
     // Parse `while cond { body }`. The condition disallows bare struct
-    // literals (matches Rust's parser).
+    // literals (matches Rust's parser). Also handles the `while let
+    // PAT = scrut { body }` form by desugaring to `while true { if let
+    // PAT = scrut { body } else { break; } }`.
     fn parse_while_expr(
         &mut self,
         label: Option<String>,
         label_span: Option<Span>,
     ) -> Result<Expr, Error> {
         let while_span = self.expect(&TokenKind::While, "`while`")?;
+        // `while let PAT = scrut { body }` — desugar at parse time.
+        // The synthesized loop's break targets the user's optional
+        // label; without one, an unlabeled break inside the body
+        // naturally finds the synthesized while.
+        if self.peek_kind(&TokenKind::Let) {
+            self.pos += 1;
+            let pattern = self.parse_pattern()?;
+            self.expect(&TokenKind::Eq, "`=`")?;
+            let saved = self.no_struct_lit;
+            self.no_struct_lit = true;
+            let scrutinee = self.parse_expr()?;
+            self.no_struct_lit = saved;
+            let body = self.parse_block()?;
+            let body_span = body.span.copy();
+            let while_span_copy = while_span.copy();
+            let span_start = label_span
+                .as_ref()
+                .map(|s| s.start.copy())
+                .unwrap_or(while_span_copy.start);
+            let span = Span::new(span_start, body_span.end.copy());
+            // Synthesized `else { break; }` — bare break, no label
+            // (targets the innermost / synthesized while).
+            let break_expr_id = self.alloc_node_id();
+            let break_expr = Expr {
+                kind: ExprKind::Break {
+                    label: None,
+                    label_span: None,
+                },
+                span: body_span.copy(),
+                id: break_expr_id,
+            };
+            let else_block = Block {
+                stmts: vec![Stmt::Expr(break_expr)],
+                tail: None,
+                span: body_span.copy(),
+            };
+            // Synthesized if-let wrapping the user's body. Then-block
+            // is the body verbatim; else-block is the break.
+            let if_let_id = self.alloc_node_id();
+            let if_let_expr = Expr {
+                kind: ExprKind::IfLet(IfLetExpr {
+                    pattern,
+                    scrutinee: Box::new(scrutinee),
+                    then_block: Box::new(body),
+                    else_block: Box::new(else_block),
+                }),
+                span: body_span.copy(),
+                id: if_let_id,
+            };
+            // Body of the synthesized `while true { … }` — just the
+            // if-let as a statement.
+            let synth_body = Block {
+                stmts: vec![Stmt::Expr(if_let_expr)],
+                tail: None,
+                span: body_span.copy(),
+            };
+            // `true` cond.
+            let cond_id = self.alloc_node_id();
+            let cond = Expr {
+                kind: ExprKind::BoolLit(true),
+                span: while_span.copy(),
+                id: cond_id,
+            };
+            let id = self.alloc_node_id();
+            return Ok(Expr {
+                kind: ExprKind::While(crate::ast::WhileExpr {
+                    label,
+                    label_span,
+                    cond: Box::new(cond),
+                    body: Box::new(synth_body),
+                }),
+                span,
+                id,
+            });
+        }
         let saved = self.no_struct_lit;
         self.no_struct_lit = true;
         let cond = self.parse_expr()?;
