@@ -254,11 +254,20 @@ pub fn flatten_use_tree(
 ) {
     match tree {
         crate::ast::UseTree::Leaf { path, rename, .. } => {
+            // `self` as a leaf inside a brace (`use foo::{self, ...}`)
+            // re-imports the brace's prefix path itself. Encoded by
+            // the parser as path = ["self"]; the prefix carries the
+            // module path, so the imported absolute path is the
+            // prefix and the local name is the prefix's last segment
+            // (or the explicit rename).
+            let is_self_leaf = path.len() == 1 && path[0] == "self";
             let mut full = prefix.clone();
-            let mut i = 0;
-            while i < path.len() {
-                full.push(path[i].clone());
-                i += 1;
+            if !is_self_leaf {
+                let mut i = 0;
+                while i < path.len() {
+                    full.push(path[i].clone());
+                    i += 1;
+                }
             }
             // Local name comes from the *original* last segment (or
             // explicit rename) — `use crate::foo::Bar;` imports `Bar`,

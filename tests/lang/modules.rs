@@ -65,6 +65,22 @@ fn use_brace_returns_42() {
     expect_answer("lang/modules/use_brace", 42i32);
 }
 
+// `self` inside a brace group re-imports the prefix path itself:
+// `use std::dummy::{self, id};` brings both `dummy` (the module,
+// resolvable as `dummy::id(...)`) and `id` (bare-name) into scope.
+#[test]
+fn use_brace_self_returns_42() {
+    expect_answer("lang/modules/use_brace_self", 42u32);
+}
+
+// `self as <name>` inside a brace renames the imported module:
+// `use std::dummy::{self as d};` makes `d::id(...)` resolve while
+// the original name `dummy` does not enter the local scope.
+#[test]
+fn use_brace_self_rename_returns_42() {
+    expect_answer("lang/modules/use_brace_self_rename", 42u32);
+}
+
 // Block-scope use: `use std::dummy::id;` inside a block expression
 // scopes the import to that block.
 #[test]

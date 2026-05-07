@@ -19,6 +19,7 @@ No inline `mod NAME { … }` syntax yet, no `super::` (use `crate::…` instead)
 - `use a::b::c as d;` — rename.
 - `use a::*;` — glob.
 - `use a::{b, c::*, d as e};` — brace multi, with arbitrary nesting, glob, and rename inside.
+- `use a::b::{self, c};` — `self` inside a brace re-imports the prefix path itself alongside the named children. Optional rename (`{self as foo}`) overrides the local name. Parser encodes the leaf as `path: ["self"]` (sentinel); `flatten_use_tree` recognizes it and substitutes the brace's prefix as the imported absolute path.
 - `use crate::…` — absolute-from-crate-root.
 
 Allowed at module level (`Item::Use`) and inside any block (`Stmt::Use`); block-level uses scope to the enclosing block.

@@ -248,6 +248,34 @@ impl Parser {
                 span,
             });
         }
+        // `self` as a use-tree leaf — only meaningful inside a brace
+        // group, where `use foo::{self, Bar};` re-imports `foo` itself
+        // alongside its children. Encode as a Leaf with empty path so
+        // `flatten_use_tree`'s prefix-extension produces the brace's
+        // prefix as the imported absolute path. The local name comes
+        // from the prefix's last segment, matching the standard
+        // semantics. An optional rename (`self as foo_mod`) overrides.
+        if self.peek_kind(&TokenKind::SelfLower) {
+            let self_span = self.tokens[self.pos].span.copy();
+            self.pos += 1;
+            let rename = if self.pos < self.tokens.len()
+                && matches!(self.tokens[self.pos].kind, TokenKind::As)
+            {
+                self.pos += 1;
+                let (name, _) = self.expect_ident()?;
+                Some(name)
+            } else {
+                None
+            };
+            let end = self.tokens[self.pos.saturating_sub(1)].span.end.copy();
+            // Sentinel "self" path; flatten_use_tree interprets the
+            // leaf as the brace's prefix (the actual imported module).
+            return Ok(UseTree::Leaf {
+                path: vec!["self".to_string()],
+                rename,
+                span: Span::new(self_span.start, end),
+            });
+        }
         // Otherwise we have at least one path segment.
         let mut segments: Vec<String> = Vec::new();
         let (first, _) = self.expect_ident()?;
