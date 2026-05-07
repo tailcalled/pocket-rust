@@ -29,6 +29,8 @@ pub trait Fn<Args>: FnMut<Args> { fn call(&self, args: Args) -> Self::Output; }
 
 **HRTB:** `for<'a, 'b> Path<...>` parses with the lifetimes captured on `TraitBound.hrtb_lifetime_params`. Lifetimes scope only into the bound's own types. Setup's bound resolution loop validates each resolved trait-arg's named lifetimes against the enclosing fn/impl scope **plus** the bound's HRTB lifetimes — so `fn f<F: for<'a> Fn(&'a u32) -> u32>` accepts `'a` while `fn f<F: Fn(&'a u32) -> u32>` (no HRTB) is rejected with `undeclared lifetime 'a`.
 
+**APIT (argument-position `impl Trait`):** `fn apply(f: impl Fn(u32) -> u32) -> u32` parses to `TypeKind::ImplTrait(bounds)` and the parser's post-params `desugar_apit` step rewrites it into a fresh anonymous type-param `__impl_<n>` with the recorded bounds, appended to `Function.type_params`. Calls dispatch the same way as an explicit `<F: Fn(...)>` declaration. Bare-call `f(args)` against an APIT-typed local routes through `check_bare_typeparam_fn_call` (sibling of `check_bare_closure_call`): looks up the Fn signature on the type-param's bound via `typeparam_fn_signature` (reads `ctx.type_param_bounds` / `type_param_bound_args` / `type_param_bound_assoc`), unifies the arg tuple, and records a `Fn::call` trait dispatch with `recv_type = Param(name)`. Return-position `impl Trait`, struct-field `impl Trait`, and other non-fn-arg positions are rejected at `resolve_type` with "`impl Trait` is only allowed in argument position".
+
 ## AST
 
 - `ExprKind::Closure(Closure)` — `Closure { params, return_type: Option<Type>, body: Box<Expr>, is_move: bool, span }`.
@@ -197,4 +199,5 @@ Without all four, a closure inside `fn helper<T>(...)` errors `unknown type: T` 
 - **AssocProj cast gap**: `let f = |x| x + 1; f.call((5,)) as u32` (gap-tested) — both sides are unconstrained num-lit Vars; the AssocProj `<?int as Add>::Output` stays unresolved at typeck time, so the cast fails. Fix would propagate the cast's expected type into the closure's return-var.
 - **Function items as Fn**: passing `foo` where `Fn(...)` is expected (auto-impl on fn items + fn-pointer types `fn(T) -> R`).
 - **`dyn Fn` trait objects**: not yet supported.
+- **Return-position `impl Trait`** (RPIT): not implemented; rejected at `resolve_type`.
 - **Async closures / generators**: out of scope.

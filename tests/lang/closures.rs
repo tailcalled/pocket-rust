@@ -436,3 +436,60 @@ fn refutable_closure_pattern_is_rejected() {
         err,
     );
 }
+
+// Argument-position `impl Trait`: `fn apply(f: impl Fn(u32) -> u32)`
+// desugars at parse time to an anonymous type-param
+// `<__impl_0: Fn(u32) -> u32>` bound on the function. Bidirectional
+// inference still flows the closure's expected param/return through
+// the bound.
+#[test]
+fn apit_with_fn_bound_returns_15() {
+    let bytes = compile_inline(
+        "fn apply(f: impl Fn(u32) -> u32) -> u32 { f.call((10u32,)) }\n\
+         pub fn answer() -> u32 { apply(|x| x + 5u32) }",
+    );
+    assert_eq!(answer_u32(&bytes), 15);
+}
+
+// APIT works with the bare-call sugar too — the synthesized type-param
+// participates in the same Fn-bound dispatch.
+#[test]
+fn apit_with_fn_bound_bare_call_returns_8() {
+    let bytes = compile_inline(
+        "fn apply(f: impl Fn(u32) -> u32) -> u32 { f(3u32) }\n\
+         pub fn answer() -> u32 { apply(|x| x + 5u32) }",
+    );
+    assert_eq!(answer_u32(&bytes), 8);
+}
+
+// Negative: `impl Trait` in return position is not yet supported. The
+// parser produces a `TypeKind::ImplTrait` that survives into typeck;
+// `resolve_type` rejects it with a clear diagnostic.
+#[test]
+fn return_position_impl_trait_is_rejected() {
+    let err = compile_source(
+        "trait Show { fn show(self) -> u32; }\n\
+         fn make() -> impl Show { 0u32 }\n\
+         fn answer() -> u32 { 0u32 }",
+    );
+    assert!(
+        err.contains("`impl Trait` is only allowed in argument position"),
+        "expected APIT-only error, got: {}",
+        err,
+    );
+}
+
+// Negative: `impl Trait` in a struct field is also rejected.
+#[test]
+fn impl_trait_in_struct_field_is_rejected() {
+    let err = compile_source(
+        "trait Show { fn show(self) -> u32; }\n\
+         struct Holder { x: impl Show }\n\
+         fn answer() -> u32 { 0u32 }",
+    );
+    assert!(
+        err.contains("`impl Trait` is only allowed in argument position"),
+        "expected APIT-only error, got: {}",
+        err,
+    );
+}

@@ -319,6 +319,16 @@ pub enum TypeKind {
     Never,
     // (`str` is a single-segment Path("str") at the AST level — the
     // type-resolver maps it to `RType::Str`. No dedicated AST variant.)
+
+    // `impl T1 + T2` (argument-position impl trait). The parser
+    // recognizes this anywhere `parse_type` is called, but only the
+    // top of a fn parameter is a valid position: after parsing fn
+    // params, `parse_function_with_vis` walks each param.ty and
+    // desugars top-level `ImplTrait` into a fresh anonymous type-param
+    // (`__impl_<n>`) with the recorded bounds. Any `ImplTrait` that
+    // survives into typeck (return position, struct field, alias, …)
+    // is rejected with "`impl Trait` not allowed here".
+    ImplTrait(Vec<TraitBound>),
 }
 
 #[derive(Clone)]

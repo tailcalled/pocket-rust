@@ -500,18 +500,19 @@ impl Parser {
     fn parse_trait_method_sig(&mut self) -> Result<TraitMethodSig, Error> {
         self.expect(&TokenKind::Fn, "`fn`")?;
         let (name, name_span) = self.expect_ident()?;
-        let (lifetime_params, type_params) = if self.peek_kind(&TokenKind::LAngle) {
+        let (lifetime_params, mut type_params) = if self.peek_kind(&TokenKind::LAngle) {
             self.parse_generic_params()?
         } else {
             (Vec::new(), Vec::new())
         };
         self.expect(&TokenKind::LParen, "`(`")?;
-        let params = if self.peek_kind(&TokenKind::RParen) {
+        let mut params = if self.peek_kind(&TokenKind::RParen) {
             Vec::new()
         } else {
             self.parse_params()?
         };
         self.expect(&TokenKind::RParen, "`)`")?;
+        self.desugar_apit(&mut params, &mut type_params);
         let return_type = if self.peek_kind(&TokenKind::Arrow) {
             self.pos += 1;
             Some(self.parse_type()?)
@@ -738,6 +739,74 @@ impl Parser {
         })
     }
 
+    // Desugar argument-position `impl Trait` into anonymous type
+    // parameters. Walks each param.ty: when it's `TypeKind::ImplTrait`
+    // at the top level, allocates a fresh `__impl_<N>` name (counter
+    // local to this fn signature, plus any pre-existing `__impl_*` to
+    // keep the names disjoint), appends a `TypeParam` carrying the
+    // bounds, and replaces the param's type with a Path to that name.
+    // Nested `impl Trait` (e.g. `Vec<impl Trait>`) is left alone — it
+    // will surface a "not allowed here" error at typeck.
+    fn desugar_apit(
+        &mut self,
+        params: &mut Vec<Param>,
+        type_params: &mut Vec<TypeParam>,
+    ) {
+        let mut counter: u32 = 0;
+        let mut i = 0;
+        while i < params.len() {
+            let take = matches!(&params[i].ty.kind, TypeKind::ImplTrait(_));
+            if take {
+                let span = params[i].ty.span.copy();
+                let bounds = match std::mem::replace(
+                    &mut params[i].ty.kind,
+                    TypeKind::Tuple(Vec::new()),
+                ) {
+                    TypeKind::ImplTrait(b) => b,
+                    _ => unreachable!("just checked"),
+                };
+                // Pick a name that doesn't collide with an existing
+                // user type-param (rare, but cheap to defend against).
+                let name = loop {
+                    let candidate = format!("__impl_{}", counter);
+                    counter += 1;
+                    let mut clash = false;
+                    let mut k = 0;
+                    while k < type_params.len() {
+                        if type_params[k].name == candidate {
+                            clash = true;
+                            break;
+                        }
+                        k += 1;
+                    }
+                    if !clash {
+                        break candidate;
+                    }
+                };
+                let path = Path {
+                    segments: vec![PathSegment {
+                        name: name.clone(),
+                        span: span.copy(),
+                        lifetime_args: Vec::new(),
+                        args: Vec::new(),
+                    }],
+                    span: span.copy(),
+                };
+                params[i].ty = Type {
+                    kind: TypeKind::Path(path),
+                    span: span.copy(),
+                };
+                type_params.push(TypeParam {
+                    name,
+                    name_span: span,
+                    bounds,
+                    default: None,
+                });
+            }
+            i += 1;
+        }
+    }
+
     fn parse_function(&mut self) -> Result<Function, Error> {
         self.parse_function_with_vis(false)
     }
@@ -754,18 +823,22 @@ impl Parser {
         };
         self.expect(&TokenKind::Fn, "`fn`")?;
         let (name, name_span) = self.expect_ident()?;
-        let (lifetime_params, type_params) = if self.peek_kind(&TokenKind::LAngle) {
+        let (lifetime_params, mut type_params) = if self.peek_kind(&TokenKind::LAngle) {
             self.parse_generic_params()?
         } else {
             (Vec::new(), Vec::new())
         };
         self.expect(&TokenKind::LParen, "`(`")?;
-        let params = if self.peek_kind(&TokenKind::RParen) {
+        let mut params = if self.peek_kind(&TokenKind::RParen) {
             Vec::new()
         } else {
             self.parse_params()?
         };
         self.expect(&TokenKind::RParen, "`)`")?;
+        // Desugar argument-position `impl Trait` after params and any
+        // user-written `<…>` type-params are both known, so the synth
+        // names can avoid colliding.
+        self.desugar_apit(&mut params, &mut type_params);
         let return_type = if self.peek_kind(&TokenKind::Arrow) {
             self.pos += 1;
             Some(self.parse_type()?)
@@ -1392,6 +1465,26 @@ impl Parser {
             // form requires a trailing comma to disambiguate from
             // a parenthesized `(T)`.
             return self.parse_tuple_type();
+        }
+        if self.peek_kind(&TokenKind::Impl) {
+            // `impl T1 + T2 + …` — argument-position impl trait. Only
+            // valid at the top of a fn parameter type; the function
+            // parser desugars matching params to anonymous type-params
+            // after the params list is parsed. Anywhere else, this
+            // ImplTrait survives into typeck and is rejected.
+            let impl_span = self.expect(&TokenKind::Impl, "`impl`")?;
+            let mut bounds: Vec<TraitBound> = Vec::new();
+            bounds.push(self.parse_trait_bound()?);
+            while self.peek_kind(&TokenKind::Plus) {
+                self.pos += 1;
+                bounds.push(self.parse_trait_bound()?);
+            }
+            let end = self.tokens[self.pos.saturating_sub(1)].span.end.copy();
+            let span = Span::new(impl_span.start, end);
+            return Ok(Type {
+                kind: TypeKind::ImplTrait(bounds),
+                span,
+            });
         }
         if self.peek_kind(&TokenKind::Bang) {
             // `!` — the never type. Bare bang in type position only.

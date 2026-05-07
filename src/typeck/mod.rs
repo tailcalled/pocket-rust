@@ -1626,6 +1626,12 @@ pub(crate) struct CheckCtx<'a> {
     // `GenericTemplate.type_param_bounds` — `[i]` lists the bound traits
     // on `type_params[i]`. Empty for non-generic functions.
     pub(crate) type_param_bounds: &'a Vec<Vec<Vec<String>>>,
+    // Per-type-param positional trait-args parallel to `type_param_bounds`.
+    // `[i][j][k]` is the k-th positional arg of the j-th bound on
+    // `type_params[i]`. Used by `lookup_fn_bound_signature` to extract
+    // the `(P0, P1, …)` tuple from `T: Fn(P0, P1) -> R` bounds when
+    // dispatching bare `f(args)` against a type-param-typed local.
+    pub(crate) type_param_bound_args: &'a Vec<Vec<Vec<RType>>>,
     // Per-type-param `Trait<Name = X>` constraints from the function's
     // bounds. `[i]` lists `(name, ResolvedRType)` for each constraint
     // on `type_params[i]`'s bounds. Used by AssocProj concretization to
@@ -1838,25 +1844,32 @@ fn check_function(
         p.push(func.name.clone());
         p
     };
-    let (type_param_names, type_param_bounds): (Vec<String>, Vec<Vec<Vec<String>>>) =
-        match template_lookup(funcs, &lookup_path) {
-            Some((_, t)) => {
-                let mut bounds_clone: Vec<Vec<Vec<String>>> = Vec::new();
-                let mut i = 0;
-                while i < t.type_param_bounds.len() {
-                    let mut row: Vec<Vec<String>> = Vec::new();
-                    let mut j = 0;
-                    while j < t.type_param_bounds[i].len() {
-                        row.push(t.type_param_bounds[i][j].clone());
-                        j += 1;
-                    }
-                    bounds_clone.push(row);
-                    i += 1;
+    let (type_param_names, type_param_bounds, type_param_bound_args): (
+        Vec<String>,
+        Vec<Vec<Vec<String>>>,
+        Vec<Vec<Vec<RType>>>,
+    ) = match template_lookup(funcs, &lookup_path) {
+        Some((_, t)) => {
+            let mut bounds_clone: Vec<Vec<Vec<String>>> = Vec::new();
+            let mut i = 0;
+            while i < t.type_param_bounds.len() {
+                let mut row: Vec<Vec<String>> = Vec::new();
+                let mut j = 0;
+                while j < t.type_param_bounds[i].len() {
+                    row.push(t.type_param_bounds[i][j].clone());
+                    j += 1;
                 }
-                (t.type_params.clone(), bounds_clone)
+                bounds_clone.push(row);
+                i += 1;
             }
-            None => (Vec::new(), Vec::new()),
-        };
+            (
+                t.type_params.clone(),
+                bounds_clone,
+                t.type_param_bound_args.clone(),
+            )
+        }
+        None => (Vec::new(), Vec::new(), Vec::new()),
+    };
     // Per type-param, collect all `Trait<Name = X>` constraints from
     // the function's bounds (resolved at check time from the AST). Used
     // for `T::Name` projections inside the body.
@@ -2003,6 +2016,7 @@ fn check_function(
             self_target,
             type_params: &type_param_names,
             type_param_bounds: &type_param_bounds,
+            type_param_bound_args: &type_param_bound_args,
             type_param_bound_assoc: &type_param_bound_assoc,
             reexports,
             use_scope: initial_use_scope,
@@ -5591,6 +5605,135 @@ fn check_bare_closure_call(
     ))
 }
 
+// Find the `(params, return)` signature on a type-param's
+// `Fn`/`FnMut`/`FnOnce` bound. Walks the (paths, args, assoc)
+// triples we keep on `ctx`. Returns None if `param_name` doesn't
+// have an Fn-family bound.
+fn typeparam_fn_signature(
+    ctx: &CheckCtx,
+    param_name: &str,
+) -> Option<(Vec<InferType>, InferType)> {
+    let mut idx: Option<usize> = None;
+    let mut i = 0;
+    while i < ctx.type_params.len() {
+        if ctx.type_params[i] == param_name {
+            idx = Some(i);
+            break;
+        }
+        i += 1;
+    }
+    let idx = idx?;
+    if idx >= ctx.type_param_bounds.len() {
+        return None;
+    }
+    let bounds = &ctx.type_param_bounds[idx];
+    let args_rows = ctx.type_param_bound_args.get(idx);
+    let mut b = 0;
+    while b < bounds.len() {
+        let path = &bounds[b];
+        let is_fn_family = path.len() == 3
+            && path[0] == "std"
+            && path[1] == "ops"
+            && (path[2] == "Fn" || path[2] == "FnMut" || path[2] == "FnOnce");
+        if is_fn_family {
+            let trait_args = args_rows.and_then(|r| r.get(b))?;
+            if trait_args.is_empty() {
+                return None;
+            }
+            let params: Vec<InferType> = match &trait_args[0] {
+                RType::Tuple(elems) => elems.iter().map(rtype_to_infer).collect(),
+                _ => return None,
+            };
+            // `Output` is found across the flattened per-param assoc
+            // table — for an APIT-typed binding there's a single
+            // Fn-family bound, so the `Output` entry is unambiguous.
+            let assoc = ctx.type_param_bound_assoc.get(idx)?;
+            let return_ty = assoc
+                .iter()
+                .find(|(name, _)| name == "Output")
+                .map(|(_, rt)| rtype_to_infer(rt))?;
+            return Some((params, return_ty));
+        }
+        b += 1;
+    }
+    None
+}
+
+// Bare-call dispatch for `f(args)` where `f`'s type is a type-param
+// with an `Fn`/`FnMut`/`FnOnce` bound (the APIT case). Mirrors
+// `check_bare_closure_call`'s structure but the receiver type is
+// `InferType::Param(name)` rather than a synthesized closure struct,
+// and the bare-call records the binding name on side tables so mono
+// lowers as the right method-call shape.
+fn check_bare_typeparam_fn_call(
+    ctx: &mut CheckCtx,
+    call: &Call,
+    call_expr: &Expr,
+    binding_name: String,
+    param_name: String,
+    param_types: Vec<InferType>,
+    return_type: InferType,
+) -> Result<InferType, Error> {
+    if call.args.len() != param_types.len() {
+        return Err(Error {
+            file: ctx.current_file.to_string(),
+            message: format!(
+                "wrong number of arguments to `{}`: expected {}, got {}",
+                binding_name,
+                param_types.len(),
+                call.args.len()
+            ),
+            span: call_expr.span.copy(),
+        });
+    }
+    let mut k = 0;
+    while k < call.args.len() {
+        let arg_ty = check_expr(ctx, &call.args[k])?;
+        ctx.subst.unify(
+            &arg_ty,
+            &param_types[k],
+            ctx.traits,
+            ctx.type_params,
+            ctx.type_param_bounds,
+            &call.args[k].span,
+            ctx.current_file,
+        )?;
+        k += 1;
+    }
+    let trait_path: Vec<String> = vec![
+        "std".to_string(),
+        "ops".to_string(),
+        "Fn".to_string(),
+    ];
+    let args_tuple = InferType::Tuple(param_types.clone());
+    let recv_param_infer = InferType::Param(param_name);
+    ctx.method_resolutions[call_expr.id as usize] = Some(PendingMethodCall {
+        callee_idx: 0,
+        callee_path: Vec::new(),
+        recv_adjust: ReceiverAdjust::BorrowImm,
+        ret_borrows_receiver: false,
+        template_idx: None,
+        type_arg_infers: Vec::new(),
+        trait_dispatch: Some(PendingTraitDispatch {
+            trait_path,
+            trait_arg_infers: vec![args_tuple],
+            method_name: "call".to_string(),
+            recv_type_infer: recv_param_infer,
+            dispatch_span: call_expr.span.copy(),
+        }),
+    });
+    if (call_expr.id as usize) < ctx.bare_closure_calls.len() {
+        ctx.bare_closure_calls[call_expr.id as usize] = Some(binding_name);
+    }
+    let substituted = ctx.subst.substitute(&return_type);
+    Ok(infer_concretize_assoc_proj(
+        &substituted,
+        ctx.traits,
+        ctx.type_params,
+        ctx.type_param_bound_assoc,
+    ))
+}
+
 fn check_call(ctx: &mut CheckCtx, call: &Call, call_expr: &Expr) -> Result<InferType, Error> {
     // Single-segment callee resolution — locals shadow functions.
     // When the callee is `name(...)` with no path qualification or
@@ -5630,6 +5773,27 @@ fn check_call(ctx: &mut CheckCtx, call: &Call, call_expr: &Expr) -> Result<Infer
             };
             if is_closure {
                 return check_bare_closure_call(ctx, call, call_expr, name, ty);
+            }
+            // Type-param-typed local with an `Fn`/`FnMut`/`FnOnce`
+            // bound — the canonical APIT path: `fn apply(f: impl
+            // Fn(usize) -> Foo) { f(idx) }`. The desugar in the parser
+            // turned `f`'s type into a fresh type-param with the Fn
+            // bound, so we can read the signature off the bound and
+            // dispatch via `Fn::call`.
+            if let InferType::Param(param_name) = &resolved {
+                if let Some((param_types, return_type)) =
+                    typeparam_fn_signature(ctx, param_name)
+                {
+                    return check_bare_typeparam_fn_call(
+                        ctx,
+                        call,
+                        call_expr,
+                        name,
+                        param_name.clone(),
+                        param_types,
+                        return_type,
+                    );
+                }
             }
             return Err(Error {
                 file: ctx.current_file.to_string(),

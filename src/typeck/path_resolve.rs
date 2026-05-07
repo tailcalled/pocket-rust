@@ -412,6 +412,11 @@ pub fn resolve_type(
             Ok(RType::Slice(Box::new(inner_rt)))
         }
         TypeKind::Never => Ok(RType::Never),
+        TypeKind::ImplTrait(_) => Err(Error {
+            file: file.to_string(),
+            message: "`impl Trait` is only allowed in argument position".to_string(),
+            span: ty.span.copy(),
+        }),
     }
 }
 
