@@ -417,6 +417,11 @@ pub fn resolve_type(
             message: "`impl Trait` is only allowed in argument position".to_string(),
             span: ty.span.copy(),
         }),
+        TypeKind::Placeholder => Err(Error {
+            file: file.to_string(),
+            message: "type placeholder `_` is only allowed in turbofish args and `let` annotations".to_string(),
+            span: ty.span.copy(),
+        }),
     }
 }
 

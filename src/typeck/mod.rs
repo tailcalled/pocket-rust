@@ -924,6 +924,123 @@ pub(crate) fn infer_substitute(t: &InferType, env: &Vec<(String, InferType)>) ->
     }
 }
 
+// Resolve a `Type` AST that may contain `_` placeholders, allocating
+// a fresh inference variable per placeholder. Pre-walk replaces each
+// `Placeholder` with a synthetic `Path` segment named `__infer_<id>`,
+// then `resolve_type` runs with those names in scope (so they resolve
+// to `RType::Param`), then a substitution maps each synth Param to a
+// fresh `InferType::Var`. Used at turbofish call sites and `let`
+// annotations — the only positions that accept `_`.
+pub(crate) fn resolve_type_to_infer(
+    ctx: &mut CheckCtx,
+    ty: &crate::ast::Type,
+) -> Result<InferType, Error> {
+    let mut synth_names: Vec<String> = Vec::new();
+    let unique_prefix: u32 = ctx.subst.fresh_var();
+    let rewritten = rewrite_placeholders(ty, &mut synth_names, unique_prefix);
+    let mut extended_params: Vec<String> = ctx.type_params.clone();
+    let mut k = 0;
+    while k < synth_names.len() {
+        extended_params.push(synth_names[k].clone());
+        k += 1;
+    }
+    let rt = path_resolve::resolve_type(
+        &rewritten,
+        ctx.current_module,
+        ctx.structs,
+        ctx.enums,
+        ctx.aliases,
+        ctx.self_target,
+        &extended_params,
+        &ctx.use_scope,
+        ctx.reexports,
+        ctx.current_file,
+    )?;
+    let mut env: Vec<(String, InferType)> = Vec::new();
+    let mut k = 0;
+    while k < synth_names.len() {
+        env.push((synth_names[k].clone(), InferType::Var(ctx.subst.fresh_var())));
+        k += 1;
+    }
+    Ok(infer_substitute(&rtype_to_infer(&rt), &env))
+}
+
+// Walk a Type AST, replacing each `TypeKind::Placeholder` with a
+// synthesized `Path` segment whose name is `__infer_<prefix>_<idx>`.
+// Records each synth name into `synth_names`. Recurses into the
+// composite type kinds.
+fn rewrite_placeholders(
+    ty: &crate::ast::Type,
+    synth_names: &mut Vec<String>,
+    prefix: u32,
+) -> crate::ast::Type {
+    use crate::ast::{Path, PathSegment, Type, TypeKind};
+    let kind = match &ty.kind {
+        TypeKind::Placeholder => {
+            let name = format!("__infer_{}_{}", prefix, synth_names.len());
+            synth_names.push(name.clone());
+            TypeKind::Path(Path {
+                segments: vec![PathSegment {
+                    name,
+                    span: ty.span.copy(),
+                    lifetime_args: Vec::new(),
+                    args: Vec::new(),
+                }],
+                span: ty.span.copy(),
+            })
+        }
+        TypeKind::Path(p) => {
+            let mut new_segs: Vec<PathSegment> = Vec::new();
+            let mut i = 0;
+            while i < p.segments.len() {
+                let s = &p.segments[i];
+                let mut new_args: Vec<Type> = Vec::new();
+                let mut j = 0;
+                while j < s.args.len() {
+                    new_args.push(rewrite_placeholders(&s.args[j], synth_names, prefix));
+                    j += 1;
+                }
+                new_segs.push(PathSegment {
+                    name: s.name.clone(),
+                    span: s.span.copy(),
+                    lifetime_args: s.lifetime_args.clone(),
+                    args: new_args,
+                });
+                i += 1;
+            }
+            TypeKind::Path(Path { segments: new_segs, span: p.span.copy() })
+        }
+        TypeKind::Tuple(elems) => {
+            let mut new_elems: Vec<Type> = Vec::new();
+            let mut i = 0;
+            while i < elems.len() {
+                new_elems.push(rewrite_placeholders(&elems[i], synth_names, prefix));
+                i += 1;
+            }
+            TypeKind::Tuple(new_elems)
+        }
+        TypeKind::Ref { inner, mutable, lifetime } => TypeKind::Ref {
+            inner: Box::new(rewrite_placeholders(inner, synth_names, prefix)),
+            mutable: *mutable,
+            lifetime: lifetime.clone(),
+        },
+        TypeKind::RawPtr { inner, mutable } => TypeKind::RawPtr {
+            inner: Box::new(rewrite_placeholders(inner, synth_names, prefix)),
+            mutable: *mutable,
+        },
+        TypeKind::Slice(inner) => {
+            TypeKind::Slice(Box::new(rewrite_placeholders(inner, synth_names, prefix)))
+        }
+        TypeKind::SelfType => TypeKind::SelfType,
+        TypeKind::Never => TypeKind::Never,
+        // ImplTrait can't contain `_` placeholders meaningfully —
+        // resolve_type will reject the whole `impl Trait` later if it
+        // reaches a non-arg site. Pass through unchanged.
+        TypeKind::ImplTrait(b) => TypeKind::ImplTrait(b.clone()),
+    };
+    Type { kind, span: ty.span.copy() }
+}
+
 pub(crate) fn infer_to_string(t: &InferType) -> String {
     match t {
         InferType::Var(v) => format!("?{}", v),
@@ -2644,19 +2761,12 @@ fn check_let_stmt(ctx: &mut CheckCtx, let_stmt: &LetStmt) -> Result<(), Error> {
     let value_ty = check_expr(ctx, value_expr)?;
     let final_ty = match &let_stmt.ty {
         Some(annotation) => {
-            let annot_rt = resolve_type(
-                annotation,
-                ctx.current_module,
-                ctx.structs,
-                ctx.enums,
-                ctx.aliases,
-                ctx.self_target,
-                ctx.type_params,
-                &ctx.use_scope,
-                ctx.reexports,
-                ctx.current_file,
-            )?;
-            let annot_infer = rtype_to_infer(&annot_rt);
+            // `let x: T = …;` — annotation may contain `_`
+            // placeholders (`let x: Vec<_> = …`); use the
+            // inference-aware resolver so each placeholder becomes a
+            // fresh `InferType::Var` that the unification step pins
+            // from the value's type.
+            let annot_infer = resolve_type_to_infer(ctx, annotation)?;
             ctx.subst.unify(
                 &value_ty,
                 &annot_infer,
@@ -5982,22 +6092,12 @@ fn check_call(ctx: &mut CheckCtx, call: &Call, call_expr: &Expr) -> Result<Infer
             env.push((tmpl_type_params[k].clone(), InferType::Var(v)));
             k += 1;
         }
-        // Apply explicit turbofish args by unifying.
+        // Apply explicit turbofish args by unifying. Each arg may
+        // contain `_` placeholders; resolve via the inference-aware
+        // path so they become fresh InferVars rather than errors.
         let mut k = 0;
         while k < last_seg_args.len() {
-            let user_rt = resolve_type(
-                &last_seg_args[k],
-                ctx.current_module,
-                ctx.structs,
-                ctx.enums,
-                ctx.aliases,
-                ctx.self_target,
-                ctx.type_params,
-                &ctx.use_scope,
-                ctx.reexports,
-                ctx.current_file,
-            )?;
-            let user_infer = rtype_to_infer(&user_rt);
+            let user_infer = resolve_type_to_infer(ctx, &last_seg_args[k])?;
             ctx.subst.unify(
                 &InferType::Var(var_ids[k]),
                 &user_infer,
@@ -6509,19 +6609,7 @@ fn check_variant_call(
     if !explicit_type_args.is_empty() {
         let mut k = 0;
         while k < explicit_type_args.len() {
-            let rt = resolve_type(
-                &explicit_type_args[k],
-                ctx.current_module,
-                ctx.structs,
-                ctx.enums,
-                ctx.aliases,
-                ctx.self_target,
-                ctx.type_params,
-                &ctx.use_scope,
-                ctx.reexports,
-                ctx.current_file,
-            )?;
-            let infer = rtype_to_infer(&rt);
+            let infer = resolve_type_to_infer(ctx, &explicit_type_args[k])?;
             let var_infer = InferType::Var(type_var_ids[k]);
             ctx.subst.unify(
                 &var_infer,
@@ -6696,19 +6784,7 @@ fn check_struct_lit(
     }
     let mut k = 0;
     while k < last_seg.args.len() {
-        let user_rt = resolve_type(
-            &last_seg.args[k],
-            ctx.current_module,
-            ctx.structs,
-            ctx.enums,
-            ctx.aliases,
-            ctx.self_target,
-            ctx.type_params,
-            &ctx.use_scope,
-            ctx.reexports,
-            ctx.current_file,
-        )?;
-        let user_infer = rtype_to_infer(&user_rt);
+        let user_infer = resolve_type_to_infer(ctx, &last_seg.args[k])?;
         ctx.subst.unify(
             &type_arg_infers[k],
             &user_infer,

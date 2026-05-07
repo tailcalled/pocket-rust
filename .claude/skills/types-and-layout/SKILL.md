@@ -16,6 +16,7 @@ description: Use when working with type representation, primitive types (int kin
 - `[T]` (slice DST — only valid behind a reference), `&[T]`, `&mut [T]`.
 - `str` (UTF-8 string DST), `&str`, `&mut str`.
 - `!` (the never type — has no inhabitants; produced by `break`/`continue`/`return` and by calls to functions returning `!`; coerces freely to any other type at unification time so a diverging arm of `if`/`match` doesn't constrain the construct's type; flattens to no wasm scalars and `byte_size_of` is 0).
+- `_` (type placeholder) — only meaningful in turbofish args (`id::<_>(42)`, `Pair::<u32, _>::new(...)`) and `let` annotations (`let x: Vec<_> = …`). Parser produces `TypeKind::Placeholder`; the inference-aware `typeck::resolve_type_to_infer` helper pre-walks the AST, replaces each placeholder with a synth `Path("__infer_<n>")` segment, runs `resolve_type` with the synth name added to `type_params`, then substitutes each synth `Param` with a fresh `InferType::Var`. The plain `resolve_type` rejects placeholders elsewhere (fn return, params, struct fields, aliases, …) with "type placeholder `_` is only allowed in turbofish args and `let` annotations".
 
 ## WASM flat layout
 

@@ -464,19 +464,7 @@ fn dispatch_method_through_trait(
         }
         let mut t = 0;
         while t < mc.turbofish_args.len() {
-            let user_rt = resolve_type(
-                &mc.turbofish_args[t],
-                ctx.current_module,
-                ctx.structs,
-                ctx.enums,
-                ctx.aliases,
-                ctx.self_target,
-                ctx.type_params,
-                &ctx.use_scope,
-                ctx.reexports,
-                ctx.current_file,
-            )?;
-            let user_infer = rtype_to_infer(&user_rt);
+            let user_infer = crate::typeck::resolve_type_to_infer(ctx, &mc.turbofish_args[t])?;
             ctx.subst.unify(
                 &InferType::Var(method_type_var_ids[t]),
                 &user_infer,
@@ -1201,19 +1189,7 @@ pub(super) fn check_method_call(
             }
             let mut k = 0;
             while k < mc.turbofish_args.len() {
-                let user_rt = resolve_type(
-                    &mc.turbofish_args[k],
-                    ctx.current_module,
-                    ctx.structs,
-                    ctx.enums,
-                    ctx.aliases,
-                    ctx.self_target,
-                    ctx.type_params,
-                    &ctx.use_scope,
-                    ctx.reexports,
-                    ctx.current_file,
-                )?;
-                let user_infer = rtype_to_infer(&user_rt);
+                let user_infer = crate::typeck::resolve_type_to_infer(ctx, &mc.turbofish_args[k])?;
                 let var_id = method_type_var_ids[impl_param_count + k];
                 ctx.subst.unify(
                     &InferType::Var(var_id),

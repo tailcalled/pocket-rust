@@ -1541,6 +1541,17 @@ impl Parser {
                 span,
             });
         }
+        if self.peek_kind(&TokenKind::Underscore) {
+            // `_` — type placeholder. Only meaningful at inference-
+            // aware call sites (turbofish, `let` annotation); typeck's
+            // `resolve_type` rejects it elsewhere.
+            let span = self.tokens[self.pos].span.copy();
+            self.pos += 1;
+            return Ok(Type {
+                kind: TypeKind::Placeholder,
+                span,
+            });
+        }
         if self.peek_kind(&TokenKind::SelfUpper) {
             // Bare `Self` → SelfType. `Self::Name` → fall through to
             // path parsing (`parse_path_with_type_args` handles the

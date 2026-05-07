@@ -353,6 +353,15 @@ pub enum TypeKind {
     // survives into typeck (return position, struct field, alias, …)
     // is rejected with "`impl Trait` not allowed here".
     ImplTrait(Vec<TraitBound>),
+    // `_` in type position — a placeholder for type inference. Valid
+    // in turbofish args and let-annotations (`let x: Vec<_> = …`,
+    // `Vec::<_>::new()`). At those sites typeck pre-walks the AST,
+    // replacing each Placeholder with a synth `Param` name, calls
+    // `resolve_type` with the synth name added to `type_params`, and
+    // substitutes each `Param(synth)` for a fresh inference var. In
+    // any other position (fn return, struct field, alias, …) the
+    // standard `resolve_type` rejects it with a clear error.
+    Placeholder,
 }
 
 #[derive(Clone)]
