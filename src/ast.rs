@@ -161,16 +161,38 @@ pub struct TraitBound {
     pub hrtb_lifetime_params: Vec<LifetimeParam>,
 }
 
-// One predicate of a `where` clause: `<lhs>: <bound1> + <bound2> + …`.
-// LHS is any type expression; the common case is a bare type-param
-// (`T: Bound`, equivalent to inline bound), but complex LHS is also
-// allowed (`Vec<T>: Clone`, `&T: Send`, etc.). Lifetime predicates
-// (`'a: 'b`) are not yet supported.
+// One predicate of a `where` clause. Two shapes:
+//   * `Type` — `<type>: <Trait1> + <Trait2> + 'lt`. The `bounds`
+//     hold the trait obligations; `lifetime_bounds` hold the
+//     trailing `+ 'lifetime` outlives obligations on the type.
+//   * `Lifetime` — `'a: 'b + 'c`. An outlives obligation on
+//     lifetimes alone. Real Rust uses these to declare relations
+//     the borrow checker can rely on; pocket-rust's lifetime
+//     checking is Phase B structural-only, so these are validated
+//     for in-scope lifetimes at setup but don't yet constrain
+//     borrowck.
 #[derive(Clone)]
-pub struct WherePredicate {
-    pub lhs: Type,
-    pub bounds: Vec<TraitBound>,
-    pub span: Span,
+pub enum WherePredicate {
+    Type {
+        lhs: Type,
+        bounds: Vec<TraitBound>,
+        lifetime_bounds: Vec<Lifetime>,
+        span: Span,
+    },
+    Lifetime {
+        lhs: Lifetime,
+        bounds: Vec<Lifetime>,
+        span: Span,
+    },
+}
+
+impl WherePredicate {
+    pub fn span(&self) -> &Span {
+        match self {
+            WherePredicate::Type { span, .. } => span,
+            WherePredicate::Lifetime { span, .. } => span,
+        }
+    }
 }
 
 // `Name = Type` inside a `Trait<…>` bound.

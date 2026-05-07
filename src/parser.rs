@@ -1269,17 +1269,64 @@ impl Parser {
             {
                 break;
             }
+            // Lifetime predicate: `'a: 'b + 'c`. The LHS is a
+            // lifetime, not a type. Real Rust requires every named
+            // lifetime to be in scope; pocket-rust's setup walks
+            // these and validates against the enclosing fn/impl's
+            // lifetime params, then stores them on the FnSymbol/
+            // Template for future borrowck consumption.
+            if self.peek_lifetime() {
+                let (lhs_name, lhs_span) = self.expect_lifetime()?;
+                self.expect(&TokenKind::Colon, "`:`")?;
+                let mut bounds: Vec<Lifetime> = Vec::new();
+                let (b0_name, b0_span) = self.expect_lifetime()?;
+                bounds.push(Lifetime { name: b0_name, span: b0_span });
+                while self.peek_kind(&TokenKind::Plus) {
+                    self.pos += 1;
+                    let (bn_name, bn_span) = self.expect_lifetime()?;
+                    bounds.push(Lifetime { name: bn_name, span: bn_span });
+                }
+                let end = self.tokens[self.pos.saturating_sub(1)].span.end.copy();
+                let span = Span::new(lhs_span.start.copy(), end);
+                preds.push(WherePredicate::Lifetime {
+                    lhs: Lifetime { name: lhs_name, span: lhs_span },
+                    bounds,
+                    span,
+                });
+                if self.peek_kind(&TokenKind::Comma) {
+                    self.pos += 1;
+                    continue;
+                }
+                break;
+            }
             let lhs = self.parse_type()?;
             self.expect(&TokenKind::Colon, "`:`")?;
             let mut bounds: Vec<TraitBound> = Vec::new();
-            bounds.push(self.parse_trait_bound()?);
+            let mut lifetime_bounds: Vec<Lifetime> = Vec::new();
+            // First bound: lifetime or trait.
+            if self.peek_lifetime() {
+                let (n, s) = self.expect_lifetime()?;
+                lifetime_bounds.push(Lifetime { name: n, span: s });
+            } else {
+                bounds.push(self.parse_trait_bound()?);
+            }
             while self.peek_kind(&TokenKind::Plus) {
                 self.pos += 1;
-                bounds.push(self.parse_trait_bound()?);
+                if self.peek_lifetime() {
+                    let (n, s) = self.expect_lifetime()?;
+                    lifetime_bounds.push(Lifetime { name: n, span: s });
+                } else {
+                    bounds.push(self.parse_trait_bound()?);
+                }
             }
             let end = self.tokens[self.pos.saturating_sub(1)].span.end.copy();
             let span = Span::new(lhs.span.start.copy(), end);
-            preds.push(WherePredicate { lhs, bounds, span });
+            preds.push(WherePredicate::Type {
+                lhs,
+                bounds,
+                lifetime_bounds,
+                span,
+            });
             if self.peek_kind(&TokenKind::Comma) {
                 self.pos += 1;
                 continue;

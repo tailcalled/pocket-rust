@@ -41,6 +41,7 @@ pub(super) fn collect_trait_names(module: &Module, path: &mut Vec<String>, table
                         name: td.methods[k].name.clone(),
                         name_span: td.methods[k].name_span.copy(),
                         type_params,
+                        type_param_bounds: Vec::new(),
                         param_types: Vec::new(),
                         return_type: None,
                         receiver_shape: None,
@@ -282,19 +283,50 @@ pub(super) fn resolve_trait_methods(
                         param_types.push(rt);
                         p += 1;
                     }
+                    // RPIT-aware return-type resolution. Each `impl
+                    // Trait` slot in the trait method sig becomes an
+                    // `RType::Opaque{<trait>::<method>, slot}` (no
+                    // pin — pins live on each impl method's own
+                    // FnSymbol). Bounds resolved here for future
+                    // validation.
+                    let mut rpit_synth_names: Vec<String> = Vec::new();
+                    let mut rpit_slot_bounds_ast: Vec<Vec<crate::ast::TraitBound>> =
+                        Vec::new();
                     let return_type = match &m.return_type {
-                        Some(ty) => Some(resolve_type(
-                            ty,
-                            path,
-                            structs,
-                            enums,
-                            aliases,
-                            Some(&self_target),
-                            &type_params,
-                            &use_scope,
-                            reexports,
-                            &module.source_file,
-                        )?),
+                        Some(ty) => {
+                            let rewritten = rewrite_rpit_in_type(
+                                ty,
+                                &mut rpit_synth_names,
+                                &mut rpit_slot_bounds_ast,
+                            );
+                            let mut extended_params = type_params.clone();
+                            let mut s = 0;
+                            while s < rpit_synth_names.len() {
+                                extended_params.push(rpit_synth_names[s].clone());
+                                s += 1;
+                            }
+                            let raw = resolve_type(
+                                &rewritten,
+                                path,
+                                structs,
+                                enums,
+                                aliases,
+                                Some(&self_target),
+                                &extended_params,
+                                &use_scope,
+                                reexports,
+                                &module.source_file,
+                            )?;
+                            // Unique fn_path for the trait method's
+                            // opaques: trait full path + method name.
+                            let mut method_fn_path = full.clone();
+                            method_fn_path.push(m.name.clone());
+                            Some(substitute_rpit_synths_to_opaque(
+                                &raw,
+                                &rpit_synth_names,
+                                &method_fn_path,
+                            ))
+                        }
                         None => None,
                     };
                     let receiver_shape = if !m.params.is_empty() && m.params[0].name == "self" {
@@ -320,9 +352,85 @@ pub(super) fn resolve_trait_methods(
                     let filled_return = return_type
                         .as_ref()
                         .map(|rt| fill_assoc_trait_path_via_closure(rt, &full, traits));
+                    // Resolve method type-param bounds. The slots
+                    // for the trait's own type-params come first
+                    // (always empty here — trait-level bounds aren't
+                    // tracked here), followed by the method's own
+                    // `<U: Bound>` bounds, plus any merge from the
+                    // method's where-clause Param-LHS predicates.
+                    let mut method_bounds: Vec<Vec<Vec<String>>> =
+                        td.type_params.iter().map(|_| Vec::new()).collect();
+                    let mut tp = 0;
+                    while tp < m.type_params.len() {
+                        let mut row: Vec<Vec<String>> = Vec::new();
+                        let mut bj = 0;
+                        while bj < m.type_params[tp].bounds.len() {
+                            let resolved = resolve_trait_path(
+                                &m.type_params[tp].bounds[bj].path,
+                                path,
+                                traits,
+                                &use_scope,
+                                reexports,
+                                &module.source_file,
+                            )?;
+                            row.push(resolved);
+                            bj += 1;
+                        }
+                        method_bounds.push(row);
+                        tp += 1;
+                    }
+                    // Merge where-clause Param-LHS preds.
+                    let mut wi = 0;
+                    while wi < m.where_clause.len() {
+                        if let crate::ast::WherePredicate::Type {
+                            lhs, bounds: wbounds, ..
+                        } = &m.where_clause[wi]
+                        {
+                            let lhs_rt = resolve_type(
+                                lhs,
+                                path,
+                                structs,
+                                enums,
+                                aliases,
+                                Some(&self_target),
+                                &type_params,
+                                &use_scope,
+                                reexports,
+                                &module.source_file,
+                            )?;
+                            if let RType::Param(name) = &lhs_rt {
+                                let mut idx: Option<usize> = None;
+                                let mut k2 = 0;
+                                while k2 < type_params.len() {
+                                    if &type_params[k2] == name {
+                                        idx = Some(k2);
+                                        break;
+                                    }
+                                    k2 += 1;
+                                }
+                                if let Some(idx) = idx {
+                                    let mut bj = 0;
+                                    while bj < wbounds.len() {
+                                        let resolved = resolve_trait_path(
+                                            &wbounds[bj].path,
+                                            path,
+                                            traits,
+                                            &use_scope,
+                                            reexports,
+                                            &module.source_file,
+                                        )?;
+                                        method_bounds[idx].push(resolved);
+                                        bj += 1;
+                                    }
+                                }
+                            }
+                        }
+                        wi += 1;
+                    }
                     traits.entries[entry_idx].methods[k].param_types = filled_params;
                     traits.entries[entry_idx].methods[k].return_type = filled_return;
                     traits.entries[entry_idx].methods[k].receiver_shape = receiver_shape;
+                    traits.entries[entry_idx].methods[k].type_param_bounds = method_bounds;
                     k += 1;
                 }
             }
@@ -732,6 +840,60 @@ pub(super) fn collect_funcs(
                     }
                     impl_type_param_bounds.push(row);
                     bi += 1;
+                }
+                // Merge impl-level where-clause predicates into
+                // `impl_type_param_bounds`. Param-LHS predicates
+                // (`where T: Bound` where T is an impl-level
+                // type-param) are equivalent to the inline
+                // `<T: Bound>` form, so this just appends. Complex-
+                // LHS predicates and lifetime predicates pass
+                // through (parsed but not yet enforced).
+                let mut wi = 0;
+                while wi < ib.where_clause.len() {
+                    if let crate::ast::WherePredicate::Type {
+                        lhs, bounds, ..
+                    } = &ib.where_clause[wi]
+                    {
+                        let lhs_rt = resolve_type(
+                            lhs,
+                            path,
+                            structs,
+                            enums,
+                            aliases,
+                            Some(&target_rt),
+                            &impl_type_params,
+                            &use_scope,
+                            reexports,
+                            &module.source_file,
+                        )?;
+                        if let RType::Param(name) = &lhs_rt {
+                            let mut idx: Option<usize> = None;
+                            let mut k = 0;
+                            while k < impl_type_params.len() {
+                                if &impl_type_params[k] == name {
+                                    idx = Some(k);
+                                    break;
+                                }
+                                k += 1;
+                            }
+                            if let Some(idx) = idx {
+                                let mut bj = 0;
+                                while bj < bounds.len() {
+                                    let resolved = resolve_trait_path(
+                                        &bounds[bj].path,
+                                        path,
+                                        traits,
+                                        &use_scope,
+                                        reexports,
+                                        &module.source_file,
+                                    )?;
+                                    impl_type_param_bounds[idx].push(resolved);
+                                    bj += 1;
+                                }
+                            }
+                        }
+                    }
+                    wi += 1;
                 }
                 let trait_impl_idx_for_methods: Option<usize> =
                     if let Some(trait_path_node) = &ib.trait_path {
@@ -1659,6 +1821,13 @@ pub(super) fn validate_trait_impl_signatures(
             p += 1;
         }
         match (&expected_return_type, &impl_return_type) {
+            (Some(RType::Opaque { .. }), _) => {
+                // Trait method declared `-> impl Trait` (RPITIT). The
+                // impl can pick any concrete type that satisfies the
+                // slot's bounds — and the impl's body-check has
+                // already validated its own pin against its own
+                // declared bounds. Skip strict signature equality.
+            }
             (Some(e), Some(a)) => {
                 if !rtype_eq(e, a) {
                     return Err(Error {
@@ -2470,6 +2639,9 @@ pub(super) fn register_function(
         type_param_bound_args.push(row_args);
         i += 1;
     }
+    // (Trait method bound inheritance is applied after the
+    // bound_assoc table is built so the three parallel vectors stay
+    // length-matched per slot. See below.)
     // Per-type-param `Trait<Name = T, ...>` constraints. Aligned to
     // `type_param_bounds` (impl-level slots first — currently always
     // empty since impl bounds don't carry assoc constraints yet —
@@ -2516,6 +2688,47 @@ pub(super) fn register_function(
         type_param_bound_assoc.push(row);
         i += 1;
     }
+    // Inherit trait method bounds: for an impl method that
+    // implements a trait, the corresponding trait method may
+    // declare bounds (`fn x<T>() where T: Bar`) that the impl's
+    // `T` automatically inherits. Append the trait method's
+    // bounds to the matching impl-method slot in all three
+    // parallel vectors (paths, args, assoc) so length invariants
+    // hold downstream.
+    if let Some(impl_idx) = trait_impl_idx {
+        let trait_path_for_lookup = traits.impls[impl_idx].trait_path.clone();
+        if let Some(trait_entry) = trait_lookup(traits, &trait_path_for_lookup) {
+            let mut tm_idx: Option<usize> = None;
+            let mut t = 0;
+            while t < trait_entry.methods.len() {
+                if trait_entry.methods[t].name == f.name {
+                    tm_idx = Some(t);
+                    break;
+                }
+                t += 1;
+            }
+            if let Some(tm_idx) = tm_idx {
+                let tm_bounds = &trait_entry.methods[tm_idx].type_param_bounds;
+                let trait_type_params_len = trait_entry.trait_type_params.len();
+                let impl_off = impl_type_params.len();
+                let mut mt = trait_type_params_len;
+                while mt < tm_bounds.len() {
+                    let dest_idx = impl_off + (mt - trait_type_params_len);
+                    if dest_idx < type_param_bounds.len() {
+                        let mut bj = 0;
+                        while bj < tm_bounds[mt].len() {
+                            type_param_bounds[dest_idx]
+                                .push(tm_bounds[mt][bj].clone());
+                            type_param_bound_args[dest_idx].push(Vec::new());
+                            type_param_bound_assoc[dest_idx].push(Vec::new());
+                            bj += 1;
+                        }
+                    }
+                    mt += 1;
+                }
+            }
+        }
+    }
     // Where-clause predicates. Resolve each predicate's LHS:
     //   * `Param(name)` matching a known type-param → append the
     //     resolved bounds onto that param's bounds rows so they're
@@ -2524,11 +2737,61 @@ pub(super) fn register_function(
     //     `where_predicates` for call-time enforcement after the
     //     type-param substitution is built.
     let mut where_predicates: Vec<crate::typeck::tables::WherePredResolved> = Vec::new();
+    let mut lifetime_predicates: Vec<crate::typeck::tables::LifetimePredResolved> =
+        Vec::new();
     let mut wi = 0;
     while wi < f.where_clause.len() {
-        let pred = &f.where_clause[wi];
+        match &f.where_clause[wi] {
+            crate::ast::WherePredicate::Lifetime { lhs, bounds, span } => {
+                // Validate every named lifetime in the predicate is
+                // declared in the enclosing fn/impl scope. Phase B
+                // structural carry — borrowck doesn't yet consume
+                // these as outlives obligations.
+                if !lifetime_param_names.iter().any(|n| n == &lhs.name) {
+                    return Err(crate::span::Error {
+                        file: source_file.to_string(),
+                        message: format!(
+                            "undeclared lifetime `'{}` in where-clause",
+                            lhs.name
+                        ),
+                        span: lhs.span.copy(),
+                    });
+                }
+                let mut resolved_bounds: Vec<String> = Vec::new();
+                let mut bi = 0;
+                while bi < bounds.len() {
+                    let b = &bounds[bi];
+                    if !lifetime_param_names.iter().any(|n| n == &b.name) {
+                        return Err(crate::span::Error {
+                            file: source_file.to_string(),
+                            message: format!(
+                                "undeclared lifetime `'{}` in where-clause",
+                                b.name
+                            ),
+                            span: b.span.copy(),
+                        });
+                    }
+                    resolved_bounds.push(b.name.clone());
+                    bi += 1;
+                }
+                lifetime_predicates.push(crate::typeck::tables::LifetimePredResolved {
+                    lhs: lhs.name.clone(),
+                    bounds: resolved_bounds,
+                    span: span.copy(),
+                });
+                wi += 1;
+                continue;
+            }
+            crate::ast::WherePredicate::Type { .. } => {}
+        }
+        let (pred_lhs, pred_bounds, pred_lifetime_bounds, pred_span) = match &f.where_clause[wi] {
+            crate::ast::WherePredicate::Type { lhs, bounds, lifetime_bounds, span } => {
+                (lhs, bounds, lifetime_bounds, span)
+            }
+            crate::ast::WherePredicate::Lifetime { .. } => unreachable!(),
+        };
         let lhs_rt = resolve_type(
-            &pred.lhs,
+            pred_lhs,
             current_module,
             structs,
             enums,
@@ -2539,11 +2802,30 @@ pub(super) fn register_function(
             reexports,
             source_file,
         )?;
+        // Validate trailing `+ 'lifetime` outlives bounds on the type
+        // (`T: Trait + 'a`). Carry-only — borrowck doesn't enforce
+        // outlives constraints yet, but we still verify each named
+        // lifetime is in scope so the diagnostic catches typos.
+        let mut k = 0;
+        while k < pred_lifetime_bounds.len() {
+            let lt = &pred_lifetime_bounds[k];
+            if !lifetime_param_names.iter().any(|n| n == &lt.name) {
+                return Err(crate::span::Error {
+                    file: source_file.to_string(),
+                    message: format!(
+                        "undeclared lifetime `'{}` in where-clause",
+                        lt.name
+                    ),
+                    span: lt.span.copy(),
+                });
+            }
+            k += 1;
+        }
         // Resolve every bound in this predicate to (path, args, assoc).
         let mut resolved_bounds: Vec<crate::typeck::tables::WhereBoundResolved> = Vec::new();
         let mut bi = 0;
-        while bi < pred.bounds.len() {
-            let b = &pred.bounds[bi];
+        while bi < pred_bounds.len() {
+            let b = &pred_bounds[bi];
             let (resolved_path, resolved_args) = resolve_trait_ref(
                 &b.path,
                 current_module,
@@ -2631,7 +2913,7 @@ pub(super) fn register_function(
             where_predicates.push(crate::typeck::tables::WherePredResolved {
                 lhs: lhs_rt,
                 bounds: resolved_bounds,
-                span: pred.span.copy(),
+                span: pred_span.copy(),
             });
         }
         wi += 1;
@@ -2723,6 +3005,7 @@ pub(super) fn register_function(
             bare_closure_calls: Vec::new(),
             rpit_slots: rpit_slots.clone(),
             where_predicates,
+            lifetime_predicates: lifetime_predicates.clone(),
         });
     } else {
         // Non-generic functions can't reference any type-param in a
@@ -2780,6 +3063,7 @@ pub(super) fn register_function(
             closures: Vec::new(),
             bare_closure_calls: Vec::new(),
             rpit_slots: rpit_slots.clone(),
+            lifetime_predicates: lifetime_predicates.clone(),
         });
         *next_idx += 1;
     }

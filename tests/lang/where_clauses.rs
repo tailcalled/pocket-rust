@@ -81,3 +81,44 @@ fn where_clause_unsatisfied_complex_lhs_at_call_site_is_rejected() {
         err,
     );
 }
+
+// `where 'a: 'b` — outlives predicate. Stored on the FnSymbol's
+// `lifetime_predicates` (Phase B carry-only); both LHS and bounds
+// must be in the enclosing fn/impl's lifetime scope.
+#[test]
+fn where_lifetime_predicate_compiles() {
+    let bytes = compile_inline(
+        "fn pick<'a, 'b>(x: &'a u32, _y: &'b u32) -> &'b u32 where 'a: 'b { x }\n\
+         pub fn answer() -> u32 { let a: u32 = 21u32; let b: u32 = 21u32; *pick(&a, &b) + 21u32 }",
+    );
+    assert_eq!(answer_u32(&bytes), 42);
+}
+
+// Negative: a `where` predicate naming an undeclared lifetime is
+// rejected with an "undeclared lifetime" diagnostic.
+#[test]
+fn where_lifetime_undeclared_is_rejected() {
+    let err = compile_source(
+        "fn pick<'a>(x: &'a u32) -> &'a u32 where 'a: 'b { x }\n\
+         fn answer() -> u32 { 0u32 }",
+    );
+    assert!(
+        err.contains("undeclared lifetime"),
+        "expected undeclared-lifetime error, got: {}",
+        err,
+    );
+}
+
+// `T: Trait + 'a` — trailing lifetime bound on a type-where
+// predicate. The lifetime is validated for in-scope-ness; the trait
+// bound is processed normally.
+#[test]
+fn where_type_with_trailing_lifetime_compiles() {
+    let bytes = compile_inline(
+        "trait Show { fn show(self) -> u32; }\n\
+         impl Show for u32 { fn show(self) -> u32 { self } }\n\
+         fn run<'a, T>(t: T, _r: &'a u32) -> u32 where T: Show + 'a { t.show() }\n\
+         pub fn answer() -> u32 { let r: u32 = 0u32; run(42u32, &r) }",
+    );
+    assert_eq!(answer_u32(&bytes), 42);
+}

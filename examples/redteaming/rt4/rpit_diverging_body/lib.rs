@@ -25,9 +25,9 @@ impl Show for u32 {
 
 fn make_or_die(b: bool) -> impl Show {
     if b {
-        panic!("never");
+        panic!("never")
     } else {
-        7u32
+        42u32
     }
 }
 

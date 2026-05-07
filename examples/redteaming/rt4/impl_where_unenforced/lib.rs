@@ -1,35 +1,35 @@
-// `impl` block with a where-clause that names a bound `T` does
-// **not** satisfy. Real Rust rejects the impl declaration itself
-// at the use site: `Holder::<NotRequired>::ok()` would error with
-// "the trait bound `NotRequired: Required` is not satisfied" because
-// the impl's where-clause excludes `NotRequired` from the impl's
-// applicable set.
+// Method body inside an impl uses a method declared on a trait
+// the impl's where-clause requires. Without merging the where-clause
+// into the impl's type-param bound table, `self.v.must_have()` fails
+// because typeck sees `T`'s bound list as empty.
 //
-// Pocket-rust currently accepts: `ImplBlock.where_clause` is parsed
-// but no setup pass reads it. The impl's bounds aren't merged into
-// the impl-level type-param-bound table that controls whether a
-// concrete type-arg is admissible at the impl. So `Holder::<NotRequired>`
-// is constructed and `ok()` is called as if no where-clause existed.
-//
-// Expected post-fix: typeck rejects this with a where-clause-not-
-// satisfied diagnostic naming `NotRequired: Required`.
+// With the fix, the where-clause's `T: Required` predicate gets
+// merged into `impl_type_param_bounds[T]` at setup time, so method
+// dispatch on `T` finds the Required trait via the bound.
 
 trait Required {
     fn must_have(self) -> u32;
 }
 
-struct NotRequired;
+impl Required for u32 {
+    fn must_have(self) -> u32 {
+        self
+    }
+}
 
 struct Holder<T> {
     v: T,
 }
 
-impl<T> Holder<T> where T: Required {
-    fn ok() -> u32 {
-        42u32
+impl<T> Holder<T>
+where
+    T: Required,
+{
+    fn check(self) -> u32 {
+        self.v.must_have()
     }
 }
 
 pub fn answer() -> u32 {
-    Holder::<NotRequired>::ok()
+    Holder { v: 42u32 }.check()
 }

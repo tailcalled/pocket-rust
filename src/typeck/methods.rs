@@ -300,6 +300,56 @@ fn check_method_call_symbolic(
     )
 }
 
+// Method dispatch on an RPIT existential receiver. The slot's
+// bounds (FnSymbol/Template.rpit_slots[slot].bounds) play the role
+// `ctx.type_param_bounds[idx]` plays for `Param(T)` receivers —
+// they list the traits the opaque type definitely impls. Walk the
+// supertrait closure of each bound, find which declare `method`,
+// and dispatch through that trait.
+fn check_method_call_opaque(
+    ctx: &mut CheckCtx,
+    mc: &crate::ast::MethodCall,
+    call_expr: &Expr,
+    fn_path: Vec<String>,
+    slot: u32,
+    recv_shape: SymRecvShape,
+) -> Result<InferType, Error> {
+    // Extract the slot's bound paths (just paths — args/assoc are
+    // matched at impl resolution time, not here).
+    let bounds: Vec<Vec<String>> = {
+        let mut out: Vec<Vec<String>> = Vec::new();
+        if let Some(e) = ctx.funcs.entries.iter().find(|e| e.path == fn_path) {
+            if let Some(s) = e.rpit_slots.get(slot as usize) {
+                for b in &s.bounds {
+                    out.push(b.trait_path.clone());
+                }
+            }
+        } else if let Some(t) = ctx.funcs.templates.iter().find(|t| t.path == fn_path) {
+            if let Some(s) = t.rpit_slots.get(slot as usize) {
+                for b in &s.bounds {
+                    out.push(b.trait_path.clone());
+                }
+            }
+        }
+        out
+    };
+    let matching_traits = collect_traits_declaring_method(ctx.traits, &bounds, &mc.method);
+    let display_name = format!(
+        "impl <{}#{}>",
+        crate::typeck::place_to_string(&fn_path),
+        slot
+    );
+    dispatch_method_through_trait(
+        ctx,
+        mc,
+        call_expr,
+        InferType::Opaque { fn_path, slot },
+        matching_traits,
+        recv_shape,
+        display_name,
+    )
+}
+
 // Returns the trait paths (post supertrait-closure, deduped) that
 // declare `method`. Used by both the explicit bounded-param symbolic
 // dispatch path and the num-lit-var implicit-bound path below.
@@ -740,6 +790,40 @@ pub(super) fn check_method_call(
                 SymRecvShape::SharedRef
             };
             return check_method_call_symbolic(ctx, mc, call_expr, name.clone(), shape);
+        }
+    }
+    // RPIT existential receiver: when the recv type is an `Opaque`,
+    // method dispatch consults the slot's bounds — same shape as
+    // Param-receiver symbolic dispatch but the bound list lives on
+    // the FnSymbol's `rpit_slots[slot].bounds` rather than on
+    // `ctx.type_param_bounds`. This makes forward-reference to RPIT
+    // functions work: callers don't need the slot's pin to be set,
+    // they only need the bounds.
+    if let InferType::Opaque { fn_path, slot } = &resolved_recv {
+        return check_method_call_opaque(
+            ctx,
+            mc,
+            call_expr,
+            fn_path.clone(),
+            *slot,
+            SymRecvShape::Owned,
+        );
+    }
+    if let InferType::Ref { inner, mutable, .. } = &resolved_recv {
+        if let InferType::Opaque { fn_path, slot } = inner.as_ref() {
+            let shape = if *mutable {
+                SymRecvShape::MutRef
+            } else {
+                SymRecvShape::SharedRef
+            };
+            return check_method_call_opaque(
+                ctx,
+                mc,
+                call_expr,
+                fn_path.clone(),
+                *slot,
+                shape,
+            );
         }
     }
     // Method on an unbound integer literal var (e.g. `30 + 12` or

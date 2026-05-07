@@ -291,6 +291,12 @@ pub struct TraitMethodEntry {
     // trait's `<U>`); symbolic dispatch allocates fresh inference vars
     // per call, optionally pinned by turbofish.
     pub type_params: Vec<String>,
+    // Per-type-param trait-bound paths, parallel to `type_params`.
+    // Populated from the method's inline `<U: Bound>` declarations
+    // and from where-clause Param-LHS predicates. Impls of this
+    // trait inherit these bounds — so an impl method's body sees
+    // `U: Bound` even if the impl signature doesn't restate it.
+    pub type_param_bounds: Vec<Vec<Vec<String>>>,
     // Resolved param types in declaration order. Param 0 is the receiver
     // (when the method has one); `Self` appears as `RType::Param("Self")`
     // and gets substituted with the impl target during validation +
@@ -429,6 +435,9 @@ pub struct FnSymbol {
     // resolves to `pin` for layout queries; trait dispatch on the
     // Opaque consults `bounds`.
     pub rpit_slots: Vec<RpitSlot>,
+    // Lifetime outlives predicates declared in the fn's where-clause
+    // (`where 'a: 'b`). Phase B carry-only (see `GenericTemplate.lifetime_predicates`).
+    pub lifetime_predicates: Vec<LifetimePredResolved>,
 }
 
 #[derive(Clone)]
@@ -544,6 +553,10 @@ pub struct GenericTemplate {
     // each bound is resolved via `solve_impl_in_ctx_with_args`, and
     // failure produces "where-clause predicate not satisfied".
     pub where_predicates: Vec<WherePredResolved>,
+    // Lifetime outlives predicates from the function's where-clause
+    // (`where 'a: 'b`). Phase B structural carry — see
+    // `LifetimePredResolved`.
+    pub lifetime_predicates: Vec<LifetimePredResolved>,
 }
 
 #[derive(Clone)]
@@ -558,6 +571,19 @@ pub struct WhereBoundResolved {
     pub trait_path: Vec<String>,
     pub trait_args: Vec<RType>,
     pub assoc_constraints: Vec<(String, RType)>,
+}
+
+// `'lhs: 'b1 + 'b2 + …` — outlives obligation. Phase B
+// structural carry: validated for in-scope lifetimes at setup time
+// and stored here for future borrowck phases to consume as outlives
+// constraints. Today's borrowck doesn't yet do lifetime relation
+// solving, so these are inert except for the in-scope check at
+// setup.
+#[derive(Clone)]
+pub struct LifetimePredResolved {
+    pub lhs: String,
+    pub bounds: Vec<String>,
+    pub span: crate::span::Span,
 }
 
 #[derive(Clone)]

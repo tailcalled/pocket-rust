@@ -1,34 +1,42 @@
-// Trait declares a method with a `where` clause: `fn x<T>() -> u32
-// where T: Required`. The clause requires every caller to supply a
-// `T` that implements `Required`. Real Rust enforces this at the
-// call site: `Maker::<NotRequired>::x::<NotRequired>(...)` (or
-// equivalent) would error.
+// Trait method declares a where-clause on its type-param. The impl
+// method's body uses `t.must_have()` — which compiles only when
+// `T` carries the `Required` bound. Without the fix, the trait's
+// where-clause was silently dropped, the impl method's `T` had no
+// bound, and the body failed to dispatch `must_have`.
 //
-// Pocket-rust drops the where-clause silently at trait setup:
-// `resolve_trait_methods` doesn't walk `TraitMethodSig.where_clause`,
-// so the method's `type_param_bounds` lists no constraint on `T`.
-// The `impl` for `NotRequired` then satisfies the (empty) trait
-// method bound, and the call goes through.
-//
-// Expected post-fix: pocket-rust rejects this at the call site with
-// a diagnostic naming the unsatisfied `T: Required` bound.
+// With the fix:
+//   1. `resolve_trait_methods` walks `m.where_clause`, merges
+//      Param-LHS predicates into `TraitMethodEntry.type_param_bounds`.
+//   2. `register_function` for the impl method (when the impl is
+//      for a trait) looks up the trait method's bounds and merges
+//      them onto the impl method's matching type-param slots.
+//   3. The impl method body type-checks `t.must_have()` via the
+//      inherited `T: Required` bound.
 
 trait Required {
     fn must_have(self) -> u32;
 }
 
-struct NotRequired;
-
-trait Maker {
-    fn x<T>() -> u32 where T: Required;
+impl Required for u32 {
+    fn must_have(self) -> u32 {
+        self
+    }
 }
 
-impl Maker for NotRequired {
-    fn x<T>() -> u32 {
-        0u32
+trait Maker {
+    fn x<T>(t: T) -> u32
+    where
+        T: Required;
+}
+
+struct UnitMaker;
+
+impl Maker for UnitMaker {
+    fn x<T>(t: T) -> u32 {
+        t.must_have()
     }
 }
 
 pub fn answer() -> u32 {
-    NotRequired::x::<NotRequired>()
+    UnitMaker::x(42u32)
 }

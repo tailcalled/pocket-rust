@@ -2367,7 +2367,21 @@ fn check_function(
                             },
                             _ => false,
                         };
-                        if needs_validation && !recv_is_closure {
+                        // Opaque receiver — the slot's bounds (already
+                        // checked at body time) guarantee the trait
+                        // is satisfied by the eventual concrete pin.
+                        // After post-typeck `finalize_rpit_substitutions`
+                        // codegen sees the concrete type and re-resolves
+                        // the impl normally; here at typeck no real
+                        // impl exists for `Opaque`, so skip.
+                        let recv_is_opaque = match &recv_type {
+                            RType::Opaque { .. } => true,
+                            RType::Ref { inner, .. } => {
+                                matches!(inner.as_ref(), RType::Opaque { .. })
+                            }
+                            _ => false,
+                        };
+                        if needs_validation && !recv_is_closure && !recv_is_opaque {
                             let recv_for_solve = match &recv_type {
                                 RType::Ref { inner, .. } => (**inner).clone(),
                                 other => other.clone(),
@@ -2735,6 +2749,17 @@ fn check_block(
         let (var, fn_path, slot) = opaque_slots[k].clone();
         let resolved = ctx.subst.substitute(&InferType::Var(var));
         let pinned_rt = infer_to_rtype_for_check(&resolved);
+        // Diverging body — `panic!()`, `return`, etc. — pins the
+        // slot to `!`. Real Rust accepts this: `!` is uninhabited so
+        // any trait obligation is vacuously true. Skip bound
+        // validation; pinning to `!` lets layout queries on a
+        // never-reached path produce zero-sized output (matching
+        // `byte_size_of(Never) == 0`).
+        if matches!(pinned_rt, RType::Never) {
+            record_rpit_pin(ctx.funcs, &fn_path, slot, pinned_rt);
+            k += 1;
+            continue;
+        }
         // Look up the slot's bounds from FuncTable. Try entries
         // first, then templates.
         let bounds = lookup_rpit_slot_bounds(ctx.funcs, &fn_path, slot);
@@ -2876,6 +2901,59 @@ fn lookup_rpit_slot_bounds(
 // (no body, abstract function in a trait sig, etc.) leave the Opaque
 // in place — the subsequent pass that consumes the function's
 // signature is responsible for recognizing that case if it matters.
+// Walk every recorded `MethodResolution.trait_dispatch.recv_type`
+// and substitute Opaque->pin too — the dispatch's receiver type is
+// used at mono/codegen for impl resolution. Without this, a caller
+// that took a method on an RPIT result still sees Opaque in its
+// recorded dispatch even after `finalize_rpit_substitutions`
+// updated the function's stored return_type. Iterates through every
+// FnSymbol and Template's `method_resolutions`, and the per-call
+// `MethodResolution.trait_dispatch.recv_type`. Only walks RPIT
+// pinning; ordinary methods are unaffected.
+fn finalize_rpit_in_method_resolutions<F>(funcs: &mut FuncTable, lookup: &F)
+where
+    F: Fn(&Vec<String>, u32) -> Option<RType>,
+{
+    let mut e = 0;
+    while e < funcs.entries.len() {
+        let mut k = 0;
+        while k < funcs.entries[e].method_resolutions.len() {
+            if let Some(mr) = &mut funcs.entries[e].method_resolutions[k] {
+                if let Some(td) = &mut mr.trait_dispatch {
+                    td.recv_type = substitute_opaque_with_pins(&td.recv_type, lookup);
+                    let mut t = 0;
+                    while t < td.trait_args.len() {
+                        td.trait_args[t] =
+                            substitute_opaque_with_pins(&td.trait_args[t], lookup);
+                        t += 1;
+                    }
+                }
+            }
+            k += 1;
+        }
+        e += 1;
+    }
+    let mut e = 0;
+    while e < funcs.templates.len() {
+        let mut k = 0;
+        while k < funcs.templates[e].method_resolutions.len() {
+            if let Some(mr) = &mut funcs.templates[e].method_resolutions[k] {
+                if let Some(td) = &mut mr.trait_dispatch {
+                    td.recv_type = substitute_opaque_with_pins(&td.recv_type, lookup);
+                    let mut t = 0;
+                    while t < td.trait_args.len() {
+                        td.trait_args[t] =
+                            substitute_opaque_with_pins(&td.trait_args[t], lookup);
+                        t += 1;
+                    }
+                }
+            }
+            k += 1;
+        }
+        e += 1;
+    }
+}
+
 fn finalize_rpit_substitutions(funcs: &mut FuncTable) {
     // Snapshot all pins first so we don't borrow funcs immutably and
     // mutably at the same time.
@@ -2939,6 +3017,7 @@ fn finalize_rpit_substitutions(funcs: &mut FuncTable) {
         }
         i += 1;
     }
+    finalize_rpit_in_method_resolutions(funcs, &lookup_pin);
 }
 
 fn substitute_opaque_with_pins<F>(rt: &RType, lookup: &F) -> RType
@@ -6120,10 +6199,18 @@ fn check_bare_closure_call(
 // `Fn`/`FnMut`/`FnOnce` bound. Walks the (paths, args, assoc)
 // triples we keep on `ctx`. Returns None if `param_name` doesn't
 // have an Fn-family bound.
+// Returns `(matched_trait_path, params, return_ty)` for the matching
+// Fn-family bound. The trait path is one of `std::ops::Fn`,
+// `std::ops::FnMut`, or `std::ops::FnOnce` — picking the most-
+// permissive one the type-param actually carries lets bare-call
+// dispatch use the right `call` / `call_mut` / `call_once` method.
+// A type-param bounded by only `FnMut` (e.g. via `impl FnMut(u32)`)
+// must dispatch via `FnMut::call_mut`, not `Fn::call`, since the
+// closure passed in has no `Fn` impl.
 fn typeparam_fn_signature(
     ctx: &CheckCtx,
     param_name: &str,
-) -> Option<(Vec<InferType>, InferType)> {
+) -> Option<(Vec<String>, Vec<InferType>, InferType)> {
     let mut idx: Option<usize> = None;
     let mut i = 0;
     while i < ctx.type_params.len() {
@@ -6139,6 +6226,11 @@ fn typeparam_fn_signature(
     }
     let bounds = &ctx.type_param_bounds[idx];
     let args_rows = ctx.type_param_bound_args.get(idx);
+    // Prefer Fn over FnMut over FnOnce when multiple are listed —
+    // `Fn` is the strictest and gives the broadest call shape (`&self`).
+    // If only FnMut is present, dispatch as FnMut; if only FnOnce,
+    // FnOnce.
+    let mut best: Option<(usize, &Vec<String>)> = None;
     let mut b = 0;
     while b < bounds.len() {
         let path = &bounds[b];
@@ -6147,27 +6239,56 @@ fn typeparam_fn_signature(
             && path[1] == "ops"
             && (path[2] == "Fn" || path[2] == "FnMut" || path[2] == "FnOnce");
         if is_fn_family {
-            let trait_args = args_rows.and_then(|r| r.get(b))?;
-            if trait_args.is_empty() {
-                return None;
-            }
-            let params: Vec<InferType> = match &trait_args[0] {
-                RType::Tuple(elems) => elems.iter().map(rtype_to_infer).collect(),
-                _ => return None,
+            let priority = match path[2].as_str() {
+                "Fn" => 0,
+                "FnMut" => 1,
+                "FnOnce" => 2,
+                _ => 3,
             };
-            // `Output` is found across the flattened per-param assoc
-            // table — for an APIT-typed binding there's a single
-            // Fn-family bound, so the `Output` entry is unambiguous.
-            let assoc = ctx.type_param_bound_assoc.get(idx)?;
-            let return_ty = assoc
-                .iter()
-                .find(|(name, _)| name == "Output")
-                .map(|(_, rt)| rtype_to_infer(rt))?;
-            return Some((params, return_ty));
+            let pick = match best {
+                None => true,
+                Some((bp, _)) => priority < bp,
+            };
+            if pick {
+                best = Some((priority, path));
+                let _ = b;
+            }
         }
         b += 1;
     }
-    None
+    let (_priority, trait_path_ref) = best?;
+    let trait_path = trait_path_ref.clone();
+    // Re-find the bound index for trait_args lookup.
+    let mut bidx: Option<usize> = None;
+    let mut b = 0;
+    while b < bounds.len() {
+        if bounds[b] == trait_path {
+            bidx = Some(b);
+            break;
+        }
+        b += 1;
+    }
+    let bidx = bidx?;
+    let trait_args = args_rows.and_then(|r| r.get(bidx))?;
+    if trait_args.is_empty() {
+        return None;
+    }
+    let params: Vec<InferType> = match &trait_args[0] {
+        RType::Tuple(elems) => elems.iter().map(rtype_to_infer).collect(),
+        _ => return None,
+    };
+    // `Output` is recorded under the matching bound's slot in the
+    // flattened-per-param assoc table. Since `FnOnce` declares
+    // `Output` and the others inherit, the assoc entry comes from
+    // the trait-arg's matching bound or any of the family's
+    // closures (we trust the assoc-table to be correct for the
+    // dispatch trait).
+    let assoc = ctx.type_param_bound_assoc.get(idx)?;
+    let return_ty = assoc
+        .iter()
+        .find(|(name, _)| name == "Output")
+        .map(|(_, rt)| rtype_to_infer(rt))?;
+    Some((trait_path, params, return_ty))
 }
 
 // Bare-call dispatch for `f(args)` where `f`'s type is a type-param
@@ -6182,6 +6303,7 @@ fn check_bare_typeparam_fn_call(
     call_expr: &Expr,
     binding_name: String,
     param_name: String,
+    trait_path: Vec<String>,
     param_types: Vec<InferType>,
     return_type: InferType,
 ) -> Result<InferType, Error> {
@@ -6211,24 +6333,29 @@ fn check_bare_typeparam_fn_call(
         )?;
         k += 1;
     }
-    let trait_path: Vec<String> = vec![
-        "std".to_string(),
-        "ops".to_string(),
-        "Fn".to_string(),
-    ];
+    // Pick the matching method name + receiver-adjust per family.
+    // Fn → `&self` borrow + `call`, FnMut → `&mut self` + `call_mut`,
+    // FnOnce → `self` move + `call_once`. The trait_path arg is the
+    // family the type-param actually carries, picked by
+    // `typeparam_fn_signature`.
+    let (method_name, recv_adjust) = match trait_path.last().map(|s| s.as_str()) {
+        Some("FnMut") => ("call_mut".to_string(), ReceiverAdjust::BorrowMut),
+        Some("FnOnce") => ("call_once".to_string(), ReceiverAdjust::Move),
+        _ => ("call".to_string(), ReceiverAdjust::BorrowImm),
+    };
     let args_tuple = InferType::Tuple(param_types.clone());
     let recv_param_infer = InferType::Param(param_name);
     ctx.method_resolutions[call_expr.id as usize] = Some(PendingMethodCall {
         callee_idx: 0,
         callee_path: Vec::new(),
-        recv_adjust: ReceiverAdjust::BorrowImm,
+        recv_adjust,
         ret_borrows_receiver: false,
         template_idx: None,
         type_arg_infers: Vec::new(),
         trait_dispatch: Some(PendingTraitDispatch {
             trait_path,
             trait_arg_infers: vec![args_tuple],
-            method_name: "call".to_string(),
+            method_name,
             recv_type_infer: recv_param_infer,
             dispatch_span: call_expr.span.copy(),
         }),
@@ -6290,9 +6417,9 @@ fn check_call(ctx: &mut CheckCtx, call: &Call, call_expr: &Expr) -> Result<Infer
             // Fn(usize) -> Foo) { f(idx) }`. The desugar in the parser
             // turned `f`'s type into a fresh type-param with the Fn
             // bound, so we can read the signature off the bound and
-            // dispatch via `Fn::call`.
+            // dispatch via the matching family trait.
             if let InferType::Param(param_name) = &resolved {
-                if let Some((param_types, return_type)) =
+                if let Some((trait_path, param_types, return_type)) =
                     typeparam_fn_signature(ctx, param_name)
                 {
                     return check_bare_typeparam_fn_call(
@@ -6301,6 +6428,7 @@ fn check_call(ctx: &mut CheckCtx, call: &Call, call_expr: &Expr) -> Result<Infer
                         call_expr,
                         name,
                         param_name.clone(),
+                        trait_path,
                         param_types,
                         return_type,
                     );
