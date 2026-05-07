@@ -229,4 +229,5 @@ mod traits;
 mod try_op;
 mod tuples;
 mod type_aliases;
+mod where_clauses;
 mod while_loops;

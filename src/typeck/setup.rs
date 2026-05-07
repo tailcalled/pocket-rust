@@ -2346,6 +2346,126 @@ pub(super) fn register_function(
         type_param_bound_assoc.push(row);
         i += 1;
     }
+    // Where-clause predicates. Resolve each predicate's LHS:
+    //   * `Param(name)` matching a known type-param → append the
+    //     resolved bounds onto that param's bounds rows so they're
+    //     indistinguishable from inline `<T: Bound>` bounds.
+    //   * Anything else (`Vec<T>`, `&T`, `(T, U)`, …) → store on
+    //     `where_predicates` for call-time enforcement after the
+    //     type-param substitution is built.
+    let mut where_predicates: Vec<crate::typeck::tables::WherePredResolved> = Vec::new();
+    let mut wi = 0;
+    while wi < f.where_clause.len() {
+        let pred = &f.where_clause[wi];
+        let lhs_rt = resolve_type(
+            &pred.lhs,
+            current_module,
+            structs,
+            enums,
+            aliases,
+            self_target,
+            &type_param_names,
+            use_scope,
+            reexports,
+            source_file,
+        )?;
+        // Resolve every bound in this predicate to (path, args, assoc).
+        let mut resolved_bounds: Vec<crate::typeck::tables::WhereBoundResolved> = Vec::new();
+        let mut bi = 0;
+        while bi < pred.bounds.len() {
+            let b = &pred.bounds[bi];
+            let (resolved_path, resolved_args) = resolve_trait_ref(
+                &b.path,
+                current_module,
+                structs,
+                enums,
+                aliases,
+                self_target,
+                &type_param_names,
+                traits,
+                use_scope,
+                reexports,
+                source_file,
+            )?;
+            let mut bound_lifetime_scope = lifetime_param_names.clone();
+            let mut h = 0;
+            while h < b.hrtb_lifetime_params.len() {
+                bound_lifetime_scope.push(b.hrtb_lifetime_params[h].name.clone());
+                h += 1;
+            }
+            let mut a = 0;
+            while a < resolved_args.len() {
+                crate::typeck::validate_named_lifetimes(
+                    &resolved_args[a],
+                    &bound_lifetime_scope,
+                    &b.path.span,
+                    source_file,
+                )?;
+                a += 1;
+            }
+            let mut constraints: Vec<(String, RType)> = Vec::new();
+            let mut c = 0;
+            while c < b.assoc_constraints.len() {
+                let ac = &b.assoc_constraints[c];
+                let cty = resolve_type(
+                    &ac.ty,
+                    current_module,
+                    structs,
+                    enums,
+                    aliases,
+                    self_target,
+                    &type_param_names,
+                    use_scope,
+                    reexports,
+                    source_file,
+                )?;
+                constraints.push((ac.name.clone(), cty));
+                c += 1;
+            }
+            resolved_bounds.push(crate::typeck::tables::WhereBoundResolved {
+                trait_path: resolved_path,
+                trait_args: resolved_args,
+                assoc_constraints: constraints,
+            });
+            bi += 1;
+        }
+        // Param-LHS path: merge into the matching type-param's rows.
+        let merged = match &lhs_rt {
+            RType::Param(name) => {
+                let mut idx: Option<usize> = None;
+                let mut k = 0;
+                while k < type_param_names.len() {
+                    if type_param_names[k] == *name {
+                        idx = Some(k);
+                        break;
+                    }
+                    k += 1;
+                }
+                if let Some(idx) = idx {
+                    let mut bk = 0;
+                    while bk < resolved_bounds.len() {
+                        let rb = &resolved_bounds[bk];
+                        type_param_bounds[idx].push(rb.trait_path.clone());
+                        type_param_bound_args[idx].push(rb.trait_args.clone());
+                        type_param_bound_assoc[idx].push(rb.assoc_constraints.clone());
+                        bk += 1;
+                    }
+                    true
+                } else {
+                    false
+                }
+            }
+            _ => false,
+        };
+        if !merged {
+            where_predicates.push(crate::typeck::tables::WherePredResolved {
+                lhs: lhs_rt,
+                bounds: resolved_bounds,
+                span: pred.span.copy(),
+            });
+        }
+        wi += 1;
+    }
     if is_generic {
         funcs.templates.push(GenericTemplate {
             path: full,
@@ -2374,8 +2494,43 @@ pub(super) fn register_function(
             pattern_ergo: Vec::new(),
             closures: Vec::new(),
             bare_closure_calls: Vec::new(),
+            where_predicates,
         });
     } else {
+        // Non-generic functions can't reference any type-param in a
+        // where-clause LHS, so any leftover (non-merged) predicate is
+        // a constraint on a fully-concrete type. Eagerly verify each
+        // bound resolves at setup; that's the entire enforcement
+        // story for them — no per-call recheck needed.
+        let mut wp = 0;
+        while wp < where_predicates.len() {
+            let pred = &where_predicates[wp];
+            let mut bk = 0;
+            while bk < pred.bounds.len() {
+                let b = &pred.bounds[bk];
+                if crate::typeck::traits::solve_impl_with_args(
+                    &b.trait_path,
+                    &b.trait_args,
+                    &pred.lhs,
+                    traits,
+                    0,
+                )
+                .is_none()
+                {
+                    return Err(crate::span::Error {
+                        file: source_file.to_string(),
+                        message: format!(
+                            "where-clause predicate not satisfied: `{}: {}` has no matching impl",
+                            crate::typeck::rtype_to_string(&pred.lhs),
+                            crate::typeck::place_to_string(&b.trait_path),
+                        ),
+                        span: pred.span.copy(),
+                    });
+                }
+                bk += 1;
+            }
+            wp += 1;
+        }
         funcs.entries.push(FnSymbol {
             path: full,
             idx: *next_idx,

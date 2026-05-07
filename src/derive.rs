@@ -439,6 +439,7 @@ fn empty_marker_impl(
         target,
         methods: Vec::new(),
         assoc_type_bindings: Vec::new(),
+        where_clause: Vec::new(),
         span: span.copy(),
     }
 }
@@ -461,6 +462,7 @@ fn struct_clone_impl(sd: &StructDef, span: &Span) -> ImplBlock {
         target,
         methods: vec![method],
         assoc_type_bindings: Vec::new(),
+        where_clause: Vec::new(),
         span: span.copy(),
     }
 }
@@ -495,6 +497,7 @@ fn build_struct_clone_method(sd: &StructDef, return_type: Type, span: &Span) -> 
         params: vec![mk_self_param(span)],
         return_type: Some(return_type),
         body,
+        where_clause: Vec::new(),
         node_count: b.next_id,
         is_pub: false,
         is_unsafe: false,
@@ -519,6 +522,7 @@ fn enum_clone_impl(ed: &EnumDef, span: &Span) -> ImplBlock {
         target,
         methods: vec![method],
         assoc_type_bindings: Vec::new(),
+        where_clause: Vec::new(),
         span: span.copy(),
     }
 }
@@ -547,6 +551,7 @@ fn build_enum_clone_method(ed: &EnumDef, return_type: Type, span: &Span) -> Func
         params: vec![mk_self_param(span)],
         return_type: Some(return_type),
         body,
+        where_clause: Vec::new(),
         node_count: b.next_id,
         is_pub: false,
         is_unsafe: false,
@@ -645,6 +650,7 @@ fn struct_partial_eq_impl(sd: &StructDef, span: &Span) -> ImplBlock {
         target,
         methods: vec![eq, ne],
         assoc_type_bindings: Vec::new(),
+        where_clause: Vec::new(),
         span: span.copy(),
     }
 }
@@ -682,6 +688,7 @@ fn build_struct_eq_method(sd: &StructDef, other_target: &Type, span: &Span) -> F
         params: vec![mk_self_param(span), mk_other_param(other_target, span)],
         return_type: Some(mk_bool_type(span)),
         body,
+        where_clause: Vec::new(),
         node_count: b.next_id,
         is_pub: false,
         is_unsafe: false,
@@ -711,6 +718,7 @@ fn build_ne_method_from_eq(span: &Span) -> Function {
         ],
         return_type: Some(mk_bool_type(span)),
         body,
+        where_clause: Vec::new(),
         node_count: b.next_id,
         is_pub: false,
         is_unsafe: false,
@@ -746,6 +754,7 @@ fn enum_partial_eq_impl(ed: &EnumDef, span: &Span) -> ImplBlock {
         target,
         methods: vec![eq, ne],
         assoc_type_bindings: Vec::new(),
+        where_clause: Vec::new(),
         span: span.copy(),
     }
 }
@@ -803,6 +812,7 @@ fn build_enum_eq_method(ed: &EnumDef, other_target: &Type, span: &Span) -> Funct
         params: vec![mk_self_param(span), mk_other_param(other_target, span)],
         return_type: Some(mk_bool_type(span)),
         body,
+        where_clause: Vec::new(),
         node_count: b.next_id,
         is_pub: false,
         is_unsafe: false,
@@ -868,6 +878,7 @@ fn struct_partial_ord_impl(sd: &StructDef, span: &Span) -> ImplBlock {
         target,
         methods: vec![lt, le, gt, ge],
         assoc_type_bindings: Vec::new(),
+        where_clause: Vec::new(),
         span: span.copy(),
     }
 }
@@ -919,6 +930,7 @@ fn build_struct_lt_method(sd: &StructDef, other_target: &Type, span: &Span) -> F
         params: vec![mk_self_param(span), mk_other_param(other_target, span)],
         return_type: Some(mk_bool_type(span)),
         body,
+        where_clause: Vec::new(),
         node_count: b.next_id,
         is_pub: false,
         is_unsafe: false,
@@ -954,6 +966,7 @@ fn enum_partial_ord_impl(ed: &EnumDef, span: &Span) -> ImplBlock {
         target,
         methods: vec![lt, le, gt, ge],
         assoc_type_bindings: Vec::new(),
+        where_clause: Vec::new(),
         span: span.copy(),
     }
 }
@@ -1007,6 +1020,7 @@ fn build_enum_lt_method(ed: &EnumDef, other_target: &Type, span: &Span) -> Funct
         params: vec![mk_self_param(span), mk_other_param(other_target, span)],
         return_type: Some(mk_bool_type(span)),
         body,
+        where_clause: Vec::new(),
         node_count: b.next_id,
         is_pub: false,
         is_unsafe: false,
@@ -1121,6 +1135,7 @@ fn build_simple_partial_ord_companion(name: &str, negate: bool, span: &Span) -> 
         ],
         return_type: Some(mk_bool_type(span)),
         body,
+        where_clause: Vec::new(),
         node_count: b.next_id,
         is_pub: false,
         is_unsafe: false,

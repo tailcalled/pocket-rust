@@ -6174,6 +6174,47 @@ fn check_call(ctx: &mut CheckCtx, call: &Call, call_expr: &Expr) -> Result<Infer
             }
             p += 1;
         }
+        // Where-clause predicates with complex LHS. After substitution
+        // the LHS is a concrete RType; each bound must have a
+        // resolvable impl.
+        let tmpl_where = ctx.funcs.templates[template_idx].where_predicates.clone();
+        let mut wp = 0;
+        while wp < tmpl_where.len() {
+            let pred = &tmpl_where[wp];
+            let lhs_substituted = substitute_rtype(&pred.lhs, &subst_env);
+            let mut bk = 0;
+            while bk < pred.bounds.len() {
+                let b = &pred.bounds[bk];
+                let trait_args_subst: Vec<RType> = b
+                    .trait_args
+                    .iter()
+                    .map(|t| substitute_rtype(t, &subst_env))
+                    .collect();
+                if traits::solve_impl_in_ctx_with_args(
+                    &b.trait_path,
+                    &trait_args_subst,
+                    &lhs_substituted,
+                    ctx.traits,
+                    ctx.type_params,
+                    ctx.type_param_bounds,
+                    0,
+                )
+                .is_none()
+                {
+                    return Err(Error {
+                        file: ctx.current_file.to_string(),
+                        message: format!(
+                            "where-clause predicate not satisfied at call site: `{}: {}` has no matching impl",
+                            rtype_to_string(&lhs_substituted),
+                            place_to_string(&b.trait_path),
+                        ),
+                        span: call_expr.span.copy(),
+                    });
+                }
+                bk += 1;
+            }
+            wp += 1;
+        }
         return Ok(return_infer);
     }
     Err(Error {

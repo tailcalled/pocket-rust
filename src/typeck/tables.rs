@@ -512,6 +512,29 @@ pub struct GenericTemplate {
     pub closures: Vec<Option<ClosureInfo>>,
     // See FnSymbol.bare_closure_calls.
     pub bare_closure_calls: Vec<Option<String>>,
+    // Where-clause predicates whose LHS is a complex type (anything
+    // other than a bare type-param). Param-LHS predicates are merged
+    // into `type_param_bounds`/`type_param_bound_args`/`type_param_bound_assoc`
+    // at setup time so they look indistinguishable from inline bounds.
+    // Complex-LHS predicates are checked at each call site after the
+    // type-param substitution is built: the LHS RType is substituted,
+    // each bound is resolved via `solve_impl_in_ctx_with_args`, and
+    // failure produces "where-clause predicate not satisfied".
+    pub where_predicates: Vec<WherePredResolved>,
+}
+
+#[derive(Clone)]
+pub struct WherePredResolved {
+    pub lhs: RType,
+    pub bounds: Vec<WhereBoundResolved>,
+    pub span: crate::span::Span,
+}
+
+#[derive(Clone)]
+pub struct WhereBoundResolved {
+    pub trait_path: Vec<String>,
+    pub trait_args: Vec<RType>,
+    pub assoc_constraints: Vec<(String, RType)>,
 }
 
 #[derive(Clone)]

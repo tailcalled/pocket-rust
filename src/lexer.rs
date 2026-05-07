@@ -37,6 +37,10 @@ pub enum TokenKind {
     // impl bodies (`type Name = T;`) so far. Lexed unconditionally; the
     // parser is the one that requires it to be in those positions.
     Type,
+    // `where` — introduces a trailing predicate list after a fn/impl
+    // signature: `fn f<T>(...) -> R where T: Bound { ... }`. The
+    // parser consumes it via `parse_where_clause_opt`.
+    Where,
     // `return` — early-exit expression. `return EXPR` or `return`.
     Return,
     // `?` — try-operator postfix. `expr?` short-circuits to the
@@ -141,6 +145,7 @@ pub fn token_kind_name(t: &TokenKind) -> &'static str {
         TokenKind::Impl => "`impl`",
         TokenKind::Trait => "`trait`",
         TokenKind::Type => "`type`",
+        TokenKind::Where => "`where`",
         TokenKind::Return => "`return`",
         TokenKind::Question => "`?`",
         TokenKind::For => "`for`",
@@ -293,6 +298,11 @@ pub fn tokenize(file: &str, source: &str) -> Result<Vec<Token>, Error> {
             } else if text == "type" {
                 tokens.push(Token {
                     kind: TokenKind::Type,
+                    span,
+                });
+            } else if text == "where" {
+                tokens.push(Token {
+                    kind: TokenKind::Where,
                     span,
                 });
             } else if text == "return" {

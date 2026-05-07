@@ -27,6 +27,10 @@ For trait impls on non-Path targets (`impl Trait for (u32, u32)`, `impl<T> Trait
 
 Bounds: `<T: Trait1 + Trait2>` parse and resolve. Each fn/impl's per-type-param resolved bound trait paths live on `GenericTemplate.type_param_bounds` and `TraitImplEntry.impl_type_param_bounds`. Impl targets accept any type pattern: `impl<T: Show> Show for &T` and `impl<T> Show for Wrap<T>` both work; inherent (non-trait) impls still require the target to resolve to a struct.
 
+Where-clauses: `fn f<T>() -> R where T: Trait1, Vec<T>: Trait2 { ... }` parses on Function, TraitMethodSig, and ImplBlock (parser appends `where_clause: Vec<WherePredicate>` after the `-> R` and before the body brace). Setup splits each predicate by LHS shape:
+- **Bare type-param LHS** (`T: Bound`) — appended onto the matching type-param's rows (`type_param_bounds` / `type_param_bound_args` / `type_param_bound_assoc`), so it's indistinguishable from an inline `<T: Bound>` bound from this point on.
+- **Complex LHS** (`Vec<T>: Bound`, `&T: Bound`, `(T, U): Bound`, …) — stored on `GenericTemplate.where_predicates: Vec<WherePredResolved>` (or rejected at setup with "predicate not satisfied" if the function is non-generic and the LHS has no impl). At each call site, after the type-param substitution `subst_env` is built, the LHS is substituted and each bound is checked via `solve_impl_in_ctx_with_args`. Failure → "where-clause predicate not satisfied at call site".
+
 ## Trait method signatures
 
 Each `TraitMethodEntry` records the resolved `param_types: Vec<RType>`, `return_type: Option<RType>`, `receiver_shape: Option<TraitReceiverShape>` (Move/BorrowImm/BorrowMut), and `type_params: Vec<String>` (method-level `<U>` names).

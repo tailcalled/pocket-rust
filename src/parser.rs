@@ -4,7 +4,7 @@ use crate::ast::{
     IfLetExpr, ImplAssocType, ImplBlock, LetStmt, Lifetime, LifetimeParam, MatchArm, MatchExpr,
     MethodCall, Param, Path, PathSegment, Pattern, PatternKind, Stmt, StructDef, StructField,
     StructLit, TraitAssocType, TraitBound, TraitDef, TraitMethodSig, Type, TypeAlias, TypeKind,
-    TypeParam, UseDecl, UseTree, VariantPayload,
+    TypeParam, UseDecl, UseTree, VariantPayload, WherePredicate,
 };
 use crate::lexer::{Token, TokenKind, token_kind_name};
 use crate::span::{Error, Pos, Span};
@@ -382,6 +382,7 @@ impl Parser {
         } else {
             (None, first_type)
         };
+        let where_clause = self.parse_where_clause_opt()?;
         self.expect(&TokenKind::LBrace, "`{`")?;
         let mut methods: Vec<Function> = Vec::new();
         let mut assoc_type_bindings: Vec<ImplAssocType> = Vec::new();
@@ -433,6 +434,7 @@ impl Parser {
             target,
             methods,
             assoc_type_bindings,
+            where_clause,
             span: Span::new(impl_span.start, rb.end),
         })
     }
@@ -519,6 +521,7 @@ impl Parser {
         } else {
             None
         };
+        let where_clause = self.parse_where_clause_opt()?;
         self.expect(&TokenKind::Semi, "`;`")?;
         Ok(TraitMethodSig {
             name,
@@ -527,6 +530,7 @@ impl Parser {
             type_params,
             params,
             return_type,
+            where_clause,
         })
     }
 
@@ -845,6 +849,7 @@ impl Parser {
         } else {
             None
         };
+        let where_clause = self.parse_where_clause_opt()?;
         // Reset per-function NodeId counter; capture node_count at exit.
         let saved_node_id = self.next_node_id;
         self.next_node_id = 0;
@@ -859,6 +864,7 @@ impl Parser {
             params,
             return_type,
             body,
+            where_clause,
             node_count,
             is_pub,
             is_unsafe,
@@ -1241,6 +1247,46 @@ impl Parser {
             None
         };
         Ok(TypeParam { name, name_span, bounds, default })
+    }
+
+    // Parse an optional `where` clause: `where <pred>, <pred>, …`
+    // (trailing comma allowed). Each predicate is `<type>: <bound1> +
+    // <bound2> + …`. Returns an empty vec when no `where` keyword
+    // follows. The clause is terminated by whatever item-shape the
+    // caller expects (`{`, `;`, …) — we stop before any token that
+    // isn't a comma followed by another type-shaped lookahead.
+    fn parse_where_clause_opt(&mut self) -> Result<Vec<WherePredicate>, Error> {
+        if !self.peek_kind(&TokenKind::Where) {
+            return Ok(Vec::new());
+        }
+        self.pos += 1;
+        let mut preds: Vec<WherePredicate> = Vec::new();
+        // The clause ends at any of these "next item" delimiters.
+        loop {
+            if self.peek_kind(&TokenKind::LBrace)
+                || self.peek_kind(&TokenKind::Semi)
+                || self.pos >= self.tokens.len()
+            {
+                break;
+            }
+            let lhs = self.parse_type()?;
+            self.expect(&TokenKind::Colon, "`:`")?;
+            let mut bounds: Vec<TraitBound> = Vec::new();
+            bounds.push(self.parse_trait_bound()?);
+            while self.peek_kind(&TokenKind::Plus) {
+                self.pos += 1;
+                bounds.push(self.parse_trait_bound()?);
+            }
+            let end = self.tokens[self.pos.saturating_sub(1)].span.end.copy();
+            let span = Span::new(lhs.span.start.copy(), end);
+            preds.push(WherePredicate { lhs, bounds, span });
+            if self.peek_kind(&TokenKind::Comma) {
+                self.pos += 1;
+                continue;
+            }
+            break;
+        }
+        Ok(preds)
     }
 
     fn parse_trait_bound(&mut self) -> Result<TraitBound, Error> {
@@ -3538,6 +3584,7 @@ impl Parser {
             (TokenKind::Impl, TokenKind::Impl) => true,
             (TokenKind::Trait, TokenKind::Trait) => true,
             (TokenKind::Type, TokenKind::Type) => true,
+            (TokenKind::Where, TokenKind::Where) => true,
             (TokenKind::Return, TokenKind::Return) => true,
             (TokenKind::Question, TokenKind::Question) => true,
             (TokenKind::For, TokenKind::For) => true,

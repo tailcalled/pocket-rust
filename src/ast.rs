@@ -96,6 +96,11 @@ pub struct ImplBlock {
     // must provide one binding per associated type the trait declares;
     // inherent impls are not allowed to declare any.
     pub assoc_type_bindings: Vec<ImplAssocType>,
+    // `where` clause on the impl block. Predicates with a bare-type-param
+    // LHS are merged into the matching type-param's bounds at setup
+    // time; complex-LHS predicates are stored separately and enforced
+    // at impl resolution.
+    pub where_clause: Vec<WherePredicate>,
     pub span: Span,
 }
 
@@ -139,6 +144,7 @@ pub struct TraitMethodSig {
     pub type_params: Vec<TypeParam>,
     pub params: Vec<Param>,
     pub return_type: Option<Type>,
+    pub where_clause: Vec<WherePredicate>,
 }
 
 #[derive(Clone)]
@@ -153,6 +159,18 @@ pub struct TraitBound {
     // bound's path/args/assoc-constraint types only — they do not
     // leak out to the enclosing fn/impl's lifetime scope.
     pub hrtb_lifetime_params: Vec<LifetimeParam>,
+}
+
+// One predicate of a `where` clause: `<lhs>: <bound1> + <bound2> + …`.
+// LHS is any type expression; the common case is a bare type-param
+// (`T: Bound`, equivalent to inline bound), but complex LHS is also
+// allowed (`Vec<T>: Clone`, `&T: Send`, etc.). Lifetime predicates
+// (`'a: 'b`) are not yet supported.
+#[derive(Clone)]
+pub struct WherePredicate {
+    pub lhs: Type,
+    pub bounds: Vec<TraitBound>,
+    pub span: Span,
 }
 
 // `Name = Type` inside a `Trait<…>` bound.
@@ -242,6 +260,12 @@ pub struct Function {
     pub params: Vec<Param>,
     pub return_type: Option<Type>,
     pub body: Block,
+    // `where` clause: trailing list of predicates after `-> R`, before
+    // the body brace. Predicates with a bare-type-param LHS merge into
+    // the matching type-param's inline bounds at setup time; complex-
+    // LHS predicates are stored on the FnSymbol/GenericTemplate and
+    // enforced at call sites after substitution.
+    pub where_clause: Vec<WherePredicate>,
     // Number of NodeIds allocated within this function's body. Side vectors
     // (typeck/borrowck/codegen) sized to this length, indexed by Expr.id.
     pub node_count: u32,

@@ -826,6 +826,7 @@ fn synthesize_impl_for_closure(
         params: vec![self_param, args_param],
         return_type: Some(output_ty.clone()),
         body: block,
+        where_clause: Vec::new(),
         node_count: id_alloc.next,
         is_pub: true,
         is_unsafe: false,
@@ -851,6 +852,7 @@ fn synthesize_impl_for_closure(
         target: target_ty,
         methods: vec![method],
         assoc_type_bindings,
+        where_clause: Vec::new(),
         span,
     })
 }
