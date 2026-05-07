@@ -250,6 +250,10 @@ pub(crate) fn infer_to_rtype_for_check(t: &InferType) -> RType {
         },
         InferType::Never => RType::Never,
         InferType::Char => RType::Char,
+        InferType::Opaque { fn_path, slot } => RType::Opaque {
+            fn_path: fn_path.clone(),
+            slot: *slot,
+        },
     }
 }
 
@@ -350,6 +354,17 @@ pub fn check(
     push_root_name(&mut path, root);
     let mut current_file = root.source_file.clone();
     check_module(root, &mut path, root_crate_name, &mut current_file, structs, enums, aliases, traits, funcs, reexports)?;
+
+    // RPIT post-typeck: every function whose return-type uses
+    // `impl Trait` had each Opaque slot pinned during its body check.
+    // After this crate's bodies are checked, walk all FnSymbol/
+    // Template return types and substitute each `Opaque{slot}` with
+    // its `rpit_slots[slot].pin`. Subsequent passes (closure_lower,
+    // borrowck, safeck, codegen) then see the concrete type, so
+    // layout queries / method dispatch / etc. work without per-pass
+    // Opaque handling. Opacity to typeck is maintained — only this
+    // post-typeck finalize substitutes Opaque to its hidden type.
+    finalize_rpit_substitutions(funcs);
 
     // Register a unit `StructEntry` for each closure discovered during
     // typeck so borrowck/codegen can look up the synthesized type. The
@@ -769,6 +784,15 @@ pub(crate) enum InferType {
     Never,
     // `char` — InferType counterpart of `RType::Char`.
     Char,
+    // Existential `impl Trait` — InferType counterpart of
+    // `RType::Opaque`. Each `impl Trait` occurrence in the return
+    // type gets a distinct `slot`; trait dispatch consults
+    // `FnSymbol.rpit_slots[slot].bounds`, structure-level operations
+    // resolve via `rpit_slots[slot].pin`.
+    Opaque {
+        fn_path: Vec<String>,
+        slot: u32,
+    },
 }
 
 // Build a name → InferType env from a generic struct/template's type-param
@@ -847,6 +871,10 @@ pub(crate) fn rtype_to_infer(rt: &RType) -> InferType {
         },
         RType::Never => InferType::Never,
         RType::Char => InferType::Char,
+        RType::Opaque { fn_path, slot } => InferType::Opaque {
+            fn_path: fn_path.clone(),
+            slot: *slot,
+        },
     }
 }
 
@@ -921,6 +949,10 @@ pub(crate) fn infer_substitute(t: &InferType, env: &Vec<(String, InferType)>) ->
         },
         InferType::Never => InferType::Never,
         InferType::Char => InferType::Char,
+        InferType::Opaque { fn_path, slot } => InferType::Opaque {
+            fn_path: fn_path.clone(),
+            slot: *slot,
+        },
     }
 }
 
@@ -1125,6 +1157,9 @@ pub(crate) fn infer_to_string(t: &InferType) -> String {
         }
         InferType::Never => "!".to_string(),
         InferType::Char => "char".to_string(),
+        InferType::Opaque { fn_path, slot } => {
+            format!("impl <{}#{}>", place_to_string(fn_path), slot)
+        }
     }
 }
 
@@ -1217,6 +1252,10 @@ impl Subst {
             },
             InferType::Never => InferType::Never,
             InferType::Char => InferType::Char,
+            InferType::Opaque { fn_path, slot } => InferType::Opaque {
+                fn_path: fn_path.clone(),
+                slot: *slot,
+            },
         }
     }
 
@@ -1445,6 +1484,10 @@ impl Subst {
             (InferType::Bool, InferType::Bool) => Ok(()),
             (InferType::Char, InferType::Char) => Ok(()),
             (InferType::Str, InferType::Str) => Ok(()),
+            (
+                InferType::Opaque { fn_path: a_fp, slot: a_slot },
+                InferType::Opaque { fn_path: b_fp, slot: b_slot },
+            ) if a_fp == b_fp && a_slot == b_slot => Ok(()),
             (InferType::Tuple(ea), InferType::Tuple(eb)) => {
                 if ea.len() != eb.len() {
                     return Err(Error {
@@ -1675,6 +1718,7 @@ impl Subst {
             },
             InferType::Never => RType::Never,
             InferType::Char => RType::Char,
+            InferType::Opaque { fn_path, slot } => RType::Opaque { fn_path, slot },
         }
     }
 }
@@ -2062,28 +2106,18 @@ fn check_function(
         });
         k += 1;
     }
-    let return_rt: Option<RType> = match &func.return_type {
-        Some(ty) => Some({
-            let rt = resolve_type(
-                ty,
-                current_module,
-                structs,
-                enums,
-                aliases,
-                self_target,
-                &type_param_names,
-                module_use_scope,
-                reexports,
-                current_file,
-            )?;
-            concretize_assoc_proj_with_bounds(
-                &rt,
-                traits,
-                &type_param_names,
-                &type_param_bound_assoc,
-            )
-        }),
-        None => None,
+    // Reuse the return type that setup already resolved (it ran the
+    // RPIT rewrite + concretize pass). Re-resolving from the AST
+    // would re-error on `impl Trait` in return position. Look up the
+    // FnSymbol/Template by `lookup_path`; missing means no signature
+    // was registered (shouldn't happen for a well-formed call into
+    // `check_function`).
+    let return_rt: Option<RType> = if let Some(e) = func_lookup(funcs, &lookup_path) {
+        e.return_type.clone()
+    } else if let Some((_, t)) = template_lookup(funcs, &lookup_path) {
+        t.return_type.clone()
+    } else {
+        None
     };
 
     let node_count = func.node_count as usize;
@@ -2550,7 +2584,71 @@ fn check_function(
             t += 1;
         }
     }
+    // RPIT one-fn finalize: now that this function's body is checked
+    // and its slots are pinned, substitute Opaque{this_fn, slot} →
+    // pin in this function's own return_type. Subsequent functions
+    // checked in this crate then see the concrete type at call sites
+    // (rather than the opaque proxy). The crate-level
+    // `finalize_rpit_substitutions` call after `check_module`
+    // mops up any opaques that reference fns in earlier libraries.
+    finalize_rpit_for_one_function(funcs, &lookup_path);
     Ok(())
+}
+
+fn finalize_rpit_for_one_function(funcs: &mut FuncTable, fn_path: &Vec<String>) {
+    // Skip functions without RPIT slots — fast path; the common case.
+    let has_slots = funcs
+        .entries
+        .iter()
+        .find(|e| &e.path == fn_path)
+        .map(|e| !e.rpit_slots.is_empty())
+        .or_else(|| {
+            funcs
+                .templates
+                .iter()
+                .find(|t| &t.path == fn_path)
+                .map(|t| !t.rpit_slots.is_empty())
+        })
+        .unwrap_or(false);
+    if !has_slots {
+        return;
+    }
+    // Collect this function's pins, then substitute in its own
+    // return type.
+    let pins: Vec<Option<RType>> = if let Some(e) = funcs.entries.iter().find(|e| &e.path == fn_path) {
+        e.rpit_slots.iter().map(|s| s.pin.clone()).collect()
+    } else if let Some(t) = funcs.templates.iter().find(|t| &t.path == fn_path) {
+        t.rpit_slots.iter().map(|s| s.pin.clone()).collect()
+    } else {
+        return;
+    };
+    let lookup = |path: &Vec<String>, slot: u32| -> Option<RType> {
+        if path == fn_path {
+            pins.get(slot as usize).and_then(|p| p.clone())
+        } else {
+            None
+        }
+    };
+    let mut i = 0;
+    while i < funcs.entries.len() {
+        if &funcs.entries[i].path == fn_path {
+            if let Some(rt) = funcs.entries[i].return_type.take() {
+                funcs.entries[i].return_type = Some(substitute_opaque_with_pins(&rt, &lookup));
+            }
+            return;
+        }
+        i += 1;
+    }
+    let mut i = 0;
+    while i < funcs.templates.len() {
+        if &funcs.templates[i].path == fn_path {
+            if let Some(rt) = funcs.templates[i].return_type.take() {
+                funcs.templates[i].return_type = Some(substitute_opaque_with_pins(&rt, &lookup));
+            }
+            return;
+        }
+        i += 1;
+    }
 }
 
 // Per-call recording during body check; resolved at end-of-fn into `CallResolution`.
@@ -2610,17 +2708,320 @@ fn check_block(
         Some(rt) => rt.clone(),
         None => RType::Tuple(Vec::new()),
     };
-    let expected_infer = rtype_to_infer(&expected);
+    // RPIT path: each `Opaque { fn_path, slot }` in the declared
+    // return becomes a fresh inference var so unification pins it
+    // from the body's actual return shape. After unify, each var
+    // resolves to the concrete sub-type — that's the slot's pin.
+    // Validate the pin against the slot's bounds before storing.
+    let mut opaque_slots: Vec<(u32, Vec<String>, u32)> = Vec::new();
+    let expected_infer = rtype_to_infer_with_opaque_vars(
+        &expected,
+        &mut ctx.subst,
+        &mut opaque_slots,
+    );
+    let span = tail_span_or_block(block);
     ctx.subst.unify(
         &actual,
         &expected_infer,
         ctx.traits,
         ctx.type_params,
         ctx.type_param_bounds,
-        &tail_span_or_block(block),
+        &span,
         ctx.current_file,
     )?;
+    // Per-Opaque post-unify pinning + bound validation.
+    let mut k = 0;
+    while k < opaque_slots.len() {
+        let (var, fn_path, slot) = opaque_slots[k].clone();
+        let resolved = ctx.subst.substitute(&InferType::Var(var));
+        let pinned_rt = infer_to_rtype_for_check(&resolved);
+        // Look up the slot's bounds from FuncTable. Try entries
+        // first, then templates.
+        let bounds = lookup_rpit_slot_bounds(ctx.funcs, &fn_path, slot);
+        let bounds = match bounds {
+            Some(b) => b,
+            None => {
+                k += 1;
+                continue;
+            }
+        };
+        let mut bi = 0;
+        while bi < bounds.len() {
+            let b = &bounds[bi];
+            if traits::solve_impl_in_ctx_with_args(
+                &b.trait_path,
+                &b.trait_args,
+                &pinned_rt,
+                ctx.traits,
+                ctx.type_params,
+                ctx.type_param_bounds,
+                0,
+            )
+            .is_none()
+            {
+                return Err(Error {
+                    file: ctx.current_file.to_string(),
+                    message: format!(
+                        "RPIT body return type `{}` does not satisfy bound `{}` declared on `{}`",
+                        rtype_to_string(&pinned_rt),
+                        place_to_string(&b.trait_path),
+                        place_to_string(&fn_path),
+                    ),
+                    span: span.copy(),
+                });
+            }
+            bi += 1;
+        }
+        // Pin the slot.
+        record_rpit_pin(ctx.funcs, &fn_path, slot, pinned_rt);
+        k += 1;
+    }
     Ok(())
+}
+
+// Convert an RType to an InferType, allocating a fresh inference
+// variable at each `Opaque` slot. `out` collects `(var, fn_path,
+// slot)` triples so the caller can post-unify look up the resolved
+// concrete type and pin the slot.
+fn rtype_to_infer_with_opaque_vars(
+    rt: &RType,
+    subst: &mut Subst,
+    out: &mut Vec<(u32, Vec<String>, u32)>,
+) -> InferType {
+    match rt {
+        RType::Opaque { fn_path, slot } => {
+            let v = subst.fresh_var();
+            out.push((v, fn_path.clone(), *slot));
+            InferType::Var(v)
+        }
+        RType::Int(k) => InferType::Int(*k),
+        RType::Bool => InferType::Bool,
+        RType::Char => InferType::Char,
+        RType::Str => InferType::Str,
+        RType::Never => InferType::Never,
+        RType::Param(name) => InferType::Param(name.clone()),
+        RType::Struct { path, type_args, lifetime_args } => InferType::Struct {
+            path: path.clone(),
+            type_args: type_args
+                .iter()
+                .map(|a| rtype_to_infer_with_opaque_vars(a, subst, out))
+                .collect(),
+            lifetime_args: lifetime_args.clone(),
+        },
+        RType::Enum { path, type_args, lifetime_args } => InferType::Enum {
+            path: path.clone(),
+            type_args: type_args
+                .iter()
+                .map(|a| rtype_to_infer_with_opaque_vars(a, subst, out))
+                .collect(),
+            lifetime_args: lifetime_args.clone(),
+        },
+        RType::Tuple(elems) => InferType::Tuple(
+            elems
+                .iter()
+                .map(|e| rtype_to_infer_with_opaque_vars(e, subst, out))
+                .collect(),
+        ),
+        RType::Ref { inner, mutable, lifetime } => InferType::Ref {
+            inner: Box::new(rtype_to_infer_with_opaque_vars(inner, subst, out)),
+            mutable: *mutable,
+            lifetime: lifetime.clone(),
+        },
+        RType::RawPtr { inner, mutable } => InferType::RawPtr {
+            inner: Box::new(rtype_to_infer_with_opaque_vars(inner, subst, out)),
+            mutable: *mutable,
+        },
+        RType::Slice(inner) => InferType::Slice(Box::new(
+            rtype_to_infer_with_opaque_vars(inner, subst, out),
+        )),
+        RType::AssocProj { base, trait_path, name } => InferType::AssocProj {
+            base: Box::new(rtype_to_infer_with_opaque_vars(base, subst, out)),
+            trait_path: trait_path.clone(),
+            name: name.clone(),
+        },
+    }
+}
+
+fn lookup_rpit_slot_bounds(
+    funcs: &FuncTable,
+    fn_path: &Vec<String>,
+    slot: u32,
+) -> Option<Vec<crate::typeck::tables::RpitBound>> {
+    let mut i = 0;
+    while i < funcs.entries.len() {
+        if funcs.entries[i].path == *fn_path {
+            return funcs.entries[i]
+                .rpit_slots
+                .get(slot as usize)
+                .map(|s| s.bounds.clone());
+        }
+        i += 1;
+    }
+    let mut i = 0;
+    while i < funcs.templates.len() {
+        if funcs.templates[i].path == *fn_path {
+            return funcs.templates[i]
+                .rpit_slots
+                .get(slot as usize)
+                .map(|s| s.bounds.clone());
+        }
+        i += 1;
+    }
+    None
+}
+
+// Walk every FnSymbol/Template's `return_type` and substitute each
+// `RType::Opaque{fn_path, slot}` for the corresponding pin recorded
+// in the matching `rpit_slots[slot].pin`. Pins that are still `None`
+// (no body, abstract function in a trait sig, etc.) leave the Opaque
+// in place — the subsequent pass that consumes the function's
+// signature is responsible for recognizing that case if it matters.
+fn finalize_rpit_substitutions(funcs: &mut FuncTable) {
+    // Snapshot all pins first so we don't borrow funcs immutably and
+    // mutably at the same time.
+    struct PinEntry {
+        fn_path: Vec<String>,
+        pins: Vec<Option<RType>>,
+    }
+    let mut all_pins: Vec<PinEntry> = Vec::new();
+    let mut i = 0;
+    while i < funcs.entries.len() {
+        if !funcs.entries[i].rpit_slots.is_empty() {
+            all_pins.push(PinEntry {
+                fn_path: funcs.entries[i].path.clone(),
+                pins: funcs.entries[i]
+                    .rpit_slots
+                    .iter()
+                    .map(|s| s.pin.clone())
+                    .collect(),
+            });
+        }
+        i += 1;
+    }
+    let mut i = 0;
+    while i < funcs.templates.len() {
+        if !funcs.templates[i].rpit_slots.is_empty() {
+            all_pins.push(PinEntry {
+                fn_path: funcs.templates[i].path.clone(),
+                pins: funcs.templates[i]
+                    .rpit_slots
+                    .iter()
+                    .map(|s| s.pin.clone())
+                    .collect(),
+            });
+        }
+        i += 1;
+    }
+    let lookup_pin = |fn_path: &Vec<String>, slot: u32| -> Option<RType> {
+        let mut k = 0;
+        while k < all_pins.len() {
+            if all_pins[k].fn_path == *fn_path {
+                return all_pins[k]
+                    .pins
+                    .get(slot as usize)
+                    .and_then(|p| p.clone());
+            }
+            k += 1;
+        }
+        None
+    };
+    let mut i = 0;
+    while i < funcs.entries.len() {
+        if let Some(rt) = funcs.entries[i].return_type.take() {
+            funcs.entries[i].return_type = Some(substitute_opaque_with_pins(&rt, &lookup_pin));
+        }
+        i += 1;
+    }
+    let mut i = 0;
+    while i < funcs.templates.len() {
+        if let Some(rt) = funcs.templates[i].return_type.take() {
+            funcs.templates[i].return_type = Some(substitute_opaque_with_pins(&rt, &lookup_pin));
+        }
+        i += 1;
+    }
+}
+
+fn substitute_opaque_with_pins<F>(rt: &RType, lookup: &F) -> RType
+where
+    F: Fn(&Vec<String>, u32) -> Option<RType>,
+{
+    match rt {
+        RType::Opaque { fn_path, slot } => match lookup(fn_path, *slot) {
+            Some(pin) => substitute_opaque_with_pins(&pin, lookup),
+            None => rt.clone(),
+        },
+        RType::Struct { path, type_args, lifetime_args } => RType::Struct {
+            path: path.clone(),
+            type_args: type_args
+                .iter()
+                .map(|a| substitute_opaque_with_pins(a, lookup))
+                .collect(),
+            lifetime_args: lifetime_args.clone(),
+        },
+        RType::Enum { path, type_args, lifetime_args } => RType::Enum {
+            path: path.clone(),
+            type_args: type_args
+                .iter()
+                .map(|a| substitute_opaque_with_pins(a, lookup))
+                .collect(),
+            lifetime_args: lifetime_args.clone(),
+        },
+        RType::Tuple(elems) => RType::Tuple(
+            elems
+                .iter()
+                .map(|e| substitute_opaque_with_pins(e, lookup))
+                .collect(),
+        ),
+        RType::Ref { inner, mutable, lifetime } => RType::Ref {
+            inner: Box::new(substitute_opaque_with_pins(inner, lookup)),
+            mutable: *mutable,
+            lifetime: lifetime.clone(),
+        },
+        RType::RawPtr { inner, mutable } => RType::RawPtr {
+            inner: Box::new(substitute_opaque_with_pins(inner, lookup)),
+            mutable: *mutable,
+        },
+        RType::Slice(inner) => RType::Slice(Box::new(substitute_opaque_with_pins(inner, lookup))),
+        RType::AssocProj { base, trait_path, name } => RType::AssocProj {
+            base: Box::new(substitute_opaque_with_pins(base, lookup)),
+            trait_path: trait_path.clone(),
+            name: name.clone(),
+        },
+        RType::Bool
+        | RType::Int(_)
+        | RType::Str
+        | RType::Never
+        | RType::Char
+        | RType::Param(_) => rt.clone(),
+    }
+}
+
+fn record_rpit_pin(
+    funcs: &mut FuncTable,
+    fn_path: &Vec<String>,
+    slot: u32,
+    pinned: RType,
+) {
+    let mut i = 0;
+    while i < funcs.entries.len() {
+        if funcs.entries[i].path == *fn_path {
+            if let Some(s) = funcs.entries[i].rpit_slots.get_mut(slot as usize) {
+                s.pin = Some(pinned);
+            }
+            return;
+        }
+        i += 1;
+    }
+    let mut i = 0;
+    while i < funcs.templates.len() {
+        if funcs.templates[i].path == *fn_path {
+            if let Some(s) = funcs.templates[i].rpit_slots.get_mut(slot as usize) {
+                s.pin = Some(pinned);
+            }
+            return;
+        }
+        i += 1;
+    }
 }
 
 // A block always has a type. With a tail expression, it's the tail's

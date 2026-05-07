@@ -421,6 +421,27 @@ pub struct FnSymbol {
     // MonoExpr using the binding's local + a synthesized args tuple.
     // None elsewhere.
     pub bare_closure_calls: Vec<Option<String>>,
+    // RPIT slots: one entry per `impl Trait` occurrence in the
+    // declared return type (in order found by depth-first walk).
+    // Each slot's `bounds` are resolved at setup time; `pin` is the
+    // concrete type the body returns at that position, recorded once
+    // body-check completes. `Opaque { fn_path: self.path, slot }`
+    // resolves to `pin` for layout queries; trait dispatch on the
+    // Opaque consults `bounds`.
+    pub rpit_slots: Vec<RpitSlot>,
+}
+
+#[derive(Clone)]
+pub struct RpitSlot {
+    pub bounds: Vec<RpitBound>,
+    pub pin: Option<RType>,
+}
+
+#[derive(Clone)]
+pub struct RpitBound {
+    pub trait_path: Vec<String>,
+    pub trait_args: Vec<RType>,
+    pub assoc_constraints: Vec<(String, RType)>,
 }
 
 // How a `Call` expression resolves to a callee. For non-generic functions
@@ -512,6 +533,8 @@ pub struct GenericTemplate {
     pub closures: Vec<Option<ClosureInfo>>,
     // See FnSymbol.bare_closure_calls.
     pub bare_closure_calls: Vec<Option<String>>,
+    // See FnSymbol.rpit_slots.
+    pub rpit_slots: Vec<RpitSlot>,
     // Where-clause predicates whose LHS is a complex type (anything
     // other than a bare type-param). Param-LHS predicates are merged
     // into `type_param_bounds`/`type_param_bound_args`/`type_param_bound_assoc`

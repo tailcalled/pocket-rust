@@ -183,6 +183,21 @@ pub enum RType {
         trait_path: Vec<String>,
         name: String,
     },
+    // Existential opaque type from a return-position `impl Trait` (RPIT).
+    // The function whose signature uses RPIT promises to return *some*
+    // concrete type that satisfies the bounds attached to this slot.
+    // `fn_path` identifies the function; `slot` disambiguates multiple
+    // RPIT positions in the same return type — `fn f() -> (impl A,
+    // impl B)` produces two distinct opaque slots, and the per-slot
+    // bounds + pin live on the FnSymbol's `rpit_slots[slot]`. Callers
+    // see this `Opaque` and use it via the bounds; operations that
+    // need the concrete type's structure (field access, layout)
+    // resolve through `rpit_slots[slot].pin`, set when the body is
+    // checked. Two `Opaque`s are equal iff `fn_path` and `slot` match.
+    Opaque {
+        fn_path: Vec<String>,
+        slot: u32,
+    },
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -299,6 +314,10 @@ pub fn rtype_contains_param(t: &RType) -> bool {
         }
         RType::AssocProj { base, .. } => rtype_contains_param(base),
         RType::Bool | RType::Int(_) | RType::Str | RType::Never | RType::Char => false,
+        // Opaque doesn't contain a Param structurally — its hidden
+        // concrete type is resolved through the FnSymbol's pin, not
+        // by walking the RType tree.
+        RType::Opaque { .. } => false,
     }
 }
 
@@ -381,6 +400,7 @@ pub fn rtype_to_string(t: &RType) -> String {
         }
         RType::Never => "!".to_string(),
         RType::Char => "char".to_string(),
+        RType::Opaque { fn_path, slot } => format!("impl <{}#{}>", place_to_string(fn_path), slot),
     }
 }
 
@@ -435,6 +455,9 @@ pub fn rtype_size(ty: &RType, structs: &StructTable) -> u32 {
         // before any storage layout matters.
         RType::Never => 0,
         RType::Char => 1,
+        RType::Opaque { .. } => unreachable!(
+            "rtype_size called on Opaque RPIT type — codegen must resolve to the FnSymbol's rpit_pin first"
+        ),
     }
 }
 
@@ -510,6 +533,9 @@ pub fn flatten_rtype(ty: &RType, structs: &StructTable, out: &mut Vec<crate::was
         // `char` flattens to a single i32 (the codepoint as a 4-byte
         // value).
         RType::Char => out.push(crate::wasm::ValType::I32),
+        RType::Opaque { .. } => unreachable!(
+            "flatten_rtype called on Opaque RPIT type — codegen must resolve to the FnSymbol's rpit_pin first"
+        ),
     }
 }
 
@@ -575,6 +601,9 @@ pub fn byte_size_of(rt: &RType, structs: &StructTable, enums: &EnumTable) -> u32
         ),
         RType::Never => 0,
         RType::Char => 4,
+        RType::Opaque { .. } => unreachable!(
+            "byte_size_of called on Opaque RPIT type — codegen must resolve to the FnSymbol's rpit_pin first"
+        ),
     }
 }
 
@@ -682,6 +711,10 @@ pub fn substitute_rtype(rt: &RType, env: &Vec<(String, RType)>) -> RType {
         },
         RType::Never => RType::Never,
         RType::Char => RType::Char,
+        RType::Opaque { fn_path, slot } => RType::Opaque {
+            fn_path: fn_path.clone(),
+            slot: *slot,
+        },
     }
 }
 

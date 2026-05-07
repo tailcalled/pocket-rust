@@ -1320,6 +1320,14 @@ fn rtype_to_ast_type(rt: &RType, span: &Span, source_file: &str) -> Result<Type,
                 span: span.copy(),
             });
         }
+        RType::Opaque { .. } => {
+            return Err(Error {
+                file: source_file.to_string(),
+                message: "internal: opaque RPIT type in closure signature — not yet handled by lowering"
+                    .to_string(),
+                span: span.copy(),
+            });
+        }
     };
     Ok(Type { kind, span: span.copy() })
 }

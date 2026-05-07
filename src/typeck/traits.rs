@@ -563,6 +563,10 @@ fn try_match_rtype_ctx(
         (RType::Bool, RType::Bool) => true,
         (RType::Never, RType::Never) => true,
         (RType::Char, RType::Char) => true,
+        (
+            RType::Opaque { fn_path: a_fp, slot: a_slot },
+            RType::Opaque { fn_path: b_fp, slot: b_slot },
+        ) => a_fp == b_fp && a_slot == b_slot,
         (RType::Tuple(a), RType::Tuple(b)) => {
             if a.len() != b.len() {
                 return false;
@@ -768,6 +772,17 @@ fn try_match_against_infer_ctx(
         // means there's nothing else `!` should be picked up by).
         RType::Never => matches!(resolved, InferType::Never),
         RType::Char => matches!(resolved, InferType::Char),
+        // An impl pattern that names an opaque RPIT slot only matches
+        // an opaque with the same `(fn_path, slot)` pair. Trait
+        // dispatch on Opaque receivers is handled separately via the
+        // FnSymbol's `rpit_slots[slot].bounds`, not by direct impl
+        // matching.
+        RType::Opaque { fn_path: pa_fp, slot: pa_slot } => match resolved {
+            InferType::Opaque { fn_path: rb_fp, slot: rb_slot } => {
+                pa_fp == &rb_fp && *pa_slot == rb_slot
+            }
+            _ => false,
+        },
     }
 }
 pub fn find_trait_impl_idx_by_span(

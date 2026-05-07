@@ -1513,16 +1513,22 @@ impl Parser {
             return self.parse_tuple_type();
         }
         if self.peek_kind(&TokenKind::Impl) {
-            // `impl T1 + T2 + …` — argument-position impl trait. Only
-            // valid at the top of a fn parameter type; the function
-            // parser desugars matching params to anonymous type-params
-            // after the params list is parsed. Anywhere else, this
-            // ImplTrait survives into typeck and is rejected.
+            // `impl T1 + T2 + …` and `impl Trait + 'a` (lifetime
+            // bound on an opaque). Lifetime bounds are accepted but
+            // currently treated as carry-only — pocket-rust doesn't
+            // yet enforce lifetime obligations on RPIT opaques.
             let impl_span = self.expect(&TokenKind::Impl, "`impl`")?;
             let mut bounds: Vec<TraitBound> = Vec::new();
             bounds.push(self.parse_trait_bound()?);
             while self.peek_kind(&TokenKind::Plus) {
                 self.pos += 1;
+                if self.peek_lifetime() {
+                    // Consume `'lifetime` and discard. (Phase B
+                    // structural carry only — `+ 'a` on `impl Trait`
+                    // doesn't yet feed into borrowck.)
+                    let _ = self.expect_lifetime()?;
+                    continue;
+                }
                 bounds.push(self.parse_trait_bound()?);
             }
             let end = self.tokens[self.pos.saturating_sub(1)].span.end.copy();

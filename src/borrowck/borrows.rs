@@ -411,6 +411,11 @@ fn rtype_contains_ref(t: &crate::typeck::RType) -> bool {
         RType::Never => false,
         // `char` is a 4-byte u32 codepoint — no refs inside.
         RType::Char => false,
+        // Opaque RPIT — be conservative. The hidden concrete type
+        // could carry a ref; without resolving the pin we can't tell.
+        // Treat as ref-bearing so borrow propagation doesn't drop a
+        // borrow that the underlying type actually keeps live.
+        RType::Opaque { .. } => true,
     }
 }
 

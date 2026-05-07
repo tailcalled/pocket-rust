@@ -1387,5 +1387,9 @@ fn collect_sized_required_params(t: &RType, sized_ctx: bool, out: &mut Vec<Strin
             // (the projection's own base param has already been visited
             // in its enclosing context if relevant).
         }
+        // Opaque carries no Param bindings — Sized obligations on the
+        // hidden concrete type are enforced when the body's actual
+        // return type is validated against the slot's bounds.
+        RType::Opaque { .. } => {}
     }
 }

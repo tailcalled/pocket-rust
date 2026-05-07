@@ -462,22 +462,10 @@ fn apit_with_fn_bound_bare_call_returns_8() {
     assert_eq!(answer_u32(&bytes), 8);
 }
 
-// Negative: `impl Trait` in return position is not yet supported. The
-// parser produces a `TypeKind::ImplTrait` that survives into typeck;
-// `resolve_type` rejects it with a clear diagnostic.
-#[test]
-fn return_position_impl_trait_is_rejected() {
-    let err = compile_source(
-        "trait Show { fn show(self) -> u32; }\n\
-         fn make() -> impl Show { 0u32 }\n\
-         fn answer() -> u32 { 0u32 }",
-    );
-    assert!(
-        err.contains("`impl Trait` is only allowed in argument position"),
-        "expected APIT-only error, got: {}",
-        err,
-    );
-}
+// `impl Trait` in return position (RPIT) is supported — see the
+// `rpit_*` tests below for positive coverage. The setup phase walks
+// the declared return type and replaces each `ImplTrait` occurrence
+// with `RType::Opaque{fn_path, slot}`; body check pins each slot.
 
 // Negative: `impl Trait` in a struct field is also rejected.
 #[test]
@@ -490,6 +478,57 @@ fn impl_trait_in_struct_field_is_rejected() {
     assert!(
         err.contains("`impl Trait` is only allowed in argument position"),
         "expected APIT-only error, got: {}",
+        err,
+    );
+}
+
+// Return-position `impl Trait` (RPIT) — the function picks a
+// concrete return type that's hidden behind the trait bound. Setup
+// resolves the return type to `RType::Opaque{fn_path, slot}` and
+// records the slot bounds; body check pins the slot to the body's
+// actual type. The post-typeck `finalize_rpit_substitutions` pass
+// then substitutes Opaque → pin in every FnSymbol's return_type so
+// callers see the concrete type for codegen.
+#[test]
+fn rpit_returns_42() {
+    let bytes = compile_inline(
+        "trait Show { fn show(self) -> u32; }\n\
+         impl Show for u32 { fn show(self) -> u32 { self * 2u32 } }\n\
+         fn make() -> impl Show { 21u32 }\n\
+         pub fn answer() -> u32 { make().show() }",
+    );
+    assert_eq!(answer_u32(&bytes), 42);
+}
+
+// RPIT in a non-top-level position: `(impl A, impl B)` produces two
+// distinct opaque slots in the same return signature. Each slot's
+// bounds are tracked separately and pinned independently from the
+// body's tail tuple.
+#[test]
+fn rpit_in_tuple_returns_42() {
+    let bytes = compile_inline(
+        "trait LeftSide { fn left(self) -> u32; }\n\
+         trait RightSide { fn right(self) -> u32; }\n\
+         impl LeftSide for u32 { fn left(self) -> u32 { self } }\n\
+         impl RightSide for u32 { fn right(self) -> u32 { self * 2u32 } }\n\
+         fn make() -> (impl LeftSide, impl RightSide) { (10u32, 16u32) }\n\
+         pub fn answer() -> u32 { let (a, b) = make(); a.left() + b.right() }",
+    );
+    assert_eq!(answer_u32(&bytes), 42);
+}
+
+// Negative: body returns a type that doesn't satisfy the bound. The
+// post-unify validation in `check_block` catches this and errors.
+#[test]
+fn rpit_body_violates_bound_is_rejected() {
+    let err = compile_source(
+        "trait Show { fn show(self) -> u32; }\n\
+         fn make() -> impl Show { 21u32 }\n\
+         fn answer() -> u32 { 0u32 }",
+    );
+    assert!(
+        err.contains("does not satisfy bound"),
+        "expected RPIT-bound error, got: {}",
         err,
     );
 }

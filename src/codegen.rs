@@ -518,6 +518,9 @@ fn collect_leaves(
             signed: false,
             valtype: wasm::ValType::I32,
         }),
+        RType::Opaque { .. } => unreachable!(
+            "collect_leaves on Opaque RPIT — typeck should have substituted via FnSymbol.rpit_slots[slot].pin before codegen reaches layout"
+        ),
     }
 }
 

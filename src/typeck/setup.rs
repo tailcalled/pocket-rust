@@ -1032,7 +1032,8 @@ fn fill_assoc_trait_path_via_closure(
         | RType::Bool
         | RType::Str
         | RType::Never
-        | RType::Char => rt.clone(),
+        | RType::Char
+        | RType::Opaque { .. } => rt.clone(),
     }
 }
 
@@ -1181,9 +1182,13 @@ fn walk_resolve_self_proj(
             mutable: *mutable,
         },
         RType::Slice(inner) => RType::Slice(Box::new(recurse(inner))),
-        RType::Param(_) | RType::Int(_) | RType::Bool | RType::Str | RType::Never | RType::Char => {
-            rt.clone()
-        }
+        RType::Param(_)
+        | RType::Int(_)
+        | RType::Bool
+        | RType::Str
+        | RType::Never
+        | RType::Char
+        | RType::Opaque { .. } => rt.clone(),
     }
 }
 
@@ -1252,7 +1257,8 @@ fn fill_assoc_trait_path(rt: &RType, default_trait_path: &Vec<String>) -> RType 
         | RType::Bool
         | RType::Str
         | RType::Never
-        | RType::Char => rt.clone(),
+        | RType::Char
+        | RType::Opaque { .. } => rt.clone(),
     }
 }
 
@@ -2072,6 +2078,147 @@ pub(super) fn resolve_impl_target(
     Ok(resolved)
 }
 
+// Walk a `Type` AST and replace each `TypeKind::ImplTrait(bounds)`
+// with a synth `Path("__rpit_<n>")` segment, allocating one synth
+// name + one slot per occurrence (depth-first order). `synth_names`
+// receives the synth names in the order the slots were allocated;
+// `bounds_per_slot[n]` collects the AST trait bounds for slot N.
+// The synth names get added to the `type_params` slice passed to
+// `resolve_type` so they resolve as `RType::Param(synth)` — which a
+// post-pass swaps for `RType::Opaque { fn_path, slot: n }`.
+fn rewrite_rpit_in_type(
+    ty: &crate::ast::Type,
+    synth_names: &mut Vec<String>,
+    bounds_per_slot: &mut Vec<Vec<crate::ast::TraitBound>>,
+) -> crate::ast::Type {
+    use crate::ast::{Path, PathSegment, Type, TypeKind};
+    let kind = match &ty.kind {
+        TypeKind::ImplTrait(bounds) => {
+            let slot = synth_names.len() as u32;
+            let name = format!("__rpit_slot_{}", slot);
+            synth_names.push(name.clone());
+            bounds_per_slot.push(bounds.clone());
+            TypeKind::Path(Path {
+                segments: vec![PathSegment {
+                    name,
+                    span: ty.span.copy(),
+                    lifetime_args: Vec::new(),
+                    args: Vec::new(),
+                }],
+                span: ty.span.copy(),
+            })
+        }
+        TypeKind::Path(p) => {
+            let mut new_segs: Vec<PathSegment> = Vec::new();
+            let mut i = 0;
+            while i < p.segments.len() {
+                let s = &p.segments[i];
+                let mut new_args: Vec<Type> = Vec::new();
+                let mut j = 0;
+                while j < s.args.len() {
+                    new_args.push(rewrite_rpit_in_type(&s.args[j], synth_names, bounds_per_slot));
+                    j += 1;
+                }
+                new_segs.push(PathSegment {
+                    name: s.name.clone(),
+                    span: s.span.copy(),
+                    lifetime_args: s.lifetime_args.clone(),
+                    args: new_args,
+                });
+                i += 1;
+            }
+            TypeKind::Path(Path { segments: new_segs, span: p.span.copy() })
+        }
+        TypeKind::Tuple(elems) => {
+            let mut new_elems: Vec<Type> = Vec::new();
+            let mut i = 0;
+            while i < elems.len() {
+                new_elems.push(rewrite_rpit_in_type(&elems[i], synth_names, bounds_per_slot));
+                i += 1;
+            }
+            TypeKind::Tuple(new_elems)
+        }
+        TypeKind::Ref { inner, mutable, lifetime } => TypeKind::Ref {
+            inner: Box::new(rewrite_rpit_in_type(inner, synth_names, bounds_per_slot)),
+            mutable: *mutable,
+            lifetime: lifetime.clone(),
+        },
+        TypeKind::RawPtr { inner, mutable } => TypeKind::RawPtr {
+            inner: Box::new(rewrite_rpit_in_type(inner, synth_names, bounds_per_slot)),
+            mutable: *mutable,
+        },
+        TypeKind::Slice(inner) => TypeKind::Slice(Box::new(
+            rewrite_rpit_in_type(inner, synth_names, bounds_per_slot),
+        )),
+        TypeKind::SelfType => TypeKind::SelfType,
+        TypeKind::Never => TypeKind::Never,
+        TypeKind::Placeholder => TypeKind::Placeholder,
+    };
+    Type { kind, span: ty.span.copy() }
+}
+
+// Walk an `RType` and replace each `Param("__rpit_slot_N")` (a synth
+// produced by `rewrite_rpit_in_type`) with the existential
+// `Opaque { fn_path, slot: N }`. Other `Param` slots — real
+// type-params — pass through unchanged.
+fn substitute_rpit_synths_to_opaque(
+    rt: &RType,
+    synth_names: &Vec<String>,
+    fn_path: &Vec<String>,
+) -> RType {
+    if synth_names.is_empty() {
+        return rt.clone();
+    }
+    let recurse = |inner: &RType| substitute_rpit_synths_to_opaque(inner, synth_names, fn_path);
+    match rt {
+        RType::Param(name) => {
+            let mut k = 0;
+            while k < synth_names.len() {
+                if synth_names[k] == *name {
+                    return RType::Opaque {
+                        fn_path: fn_path.clone(),
+                        slot: k as u32,
+                    };
+                }
+                k += 1;
+            }
+            rt.clone()
+        }
+        RType::Struct { path, type_args, lifetime_args } => RType::Struct {
+            path: path.clone(),
+            type_args: type_args.iter().map(&recurse).collect(),
+            lifetime_args: lifetime_args.clone(),
+        },
+        RType::Enum { path, type_args, lifetime_args } => RType::Enum {
+            path: path.clone(),
+            type_args: type_args.iter().map(&recurse).collect(),
+            lifetime_args: lifetime_args.clone(),
+        },
+        RType::Tuple(elems) => RType::Tuple(elems.iter().map(&recurse).collect()),
+        RType::Ref { inner, mutable, lifetime } => RType::Ref {
+            inner: Box::new(recurse(inner)),
+            mutable: *mutable,
+            lifetime: lifetime.clone(),
+        },
+        RType::RawPtr { inner, mutable } => RType::RawPtr {
+            inner: Box::new(recurse(inner)),
+            mutable: *mutable,
+        },
+        RType::Slice(inner) => RType::Slice(Box::new(recurse(inner))),
+        RType::AssocProj { base, trait_path, name } => RType::AssocProj {
+            base: Box::new(recurse(base)),
+            trait_path: trait_path.clone(),
+            name: name.clone(),
+        },
+        RType::Bool
+        | RType::Int(_)
+        | RType::Str
+        | RType::Never
+        | RType::Char
+        | RType::Opaque { .. } => rt.clone(),
+    }
+}
+
 pub(super) fn register_function(
     f: &Function,
     current_module: &Vec<String>,
@@ -2138,21 +2285,44 @@ pub(super) fn register_function(
         param_types.push(rt);
         k += 1;
     }
+    // Return type — RPIT-aware resolution. Each `impl Trait`
+    // occurrence in the declared return type becomes an `RType::Opaque
+    // { fn_path: full, slot: N }` where N is the slot index. The
+    // bounds for each slot are resolved here too and stashed for the
+    // FnSymbol/Template later in this function.
+    let mut rpit_synth_names: Vec<String> = Vec::new();
+    let mut rpit_slot_bounds_ast: Vec<Vec<crate::ast::TraitBound>> = Vec::new();
     let mut return_type = match &f.return_type {
         Some(ty) => Some({
-            let rt = resolve_type(
+            let rewritten = rewrite_rpit_in_type(
                 ty,
+                &mut rpit_synth_names,
+                &mut rpit_slot_bounds_ast,
+            );
+            let mut extended_params = type_param_names.clone();
+            let mut s = 0;
+            while s < rpit_synth_names.len() {
+                extended_params.push(rpit_synth_names[s].clone());
+                s += 1;
+            }
+            let raw_rt = resolve_type(
+                &rewritten,
                 current_module,
                 structs,
                 enums,
                 aliases,
                 self_target,
-                &type_param_names,
+                &extended_params,
                 use_scope,
                 reexports,
                 source_file,
             )?;
-            crate::typeck::concretize_assoc_proj(&rt, traits)
+            let with_opaques = substitute_rpit_synths_to_opaque(
+                &raw_rt,
+                &rpit_synth_names,
+                &full,
+            );
+            crate::typeck::concretize_assoc_proj(&with_opaques, traits)
         }),
         None => None,
     };
@@ -2466,6 +2636,63 @@ pub(super) fn register_function(
         }
         wi += 1;
     }
+    // Resolve the bounds attached to each RPIT slot. Each slot's
+    // bounds were collected as AST `TraitBound`s during the return-
+    // type rewrite; resolve them here against the function's
+    // type-param scope and stash on the FnSymbol/Template.
+    let mut rpit_slots: Vec<crate::typeck::tables::RpitSlot> = Vec::new();
+    let mut si = 0;
+    while si < rpit_slot_bounds_ast.len() {
+        let slot_bounds = &rpit_slot_bounds_ast[si];
+        let mut resolved: Vec<crate::typeck::tables::RpitBound> = Vec::new();
+        let mut bi = 0;
+        while bi < slot_bounds.len() {
+            let b = &slot_bounds[bi];
+            let (resolved_path, resolved_args) = resolve_trait_ref(
+                &b.path,
+                current_module,
+                structs,
+                enums,
+                aliases,
+                self_target,
+                &type_param_names,
+                traits,
+                use_scope,
+                reexports,
+                source_file,
+            )?;
+            let mut constraints: Vec<(String, RType)> = Vec::new();
+            let mut c = 0;
+            while c < b.assoc_constraints.len() {
+                let ac = &b.assoc_constraints[c];
+                let cty = resolve_type(
+                    &ac.ty,
+                    current_module,
+                    structs,
+                    enums,
+                    aliases,
+                    self_target,
+                    &type_param_names,
+                    use_scope,
+                    reexports,
+                    source_file,
+                )?;
+                constraints.push((ac.name.clone(), cty));
+                c += 1;
+            }
+            resolved.push(crate::typeck::tables::RpitBound {
+                trait_path: resolved_path,
+                trait_args: resolved_args,
+                assoc_constraints: constraints,
+            });
+            bi += 1;
+        }
+        rpit_slots.push(crate::typeck::tables::RpitSlot {
+            bounds: resolved,
+            pin: None,
+        });
+        si += 1;
+    }
     if is_generic {
         funcs.templates.push(GenericTemplate {
             path: full,
@@ -2494,6 +2721,7 @@ pub(super) fn register_function(
             pattern_ergo: Vec::new(),
             closures: Vec::new(),
             bare_closure_calls: Vec::new(),
+            rpit_slots: rpit_slots.clone(),
             where_predicates,
         });
     } else {
@@ -2551,6 +2779,7 @@ pub(super) fn register_function(
             pattern_ergo: Vec::new(),
             closures: Vec::new(),
             bare_closure_calls: Vec::new(),
+            rpit_slots: rpit_slots.clone(),
         });
         *next_idx += 1;
     }

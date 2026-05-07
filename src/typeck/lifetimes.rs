@@ -82,6 +82,9 @@ pub fn freshen_inferred_lifetimes(rt: &mut RType, next_id: &mut u32) {
         RType::AssocProj { base, .. } => freshen_inferred_lifetimes(base, next_id),
         RType::Never => {}
         RType::Char => {}
+        // Opaque carries no lifetime args — the bounds + pin are
+        // tracked on the FnSymbol, not on the RType node.
+        RType::Opaque { .. } => {}
     }
 }
 
@@ -160,6 +163,7 @@ pub fn require_no_inferred_lifetimes(
         RType::AssocProj { base, .. } => require_no_inferred_lifetimes(base, span, file),
         RType::Never => Ok(()),
         RType::Char => Ok(()),
+        RType::Opaque { .. } => Ok(()),
     }
 }
 
@@ -222,6 +226,7 @@ pub fn validate_named_lifetimes(
         }
         RType::Never => Ok(()),
         RType::Char => Ok(()),
+        RType::Opaque { .. } => Ok(()),
     }
 }
 
