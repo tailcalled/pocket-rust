@@ -3491,15 +3491,34 @@ fn check_closure(
         captures: Vec::new(),
     });
 
-    // Push closure params into locals.
+    // Push closure params into locals via pattern check. The common
+    // case is a single Binding (`|x|`), but tuple destructures (`|(a,
+    // b)|`) and wildcards (`|_|`) are also accepted; refutability is
+    // checked against each param's inferred type. Bindings produced by
+    // each pattern join the local stack just like let-bindings would.
     let mut k = 0;
     while k < closure.params.len() {
-        ctx.locals.push(LocalEntry {
-            name: closure.params[k].name.clone(),
-            ty: param_infer[k].clone(),
-            mutable: false,
-            declared_uninit: false,
-        });
+        let param_ty = param_infer[k].clone();
+        let pat = &closure.params[k].pattern;
+        let mut bindings: Vec<(String, InferType, Span, bool)> = Vec::new();
+        check_pattern(ctx, pat, &param_ty, &mut bindings)?;
+        if !patterns::pattern_is_irrefutable(ctx, &param_ty, pat) {
+            return Err(Error {
+                file: ctx.current_file.to_string(),
+                message: "refutable pattern in closure parameter".to_string(),
+                span: pat.span.copy(),
+            });
+        }
+        let mut bi = 0;
+        while bi < bindings.len() {
+            ctx.locals.push(LocalEntry {
+                name: bindings[bi].0.clone(),
+                ty: bindings[bi].1.clone(),
+                mutable: bindings[bi].3,
+                declared_uninit: false,
+            });
+            bi += 1;
+        }
         k += 1;
     }
 

@@ -2293,14 +2293,17 @@ impl Parser {
     }
 
     fn parse_closure_param(&mut self) -> Result<ClosureParam, Error> {
-        let (name, name_span) = self.expect_ident()?;
+        // `|` delimits the param list, so or-patterns can't appear at
+        // the top level of a closure param. `parse_pattern_no_or`
+        // handles `name`, `_`, `(a, b)`, `Foo { x, y }`, `&pat`, …
+        let pattern = self.parse_pattern_no_or()?;
         let ty = if self.peek_kind(&TokenKind::Colon) {
             self.pos += 1;
             Some(self.parse_type()?)
         } else {
             None
         };
-        Ok(ClosureParam { name, name_span, ty })
+        Ok(ClosureParam { pattern, ty })
     }
 
     fn parse_atom(&mut self) -> Result<Expr, Error> {

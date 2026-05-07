@@ -556,8 +556,12 @@ pub struct Closure {
 
 #[derive(Clone)]
 pub struct ClosureParam {
-    pub name: String,
-    pub name_span: Span,
+    // Irrefutable pattern. The common case is a single `Binding`
+    // (i.e. an identifier), but tuple destructure (`|(a, b)|`),
+    // wildcards (`|_|`), and other irrefutable patterns are accepted.
+    // Refutability is checked at typeck time against the param's
+    // inferred type.
+    pub pattern: Pattern,
     // None when the param's type is left to inference. When `Some`, used
     // as the param's declared type and also unified against the
     // surrounding `Fn(...)` bound's slot.

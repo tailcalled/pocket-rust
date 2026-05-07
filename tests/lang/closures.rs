@@ -398,3 +398,41 @@ fn bound_with_undeclared_lifetime_rejected() {
 fn logical_or_still_works() {
     expect_answer("lang/operators/logical_or", 42i32);
 }
+
+// Tuple-pattern parameter: `|(a, b)| a + b`. Closure_lower lays
+// the param out as `let (a, b) = __args.0;` in the synthesized
+// `Fn::call` body, so the existing pattern-binding pipeline binds
+// `a` and `b`.
+#[test]
+fn tuple_pattern_closure_param_returns_15() {
+    let bytes = compile_inline(
+        "pub fn answer() -> u32 { let f = |(a, b): (u32, u32)| a + b; f.call(((10u32, 5u32),)) }",
+    );
+    assert_eq!(answer_u32(&bytes), 15);
+}
+
+// Wildcard parameter: `|_| 42`. The synthesized prelude becomes
+// `let _ = __args.0;` — the existing wildcard pattern path
+// evaluates the value for side effects (none here) and drops it.
+#[test]
+fn wildcard_closure_param_returns_42() {
+    let bytes = compile_inline(
+        "pub fn answer() -> u32 { let f = |_: u32| 42u32; f.call((99u32,)) }",
+    );
+    assert_eq!(answer_u32(&bytes), 42);
+}
+
+// Negative: refutable pattern (integer literal) in a closure
+// parameter is rejected. Same machinery as let-binding refutability:
+// `pattern_is_irrefutable` against the (concrete) param type.
+#[test]
+fn refutable_closure_pattern_is_rejected() {
+    let err = compile_source(
+        "fn answer() -> u32 { let f = |0: u32| 1u32; f.call((0u32,)) }",
+    );
+    assert!(
+        err.contains("refutable pattern in closure"),
+        "expected refutable-pattern error, got: {}",
+        err,
+    );
+}

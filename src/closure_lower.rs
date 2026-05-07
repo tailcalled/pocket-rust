@@ -727,12 +727,14 @@ fn synthesize_impl_for_closure(
         ty: arg_tuple_ty.clone(),
     };
 
-    // Build the body: `let p0 = __args.0; let p1 = __args.1; ...; <closure body>`.
+    // Build the body: `let <pat0> = __args.0; let <pat1> = __args.1;
+    // ...; <closure body>`. Each `<patN>` is the closure's own
+    // (irrefutable) param pattern, deep-cloned with fresh NodeIds —
+    // so `|(a, b)|` becomes `let (a, b) = __args.0;` and the existing
+    // pattern-binding pipeline takes it from there.
     let mut stmts: Vec<Stmt> = Vec::new();
     let mut idx = 0u32;
     while (idx as usize) < closure.params.len() {
-        let pname = closure.params[idx as usize].name.clone();
-        let pname_span = closure.params[idx as usize].name_span.copy();
         let args_var = mk_expr(&mut id_alloc, ExprKind::Var("__args".to_string()), &span);
         let tuple_idx = Expr {
             kind: ExprKind::TupleIndex {
@@ -743,16 +745,10 @@ fn synthesize_impl_for_closure(
             span: span.copy(),
             id: id_alloc.alloc(),
         };
-        let pat = Pattern {
-            kind: PatternKind::Binding {
-                name: pname.clone(),
-                name_span: pname_span.copy(),
-                by_ref: false,
-                mutable: false,
-            },
-            span: pname_span.copy(),
-            id: id_alloc.alloc(),
-        };
+        let pat = clone_pattern_fresh_ids(
+            &closure.params[idx as usize].pattern,
+            &mut id_alloc,
+        );
         stmts.push(Stmt::Let(LetStmt {
             pattern: pat,
             ty: None,

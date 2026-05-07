@@ -20,7 +20,7 @@ pub trait Fn<Args>: FnMut<Args> { fn call(&self, args: Args) -> Self::Output; }
 ## Parser surface
 
 **Closure expression — `parse_closure` (sits at parse_atom level):**
-- `|p1, p2| body` — comma-separated params inside `|...|`. Each param is `name` or `name: T`.
+- `|p1, p2| body` — comma-separated params inside `|...|`. Each param is an irrefutable pattern, optionally annotated: `name`, `_`, `(a, b)`, `Foo { x, y }`, `&pat`, …, with optional `: T`. Refutability is checked at typeck time against the param's (possibly inferred) type and reuses the let-binding/match-exhaustiveness machinery.
 - `|| body` / `move || body` — empty arg list, parsed from the `OrOr` token (the only place a leading `||` can't be the logical-or operator).
 - `move |args| body` — `move` is its own `TokenKind::Move`.
 - Optional `-> R` after `|...|` makes the body a brace-block: `|x: u32| -> u32 { x + 1 }`. Without `-> R`, body is `parse_expr()` — extends right as far as expression precedence allows.
@@ -32,7 +32,7 @@ pub trait Fn<Args>: FnMut<Args> { fn call(&self, args: Args) -> Self::Output; }
 ## AST
 
 - `ExprKind::Closure(Closure)` — `Closure { params, return_type: Option<Type>, body: Box<Expr>, is_move: bool, span }`.
-- `ClosureParam { name, name_span, ty: Option<Type> }` — `ty: None` means inferred from context.
+- `ClosureParam { pattern, ty: Option<Type> }` — `pattern` is an irrefutable AST `Pattern` (commonly a `Binding`, but tuple destructure / wildcard / ref-pattern all parse). `ty: None` means inferred from context.
 - `TraitBound.hrtb_lifetime_params: Vec<LifetimeParam>` — empty for ordinary bounds.
 
 ## Architecture: type-driven lowering after typeck
@@ -158,7 +158,7 @@ impl<'cap> std::ops::Fn<(P0, P1, ...)> for __closure_<idx><'cap> {
 }
 ```
 
-Method body: `let p0 = __args.0; let p1 = __args.1; ...; <closure body>` — body is a deep-clone of `closure.body` into a fresh NodeId space, with `Var(captured_name)` rewrites:
+Method body: `let <pat0> = __args.0; let <pat1> = __args.1; ...; <closure body>` — each `<patN>` is the closure's own (irrefutable) param pattern, deep-cloned via `clone_pattern_fresh_ids` so single-binding `|x|` becomes `let x = __args.0;` and tuple destructure `|(a, b)|` becomes `let (a, b) = __args.0;`. The body is a deep-clone of `closure.body` into a fresh NodeId space, with `Var(captured_name)` rewrites:
 - `Move` mode → `self.<name>` (FieldAccess on Var("self"))
 - `Ref` mode → `*self.<name>` (Deref of FieldAccess)
 - `RefMut` mode → `*self.<name>` (same — write through `&mut T` works)
