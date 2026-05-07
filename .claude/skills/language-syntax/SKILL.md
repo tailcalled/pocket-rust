@@ -80,6 +80,7 @@ Names are in scope for subsequent statements and the tail expression. No shadowi
 Invoked as `name!(args)` or `name![args]` (parens or brackets — the lexer's `!` and the parser's macro-detection accept both). The args parse as a comma-separated expression list either way **except** for two parse-time-special-cased macros that have non-expression-shaped args.
 
 - `vec![a, b, c]` is desugared in `parse_path_atom::desugar_vec_macro` to a block expression: `{ let mut __pr_vec_<id> = Vec::new(); __pr_vec_<id>.push(a); …; __pr_vec_<id> }` — element type is inferred from the contents (or the surrounding context for the empty `vec![]` form, which collapses to `Vec::new()`).
+- `vec![value; count]` (repeat form) is desugared in `desugar_vec_macro_repeat` to a block that binds `value` and `count` once, allocates `Vec::new()`, and pushes `value.clone()` `count` times in a synthesized while-loop. Requires `T: Clone` (Copy types qualify via the std blanket impl).
 
 - `matches!(scrut, pattern)` and `matches!(scrut, pattern if guard)` are parsed by `parse_matches_macro` (the second arg is a *pattern*, not an expression, so the regular call-args path doesn't fit) and desugar to a 2-arm match: `match scrut { pattern (if guard)? => true, _ => false }`.
 

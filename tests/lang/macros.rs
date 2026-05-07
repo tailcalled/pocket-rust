@@ -19,6 +19,20 @@ fn vec_empty_returns_42() {
     expect_answer("lang/macros/vec_empty", 42i32);
 }
 
+// `vec![value; count]` — repeat form. Builds a Vec of `count`
+// clones of `value`. `T: Clone` is required (Copy types qualify).
+#[test]
+fn vec_repeat_returns_42() {
+    expect_answer("lang/macros/vec_repeat", 42u32);
+}
+
+// Repeat form with the count taken from a local — the count
+// expression is evaluated once before the loop runs.
+#[test]
+fn vec_repeat_dynamic_returns_42() {
+    expect_answer("lang/macros/vec_repeat_dynamic", 42u32);
+}
+
 // `matches!(scrut, pattern)` — desugars to `match scrut { pattern
 // => true, _ => false }`. Exercises the basic pattern-match.
 #[test]

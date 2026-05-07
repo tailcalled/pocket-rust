@@ -3076,6 +3076,41 @@ impl Parser {
                 let span_start = path.span.start.copy();
                 return self.parse_matches_macro(span_start);
             }
+            // `vec!` has two bracket forms — `vec![a, b, c]` (list) and
+            // `vec![value; count]` (repeat). Custom-parse the bracket
+            // body to disambiguate, then desugar to the corresponding
+            // synthesized block. Outside `vec!`, all macros use the
+            // generic comma-separated-expr shape.
+            if path.segments[0].name == "vec" && macro_bracket {
+                self.expect(&TokenKind::LBracket, "`[`")?;
+                if self.peek_kind(&TokenKind::RBracket) {
+                    self.pos += 1;
+                    let end = self.tokens[self.pos - 1].span.end.copy();
+                    let span = Span::new(path.span.start.copy(), end);
+                    return Ok(self.desugar_vec_macro(Vec::new(), span));
+                }
+                let first = self.parse_expr()?;
+                if self.peek_kind(&TokenKind::Semi) {
+                    self.pos += 1;
+                    let count = self.parse_expr()?;
+                    self.expect(&TokenKind::RBracket, "`]`")?;
+                    let end = self.tokens[self.pos - 1].span.end.copy();
+                    let span = Span::new(path.span.start.copy(), end);
+                    return Ok(self.desugar_vec_macro_repeat(first, count, span));
+                }
+                let mut args = vec![first];
+                while self.peek_kind(&TokenKind::Comma) {
+                    self.pos += 1;
+                    if self.peek_kind(&TokenKind::RBracket) {
+                        break;
+                    }
+                    args.push(self.parse_expr()?);
+                }
+                self.expect(&TokenKind::RBracket, "`]`")?;
+                let end = self.tokens[self.pos - 1].span.end.copy();
+                let span = Span::new(path.span.start.copy(), end);
+                return Ok(self.desugar_vec_macro(args, span));
+            }
             let args = if macro_paren {
                 self.parse_call_args()?
             } else {
@@ -3352,6 +3387,222 @@ impl Parser {
         };
         Expr {
             kind: ExprKind::Block(Box::new(block)),
+            span,
+            id: outer_id,
+        }
+    }
+
+    // `vec![value; count]` desugar. Builds a synthesized block:
+    //   {
+    //       let __pr_vec_v_<id> = <value>;
+    //       let __pr_vec_n_<id> = <count>;
+    //       let mut __pr_vec_<id> = Vec::new();
+    //       let mut __pr_vec_i_<id>: usize = 0usize;
+    //       while __pr_vec_i_<id> < __pr_vec_n_<id> {
+    //           __pr_vec_<id>.push(__pr_vec_v_<id>.clone());
+    //           __pr_vec_i_<id> = __pr_vec_i_<id> + 1usize;
+    //       }
+    //       __pr_vec_<id>
+    //   }
+    // The value is bound once so any side effects in `<value>` happen
+    // exactly once; the count similarly. `T: Clone` is required (Copy
+    // types satisfy it via the std blanket impl).
+    fn desugar_vec_macro_repeat(&mut self, value: Expr, count: Expr, span: Span) -> Expr {
+        let outer_id = self.alloc_node_id();
+        let v_name = format!("__pr_vec_v_{}", outer_id);
+        let n_name = format!("__pr_vec_n_{}", outer_id);
+        let vec_name = format!("__pr_vec_{}", outer_id);
+        let i_name = format!("__pr_vec_i_{}", outer_id);
+        let mk_binding_pat = |this: &mut Self, name: &str, mutable: bool| -> Pattern {
+            let id = this.alloc_node_id();
+            Pattern {
+                kind: PatternKind::Binding {
+                    name: name.to_string(),
+                    name_span: span.copy(),
+                    by_ref: false,
+                    mutable,
+                },
+                span: span.copy(),
+                id,
+            }
+        };
+        let mk_var = |this: &mut Self, name: &str| -> Expr {
+            let id = this.alloc_node_id();
+            Expr {
+                kind: ExprKind::Var(name.to_string()),
+                span: span.copy(),
+                id,
+            }
+        };
+        let mk_method_call = |this: &mut Self, recv: Expr, method: &str, args: Vec<Expr>| -> Expr {
+            let id = this.alloc_node_id();
+            Expr {
+                kind: ExprKind::MethodCall(MethodCall {
+                    receiver: Box::new(recv),
+                    method: method.to_string(),
+                    method_span: span.copy(),
+                    turbofish_args: Vec::new(),
+                    args,
+                }),
+                span: span.copy(),
+                id,
+            }
+        };
+        // Builds `<n>usize` as the existing parser does: an IntLit
+        // wrapped in a `Cast` to usize. The cast is the same shape
+        // `parse_int_lit` would produce for the suffixed form.
+        let mk_usize_lit = |this: &mut Self, n: u64| -> Expr {
+            let lit_id = this.alloc_node_id();
+            let lit = Expr {
+                kind: ExprKind::IntLit(n),
+                span: span.copy(),
+                id: lit_id,
+            };
+            let cast_id = this.alloc_node_id();
+            Expr {
+                kind: ExprKind::Cast {
+                    inner: Box::new(lit),
+                    ty: Type {
+                        kind: TypeKind::Path(Path {
+                            segments: vec![PathSegment {
+                                name: "usize".to_string(),
+                                span: span.copy(),
+                                lifetime_args: Vec::new(),
+                                args: Vec::new(),
+                            }],
+                            span: span.copy(),
+                        }),
+                        span: span.copy(),
+                    },
+                },
+                span: span.copy(),
+                id: cast_id,
+            }
+        };
+        // `Vec::new()`.
+        let new_call = {
+            let id = self.alloc_node_id();
+            let path = Path {
+                segments: vec![
+                    PathSegment {
+                        name: "Vec".to_string(),
+                        span: span.copy(),
+                        lifetime_args: Vec::new(),
+                        args: Vec::new(),
+                    },
+                    PathSegment {
+                        name: "new".to_string(),
+                        span: span.copy(),
+                        lifetime_args: Vec::new(),
+                        args: Vec::new(),
+                    },
+                ],
+                span: span.copy(),
+            };
+            Expr {
+                kind: ExprKind::Call(Call {
+                    callee: path,
+                    args: Vec::new(),
+                }),
+                span: span.copy(),
+                id,
+            }
+        };
+        let v_let = Stmt::Let(LetStmt {
+            pattern: mk_binding_pat(self, &v_name, false),
+            ty: None,
+            value: Some(value),
+            else_block: None,
+        });
+        let n_let = Stmt::Let(LetStmt {
+            pattern: mk_binding_pat(self, &n_name, false),
+            ty: None,
+            value: Some(count),
+            else_block: None,
+        });
+        let vec_let = Stmt::Let(LetStmt {
+            pattern: mk_binding_pat(self, &vec_name, true),
+            ty: None,
+            value: Some(new_call),
+            else_block: None,
+        });
+        // `let mut __pr_vec_i: usize = 0usize;` — explicit annotation
+        // pins the counter to usize even before the comparison drives
+        // unification, keeping diagnostics legible.
+        let usize_ty = Type {
+            kind: TypeKind::Path(Path {
+                segments: vec![PathSegment {
+                    name: "usize".to_string(),
+                    span: span.copy(),
+                    lifetime_args: Vec::new(),
+                    args: Vec::new(),
+                }],
+                span: span.copy(),
+            }),
+            span: span.copy(),
+        };
+        let zero = mk_usize_lit(self, 0);
+        let i_let = Stmt::Let(LetStmt {
+            pattern: mk_binding_pat(self, &i_name, true),
+            ty: Some(usize_ty),
+            value: Some(zero),
+            else_block: None,
+        });
+        // Cond: `__pr_vec_i_<id>.lt(&__pr_vec_n_<id>)`. Borrow the
+        // RHS the same way the comparison parser does; `lt` takes
+        // `&Self`.
+        let i_var = mk_var(self, &i_name);
+        let n_var = mk_var(self, &n_name);
+        let n_borrow_id = self.alloc_node_id();
+        let n_borrow = Expr {
+            kind: ExprKind::Borrow {
+                inner: Box::new(n_var),
+                mutable: false,
+            },
+            span: span.copy(),
+            id: n_borrow_id,
+        };
+        let cond = mk_method_call(self, i_var, "lt", vec![n_borrow]);
+        // Body stmt 1: `__pr_vec.push(__pr_vec_v.clone())`.
+        let v_var = mk_var(self, &v_name);
+        let clone_call = mk_method_call(self, v_var, "clone", Vec::new());
+        let vec_var = mk_var(self, &vec_name);
+        let push_call = mk_method_call(self, vec_var, "push", vec![clone_call]);
+        // Body stmt 2: `__pr_vec_i = __pr_vec_i + 1usize;` — desugared
+        // as MethodCall("add") on the rhs and an Assign on the lhs.
+        let i_var_rhs = mk_var(self, &i_name);
+        let one = mk_usize_lit(self, 1);
+        let add_call = mk_method_call(self, i_var_rhs, "add", vec![one]);
+        let i_lhs = mk_var(self, &i_name);
+        let assign = Stmt::Assign(AssignStmt {
+            lhs: i_lhs,
+            rhs: add_call,
+            span: span.copy(),
+        });
+        let body_block = Block {
+            stmts: vec![Stmt::Expr(push_call), assign],
+            tail: None,
+            span: span.copy(),
+        };
+        let while_id = self.alloc_node_id();
+        let while_expr = Expr {
+            kind: ExprKind::While(crate::ast::WhileExpr {
+                label: None,
+                label_span: None,
+                cond: Box::new(cond),
+                body: Box::new(body_block),
+            }),
+            span: span.copy(),
+            id: while_id,
+        };
+        let tail_var = mk_var(self, &vec_name);
+        let outer_block = Block {
+            stmts: vec![v_let, n_let, vec_let, i_let, Stmt::Expr(while_expr)],
+            tail: Some(tail_var),
+            span: span.copy(),
+        };
+        Expr {
+            kind: ExprKind::Block(Box::new(outer_block)),
             span,
             id: outer_id,
         }
