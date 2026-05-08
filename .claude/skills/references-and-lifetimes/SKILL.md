@@ -33,7 +33,9 @@ Refs in struct fields must use a `Named` lifetime (no elision in field types); t
 
 `FnSymbol.param_lifetimes: Vec<Option<LifetimeRepr>>` and `FnSymbol.ret_lifetime: Option<LifetimeRepr>` record the resolved outermost lifetimes. Borrowck propagates a returned ref's borrows from every param whose outermost lifetime matches the return's (combined sets — `fn longer<'a>(x: &'a u32, y: &'a u32) -> &'a u32` keeps both args borrowed for the result's lifetime).
 
-Type equality and unification currently ignore the lifetime field — it's structural carry today and will start participating in checks in a later phase.
+`FnSymbol.lifetime_params: Vec<String>` and `FnSymbol.lifetime_predicates: Vec<LifetimePredResolved>` carry the user-declared `<'a, 'b>` and `where 'a: 'b` clauses. Borrowck's region pass reads these to populate the per-fn `RegionGraph`; the outlives solver enforces requirements at every body-tail-return / call-site / assignment.
+
+Type equality and unification ignore the lifetime field — `unify` is invariant in non-region positions and lifetimes flow through borrowck's `RegionGraph` rather than through the typeck unifier. Variance-aware constraint emission lives in borrowck (`emit_assign_constraints` / `emit_call_constraints`); see the `borrowck-pipeline` skill's "Region inference" section.
 
 ## Field access through references
 

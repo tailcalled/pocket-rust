@@ -476,12 +476,16 @@ pub(super) fn collect_struct_names(module: &Module, path: &mut Vec<String>, tabl
                     .iter()
                     .map(|p| p.name.clone())
                     .collect();
+                let tpv = vec![crate::typeck::Variance::Covariant; type_param_names.len()];
+                let lpv = vec![crate::typeck::Variance::Covariant; lifetime_param_names.len()];
                 table.entries.push(StructEntry {
                     path: full,
                     name_span: sd.name_span.copy(),
                     file: module.source_file.clone(),
                     type_params: type_param_names,
                     lifetime_params: lifetime_param_names,
+                    type_param_variance: tpv,
+                    lifetime_param_variance: lpv,
                     fields: Vec::new(),
                     is_pub: sd.is_pub,
                 });
@@ -534,12 +538,16 @@ pub(super) fn collect_enum_names(module: &Module, path: &mut Vec<String>, table:
                     });
                     k += 1;
                 }
+                let tpv = vec![crate::typeck::Variance::Covariant; type_param_names.len()];
+                let lpv = vec![crate::typeck::Variance::Covariant; lifetime_param_names.len()];
                 table.entries.push(EnumEntry {
                     path: full,
                     name_span: ed.name_span.copy(),
                     file: module.source_file.clone(),
                     type_params: type_param_names,
                     lifetime_params: lifetime_param_names,
+                    type_param_variance: tpv,
+                    lifetime_param_variance: lpv,
                     variants,
                     is_pub: ed.is_pub,
                 });
@@ -2747,7 +2755,7 @@ pub(super) fn register_function(
                 // declared in the enclosing fn/impl scope. Phase B
                 // structural carry — borrowck doesn't yet consume
                 // these as outlives obligations.
-                if !lifetime_param_names.iter().any(|n| n == &lhs.name) {
+                if !crate::typeck::lifetime_in_scope(&lhs.name, &lifetime_param_names) {
                     return Err(crate::span::Error {
                         file: source_file.to_string(),
                         message: format!(
@@ -2761,7 +2769,7 @@ pub(super) fn register_function(
                 let mut bi = 0;
                 while bi < bounds.len() {
                     let b = &bounds[bi];
-                    if !lifetime_param_names.iter().any(|n| n == &b.name) {
+                    if !crate::typeck::lifetime_in_scope(&b.name, &lifetime_param_names) {
                         return Err(crate::span::Error {
                             file: source_file.to_string(),
                             message: format!(
@@ -2809,7 +2817,7 @@ pub(super) fn register_function(
         let mut k = 0;
         while k < pred_lifetime_bounds.len() {
             let lt = &pred_lifetime_bounds[k];
-            if !lifetime_param_names.iter().any(|n| n == &lt.name) {
+            if !crate::typeck::lifetime_in_scope(&lt.name, &lifetime_param_names) {
                 return Err(crate::span::Error {
                     file: source_file.to_string(),
                     message: format!(
@@ -3005,6 +3013,7 @@ pub(super) fn register_function(
             bare_closure_calls: Vec::new(),
             rpit_slots: rpit_slots.clone(),
             where_predicates,
+            lifetime_params: lifetime_param_names.clone(),
             lifetime_predicates: lifetime_predicates.clone(),
         });
     } else {
@@ -3063,6 +3072,7 @@ pub(super) fn register_function(
             closures: Vec::new(),
             bare_closure_calls: Vec::new(),
             rpit_slots: rpit_slots.clone(),
+            lifetime_params: lifetime_param_names.clone(),
             lifetime_predicates: lifetime_predicates.clone(),
         });
         *next_idx += 1;

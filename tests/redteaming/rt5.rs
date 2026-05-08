@@ -145,14 +145,12 @@ fn problem_3_fnonce_called_multiple_times() {
 // a placeholder, not a name, but we'd want the same handling for
 // any future built-ins).
 //
-// Fix shape: introduce a `lifetime_in_scope(name, &fn_lifetimes)`
-// predicate that's the union of declared params and built-in
-// lifetimes; route the where-clause validator (and the trailing
-// `+ 'lifetime` slot on type predicates) through it. Pre-populating
-// `'static` into the declared-param slice would be a hack — it
-// smuggles built-ins into a slice that elsewhere means "user-
-// declared params" only. Deferred (gates on the rt5 lifetime cluster
-// — #5/#7/#8/#9 — which all need the lifetime story to evolve).
+// Fix shape (landed, Phase L2): `crate::typeck::lifetime_in_scope(name,
+// &fn_lifetimes)` predicate as the single source of truth. Three
+// where-clause validation sites in setup.rs route through it. The
+// borrowck region pass mirrors the rule: `'static` resolves to
+// `STATIC_REGION` (RegionId 0) at every lookup, never pushed into
+// `sig_named`.
 #[test]
 fn problem_5_where_static_lifetime_rejected() {
     let bytes = try_compile_example(
@@ -166,19 +164,30 @@ fn problem_5_where_static_lifetime_rejected() {
 // PROBLEMS 7–9 share an architectural shape: rt4#6 made `'a: 'b`
 // and `T: Trait + 'a` predicates parse and validate (in-scope
 // names) at setup, and stores the resolved `LifetimePredResolved`
-// on `FnSymbol/Template.lifetime_predicates`. **No consumer ever
-// reads that storage.** Borrowck is "Phase B structural-only" —
-// it doesn't solve outlives obligations — so the predicates have
-// zero effect on type-checking. Programs that should depend on
-// them to be sound (or unsound) compile either way.
+// on `FnSymbol/Template.lifetime_predicates`. Originally that
+// storage was dead — borrowck did no outlives reasoning.
 //
-// Each of #7–9 demonstrates a different angle on the gap. The
-// real fix is a borrowck overhaul: lifetime-variable inference +
-// outlives constraint solving. With that machinery, body-side
-// (#7, #9) and call-site (#8) checks fall out — the predicates
-// become declared facts the solver consumes. Without it, any
-// "fix" for a single test is a band-aid that doesn't eliminate
-// the dead-storage shape. Deferred as a cluster.
+// Fix shape (landed, Phases L0–L5): full region inference in
+// borrowck. Per-fn `RegionGraph` (`src/borrowck/cfg.rs`) populated
+// at L1's `populate_signature_regions` (sig-named, sig-inferred,
+// where-clause edges, `'static` outlives every other region).
+// L3's `populate_body_constraints` walks the CFG and emits
+// outlives constraints for body operations — assignments, returns,
+// reborrows, calls (with callee free-region instantiation +
+// where-clause edges + variance-aware flow). L4's
+// `regions::solve` does Floyd-Warshall closure of declared facts
+// and verifies each requirement whose endpoints are sig-fixed
+// (body-fresh regions are treated as solver-pickable free vars
+// — the loose-but-correct simplification).
+//
+// Closes #7 and #9. #8 still fails — it needs scope-bound modeling
+// on body regions (R_inner is bounded by inner block; R_r extends
+// past). The simple "body-fresh = free var" treatment passes the
+// caller-side constraint chain trivially; real Rust catches it via
+// region intervals over CFG points. A future extension to L3 would
+// track each body-fresh region's "max scope" CFG-point set; the
+// solver would then reject when a required outlives implies the
+// body region must extend past its scope.
 
 // PROBLEM 7: Function body that contradicts its own where-clause
 // is silently accepted. The signature declares `'a: 'b`, but the

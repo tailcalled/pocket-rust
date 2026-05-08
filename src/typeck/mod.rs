@@ -264,7 +264,9 @@ pub(crate) fn infer_to_rtype_for_check(t: &InferType) -> RType {
 // when `'a` ties multiple ref params to the return, all those args'
 // borrows propagate into the result (the "combined borrow sets" rule).
 mod lifetimes;
-pub use lifetimes::find_lifetime_source;
+pub use lifetimes::{find_lifetime_source, lifetime_in_scope};
+pub mod variance;
+pub use variance::Variance;
 use lifetimes::{
     find_elision_source, freshen_inferred_lifetimes, require_no_inferred_lifetimes,
     validate_named_lifetimes,
@@ -371,6 +373,13 @@ pub fn check(
     // emitted by the closure-lowering pass run after typeck — see the
     // `closures-and-fn-traits` skill.
     register_closure_structs(structs, funcs);
+
+    // Use-site variance inference over user (and synthesized closure)
+    // structs/enums. Borrowck consults the resulting variance vectors
+    // at each value-flow boundary between same-path types with
+    // different region/type args, to decide whether to emit a one-way
+    // outlives constraint (Covariant) or to equate (Invariant).
+    variance::compute_variance(structs, enums);
 
     Ok(())
 }
@@ -723,12 +732,16 @@ fn push_closure_struct(structs: &mut StructTable, ci: &ClosureInfo) {
     } else {
         Vec::new()
     };
+    let tpv = vec![Variance::Covariant; ci.enclosing_type_params.len()];
+    let lpv = vec![Variance::Covariant; lifetime_params.len()];
     structs.entries.push(StructEntry {
         path: ci.synthesized_struct_path.clone(),
         name_span: ci.body_span.copy(),
         file: ci.source_file.clone(),
         type_params: ci.enclosing_type_params.clone(),
         lifetime_params,
+        type_param_variance: tpv,
+        lifetime_param_variance: lpv,
         fields,
         is_pub: false,
     });
@@ -5454,11 +5467,12 @@ use methods::check_method_call;
 mod tables;
 pub use tables::{
     AliasEntry, AliasTable, CallResolution, CaptureInfo, CaptureMode, ClosureInfo, EnumEntry,
-    EnumTable, EnumVariantEntry, FnSymbol, FuncTable, GenericTemplate, MethodResolution,
-    MoveStatus, MovedPlace, PatternErgo, RTypedField, ReceiverAdjust, StructEntry, StructTable,
-    SupertraitRef, TraitDispatch, TraitEntry, TraitImplEntry, TraitMethodEntry,
-    TraitReceiverShape, TraitTable, VariantPayloadResolved, alias_lookup, enum_lookup,
-    find_inherent_synth_idx, func_lookup, struct_lookup, template_lookup, trait_lookup,
+    EnumTable, EnumVariantEntry, FnSymbol, FuncTable, GenericTemplate, LifetimePredResolved,
+    MethodResolution, MoveStatus, MovedPlace, PatternErgo, RTypedField, ReceiverAdjust,
+    StructEntry, StructTable, SupertraitRef, TraitDispatch, TraitEntry, TraitImplEntry,
+    TraitMethodEntry, TraitReceiverShape, TraitTable, VariantPayloadResolved, alias_lookup,
+    enum_lookup, find_inherent_synth_idx, func_lookup, struct_lookup, template_lookup,
+    trait_lookup,
 };
 
 mod traits;

@@ -237,23 +237,7 @@ fn check_named_in_scope(
     file: &str,
 ) -> Result<(), Error> {
     if let LifetimeRepr::Named(name) = lt {
-        // `'static` is a built-in lifetime; always in scope without
-        // an enclosing `<'static, …>` declaration. (It carries
-        // structurally just like any other Named lifetime — Phase D
-        // doesn't enforce its "outlives everything" semantics.)
-        if name == "static" {
-            return Ok(());
-        }
-        let mut found = false;
-        let mut i = 0;
-        while i < lifetime_params.len() {
-            if lifetime_params[i] == *name {
-                found = true;
-                break;
-            }
-            i += 1;
-        }
-        if !found {
+        if !lifetime_in_scope(name, lifetime_params) {
             return Err(Error {
                 file: file.to_string(),
                 message: format!("undeclared lifetime `'{}`", name),
@@ -262,6 +246,32 @@ fn check_named_in_scope(
         }
     }
     Ok(())
+}
+
+// Single source of truth for "is this lifetime name visible at this
+// site". The set of in-scope lifetimes is the union of:
+//   - user-declared parameters (`<'a, 'b>` on the enclosing fn/impl);
+//   - built-in lifetimes — currently just `'static`. Future built-ins
+//     (e.g. an explicit `'_` placeholder name) get one new arm here.
+//
+// Used by signature validation (`check_named_in_scope`), where-clause
+// validation (`setup::register_function`'s lifetime-predicate path),
+// and any future site that needs the same check. Borrowck's
+// `populate_signature_regions` resolves the same names to `RegionId`s
+// via `RegionGraph::lookup_named` plus the `STATIC_REGION` constant —
+// the two layers must stay in sync.
+pub fn lifetime_in_scope(name: &str, lifetime_params: &Vec<String>) -> bool {
+    if name == "static" {
+        return true;
+    }
+    let mut i = 0;
+    while i < lifetime_params.len() {
+        if lifetime_params[i] == name {
+            return true;
+        }
+        i += 1;
+    }
+    false
 }
 
 // Lifetime elision: returns the index of the param whose outermost ref

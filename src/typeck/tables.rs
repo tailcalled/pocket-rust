@@ -86,6 +86,15 @@ pub struct StructEntry {
     // structs. Used to validate lifetime args at type-position uses and to
     // build a substitution env when reading field types.
     pub lifetime_params: Vec<String>,
+    // Variance per type-param / lifetime-param, parallel to the Vecs
+    // above. Computed by `variance::compute_variance` after struct
+    // fields are populated. Used by borrowck at value-flow boundaries
+    // to decide one-way (Covariant) vs equate (Invariant) outlives
+    // emission. Default Covariant; narrowed to Invariant by use-site
+    // analysis (e.g. inner of `&mut T`, raw-ptr pointee, AssocProj
+    // base, slot of a struct/enum that's invariant in that param).
+    pub type_param_variance: Vec<crate::typeck::variance::Variance>,
+    pub lifetime_param_variance: Vec<crate::typeck::variance::Variance>,
     pub fields: Vec<RTypedField>,
     pub is_pub: bool,
 }
@@ -115,6 +124,9 @@ pub struct EnumEntry {
     pub file: String,
     pub type_params: Vec<String>,
     pub lifetime_params: Vec<String>,
+    // Same variance vectors as StructEntry — see there.
+    pub type_param_variance: Vec<crate::typeck::variance::Variance>,
+    pub lifetime_param_variance: Vec<crate::typeck::variance::Variance>,
     pub variants: Vec<EnumVariantEntry>,
     pub is_pub: bool,
 }
@@ -436,7 +448,14 @@ pub struct FnSymbol {
     // Opaque consults `bounds`.
     pub rpit_slots: Vec<RpitSlot>,
     // Lifetime outlives predicates declared in the fn's where-clause
-    // (`where 'a: 'b`). Phase B carry-only (see `GenericTemplate.lifetime_predicates`).
+    // User-declared lifetime parameter names (`<'a, 'b>` in source
+    // order, with any `impl<'imp_a, 'imp_b>` lifetimes prepended for
+    // methods of generic impls). Empty for fns with no lifetime
+    // generics. Borrowck's region pass (Phase L1) maps these names to
+    // RegionIds for the per-fn `RegionGraph`.
+    pub lifetime_params: Vec<String>,
+    // (`where 'a: 'b`). Borrowck (Phase L1) translates each predicate
+    // into a `WhereClause`-source edge in the per-fn `RegionGraph`.
     pub lifetime_predicates: Vec<LifetimePredResolved>,
 }
 
@@ -553,9 +572,11 @@ pub struct GenericTemplate {
     // each bound is resolved via `solve_impl_in_ctx_with_args`, and
     // failure produces "where-clause predicate not satisfied".
     pub where_predicates: Vec<WherePredResolved>,
+    // User-declared lifetime parameter names (see `FnSymbol.lifetime_params`).
+    pub lifetime_params: Vec<String>,
     // Lifetime outlives predicates from the function's where-clause
-    // (`where 'a: 'b`). Phase B structural carry — see
-    // `LifetimePredResolved`.
+    // (`where 'a: 'b`). Borrowck (Phase L1) translates each into a
+    // `WhereClause`-source edge in the per-fn `RegionGraph`.
     pub lifetime_predicates: Vec<LifetimePredResolved>,
 }
 

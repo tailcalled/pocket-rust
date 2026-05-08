@@ -194,6 +194,102 @@ pub enum CallTarget {
 
 pub type RegionId = u32;
 
+// `'static` is always the lowest-numbered region. The Builder
+// starts allocating other RegionIds from 1 onward via `fresh_region`,
+// so this constant collides with no allocated id.
+pub const STATIC_REGION: RegionId = 0;
+
+// Source of an outlives constraint, attached for diagnostics. When the
+// solver flags `'a : 'b` as missing, the source tells the user which
+// declaration / op introduced the obligation.
+#[derive(Clone, Copy)]
+pub enum ConstraintSource {
+    // `where 'a : 'b` written in source — the most authoritative
+    // constraint kind.
+    WhereClause,
+    // `'static : 'r` — built-in fact seeded for every region at
+    // graph construction (Phase L1 / L2).
+    StaticOutlives,
+    // Returned value's region must outlive the fn's declared return
+    // region. Generated at each `return r` and at the body-tail
+    // assign-to-return-local in `build()`.
+    FnReturn,
+    // Call-site arg whose region must outlive the callee's expected
+    // param region (after instantiating the callee's free regions
+    // with fresh inference vars).
+    CallArg,
+    // Call-site result region must be outlived by the callee's
+    // declared return region's instantiation.
+    CallReturn,
+    // Reborrow: `&*ref` — the reborrow's region must be outlived by
+    // the source ref's region.
+    Reborrow,
+    // Assignment / value flow at any same-typed binding boundary
+    // (let-init, struct-field assign, etc.).
+    Assign,
+}
+
+#[derive(Clone)]
+pub struct OutlivesConstraint {
+    // `sup` outlives `sub`. Read as `'sup : 'sub`.
+    pub sup: RegionId,
+    pub sub: RegionId,
+    pub span: Span,
+    pub source: ConstraintSource,
+}
+
+// Per-fn region inference state. Built during `borrowck::build` from
+// the signature + where-clauses, then extended during CFG-walk with
+// constraints from body operations (Phase L3). Phase L4's solver
+// computes the transitive closure and validates each constraint.
+//
+// Today (Phase L1): graph is populated but unread by downstream
+// passes. The structure exists; its consumers ship in subsequent
+// phases.
+pub struct RegionGraph {
+    // `'a` (named user lifetime in the fn-sig) → its RegionId. Each
+    // distinct name maps to exactly one RegionId for this fn.
+    pub sig_named: Vec<(String, RegionId)>,
+    // `LifetimeRepr::Inferred(N)` → RegionId. Elided refs in the sig
+    // each get a fresh RegionId, keyed by their `Inferred(N)` id so
+    // multiple occurrences of the same elided lifetime share a region.
+    pub sig_inferred: Vec<(u32, RegionId)>,
+    // Outermost lifetime's region of the fn's return type, if it's a
+    // ref; None otherwise. Body-return constraints emit `value : this`.
+    pub fn_return_region: Option<RegionId>,
+    // Collected constraints. Phase L4's solver consumes these.
+    pub outlives: Vec<OutlivesConstraint>,
+}
+
+impl RegionGraph {
+    pub fn new() -> Self {
+        Self {
+            sig_named: Vec::new(),
+            sig_inferred: Vec::new(),
+            fn_return_region: None,
+            outlives: Vec::new(),
+        }
+    }
+
+    pub fn lookup_named(&self, name: &str) -> Option<RegionId> {
+        for (n, r) in &self.sig_named {
+            if n == name {
+                return Some(*r);
+            }
+        }
+        None
+    }
+
+    pub fn lookup_inferred(&self, id: u32) -> Option<RegionId> {
+        for (n, r) in &self.sig_inferred {
+            if *n == id {
+                return Some(*r);
+            }
+        }
+        None
+    }
+}
+
 // A statement — a single operation that doesn't affect control flow.
 // Each statement carries the source span of the originating AST node so
 // diagnostics can point at the right place.
@@ -273,8 +369,13 @@ pub struct Cfg {
     pub locals: Vec<LocalDecl>,
     pub entry: BlockId,
     // The number of regions allocated during construction. Each Borrow
-    // rvalue carries a region id < `region_count`.
+    // rvalue carries a region id < `region_count`. RegionId 0 is the
+    // built-in `'static`; allocations from `fresh_region` start at 1.
     pub region_count: u32,
+    // Region graph: signature-derived regions, where-clause edges,
+    // and (after Phase L3 lands) body-derived outlives constraints.
+    // Phase L4's solver reads this to validate every required edge.
+    pub region_graph: RegionGraph,
     // Local 0 holds the function's return value when the return type is
     // non-unit. Parameters occupy locals 1..=param_count.
     pub return_local: Option<LocalId>,

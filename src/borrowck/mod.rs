@@ -17,6 +17,7 @@ mod cfg;
 mod borrows;
 mod liveness;
 mod moves;
+mod regions;
 
 use crate::ast::{Function, Item, Module};
 use crate::span::Error;
@@ -173,7 +174,7 @@ fn check_function(
     let cfg_move_sites: Vec<(crate::ast::NodeId, String)>;
     {
         let funcs_ro: &FuncTable = &*funcs;
-        let (param_types, expr_types, method_resolutions, call_resolutions, bare_closure_calls, type_params, type_param_bounds, pattern_ergo) =
+        let (param_types, expr_types, method_resolutions, call_resolutions, bare_closure_calls, type_params, type_param_bounds, pattern_ergo, lifetime_params, lifetime_predicates) =
             if let Some(entry) = func_lookup(funcs_ro, &full) {
                 (
                     &entry.param_types,
@@ -184,6 +185,8 @@ fn check_function(
                     Vec::<String>::new(),
                     Vec::<Vec<Vec<String>>>::new(),
                     &entry.pattern_ergo,
+                    &entry.lifetime_params,
+                    &entry.lifetime_predicates,
                 )
             } else if let Some((_, t)) = template_lookup(funcs_ro, &full) {
                 let mut bounds_clone: Vec<Vec<Vec<String>>> = Vec::new();
@@ -207,6 +210,8 @@ fn check_function(
                     t.type_params.clone(),
                     bounds_clone,
                     &t.pattern_ergo,
+                    &t.lifetime_params,
+                    &t.lifetime_predicates,
                 )
             } else {
                 unreachable!("typeck registered this function");
@@ -239,8 +244,14 @@ fn check_function(
             param_types,
             return_type: &return_ty,
             pattern_ergo,
+            lifetime_params,
+            lifetime_predicates,
         };
         let cfg = build::build(func, &cfg_ctx);
+        // Phase L4: outlives solver. Validates each body-required
+        // outlives constraint (FnReturn, CallArg, …) against the
+        // closure of declared facts (WhereClause, StaticOutlives).
+        regions::solve(&cfg.region_graph, &full, current_file)?;
         let move_analysis = moves::analyze(&cfg, traits, current_file);
         if let Some(e) = move_analysis.errors.into_iter().next() {
             return Err(e);

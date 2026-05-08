@@ -96,6 +96,23 @@ The function epilogue restores `__sp` from a function-entry-saved local rather t
 
 **sret return for enum-returning functions:** leading `i32` param is the caller-supplied destination address; before SP restore the function memcpys the constructed enum's bytes to that address (via `emit_memcpy`), then pushes the sret address as the i32 wasm result. Callers allocate the sret slot in their own frame before each enum-returning call.
 
+## Variance
+
+`StructEntry` and `EnumEntry` carry `type_param_variance: Vec<Variance>` and `lifetime_param_variance: Vec<Variance>` parallel to their `type_params` / `lifetime_params`. The lattice today is a chain — `Variance::Covariant` (default) and `Variance::Invariant`; no `Contravariant` until fn pointers land. Computed by `src/typeck/variance.rs::compute_variance`, run after `check_module` (alongside `register_closure_structs` so synthesized closure structs participate).
+
+Use-site analysis walks every field type with a "current position variance" (starts Covariant; flips to Invariant under `&mut T` inner / raw-ptr pointee / `AssocProj` base / structs marked Invariant in that slot). Each occurrence of a parameter narrows that parameter's variance via `meet`. Fixpoint terminates because the lattice is a finite chain — each (entry, slot) flips Cov→Inv at most once.
+
+Position-flipping rules (in `walk`):
+- Direct mention of param T: inherits position.
+- `&T`, `&'_ T`: outer lifetime covariant; inner T inherits.
+- `&mut T`, `&'_ mut T`: outer lifetime covariant; inner T flips to **Invariant**.
+- `*const T` / `*mut T`: T flips to Invariant.
+- `Tuple`, `Slice`: each elem inherits position.
+- `Struct<T_i, 'l_j>`: each slot composes that struct's variance for slot i with the current position. Composition: `Cov ∘ Cov = Cov`, `Cov ∘ Inv = Inv`, `Inv ∘ _ = Inv`.
+- `AssocProj { base, ... }`: base flips to Invariant.
+
+Borrowck reads these vectors at value-flow boundaries between two same-path types with differing region/type args (`emit_assign_constraints` / `emit_call_constraints` in `src/borrowck/build.rs`). Covariant slot → emit a one-way outlives edge (source : target). Invariant slot → equate (emit both directions). The variance layer lives in borrowck rather than in typeck's `unify` because `unify` is uniformly invariant by Phase 1's design — value-flow rules belong in `coerce` / borrowck, not in the structural unifier.
+
 ## `!`-arm picking in if/match
 
 `check_if_expr` (and `check_match_expr` analogously) returns the *non-`!` arm's* type when one arm diverges. So `if cond { panic!() } else { 42 }` types as the else arm's `u32`, not `!`. Without this picking, the if's recorded type would be `!` (zero flat scalars), the wasm `If` BlockType would be Empty, and downstream consumers expecting an `i32` would hit "values remaining on stack at end of block".

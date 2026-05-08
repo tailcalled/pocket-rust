@@ -41,6 +41,15 @@ pub struct CfgBuildCtx<'a> {
     // synthesized receiver effect — Move recv_adjust → move-out on the
     // binding — even though the surface AST node is `Call`, not `MethodCall`.
     pub bare_closure_calls: &'a Vec<Option<String>>,
+    // User-declared lifetime parameter names on the fn (for `<'a, 'b>`
+    // — empty if the fn has no lifetime generics). Used by Phase L1 to
+    // populate `RegionGraph.sig_named`.
+    pub lifetime_params: &'a Vec<String>,
+    // Resolved `where 'a : 'b1 + 'b2 + …` clauses on the fn. Read by
+    // Phase L1 to seed the outlives graph with WhereClause-source
+    // edges. Each predicate's lhs/bounds reference names from
+    // `lifetime_params` (or `'static`).
+    pub lifetime_predicates: &'a Vec<crate::typeck::LifetimePredResolved>,
     pub type_params: &'a Vec<String>,
     pub type_param_bounds: &'a Vec<Vec<Vec<String>>>,
     // Resolved parameter types (in order). Length = func.params.len().
@@ -68,7 +77,18 @@ struct Builder<'a> {
     ctx: &'a CfgBuildCtx<'a>,
     blocks: Vec<BasicBlock>,
     locals: Vec<LocalDecl>,
+    // Allocator counter for `fresh_region`. Starts at 1; RegionId 0
+    // is reserved for `'static` (`STATIC_REGION` in cfg.rs).
     region_count: u32,
+    region_graph: crate::borrowck::cfg::RegionGraph,
+    // Per-LocalId outermost region: the RegionId for the binding's
+    // outer lifetime when its type is `&'r T` (or a struct/enum whose
+    // first slot is a region we care about). `None` for non-ref
+    // bindings — `Use`/`Move`/`Copy` of an owned local emits no region
+    // constraint. Populated lazily by `binding_region_lookup` so locals
+    // allocated mid-CFG-walk get an entry by the time the constraint
+    // pass needs it.
+    binding_region: Vec<Option<crate::borrowck::cfg::RegionId>>,
     current_block: BlockId,
     scopes: Vec<Scope>,
     return_local: Option<LocalId>,
@@ -81,13 +101,23 @@ pub fn build(func: &Function, ctx: &CfgBuildCtx) -> Cfg {
         ctx,
         blocks: Vec::new(),
         locals: Vec::new(),
-        region_count: 0,
+        // Reserve RegionId 0 for `'static` (see `STATIC_REGION` in
+        // cfg.rs). Subsequent `fresh_region()` calls return 1, 2, …
+        region_count: 1,
+        region_graph: crate::borrowck::cfg::RegionGraph::new(),
+        binding_region: Vec::new(),
         current_block: 0,
         scopes: Vec::new(),
         return_local: None,
         param_count: 0,
         loops: Vec::new(),
     };
+    // Phase L1: signature walk. Allocate RegionIds for each named
+    // lifetime + each elided-ref `Inferred(N)` slot, seed
+    // `'static : <every-other-region>`, and emit WhereClause edges
+    // for `where 'a : 'b` predicates. Behaviorally a no-op until L3
+    // adds body constraints and L4 runs the solver.
+    populate_signature_regions(&mut b, func);
     let entry = b.new_block();
     b.current_block = entry;
 
@@ -123,13 +153,676 @@ pub fn build(func: &Function, ctx: &CfgBuildCtx) -> Cfg {
     b.set_terminator(Terminator::Return);
     b.pop_scope();
 
+    // Phase L3: body region inference. Walk the populated CFG and
+    // emit outlives constraints for each region-relevant op:
+    // assignments, returns, calls. Constraints land on
+    // `b.region_graph.outlives` and are validated by Phase L4.
+    populate_body_constraints(&mut b);
+
     Cfg {
         blocks: b.blocks,
         locals: b.locals,
         entry,
         region_count: b.region_count,
+        region_graph: b.region_graph,
         return_local: b.return_local,
         param_count: b.param_count,
+    }
+}
+
+// Walk the fn signature: assign a RegionId to each named lifetime
+// (`<'a, 'b>`) and to each `LifetimeRepr::Inferred(N)` (elided refs).
+// Seed `'static : <every other region>` (the StaticOutlives source).
+// Translate `where 'a : 'b1 + 'b2` into WhereClause-source edges.
+// Record the outermost return-region if the return type is a ref —
+// body returns will later emit `value : fn_return_region`.
+fn populate_signature_regions(b: &mut Builder, func: &Function) {
+    use crate::borrowck::cfg::{ConstraintSource, OutlivesConstraint, STATIC_REGION};
+    use crate::typeck::LifetimeRepr;
+
+    // 1. Allocate region IDs for each user-declared lifetime param.
+    let mut i = 0;
+    while i < b.ctx.lifetime_params.len() {
+        let r = b.fresh_region();
+        b.region_graph
+            .sig_named
+            .push((b.ctx.lifetime_params[i].clone(), r));
+        i += 1;
+    }
+
+    // 2. Walk param + return types collecting Inferred lifetimes (one
+    // RegionId per distinct `Inferred(N)` id) and any Named lifetimes
+    // not declared by the fn (these would have been rejected upstream
+    // by `validate_named_lifetimes`, but we accept `'static` and any
+    // re-encountered name no-op).
+    let mut i = 0;
+    while i < b.ctx.param_types.len() {
+        collect_sig_regions(&b.ctx.param_types[i], &mut b.region_graph, &mut b.region_count);
+        i += 1;
+    }
+    collect_sig_regions(b.ctx.return_type, &mut b.region_graph, &mut b.region_count);
+
+    // 3. Outermost region of the return type: if it's a ref, record
+    // it for body-return constraints.
+    if let RType::Ref { lifetime, .. } = b.ctx.return_type {
+        let r = lookup_or_static(&b.region_graph, lifetime);
+        b.region_graph.fn_return_region = r;
+    }
+
+    // 4. `'static` outlives every other region. Seed each pair with a
+    // StaticOutlives edge so the solver doesn't need to special-case
+    // RegionId 0 — it falls out of the closure.
+    let max = b.region_count;
+    let mut r = 1u32;
+    while r < max {
+        b.region_graph.outlives.push(OutlivesConstraint {
+            sup: STATIC_REGION,
+            sub: r,
+            span: func.name_span.copy(),
+            source: ConstraintSource::StaticOutlives,
+        });
+        r += 1;
+    }
+
+    // 5. Where-clauses: `where 'lhs : 'b1 + 'b2 + …` becomes one edge
+    // per `'bi`. Resolve each side via `lookup_or_static`. Predicates
+    // with unresolvable names are skipped silently — typeck rejects
+    // those at signature setup, so unresolved here means the fn
+    // wouldn't have type-checked.
+    let mut i = 0;
+    while i < b.ctx.lifetime_predicates.len() {
+        let pred = &b.ctx.lifetime_predicates[i];
+        let sup = b.region_graph.lookup_named(&pred.lhs).or_else(|| {
+            if pred.lhs == "static" {
+                Some(STATIC_REGION)
+            } else {
+                None
+            }
+        });
+        if let Some(sup) = sup {
+            let mut k = 0;
+            while k < pred.bounds.len() {
+                let sub_name = &pred.bounds[k];
+                let sub = b.region_graph.lookup_named(sub_name).or_else(|| {
+                    if sub_name == "static" {
+                        Some(STATIC_REGION)
+                    } else {
+                        None
+                    }
+                });
+                if let Some(sub) = sub {
+                    b.region_graph.outlives.push(OutlivesConstraint {
+                        sup,
+                        sub,
+                        span: pred.span.copy(),
+                        source: ConstraintSource::WhereClause,
+                    });
+                }
+                k += 1;
+            }
+        }
+        i += 1;
+    }
+}
+
+// Recurse through an RType, mapping each `LifetimeRepr::Inferred(N)`
+// to a fresh RegionId (deduped by N) and adding it to
+// `sig_inferred`. Named lifetimes are looked up in `sig_named`; if
+// they were already populated by the lifetime-params walk, they're
+// skipped here.
+fn collect_sig_regions(rt: &RType, graph: &mut crate::borrowck::cfg::RegionGraph, counter: &mut u32) {
+    use crate::typeck::LifetimeRepr;
+    match rt {
+        RType::Ref { inner, lifetime, .. } => {
+            ensure_lifetime_region(lifetime, graph, counter);
+            collect_sig_regions(inner, graph, counter);
+        }
+        RType::RawPtr { inner, .. } => collect_sig_regions(inner, graph, counter),
+        RType::Struct { type_args, lifetime_args, .. }
+        | RType::Enum { type_args, lifetime_args, .. } => {
+            for la in lifetime_args {
+                ensure_lifetime_region(la, graph, counter);
+            }
+            for ta in type_args {
+                collect_sig_regions(ta, graph, counter);
+            }
+        }
+        RType::Tuple(elems) => {
+            for e in elems {
+                collect_sig_regions(e, graph, counter);
+            }
+        }
+        RType::Slice(inner) => collect_sig_regions(inner, graph, counter),
+        RType::AssocProj { base, .. } => collect_sig_regions(base, graph, counter),
+        RType::Bool
+        | RType::Int(_)
+        | RType::Char
+        | RType::Str
+        | RType::Never
+        | RType::Param(_)
+        | RType::Opaque { .. } => {}
+    }
+}
+
+fn ensure_lifetime_region(
+    lt: &crate::typeck::LifetimeRepr,
+    graph: &mut crate::borrowck::cfg::RegionGraph,
+    counter: &mut u32,
+) {
+    use crate::borrowck::cfg::STATIC_REGION;
+    use crate::typeck::LifetimeRepr;
+    match lt {
+        LifetimeRepr::Named(name) => {
+            if name == "static" {
+                return; // STATIC_REGION already exists.
+            }
+            // Already populated by lifetime-params walk; skip.
+            if graph.lookup_named(name).is_some() {
+                return;
+            }
+            // Name not declared — typeck rejects this at sig setup.
+            // Defensively allocate a fresh region so downstream
+            // doesn't trip on a missing entry; it'll never be used in
+            // a sound program.
+            let r = *counter;
+            *counter += 1;
+            graph.sig_named.push((name.clone(), r));
+        }
+        LifetimeRepr::Inferred(id) => {
+            if graph.lookup_inferred(*id).is_some() {
+                return;
+            }
+            let r = *counter;
+            *counter += 1;
+            graph.sig_inferred.push((*id, r));
+        }
+    }
+}
+
+fn lookup_or_static(
+    graph: &crate::borrowck::cfg::RegionGraph,
+    lt: &crate::typeck::LifetimeRepr,
+) -> Option<crate::borrowck::cfg::RegionId> {
+    use crate::borrowck::cfg::STATIC_REGION;
+    use crate::typeck::LifetimeRepr;
+    match lt {
+        LifetimeRepr::Named(name) => {
+            if name == "static" {
+                Some(STATIC_REGION)
+            } else {
+                graph.lookup_named(name)
+            }
+        }
+        LifetimeRepr::Inferred(id) => graph.lookup_inferred(*id),
+    }
+}
+
+// Resolve a `LifetimeRepr` to a RegionId for a body binding.
+//
+// Sig-fixed regions (named lifetimes declared on the fn, sig-elided
+// `Inferred(N)` slots already allocated by L1's
+// `populate_signature_regions`) are looked up. Body-introduced
+// lifetimes (`Inferred(0)` placeholders, or names we've never seen —
+// defensively, since typeck rejects undeclared names at the sig site)
+// get a body-fresh RegionId that the solver treats as a free
+// variable.
+//
+// IMPORTANT: this function does NOT push to `sig_named` /
+// `sig_inferred`. Those vectors stay frozen at L1's signature walk;
+// the solver uses membership in them to decide whether a region is
+// fixed (caller picks the value, body must satisfy) or free (body
+// picks the value, satisfies trivially).
+fn resolve_or_alloc_region(
+    graph: &crate::borrowck::cfg::RegionGraph,
+    counter: &mut u32,
+    lt: &crate::typeck::LifetimeRepr,
+) -> crate::borrowck::cfg::RegionId {
+    use crate::borrowck::cfg::STATIC_REGION;
+    use crate::typeck::LifetimeRepr;
+    match lt {
+        LifetimeRepr::Named(name) => {
+            if name == "static" {
+                return STATIC_REGION;
+            }
+            if let Some(r) = graph.lookup_named(name) {
+                return r;
+            }
+            let r = *counter;
+            *counter += 1;
+            r
+        }
+        LifetimeRepr::Inferred(id) => {
+            if *id != 0 {
+                if let Some(r) = graph.lookup_inferred(*id) {
+                    return r;
+                }
+            }
+            let r = *counter;
+            *counter += 1;
+            r
+        }
+    }
+}
+
+// Compute the outermost region of a place's type given its root
+// `LocalDecl`'s type plus any `Field`/`TupleIndex`/`Deref` projections.
+// For now, supports:
+//   - bare `Local`: the local's outermost region (if its type is a ref).
+//   - `Local.field`: walks struct/tuple to find the field's type, then
+//     uses that type's outermost region.
+//   - `Local.*`: deref of a ref/raw-ptr returns the pointee's outermost
+//     region — but only when that pointee itself is a ref-type
+//     (otherwise the deref produces a place with no region).
+// Returns `None` for non-ref places (owned values, primitive types).
+fn place_outer_region(
+    b: &Builder,
+    place: &crate::borrowck::cfg::Place,
+) -> Option<crate::borrowck::cfg::RegionId> {
+    use crate::borrowck::cfg::Projection;
+    let local = &b.locals[place.root as usize];
+    let mut ty = local.ty.clone();
+    // Apply projections.
+    for proj in &place.projections {
+        match proj {
+            Projection::Field(name) => {
+                ty = field_type(b, &ty, name)?;
+            }
+            Projection::TupleIndex(idx) => match ty {
+                RType::Tuple(elems) => {
+                    if (*idx as usize) < elems.len() {
+                        ty = elems[*idx as usize].clone();
+                    } else {
+                        return None;
+                    }
+                }
+                _ => return None,
+            },
+            Projection::Deref => match ty {
+                RType::Ref { inner, .. } | RType::RawPtr { inner, .. } => {
+                    ty = (*inner).clone();
+                }
+                _ => return None,
+            },
+        }
+    }
+    match &ty {
+        RType::Ref { lifetime, .. } => lookup_or_static(&b.region_graph, lifetime),
+        _ => None,
+    }
+}
+
+fn field_type(b: &Builder, ty: &RType, name: &str) -> Option<RType> {
+    match ty {
+        RType::Struct { path, type_args, .. } => {
+            let entry = crate::typeck::struct_lookup(b.ctx.structs, path)?;
+            // Build env from struct's params → call-site type_args.
+            let mut env: Vec<(String, RType)> = Vec::new();
+            let mut i = 0;
+            while i < entry.type_params.len() && i < type_args.len() {
+                env.push((entry.type_params[i].clone(), type_args[i].clone()));
+                i += 1;
+            }
+            for f in &entry.fields {
+                if f.name == name {
+                    return Some(crate::typeck::substitute_rtype(&f.ty, &env));
+                }
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
+// Phase L3 entry point. Walks the completed CFG and emits outlives
+// constraints from each region-relevant operation:
+//   * Assigns of ref-typed values: rhs_region : lhs_region.
+//   * Returns (Assign-to-return-local): value_region : fn_return_region.
+//   * Calls: instantiate the callee's free regions; per-arg
+//     covariance-aware constraints; where-clause edges; return.
+//
+// The pass mutates `b.region_graph.outlives` and `b.binding_region`.
+// `b.binding_region` is initialized lazily by `binding_region_for`.
+fn populate_body_constraints(b: &mut Builder) {
+    use crate::borrowck::cfg::{CfgStmtKind, ConstraintSource, OutlivesConstraint, Rvalue};
+    // Initialize `binding_region` for every local: ref-typed gets a
+    // RegionId via `resolve_or_alloc_region`; others get `None`.
+    let n = b.locals.len();
+    b.binding_region = vec![None; n];
+    let mut i = 0;
+    while i < n {
+        let ty = b.locals[i].ty.clone();
+        if let RType::Ref { lifetime, .. } = &ty {
+            let r = resolve_or_alloc_region(&b.region_graph, &mut b.region_count, lifetime);
+            b.binding_region[i] = Some(r);
+        }
+        i += 1;
+    }
+
+    // Emit constraints from each block's stmts.
+    let block_count = b.blocks.len();
+    let mut bi = 0;
+    while bi < block_count {
+        let stmt_count = b.blocks[bi].stmts.len();
+        let mut si = 0;
+        while si < stmt_count {
+            // Clone stmt to avoid borrow conflict with `b` mutations.
+            let kind = clone_stmt_kind(&b.blocks[bi].stmts[si].kind);
+            let span = b.blocks[bi].stmts[si].span.copy();
+            if let CfgStmtKind::Assign { place, rvalue } = kind {
+                emit_assign_constraints(b, &place, &rvalue, &span);
+            }
+            si += 1;
+        }
+        bi += 1;
+    }
+}
+
+fn clone_stmt_kind(k: &crate::borrowck::cfg::CfgStmtKind) -> crate::borrowck::cfg::CfgStmtKind {
+    use crate::borrowck::cfg::CfgStmtKind;
+    match k {
+        CfgStmtKind::Assign { place, rvalue } => CfgStmtKind::Assign {
+            place: place.clone(),
+            rvalue: rvalue.clone(),
+        },
+        CfgStmtKind::Drop(p) => CfgStmtKind::Drop(p.clone()),
+        CfgStmtKind::StorageLive(l) => CfgStmtKind::StorageLive(*l),
+        CfgStmtKind::StorageDead(l) => CfgStmtKind::StorageDead(*l),
+        CfgStmtKind::Uninit(l) => CfgStmtKind::Uninit(*l),
+    }
+}
+
+fn emit_assign_constraints(
+    b: &mut Builder,
+    lhs_place: &crate::borrowck::cfg::Place,
+    rvalue: &crate::borrowck::cfg::Rvalue,
+    span: &crate::span::Span,
+) {
+    use crate::borrowck::cfg::{ConstraintSource, OperandKind, OutlivesConstraint, Rvalue};
+    // Determine the LHS region: outer region of the assigned-to place.
+    // None for non-ref LHS.
+    let lhs_region = place_outer_region(b, lhs_place);
+    // Identify "this is the function return" — assigns to the
+    // return_local with no projections.
+    let is_return = b.return_local == Some(lhs_place.root) && lhs_place.projections.is_empty();
+    match rvalue {
+        Rvalue::Use(operand) => {
+            if let Some(rhs_region) = operand_region(b, operand) {
+                if is_return {
+                    if let Some(ret_r) = b.region_graph.fn_return_region {
+                        b.region_graph.outlives.push(OutlivesConstraint {
+                            sup: rhs_region,
+                            sub: ret_r,
+                            span: span.copy(),
+                            source: ConstraintSource::FnReturn,
+                        });
+                    }
+                } else if let Some(lhs_r) = lhs_region {
+                    b.region_graph.outlives.push(OutlivesConstraint {
+                        sup: rhs_region,
+                        sub: lhs_r,
+                        span: span.copy(),
+                        source: ConstraintSource::Assign,
+                    });
+                }
+            }
+        }
+        Rvalue::Borrow { place: src, region: borrow_r, .. } => {
+            // The borrow's region is `borrow_r`. If the source place is
+            // itself a ref, the borrow is a reborrow: source's region
+            // outlives the reborrow.
+            if let Some(src_r) = place_outer_region(b, src) {
+                b.region_graph.outlives.push(OutlivesConstraint {
+                    sup: src_r,
+                    sub: *borrow_r,
+                    span: span.copy(),
+                    source: ConstraintSource::Reborrow,
+                });
+            }
+            // Borrow flows into LHS (or return).
+            if is_return {
+                if let Some(ret_r) = b.region_graph.fn_return_region {
+                    b.region_graph.outlives.push(OutlivesConstraint {
+                        sup: *borrow_r,
+                        sub: ret_r,
+                        span: span.copy(),
+                        source: ConstraintSource::FnReturn,
+                    });
+                }
+            } else if let Some(lhs_r) = lhs_region {
+                b.region_graph.outlives.push(OutlivesConstraint {
+                    sup: *borrow_r,
+                    sub: lhs_r,
+                    span: span.copy(),
+                    source: ConstraintSource::Assign,
+                });
+            }
+        }
+        Rvalue::Call { callee, args, .. } => {
+            emit_call_constraints(b, callee, args, lhs_place, lhs_region, is_return, span);
+        }
+        // Cast / StructLit / Tuple / Variant / Builtin / Discriminant
+        // either don't carry region constraints (Cast erases) or aren't
+        // covered by this MVP. Add as needs arise.
+        _ => {}
+    }
+}
+
+fn operand_region(b: &Builder, op: &crate::borrowck::cfg::Operand) -> Option<crate::borrowck::cfg::RegionId> {
+    use crate::borrowck::cfg::OperandKind;
+    match &op.kind {
+        OperandKind::Move(p) | OperandKind::Copy(p) => place_outer_region(b, p),
+        OperandKind::ConstStr(_) => Some(crate::borrowck::cfg::STATIC_REGION),
+        OperandKind::ConstInt(_) | OperandKind::ConstBool(_) | OperandKind::ConstUnit => None,
+    }
+}
+
+// Call-site region instantiation: for each callee free region (named
+// lifetime + each `Inferred(N)` slot in param/return types), allocate
+// a fresh RegionId in the caller. Substitute the callee's signature
+// through this map. Emit:
+//   * `arg_caller_region : arg_callee_region_inst` (CallArg) per arg
+//     whose type carries an outermost region.
+//   * `ret_callee_region_inst : ret_caller_region` (CallReturn) when
+//     the call's return value has a region and is assigned to a place
+//     with a known region (or returned directly).
+//   * Each callee where-clause `'a : 'b` becomes
+//     `'a_inst : 'b_inst` (WhereClause).
+fn emit_call_constraints(
+    b: &mut Builder,
+    callee: &crate::borrowck::cfg::CallTarget,
+    args: &Vec<crate::borrowck::cfg::Operand>,
+    lhs_place: &crate::borrowck::cfg::Place,
+    lhs_region: Option<crate::borrowck::cfg::RegionId>,
+    is_return: bool,
+    span: &crate::span::Span,
+) {
+    use crate::borrowck::cfg::{CallTarget, ConstraintSource, OutlivesConstraint};
+    // Resolve the callee's signature. For Path callees, look up FnSymbol /
+    // GenericTemplate. MethodResolution callees are deferred — typeck
+    // records the callee path on `MethodResolution`, but plumbing that
+    // through here is more substantial. (Methods invoked directly via
+    // `f.method()` will land in this path once L3 is extended; for the
+    // initial drop, free-fn calls cover rt5#8.)
+    let path = match callee {
+        CallTarget::Path(p) => p.clone(),
+        CallTarget::MethodResolution(_) => return,
+    };
+    let (param_types, return_type, lifetime_params, lifetime_predicates) =
+        match crate::typeck::func_lookup(b.ctx.funcs, &path) {
+            Some(e) => (
+                e.param_types.clone(),
+                e.return_type.clone(),
+                e.lifetime_params.clone(),
+                e.lifetime_predicates.clone(),
+            ),
+            None => match crate::typeck::template_lookup(b.ctx.funcs, &path) {
+                Some((_, t)) => (
+                    t.param_types.clone(),
+                    t.return_type.clone(),
+                    t.lifetime_params.clone(),
+                    t.lifetime_predicates.clone(),
+                ),
+                None => return,
+            },
+        };
+    // Build the substitution from callee region names → fresh caller
+    // RegionIds. Named first; Inferred slots discovered while walking
+    // param/return types (each unique `Inferred(N)` gets its own
+    // fresh region, deduped by N).
+    let mut named_subst: Vec<(String, crate::borrowck::cfg::RegionId)> = Vec::new();
+    for n in &lifetime_params {
+        let r = b.fresh_region();
+        named_subst.push((n.clone(), r));
+    }
+    let mut inferred_subst: Vec<(u32, crate::borrowck::cfg::RegionId)> = Vec::new();
+    for pt in &param_types {
+        collect_callee_inferred(pt, &mut inferred_subst, &mut b.region_count);
+    }
+    if let Some(rt) = &return_type {
+        collect_callee_inferred(rt, &mut inferred_subst, &mut b.region_count);
+    }
+    // Per-arg: `arg_region : callee_param_region_inst`.
+    let mut i = 0;
+    while i < args.len() && i < param_types.len() {
+        let arg_r = operand_region(b, &args[i]);
+        let pt_r = type_outer_region_subst(&param_types[i], &named_subst, &inferred_subst);
+        if let (Some(ar), Some(pr)) = (arg_r, pt_r) {
+            b.region_graph.outlives.push(OutlivesConstraint {
+                sup: ar,
+                sub: pr,
+                span: span.copy(),
+                source: ConstraintSource::CallArg,
+            });
+        }
+        i += 1;
+    }
+    // Where-clauses: each `'a : 'b` becomes `'a_inst : 'b_inst`.
+    for pred in &lifetime_predicates {
+        let sup = subst_lookup_named(&pred.lhs, &named_subst);
+        if sup.is_none() {
+            continue;
+        }
+        for sub_name in &pred.bounds {
+            if let Some(sub) = subst_lookup_named(sub_name, &named_subst) {
+                b.region_graph.outlives.push(OutlivesConstraint {
+                    sup: sup.unwrap(),
+                    sub,
+                    span: span.copy(),
+                    source: ConstraintSource::WhereClause,
+                });
+            }
+        }
+    }
+    // Return value's region flows into LHS (or fn return).
+    if let Some(ret_ty) = &return_type {
+        let ret_r = type_outer_region_subst(ret_ty, &named_subst, &inferred_subst);
+        if let Some(rr) = ret_r {
+            if is_return {
+                if let Some(fr) = b.region_graph.fn_return_region {
+                    b.region_graph.outlives.push(OutlivesConstraint {
+                        sup: rr,
+                        sub: fr,
+                        span: span.copy(),
+                        source: ConstraintSource::CallReturn,
+                    });
+                }
+            } else if let Some(lr) = lhs_region {
+                b.region_graph.outlives.push(OutlivesConstraint {
+                    sup: rr,
+                    sub: lr,
+                    span: span.copy(),
+                    source: ConstraintSource::CallReturn,
+                });
+            }
+        }
+    }
+    let _ = lhs_place;
+}
+
+fn collect_callee_inferred(
+    rt: &RType,
+    out: &mut Vec<(u32, crate::borrowck::cfg::RegionId)>,
+    counter: &mut u32,
+) {
+    use crate::typeck::LifetimeRepr;
+    match rt {
+        RType::Ref { inner, lifetime, .. } => {
+            if let LifetimeRepr::Inferred(id) = lifetime {
+                if *id != 0 && !out.iter().any(|(n, _)| *n == *id) {
+                    let r = *counter;
+                    *counter += 1;
+                    out.push((*id, r));
+                }
+            }
+            collect_callee_inferred(inner, out, counter);
+        }
+        RType::RawPtr { inner, .. } => collect_callee_inferred(inner, out, counter),
+        RType::Struct { type_args, lifetime_args, .. }
+        | RType::Enum { type_args, lifetime_args, .. } => {
+            for la in lifetime_args {
+                if let LifetimeRepr::Inferred(id) = la {
+                    if *id != 0 && !out.iter().any(|(n, _)| *n == *id) {
+                        let r = *counter;
+                        *counter += 1;
+                        out.push((*id, r));
+                    }
+                }
+            }
+            for ta in type_args {
+                collect_callee_inferred(ta, out, counter);
+            }
+        }
+        RType::Tuple(elems) => {
+            for e in elems {
+                collect_callee_inferred(e, out, counter);
+            }
+        }
+        RType::Slice(inner) => collect_callee_inferred(inner, out, counter),
+        RType::AssocProj { base, .. } => collect_callee_inferred(base, out, counter),
+        RType::Bool
+        | RType::Int(_)
+        | RType::Char
+        | RType::Str
+        | RType::Never
+        | RType::Param(_)
+        | RType::Opaque { .. } => {}
+    }
+}
+
+fn subst_lookup_named(
+    name: &str,
+    named_subst: &Vec<(String, crate::borrowck::cfg::RegionId)>,
+) -> Option<crate::borrowck::cfg::RegionId> {
+    if name == "static" {
+        return Some(crate::borrowck::cfg::STATIC_REGION);
+    }
+    for (n, r) in named_subst {
+        if n == name {
+            return Some(*r);
+        }
+    }
+    None
+}
+
+fn type_outer_region_subst(
+    rt: &RType,
+    named_subst: &Vec<(String, crate::borrowck::cfg::RegionId)>,
+    inferred_subst: &Vec<(u32, crate::borrowck::cfg::RegionId)>,
+) -> Option<crate::borrowck::cfg::RegionId> {
+    use crate::typeck::LifetimeRepr;
+    match rt {
+        RType::Ref { lifetime, .. } => match lifetime {
+            LifetimeRepr::Named(name) => subst_lookup_named(name, named_subst),
+            LifetimeRepr::Inferred(id) => {
+                for (n, r) in inferred_subst {
+                    if *n == *id {
+                        return Some(*r);
+                    }
+                }
+                None
+            }
+        },
+        _ => None,
     }
 }
 

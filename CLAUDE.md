@@ -51,7 +51,7 @@ Walks `<input-dir>` recursively for `*.rs` files, populates a `Vfs`, calls `comp
 Feature-specific knowledge under `.claude/skills/<name>/SKILL.md`, loaded on-demand. Keep in sync as part of the same change.
 
 - `typeck-pipeline` — typeck submodules, `RType` vocabulary, `InferType`/`Subst`, integer-literal defaulting.
-- `borrowck-pipeline` — CFG submodules, build → moves → liveness → borrows, NLL, reborrow patterns.
+- `borrowck-pipeline` — CFG submodules, build → regions → moves → liveness → borrows, NLL, reborrow patterns, region inference + outlives solver.
 - `codegen-machinery` — shadow-stack, escape analysis, frame layout, `Storage`/`BaseAddr`, monomorphization, string pool.
 - `trait-system` — declarations, dispatch (receiver-type chain), supertraits, AssocProj, default & generic trait params, `Copy`.
 - `drop-and-destructors` — `Drop` machinery, drop flags, partial-move rejection, pattern-binding interactions.
