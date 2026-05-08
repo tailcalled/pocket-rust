@@ -7,11 +7,12 @@ use crate::span::{Error, Span};
 mod types;
 pub use types::{
     IntKind, LifetimeRepr, RType, byte_size_of, copy_trait_path, drop_trait_path,
-    numeric_lit_op_traits_for_method, flatten_rtype, int_kind_name, is_copy, is_copy_with_bounds,
-    is_drop, is_raw_ptr, is_sized, is_variant_payload_uninhabited, needs_drop, outer_lifetime,
-    rtype_contains_param, rtype_eq, rtype_to_string, substitute_rtype,
+    int_kind_from_name, numeric_lit_op_traits_for_method, flatten_rtype, int_kind_name, is_copy,
+    is_copy_with_bounds, is_drop, is_raw_ptr, is_sized, is_variant_payload_uninhabited, needs_drop,
+    outer_lifetime, peel_opaque, rtype_contains_param, rtype_eq, rtype_to_string, subst_and_peel,
+    substitute_rtype,
 };
-use types::{int_kind_from_name, int_kind_max, int_kind_neg_magnitude, int_kind_signed, struct_env};
+use types::{int_kind_max, int_kind_neg_magnitude, int_kind_signed, struct_env};
 
 // T5.5: whether `t` (an InferType, possibly partially resolved) can
 // satisfy `std::Num`. Used by `Subst::bind_var` when an integer-literal
@@ -355,16 +356,14 @@ pub fn check(
     let mut current_file = root.source_file.clone();
     check_module(root, &mut path, root_crate_name, &mut current_file, structs, enums, aliases, traits, funcs, reexports)?;
 
-    // RPIT post-typeck: every function whose return-type uses
-    // `impl Trait` had each Opaque slot pinned during its body check.
-    // After this crate's bodies are checked, walk all FnSymbol/
-    // Template return types and substitute each `Opaque{slot}` with
-    // its `rpit_slots[slot].pin`. Subsequent passes (closure_lower,
-    // borrowck, safeck, codegen) then see the concrete type, so
-    // layout queries / method dispatch / etc. work without per-pass
-    // Opaque handling. Opacity to typeck is maintained — only this
-    // post-typeck finalize substitutes Opaque to its hidden type.
-    finalize_rpit_substitutions(funcs);
+    // RPIT: each `impl Trait` slot was pinned during its function's
+    // body check (`record_rpit_pin` in `check_block_with_expected`).
+    // No post-typeck finalize pass runs here — `RType::Opaque{fn,slot}`
+    // is a stable indirection through typeck's tables. Consumers
+    // outside typeck (mono, codegen, layout) call `peel_opaque` (in
+    // `types.rs`) to resolve to the slot's pin at the boundary; this
+    // avoids the "remember every RType-holding table to walk" pattern
+    // a single in-place rewrite would impose.
 
     // Register a unit `StructEntry` for each closure discovered during
     // typeck so borrowck/codegen can look up the synthesized type. The
@@ -1289,6 +1288,61 @@ impl Subst {
         Ok(())
     }
 
+    // Coerce — `actual` is an expression's inferred type flowing into a
+    // position expecting `expected`. Asymmetric: only the value-level
+    // `Never` coerces (an expression of type `!` flows into any
+    // expected type without binding it). All other shapes fall through
+    // to the invariant `unify`.
+    //
+    // Use this at every value-flow boundary (block tail vs return,
+    // call arg vs param, let RHS vs annotation, …). For pure type/type
+    // equation (turbofish, structural recursion, pattern asserts), use
+    // `unify` directly.
+    pub(crate) fn coerce(
+        &mut self,
+        actual: &InferType,
+        expected: &InferType,
+        traits: &TraitTable,
+        type_params: &Vec<String>,
+        type_param_bounds: &Vec<Vec<Vec<String>>>,
+        span: &Span,
+        file: &str,
+    ) -> Result<(), Error> {
+        let resolved_actual = self.substitute(actual);
+        if matches!(resolved_actual, InferType::Never) {
+            return Ok(());
+        }
+        self.unify(actual, expected, traits, type_params, type_param_bounds, span, file)
+    }
+
+    // Merge — symmetric variant for if/match arm-merge sites where
+    // neither side is canonically actual/expected. If either side is
+    // `Never`, the other wins (the merged type is the non-Never one).
+    // Otherwise the two are unified invariantly and `a` is returned
+    // (after unify, both are equivalent). Returns the merged type so
+    // the caller can use it as the if/match's overall expression type
+    // without a separate post-substitute pick.
+    pub(crate) fn merge(
+        &mut self,
+        a: &InferType,
+        b: &InferType,
+        traits: &TraitTable,
+        type_params: &Vec<String>,
+        type_param_bounds: &Vec<Vec<Vec<String>>>,
+        span: &Span,
+        file: &str,
+    ) -> Result<InferType, Error> {
+        let ra = self.substitute(a);
+        let rb = self.substitute(b);
+        if matches!(ra, InferType::Never) {
+            return Ok(b.clone());
+        }
+        if matches!(rb, InferType::Never) {
+            return Ok(a.clone());
+        }
+        self.unify(a, b, traits, type_params, type_param_bounds, span, file)?;
+        Ok(a.clone())
+    }
 
     pub(crate) fn unify(
         &mut self,
@@ -1303,16 +1357,13 @@ impl Subst {
         let a = self.substitute(a);
         let b = self.substitute(b);
         match (a, b) {
-            // `!` (Never) coerces to every type. Unifying with Never on
-            // either side succeeds without binding — the other side's
-            // inference proceeds unaffected. This must be checked
-            // *before* the (Var, _) / (_, Var) arms, otherwise binding
-            // a num-lit Var against Never goes through `bind_var`'s
-            // `satisfies_num(Never)` check and fails. Lets e.g.
-            // `if cond { break } else { 42 }` type as `i32`: the if's
-            // result var unifies first with the then-arm's `!` (no-op)
-            // then with the else-arm's i32 var (binds the result).
-            (InferType::Never, _) | (_, InferType::Never) => Ok(()),
+            // Never's value-level coercion lives in `coerce` / `merge`,
+            // not here. Unification is invariant: `!` equals only `!`.
+            // This matches Rust's behavior — recursing into a fn-pointer
+            // return type (or any structural position) `unify(!, T)`
+            // rejects, just as `let _: fn() -> u32 = …: fn() -> !`
+            // rejects in real Rust.
+            (InferType::Never, InferType::Never) => Ok(()),
             (InferType::Var(va), InferType::Var(vb)) => {
                 if va == vb {
                     Ok(())
@@ -2598,71 +2649,15 @@ fn check_function(
             t += 1;
         }
     }
-    // RPIT one-fn finalize: now that this function's body is checked
-    // and its slots are pinned, substitute Opaque{this_fn, slot} →
-    // pin in this function's own return_type. Subsequent functions
-    // checked in this crate then see the concrete type at call sites
-    // (rather than the opaque proxy). The crate-level
-    // `finalize_rpit_substitutions` call after `check_module`
-    // mops up any opaques that reference fns in earlier libraries.
-    finalize_rpit_for_one_function(funcs, &lookup_path);
+    // RPIT slots were pinned in `check_block_with_expected`. No
+    // per-fn finalize substitution runs — `Opaque{this_fn, slot}` stays
+    // as a stable indirection in tables. Callers in this crate that
+    // method-dispatch on the Opaque receiver route through
+    // `check_method_call_opaque` (slot-bounds-based dispatch), which
+    // works whether or not the slot's pin is set. Consumers outside
+    // typeck call `peel_opaque` to materialize the concrete type.
+    let _ = lookup_path;
     Ok(())
-}
-
-fn finalize_rpit_for_one_function(funcs: &mut FuncTable, fn_path: &Vec<String>) {
-    // Skip functions without RPIT slots — fast path; the common case.
-    let has_slots = funcs
-        .entries
-        .iter()
-        .find(|e| &e.path == fn_path)
-        .map(|e| !e.rpit_slots.is_empty())
-        .or_else(|| {
-            funcs
-                .templates
-                .iter()
-                .find(|t| &t.path == fn_path)
-                .map(|t| !t.rpit_slots.is_empty())
-        })
-        .unwrap_or(false);
-    if !has_slots {
-        return;
-    }
-    // Collect this function's pins, then substitute in its own
-    // return type.
-    let pins: Vec<Option<RType>> = if let Some(e) = funcs.entries.iter().find(|e| &e.path == fn_path) {
-        e.rpit_slots.iter().map(|s| s.pin.clone()).collect()
-    } else if let Some(t) = funcs.templates.iter().find(|t| &t.path == fn_path) {
-        t.rpit_slots.iter().map(|s| s.pin.clone()).collect()
-    } else {
-        return;
-    };
-    let lookup = |path: &Vec<String>, slot: u32| -> Option<RType> {
-        if path == fn_path {
-            pins.get(slot as usize).and_then(|p| p.clone())
-        } else {
-            None
-        }
-    };
-    let mut i = 0;
-    while i < funcs.entries.len() {
-        if &funcs.entries[i].path == fn_path {
-            if let Some(rt) = funcs.entries[i].return_type.take() {
-                funcs.entries[i].return_type = Some(substitute_opaque_with_pins(&rt, &lookup));
-            }
-            return;
-        }
-        i += 1;
-    }
-    let mut i = 0;
-    while i < funcs.templates.len() {
-        if &funcs.templates[i].path == fn_path {
-            if let Some(rt) = funcs.templates[i].return_type.take() {
-                funcs.templates[i].return_type = Some(substitute_opaque_with_pins(&rt, &lookup));
-            }
-            return;
-        }
-        i += 1;
-    }
 }
 
 // Per-call recording during body check; resolved at end-of-fn into `CallResolution`.
@@ -2734,7 +2729,7 @@ fn check_block(
         &mut opaque_slots,
     );
     let span = tail_span_or_block(block);
-    ctx.subst.unify(
+    ctx.subst.coerce(
         &actual,
         &expected_infer,
         ctx.traits,
@@ -2748,18 +2743,20 @@ fn check_block(
     while k < opaque_slots.len() {
         let (var, fn_path, slot) = opaque_slots[k].clone();
         let resolved = ctx.subst.substitute(&InferType::Var(var));
-        let pinned_rt = infer_to_rtype_for_check(&resolved);
-        // Diverging body — `panic!()`, `return`, etc. — pins the
-        // slot to `!`. Real Rust accepts this: `!` is uninhabited so
-        // any trait obligation is vacuously true. Skip bound
-        // validation; pinning to `!` lets layout queries on a
-        // never-reached path produce zero-sized output (matching
-        // `byte_size_of(Never) == 0`).
-        if matches!(pinned_rt, RType::Never) {
-            record_rpit_pin(ctx.funcs, &fn_path, slot, pinned_rt);
+        // Unbound Var ⇒ the body produced no concrete type that
+        // pinned this slot. Cases: diverging body (Never coerces at
+        // the body-tail site without binding the slot's Var), zero-
+        // iteration loop, or any future "no value flows" case. Real
+        // Rust accepts these — the function never returns, so any
+        // trait obligation on the slot is vacuously true. Pin to `!`
+        // so downstream consumers (`byte_size_of`, layout) see a
+        // concrete zero-sized type rather than an unresolved Var.
+        if matches!(resolved, InferType::Var(_)) {
+            record_rpit_pin(ctx.funcs, &fn_path, slot, RType::Never);
             k += 1;
             continue;
         }
+        let pinned_rt = infer_to_rtype_for_check(&resolved);
         // Look up the slot's bounds from FuncTable. Try entries
         // first, then templates.
         let bounds = lookup_rpit_slot_bounds(ctx.funcs, &fn_path, slot);
@@ -2893,186 +2890,6 @@ fn lookup_rpit_slot_bounds(
         i += 1;
     }
     None
-}
-
-// Walk every FnSymbol/Template's `return_type` and substitute each
-// `RType::Opaque{fn_path, slot}` for the corresponding pin recorded
-// in the matching `rpit_slots[slot].pin`. Pins that are still `None`
-// (no body, abstract function in a trait sig, etc.) leave the Opaque
-// in place — the subsequent pass that consumes the function's
-// signature is responsible for recognizing that case if it matters.
-// Walk every recorded `MethodResolution.trait_dispatch.recv_type`
-// and substitute Opaque->pin too — the dispatch's receiver type is
-// used at mono/codegen for impl resolution. Without this, a caller
-// that took a method on an RPIT result still sees Opaque in its
-// recorded dispatch even after `finalize_rpit_substitutions`
-// updated the function's stored return_type. Iterates through every
-// FnSymbol and Template's `method_resolutions`, and the per-call
-// `MethodResolution.trait_dispatch.recv_type`. Only walks RPIT
-// pinning; ordinary methods are unaffected.
-fn finalize_rpit_in_method_resolutions<F>(funcs: &mut FuncTable, lookup: &F)
-where
-    F: Fn(&Vec<String>, u32) -> Option<RType>,
-{
-    let mut e = 0;
-    while e < funcs.entries.len() {
-        let mut k = 0;
-        while k < funcs.entries[e].method_resolutions.len() {
-            if let Some(mr) = &mut funcs.entries[e].method_resolutions[k] {
-                if let Some(td) = &mut mr.trait_dispatch {
-                    td.recv_type = substitute_opaque_with_pins(&td.recv_type, lookup);
-                    let mut t = 0;
-                    while t < td.trait_args.len() {
-                        td.trait_args[t] =
-                            substitute_opaque_with_pins(&td.trait_args[t], lookup);
-                        t += 1;
-                    }
-                }
-            }
-            k += 1;
-        }
-        e += 1;
-    }
-    let mut e = 0;
-    while e < funcs.templates.len() {
-        let mut k = 0;
-        while k < funcs.templates[e].method_resolutions.len() {
-            if let Some(mr) = &mut funcs.templates[e].method_resolutions[k] {
-                if let Some(td) = &mut mr.trait_dispatch {
-                    td.recv_type = substitute_opaque_with_pins(&td.recv_type, lookup);
-                    let mut t = 0;
-                    while t < td.trait_args.len() {
-                        td.trait_args[t] =
-                            substitute_opaque_with_pins(&td.trait_args[t], lookup);
-                        t += 1;
-                    }
-                }
-            }
-            k += 1;
-        }
-        e += 1;
-    }
-}
-
-fn finalize_rpit_substitutions(funcs: &mut FuncTable) {
-    // Snapshot all pins first so we don't borrow funcs immutably and
-    // mutably at the same time.
-    struct PinEntry {
-        fn_path: Vec<String>,
-        pins: Vec<Option<RType>>,
-    }
-    let mut all_pins: Vec<PinEntry> = Vec::new();
-    let mut i = 0;
-    while i < funcs.entries.len() {
-        if !funcs.entries[i].rpit_slots.is_empty() {
-            all_pins.push(PinEntry {
-                fn_path: funcs.entries[i].path.clone(),
-                pins: funcs.entries[i]
-                    .rpit_slots
-                    .iter()
-                    .map(|s| s.pin.clone())
-                    .collect(),
-            });
-        }
-        i += 1;
-    }
-    let mut i = 0;
-    while i < funcs.templates.len() {
-        if !funcs.templates[i].rpit_slots.is_empty() {
-            all_pins.push(PinEntry {
-                fn_path: funcs.templates[i].path.clone(),
-                pins: funcs.templates[i]
-                    .rpit_slots
-                    .iter()
-                    .map(|s| s.pin.clone())
-                    .collect(),
-            });
-        }
-        i += 1;
-    }
-    let lookup_pin = |fn_path: &Vec<String>, slot: u32| -> Option<RType> {
-        let mut k = 0;
-        while k < all_pins.len() {
-            if all_pins[k].fn_path == *fn_path {
-                return all_pins[k]
-                    .pins
-                    .get(slot as usize)
-                    .and_then(|p| p.clone());
-            }
-            k += 1;
-        }
-        None
-    };
-    let mut i = 0;
-    while i < funcs.entries.len() {
-        if let Some(rt) = funcs.entries[i].return_type.take() {
-            funcs.entries[i].return_type = Some(substitute_opaque_with_pins(&rt, &lookup_pin));
-        }
-        i += 1;
-    }
-    let mut i = 0;
-    while i < funcs.templates.len() {
-        if let Some(rt) = funcs.templates[i].return_type.take() {
-            funcs.templates[i].return_type = Some(substitute_opaque_with_pins(&rt, &lookup_pin));
-        }
-        i += 1;
-    }
-    finalize_rpit_in_method_resolutions(funcs, &lookup_pin);
-}
-
-fn substitute_opaque_with_pins<F>(rt: &RType, lookup: &F) -> RType
-where
-    F: Fn(&Vec<String>, u32) -> Option<RType>,
-{
-    match rt {
-        RType::Opaque { fn_path, slot } => match lookup(fn_path, *slot) {
-            Some(pin) => substitute_opaque_with_pins(&pin, lookup),
-            None => rt.clone(),
-        },
-        RType::Struct { path, type_args, lifetime_args } => RType::Struct {
-            path: path.clone(),
-            type_args: type_args
-                .iter()
-                .map(|a| substitute_opaque_with_pins(a, lookup))
-                .collect(),
-            lifetime_args: lifetime_args.clone(),
-        },
-        RType::Enum { path, type_args, lifetime_args } => RType::Enum {
-            path: path.clone(),
-            type_args: type_args
-                .iter()
-                .map(|a| substitute_opaque_with_pins(a, lookup))
-                .collect(),
-            lifetime_args: lifetime_args.clone(),
-        },
-        RType::Tuple(elems) => RType::Tuple(
-            elems
-                .iter()
-                .map(|e| substitute_opaque_with_pins(e, lookup))
-                .collect(),
-        ),
-        RType::Ref { inner, mutable, lifetime } => RType::Ref {
-            inner: Box::new(substitute_opaque_with_pins(inner, lookup)),
-            mutable: *mutable,
-            lifetime: lifetime.clone(),
-        },
-        RType::RawPtr { inner, mutable } => RType::RawPtr {
-            inner: Box::new(substitute_opaque_with_pins(inner, lookup)),
-            mutable: *mutable,
-        },
-        RType::Slice(inner) => RType::Slice(Box::new(substitute_opaque_with_pins(inner, lookup))),
-        RType::AssocProj { base, trait_path, name } => RType::AssocProj {
-            base: Box::new(substitute_opaque_with_pins(base, lookup)),
-            trait_path: trait_path.clone(),
-            name: name.clone(),
-        },
-        RType::Bool
-        | RType::Int(_)
-        | RType::Str
-        | RType::Never
-        | RType::Char
-        | RType::Param(_) => rt.clone(),
-    }
 }
 
 fn record_rpit_pin(
@@ -3247,7 +3064,7 @@ fn check_let_stmt(ctx: &mut CheckCtx, let_stmt: &LetStmt) -> Result<(), Error> {
             // fresh `InferType::Var` that the unification step pins
             // from the value's type.
             let annot_infer = resolve_type_to_infer(ctx, annotation)?;
-            ctx.subst.unify(
+            ctx.subst.coerce(
                 &value_ty,
                 &annot_infer,
                 ctx.traits,
@@ -3392,7 +3209,7 @@ fn check_assign_stmt(ctx: &mut CheckCtx, assign: &AssignStmt) -> Result<(), Erro
     if let ExprKind::Index { .. } = &assign.lhs.kind {
         let lhs_ty = check_expr(ctx, &assign.lhs)?;
         let rhs_ty = check_expr(ctx, &assign.rhs)?;
-        ctx.subst.unify(
+        ctx.subst.coerce(
             &rhs_ty,
             &lhs_ty,
             ctx.traits,
@@ -3489,7 +3306,7 @@ fn check_assign_stmt(ctx: &mut CheckCtx, assign: &AssignStmt) -> Result<(), Erro
         &assign.lhs.span,
     )?;
     let rhs_ty = check_expr(ctx, &assign.rhs)?;
-    ctx.subst.unify(
+    ctx.subst.coerce(
         &rhs_ty,
         &lhs_ty,
         ctx.traits,
@@ -3635,7 +3452,7 @@ fn check_deref_rooted_assign(
         i += 1;
     }
     let rhs_ty = check_expr(ctx, &assign.rhs)?;
-    ctx.subst.unify(
+    ctx.subst.coerce(
         &rhs_ty,
         &current,
         ctx.traits,
@@ -4130,7 +3947,7 @@ fn check_closure(
     // (annotated or fresh-var) return type so call-site context can
     // pin both ends.
     let body_ty = check_expr(ctx, &closure.body)?;
-    ctx.subst.unify(
+    ctx.subst.coerce(
         &body_ty,
         &return_infer,
         ctx.traits,
@@ -4207,7 +4024,7 @@ fn check_macro_call(
         mutable: false,
         lifetime: LifetimeRepr::Inferred(0),
     };
-    ctx.subst.unify(
+    ctx.subst.coerce(
         &arg_ty,
         &str_ref,
         ctx.traits,
@@ -4370,7 +4187,7 @@ fn check_return_expr(
         Some(e) => e.span.copy(),
         None => expr.span.copy(),
     };
-    ctx.subst.unify(
+    ctx.subst.coerce(
         &actual,
         &expected,
         ctx.traits,
@@ -4441,7 +4258,7 @@ fn check_try_expr(
     // Unify inner E with function's E. Mismatch → "incompatible
     // error type" diagnostic.
     let fn_err_infer = rtype_to_infer(&fn_err);
-    if let Err(e) = ctx.subst.unify(
+    if let Err(e) = ctx.subst.coerce(
         &err_ty,
         &fn_err_infer,
         ctx.traits,
@@ -4489,7 +4306,7 @@ fn check_while_expr(
         }
     }
     let cond_ty = check_expr(ctx, &w.cond)?;
-    ctx.subst.unify(
+    ctx.subst.coerce(
         &cond_ty,
         &InferType::Bool,
         ctx.traits,
@@ -4501,7 +4318,7 @@ fn check_while_expr(
     ctx.loop_labels.push(w.label.clone());
     let unit = InferType::Tuple(Vec::new());
     let body_ty = check_block_inner(ctx, w.body.as_ref())?;
-    ctx.subst.unify(
+    ctx.subst.coerce(
         &body_ty,
         &unit,
         ctx.traits,
@@ -4598,7 +4415,7 @@ fn check_for_expr(
     ctx.loop_labels.push(f.label.clone());
     let unit = InferType::Tuple(Vec::new());
     let body_ty = check_block_inner(ctx, f.body.as_ref())?;
-    ctx.subst.unify(
+    ctx.subst.coerce(
         &body_ty,
         &unit,
         ctx.traits,
@@ -4661,7 +4478,7 @@ fn check_if_expr(
     // recorded under its NodeId — codegen for some sub-exprs (e.g.
     // `Builtin`) reads its own result type back out.
     let cond_ty = check_expr(ctx, &if_expr.cond)?;
-    ctx.subst.unify(
+    ctx.subst.coerce(
         &cond_ty,
         &InferType::Bool,
         ctx.traits,
@@ -4672,7 +4489,11 @@ fn check_if_expr(
     )?;
     let then_ty = check_block_expr(ctx, if_expr.then_block.as_ref())?;
     let else_ty = check_block_expr(ctx, if_expr.else_block.as_ref())?;
-    ctx.subst.unify(
+    // The if's overall type is the non-`!` arm's type when one arm
+    // diverges (so `if cond { panic!() } else { 42 }` types as the
+    // else arm's u32, not `!`). `merge` returns the non-Never side
+    // when one is Never, otherwise unifies and returns either.
+    ctx.subst.merge(
         &then_ty,
         &else_ty,
         ctx.traits,
@@ -4680,20 +4501,7 @@ fn check_if_expr(
         &ctx.type_param_bounds,
         &outer.span,
         ctx.current_file,
-    )?;
-    // The if's overall type is the non-`!` arm's type when one arm
-    // diverges (so `if cond { panic!() } else { 42 }` types as the
-    // else arm's u32, not `!`). When neither arm is `!`, returning
-    // either is fine — they unified.
-    let resolved_then = ctx.subst.substitute(&then_ty);
-    let resolved_else = ctx.subst.substitute(&else_ty);
-    let result = match (&resolved_then, &resolved_else) {
-        (InferType::Never, _) => else_ty,
-        _ => then_ty,
-    };
-    let _ = resolved_then;
-    let _ = resolved_else;
-    Ok(result)
+    )
 }
 
 // `match scrut { pat1 => arm1, pat2 if guard => arm2, _ => arm3 }`.
@@ -4741,7 +4549,7 @@ fn check_match_expr(
         // matches but before the body. Bindings are in scope.
         if let Some(g) = &arm.guard {
             let g_ty = check_expr(ctx, g)?;
-            ctx.subst.unify(
+            ctx.subst.coerce(
                 &g_ty,
                 &InferType::Bool,
                 ctx.traits,
@@ -4753,18 +4561,18 @@ fn check_match_expr(
         }
         let body_ty = check_expr(ctx, &arm.body)?;
         ctx.locals.truncate(mark);
-        match &arm_ty {
+        match arm_ty.take() {
             Some(prev) => {
-                let prev_clone = prev.clone();
-                ctx.subst.unify(
+                let merged = ctx.subst.merge(
                     &body_ty,
-                    &prev_clone,
+                    &prev,
                     ctx.traits,
                     ctx.type_params,
                     ctx.type_param_bounds,
                     &arm.body.span,
                     ctx.current_file,
                 )?;
+                arm_ty = Some(merged);
             }
             None => arm_ty = Some(body_ty),
         }
@@ -4811,7 +4619,7 @@ fn check_if_let_expr(
     let then_ty = check_block_expr(ctx, il.then_block.as_ref())?;
     ctx.locals.truncate(mark);
     let else_ty = check_block_expr(ctx, il.else_block.as_ref())?;
-    ctx.subst.unify(
+    ctx.subst.merge(
         &then_ty,
         &else_ty,
         ctx.traits,
@@ -4819,8 +4627,7 @@ fn check_if_let_expr(
         ctx.type_param_bounds,
         &outer.span,
         ctx.current_file,
-    )?;
-    Ok(then_ty)
+    )
 }
 
 
@@ -4908,7 +4715,7 @@ fn check_builtin(
     while k < args.len() {
         let arg_ty = check_expr(ctx, &args[k])?;
         let expected = rtype_to_infer(&sig.params[k]);
-        ctx.subst.unify(
+        ctx.subst.coerce(
             &arg_ty,
             &expected,
             ctx.traits,
@@ -4944,7 +4751,7 @@ fn check_builtin_alloc(
     }
     let arg_ty = check_expr(ctx, &args[0])?;
     let expected = rtype_to_infer(&RType::Int(IntKind::Usize));
-    ctx.subst.unify(
+    ctx.subst.coerce(
         &arg_ty,
         &expected,
         ctx.traits,
@@ -4984,7 +4791,7 @@ fn check_builtin_free(
         inner: Box::new(RType::Int(IntKind::U8)),
         mutable: true,
     });
-    ctx.subst.unify(
+    ctx.subst.coerce(
         &arg_ty,
         &expected,
         ctx.traits,
@@ -5062,7 +4869,7 @@ fn check_builtin_cast(
         inner: Box::new(old_pointee),
         mutable,
     });
-    ctx.subst.unify(
+    ctx.subst.coerce(
         &arg_ty,
         &expected_arg,
         ctx.traits,
@@ -5159,7 +4966,7 @@ fn check_builtin_str_as_bytes(
         mutable,
         lifetime: LifetimeRepr::Inferred(0),
     };
-    ctx.subst.unify(
+    ctx.subst.coerce(
         &arg_ty,
         &expected,
         ctx.traits,
@@ -5212,7 +5019,7 @@ fn check_builtin_make_str(
         inner: Box::new(RType::Int(IntKind::U8)),
         mutable,
     });
-    ctx.subst.unify(
+    ctx.subst.coerce(
         &arg0_ty,
         &expected0,
         ctx.traits,
@@ -5222,7 +5029,7 @@ fn check_builtin_make_str(
         ctx.current_file,
     )?;
     let expected1 = rtype_to_infer(&RType::Int(IntKind::Usize));
-    ctx.subst.unify(
+    ctx.subst.coerce(
         &arg1_ty,
         &expected1,
         ctx.traits,
@@ -5291,7 +5098,7 @@ fn check_builtin_slice_ptr(
         mutable,
         lifetime: LifetimeRepr::Inferred(0),
     };
-    ctx.subst.unify(
+    ctx.subst.coerce(
         &arg_ty,
         &expected,
         ctx.traits,
@@ -5444,7 +5251,7 @@ fn check_builtin_make_slice(
         inner: Box::new(RType::Int(IntKind::U8)),
         mutable,
     });
-    ctx.subst.unify(
+    ctx.subst.coerce(
         &arg0_ty,
         &expected0,
         ctx.traits,
@@ -5454,7 +5261,7 @@ fn check_builtin_make_slice(
         ctx.current_file,
     )?;
     let expected1 = rtype_to_infer(&RType::Int(IntKind::Usize));
-    ctx.subst.unify(
+    ctx.subst.coerce(
         &arg1_ty,
         &expected1,
         ctx.traits,
@@ -5562,7 +5369,7 @@ fn check_builtin_ptr_usize_offset(
         }
     };
     let expected = rtype_to_infer(&RType::Int(IntKind::Usize));
-    ctx.subst.unify(
+    ctx.subst.coerce(
         &arg1_ty,
         &expected,
         ctx.traits,
@@ -5620,7 +5427,7 @@ fn check_builtin_ptr_isize_offset(
         }
     };
     let expected = rtype_to_infer(&RType::Int(IntKind::Isize));
-    ctx.subst.unify(
+    ctx.subst.coerce(
         &arg1_ty,
         &expected,
         ctx.traits,
@@ -6145,7 +5952,7 @@ fn check_bare_closure_call(
     let mut k = 0;
     while k < call.args.len() {
         let arg_ty = check_expr(ctx, &call.args[k])?;
-        ctx.subst.unify(
+        ctx.subst.coerce(
             &arg_ty,
             &param_types[k],
             ctx.traits,
@@ -6322,7 +6129,7 @@ fn check_bare_typeparam_fn_call(
     let mut k = 0;
     while k < call.args.len() {
         let arg_ty = check_expr(ctx, &call.args[k])?;
-        ctx.subst.unify(
+        ctx.subst.coerce(
             &arg_ty,
             &param_types[k],
             ctx.traits,
@@ -6536,7 +6343,7 @@ fn check_call(ctx: &mut CheckCtx, call: &Call, call_expr: &Expr) -> Result<Infer
         let mut i = 0;
         while i < call.args.len() {
             let arg_ty = check_expr(ctx, &call.args[i])?;
-            ctx.subst.unify(
+            ctx.subst.coerce(
                 &arg_ty,
                 &param_infer[i],
                 ctx.traits,
@@ -6679,7 +6486,7 @@ fn check_call(ctx: &mut CheckCtx, call: &Call, call_expr: &Expr) -> Result<Infer
                 }
             }
             let arg_ty = check_expr(ctx, &call.args[i])?;
-            ctx.subst.unify(
+            ctx.subst.coerce(
                 &arg_ty,
                 &param_infer[i],
                 ctx.traits,
@@ -7018,7 +6825,7 @@ fn check_variant_struct_lit(
         seen[idx] = true;
         let value_ty = check_expr(ctx, &init.value)?;
         let expected = infer_substitute(&rtype_to_infer(&field_defs[idx].ty), &env);
-        ctx.subst.unify(
+        ctx.subst.coerce(
             &value_ty,
             &expected,
             ctx.traits,
@@ -7193,7 +7000,7 @@ fn check_variant_call(
     while i < payload_types.len() {
         let arg_ty = check_expr(ctx, &call.args[i])?;
         let expected = infer_substitute(&rtype_to_infer(&payload_types[i]), &env);
-        ctx.subst.unify(
+        ctx.subst.coerce(
             &arg_ty,
             &expected,
             ctx.traits,
@@ -7411,7 +7218,7 @@ fn check_struct_lit(
             if def_field_names[k] == init.name {
                 let expected_raw = rtype_to_infer(&def_field_types[k]);
                 let expected = infer_substitute(&expected_raw, &env);
-                ctx.subst.unify(
+                ctx.subst.coerce(
                     &init_ty,
                     &expected,
                     ctx.traits,

@@ -3,8 +3,8 @@ use crate::layout::BindingStorageKind;
 use crate::span::Error;
 use crate::typeck::{
     CallResolution, FuncTable, GenericTemplate, IntKind, MethodResolution, RType, ReceiverAdjust,
-    StructTable, byte_size_of, flatten_rtype, func_lookup, int_kind_name, struct_lookup,
-    substitute_rtype,
+    StructTable, byte_size_of, flatten_rtype, func_lookup, int_kind_name, peel_opaque,
+    struct_lookup, subst_and_peel, substitute_rtype,
 };
 use crate::wasm;
 
@@ -727,7 +727,7 @@ fn emit_monomorphic(
     mono: &mut MonoState,
 ) -> Result<(), Error> {
     let tmpl = &funcs.templates[template_idx];
-    let input = build_mono_input_for_template(tmpl, type_args, wasm_idx);
+    let input = build_mono_input_for_template(tmpl, type_args, wasm_idx, funcs);
     let mono_fn = crate::mono::lower_to_mono(
         &input,
         structs,
@@ -755,14 +755,15 @@ fn build_mono_input_for_template<'a>(
     tmpl: &'a GenericTemplate,
     type_args: Vec<RType>,
     wasm_idx: u32,
+    funcs: &FuncTable,
 ) -> crate::mono::MonoFnInput<'a> {
     let env = build_env(&tmpl.type_params, &type_args);
-    let param_types = subst_vec(&tmpl.param_types, &env);
-    let return_type = tmpl.return_type.as_ref().map(|t| substitute_rtype(t, &env));
-    let expr_types = subst_opt_vec(&tmpl.expr_types, &env);
-    let method_resolutions = subst_opt_method_resolutions(&tmpl.method_resolutions, &env);
-    let call_resolutions = subst_opt_call_resolutions(&tmpl.call_resolutions, &env);
-    let builtin_type_targets = subst_opt_vec_vec(&tmpl.builtin_type_targets, &env);
+    let param_types = subst_vec(&tmpl.param_types, &env, funcs);
+    let return_type = tmpl.return_type.as_ref().map(|t| subst_and_peel(t, &env, funcs));
+    let expr_types = subst_opt_vec(&tmpl.expr_types, &env, funcs);
+    let method_resolutions = subst_opt_method_resolutions(&tmpl.method_resolutions, &env, funcs);
+    let call_resolutions = subst_opt_call_resolutions(&tmpl.call_resolutions, &env, funcs);
+    let builtin_type_targets = subst_opt_vec_vec(&tmpl.builtin_type_targets, &env, funcs);
     // Move tracking is independent of concrete type args — the template's
     // snapshot from borrowck applies to every monomorphization.
     let moved_places = clone_moved_places(&tmpl.moved_places);
@@ -791,12 +792,13 @@ fn build_mono_input_for_template<'a>(
 fn subst_opt_vec_vec(
     v: &Vec<Option<Vec<RType>>>,
     env: &Vec<(String, RType)>,
+    funcs: &FuncTable,
 ) -> Vec<Option<Vec<RType>>> {
     let mut out: Vec<Option<Vec<RType>>> = Vec::new();
     let mut i = 0;
     while i < v.len() {
         match &v[i] {
-            Some(ts) => out.push(Some(subst_vec(ts, env))),
+            Some(ts) => out.push(Some(subst_vec(ts, env, funcs))),
             None => out.push(None),
         }
         i += 1;
@@ -804,12 +806,16 @@ fn subst_opt_vec_vec(
     out
 }
 
-fn subst_opt_vec(v: &Vec<Option<RType>>, env: &Vec<(String, RType)>) -> Vec<Option<RType>> {
+fn subst_opt_vec(
+    v: &Vec<Option<RType>>,
+    env: &Vec<(String, RType)>,
+    funcs: &FuncTable,
+) -> Vec<Option<RType>> {
     let mut out: Vec<Option<RType>> = Vec::new();
     let mut i = 0;
     while i < v.len() {
         match &v[i] {
-            Some(t) => out.push(Some(substitute_rtype(t, env))),
+            Some(t) => out.push(Some(subst_and_peel(t, env, funcs))),
             None => out.push(None),
         }
         i += 1;
@@ -820,18 +826,19 @@ fn subst_opt_vec(v: &Vec<Option<RType>>, env: &Vec<(String, RType)>) -> Vec<Opti
 fn subst_opt_method_resolutions(
     v: &Vec<Option<MethodResolution>>,
     env: &Vec<(String, RType)>,
+    funcs: &FuncTable,
 ) -> Vec<Option<MethodResolution>> {
     let mut out: Vec<Option<MethodResolution>> = Vec::new();
     for entry in v {
         out.push(entry.as_ref().map(|m| {
             let mut cloned = m.clone();
-            cloned.type_args = subst_vec(&m.type_args, env);
+            cloned.type_args = subst_vec(&m.type_args, env, funcs);
             if let Some(td) = &m.trait_dispatch {
                 cloned.trait_dispatch = Some(crate::typeck::TraitDispatch {
                     trait_path: td.trait_path.clone(),
-                    trait_args: subst_vec(&td.trait_args, env),
+                    trait_args: subst_vec(&td.trait_args, env, funcs),
                     method_name: td.method_name.clone(),
-                    recv_type: substitute_rtype(&td.recv_type, env),
+                    recv_type: subst_and_peel(&td.recv_type, env, funcs),
                 });
             }
             cloned
@@ -843,6 +850,7 @@ fn subst_opt_method_resolutions(
 fn subst_opt_call_resolutions(
     v: &Vec<Option<CallResolution>>,
     env: &Vec<(String, RType)>,
+    funcs: &FuncTable,
 ) -> Vec<Option<CallResolution>> {
     let mut out: Vec<Option<CallResolution>> = Vec::new();
     for entry in v {
@@ -850,12 +858,12 @@ fn subst_opt_call_resolutions(
             CallResolution::Direct(idx) => CallResolution::Direct(*idx),
             CallResolution::Generic { template_idx, type_args } => CallResolution::Generic {
                 template_idx: *template_idx,
-                type_args: subst_vec(type_args, env),
+                type_args: subst_vec(type_args, env, funcs),
             },
             CallResolution::Variant { enum_path, disc, type_args } => CallResolution::Variant {
                 enum_path: enum_path.clone(),
                 disc: *disc,
-                type_args: subst_vec(type_args, env),
+                type_args: subst_vec(type_args, env, funcs),
             },
         }));
     }
@@ -872,11 +880,11 @@ fn build_env(type_params: &Vec<String>, type_args: &Vec<RType>) -> Vec<(String, 
     env
 }
 
-fn subst_vec(v: &Vec<RType>, env: &Vec<(String, RType)>) -> Vec<RType> {
+fn subst_vec(v: &Vec<RType>, env: &Vec<(String, RType)>, funcs: &FuncTable) -> Vec<RType> {
     let mut out: Vec<RType> = Vec::new();
     let mut i = 0;
     while i < v.len() {
-        out.push(substitute_rtype(&v[i], env));
+        out.push(subst_and_peel(&v[i], env, funcs));
         i += 1;
     }
     out
@@ -899,13 +907,18 @@ fn emit_function(
     full.push(func.name.clone());
     let entry = func_lookup(funcs, &full).expect("typeck registered this function");
     let _ = self_target; // impl-target propagation lives in build_mono_input_for_template; non-generic paths don't need it
+    // Peel `Opaque` indirections at this boundary even for non-generic
+    // fns: the entry's recorded types may contain `Opaque{f, slot}`
+    // (when the fn calls an RPIT fn or stores its result), and codegen
+    // needs concrete types for layout / dispatch.
+    let env: Vec<(String, RType)> = Vec::new();
     let input = crate::mono::MonoFnInput {
         func,
-        param_types: entry.param_types.clone(),
-        return_type: entry.return_type.clone(),
-        expr_types: entry.expr_types.clone(),
-        method_resolutions: entry.method_resolutions.clone(),
-        call_resolutions: entry.call_resolutions.clone(),
+        param_types: subst_vec(&entry.param_types, &env, funcs),
+        return_type: entry.return_type.as_ref().map(|t| subst_and_peel(t, &env, funcs)),
+        expr_types: subst_opt_vec(&entry.expr_types, &env, funcs),
+        method_resolutions: subst_opt_method_resolutions(&entry.method_resolutions, &env, funcs),
+        call_resolutions: subst_opt_call_resolutions(&entry.call_resolutions, &env, funcs),
         builtin_type_targets: clone_btt(&entry.builtin_type_targets),
         moved_places: clone_moved_places(&entry.moved_places),
         move_sites: clone_move_sites(&entry.move_sites),
@@ -3264,7 +3277,7 @@ fn emit_int_to_int_cast(ctx: &mut FnCtx, src: &IntKind, tgt: &IntKind) {
         // shape per class above 32 bits).
         (IntClass::Narrow32, IntClass::Narrow32) => {
             if narrow_bit_width(tgt) < narrow_bit_width(src) {
-                emit_narrow_width_fixup(ctx, int_kind_name(tgt));
+                emit_narrow_normalize(ctx, tgt);
             }
         }
         _ => {}
@@ -5562,16 +5575,15 @@ fn emit_simple_builtin(
     };
     ctx.instructions.push(inst);
     // Narrow-int (u8/i8/u16/i16) results live in a wasm i32 wider than
-    // the source type; arithmetic that can carry past the type's bit
-    // width (add/sub/mul, plus signed div where i8::MIN/-1 yields 128)
-    // would otherwise leak the high bits to subsequent ops. Mask back to
-    // the type's representation: zero-extend for unsigned, sign-extend
-    // for signed. Compares produce bool i32 (already in range), and
-    // bitwise ops with in-range inputs stay in range, so neither needs a
-    // fixup. For 32-bit and wider kinds the wasm representation already
-    // matches the type; the helper is a no-op.
+    // the source type. Arithmetic that can carry past the type's bit
+    // width (add/sub/mul, plus signed div where i8::MIN / -1 → 128)
+    // leaves out-of-range high bits. Re-establish the narrow-int
+    // invariant via `emit_narrow_normalize`. Bitwise ops, compares,
+    // and 32+-bit kinds don't need the fixup.
     if op_can_overflow_narrow(op, is_signed) {
-        emit_narrow_width_fixup(ctx, ty_name);
+        if let Some(kind) = crate::typeck::int_kind_from_name(ty_name) {
+            emit_narrow_normalize(ctx, &kind);
+        }
     }
     Ok(())
 }
@@ -5580,23 +5592,41 @@ fn op_can_overflow_narrow(op: &str, signed: bool) -> bool {
     matches!(op, "add" | "sub" | "mul") || (signed && op == "div")
 }
 
-fn emit_narrow_width_fixup(ctx: &mut FnCtx, ty_name: &str) {
-    match ty_name {
-        "u8" => {
+// Invariant: every narrow-typed (u8/i8/u16/i16) value that lives in a
+// wasm-local must hold a value within the type's range. Wasm has no
+// 8/16-bit-wide locals — narrow values share an i32 wasm-local with
+// 32-bit kinds — so the invariant is enforced at PRODUCER sites by
+// this helper. Producers that may yield an out-of-range bit pattern:
+//   1. Arithmetic on narrow ints (`add`/`sub`/`mul`, signed `div`)
+//      via `emit_simple_builtin`.
+//   2. Same-class casts that strictly narrow width (e.g. `u32 → u8`)
+//      via `emit_int_to_int_cast`'s Narrow32→Narrow32 arm.
+// Other producers (literals — typeck range-checked; function returns —
+// normalized at the callee; bitwise ops — input-stable; comparisons —
+// produce bool; memory loads — `i32.load8_u`/`s` width-correct) don't
+// need it. Memory stores (`i32.store8`/`16`) silently truncate, so
+// consumer sites that read a value back from memory and then perform
+// arithmetic on it inherit the invariant correctly.
+//
+// No-op for 32-bit and wider kinds — their wasm representation already
+// matches the type.
+fn emit_narrow_normalize(ctx: &mut FnCtx, kind: &IntKind) {
+    match kind {
+        IntKind::U8 => {
             ctx.instructions.push(wasm::Instruction::I32Const(0xFF));
             ctx.instructions.push(wasm::Instruction::I32And);
         }
-        "u16" => {
+        IntKind::U16 => {
             ctx.instructions.push(wasm::Instruction::I32Const(0xFFFF));
             ctx.instructions.push(wasm::Instruction::I32And);
         }
-        "i8" => {
+        IntKind::I8 => {
             ctx.instructions.push(wasm::Instruction::I32Const(24));
             ctx.instructions.push(wasm::Instruction::I32Shl);
             ctx.instructions.push(wasm::Instruction::I32Const(24));
             ctx.instructions.push(wasm::Instruction::I32ShrS);
         }
-        "i16" => {
+        IntKind::I16 => {
             ctx.instructions.push(wasm::Instruction::I32Const(16));
             ctx.instructions.push(wasm::Instruction::I32Shl);
             ctx.instructions.push(wasm::Instruction::I32Const(16));

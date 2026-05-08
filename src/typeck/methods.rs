@@ -172,7 +172,7 @@ fn check_closure_method_call(
     }
     let expected_args_tuple = InferType::Tuple(closure_param_types);
     let arg_ty = check_expr(ctx, &mc.args[0])?;
-    ctx.subst.unify(
+    ctx.subst.coerce(
         &arg_ty,
         &expected_args_tuple,
         ctx.traits,
@@ -541,7 +541,7 @@ fn dispatch_method_through_trait(
     let mut k = 0;
     while k < mc.args.len() {
         let arg_ty = check_expr(ctx, &mc.args[k])?;
-        ctx.subst.unify(
+        ctx.subst.coerce(
             &arg_ty,
             &expected_arg_infers[k],
             ctx.traits,
@@ -1395,7 +1395,7 @@ pub(super) fn check_method_call(
     let mut i = 0;
     while i < mc.args.len() {
         let arg_ty = check_expr(ctx, &mc.args[i])?;
-        ctx.subst.unify(
+        ctx.subst.coerce(
             &arg_ty,
             &method_param_infer[i + 1],
             ctx.traits,

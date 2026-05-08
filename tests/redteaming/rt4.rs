@@ -24,18 +24,20 @@ use super::*;
 // satisfying every trait, so validation errors with "RPIT body return
 // type `!` does not satisfy bound `<Trait>`".
 //
-// Architectural shape: `!` is uninhabited — any trait obligation is
-// vacuously true, but `solve_impl_in_ctx_with_args` doesn't know that.
-// The validation of an RPIT pin should short-circuit when the pinned
-// type is `Never`. Adding a special case in the validation loop is
-// straightforward; the deeper question is whether `solve_impl` itself
-// should learn that `!` satisfies anything (cleaner, but touches
-// every other call site).
+// Architectural shape: a "Never satisfies any trait" carve-out at
+// the consumer (the per-slot bound-check loop) is the smaller move;
+// the principled answer is the per-slot Var rule rt5#1 forced — an
+// unbound Var after unify means the body produced no concrete
+// constraint on this slot (diverging body, zero-iteration loop,
+// future "no value flowed" cases), so the pin is vacuous. That rule
+// subsumes Never specifically.
 //
-// Fix shape: in the per-slot validation loop in `check_block`, skip
-// the bound check when `pinned_rt` is `RType::Never`. Optional:
-// extend `solve_impl` directly so the same skip helps any future
-// caller that asks "does `!` impl X?".
+// Fix shape (landed): coerce/unify split (Phase 1) made `coerce(Never,
+// Var)` short-circuit without binding. The pin loop's previous
+// `pinned_rt == Never` branch is now an unbound-Var branch — when
+// `subst.substitute(Var)` returns the Var unchanged, pin to `Never`
+// and skip bound validation. One rule covers diverging bodies and
+// any future no-value-flowed case.
 #[test]
 fn problem_1_rpit_diverging_body_rejected() {
     let bytes = try_compile_example(
@@ -86,20 +88,19 @@ fn problem_2_impl_where_clause_unenforced() {
 // them, so the call-site method dispatch on `Opaque{...}` fires
 // against an `impl`-less type and fails.
 //
-// Architectural shape: typeck order is single-pass declaration
-// order. Forward references work for ordinary fns because their
-// `FnSymbol.return_type` is set at setup time (before any body is
-// checked). RPIT functions defer their concrete return type to body
-// check, which is too late for callers checked earlier in the same
-// module.
+// Architectural shape: post-hoc rewriting of stored types is
+// inherently fragile — every new RType-holding table is a new place
+// finalize has to remember to walk. rt5#6 demonstrated the pattern's
+// failure mode (expr_types left out → codegen panic).
 //
-// Fix shape: either (a) do a topological sort that body-checks RPIT
-// fns first, (b) trait-dispatch on `Opaque{fn, slot}` consults the
-// slot's `bounds` directly so method calls work even before the pin
-// is set, or (c) two-pass: collect all RPIT pins in a pre-pass that
-// body-checks each RPIT fn, then run regular body checks. Option (b)
-// is the cleanest — opacity is preserved and ordering doesn't
-// matter — but requires plumbing FuncTable through `solve_impl*`.
+// Fix shape (landed): retire post-hoc rewriting entirely. `Opaque`
+// becomes a stable indirection through typeck; mono and codegen
+// peel via `peel_opaque(rt, &FuncTable)` at the conversion boundary
+// (Phase 2). Method dispatch on `Opaque` receivers consults the
+// slot's bounds directly via `check_method_call_opaque` — the
+// "option (b)" of the original plan, but achieved by removing the
+// alternative rather than choosing it. `finalize_rpit_substitutions`
+// and friends are deleted.
 #[test]
 fn problem_3_rpit_forward_reference_fails() {
     let bytes = try_compile_example(

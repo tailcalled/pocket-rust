@@ -1,6 +1,6 @@
 use super::{
-    EnumTable, StructTable, TraitTable, VariantPayloadResolved, enum_lookup, place_to_string,
-    solve_impl, struct_lookup,
+    EnumTable, FuncTable, StructTable, TraitTable, VariantPayloadResolved, enum_lookup,
+    place_to_string, solve_impl, struct_lookup,
 };
 use super::traits::solve_impl_in_ctx;
 
@@ -37,7 +37,7 @@ pub fn int_kind_name(k: &IntKind) -> &'static str {
     }
 }
 
-pub(crate) fn int_kind_from_name(name: &str) -> Option<IntKind> {
+pub fn int_kind_from_name(name: &str) -> Option<IntKind> {
     match name {
         "u8" => Some(IntKind::U8),
         "i8" => Some(IntKind::I8),
@@ -716,6 +716,88 @@ pub fn substitute_rtype(rt: &RType, env: &Vec<(String, RType)>) -> RType {
             slot: *slot,
         },
     }
+}
+
+// Peel `RType::Opaque` indirections, walking recursively.
+//
+// Each `impl Trait` in a fn return-position is represented as a
+// stable `RType::Opaque{fn_path, slot}` indirection in typeck.
+// The slot's pin is set during the body-tail unification; consumers
+// outside typeck (mono, codegen, layout) need a concrete type, so
+// they peel through the indirection at the boundary.
+//
+// When a slot has no pin (function never returns — diverging body
+// or Phase 1's unbound-Var rule), peel returns `Never`. `byte_size_of`
+// already handles `Never` as zero-sized; method dispatch on a
+// `Never` receiver is vacuous (the call is on a never-reached path).
+//
+// Recursive: a pin may itself contain `Opaque` (rare — RPIT of an
+// RPIT — but possible). Peels until no `Opaque` remains.
+pub fn peel_opaque(rt: &RType, funcs: &FuncTable) -> RType {
+    match rt {
+        RType::Opaque { fn_path, slot } => {
+            let pin = lookup_rpit_pin(funcs, fn_path, *slot);
+            match pin {
+                Some(p) => peel_opaque(&p, funcs),
+                None => RType::Never,
+            }
+        }
+        RType::Struct { path, type_args, lifetime_args } => RType::Struct {
+            path: path.clone(),
+            type_args: type_args.iter().map(|a| peel_opaque(a, funcs)).collect(),
+            lifetime_args: lifetime_args.clone(),
+        },
+        RType::Enum { path, type_args, lifetime_args } => RType::Enum {
+            path: path.clone(),
+            type_args: type_args.iter().map(|a| peel_opaque(a, funcs)).collect(),
+            lifetime_args: lifetime_args.clone(),
+        },
+        RType::Tuple(elems) => RType::Tuple(elems.iter().map(|e| peel_opaque(e, funcs)).collect()),
+        RType::Ref { inner, mutable, lifetime } => RType::Ref {
+            inner: Box::new(peel_opaque(inner, funcs)),
+            mutable: *mutable,
+            lifetime: lifetime.clone(),
+        },
+        RType::RawPtr { inner, mutable } => RType::RawPtr {
+            inner: Box::new(peel_opaque(inner, funcs)),
+            mutable: *mutable,
+        },
+        RType::Slice(inner) => RType::Slice(Box::new(peel_opaque(inner, funcs))),
+        RType::AssocProj { base, trait_path, name } => RType::AssocProj {
+            base: Box::new(peel_opaque(base, funcs)),
+            trait_path: trait_path.clone(),
+            name: name.clone(),
+        },
+        RType::Bool
+        | RType::Int(_)
+        | RType::Str
+        | RType::Never
+        | RType::Char
+        | RType::Param(_) => rt.clone(),
+    }
+}
+
+fn lookup_rpit_pin(funcs: &FuncTable, fn_path: &Vec<String>, slot: u32) -> Option<RType> {
+    for e in &funcs.entries {
+        if e.path == *fn_path {
+            return e.rpit_slots.get(slot as usize).and_then(|s| s.pin.clone());
+        }
+    }
+    for t in &funcs.templates {
+        if t.path == *fn_path {
+            return t.rpit_slots.get(slot as usize).and_then(|s| s.pin.clone());
+        }
+    }
+    None
+}
+
+// `substitute_rtype` followed by `peel_opaque` — the canonical
+// convertor used by mono / codegen to materialize a concrete RType
+// from a typeck-recorded one. Substitutes `Param(T)` via `env` first
+// (template instantiation), then peels any RPIT `Opaque` indirections
+// to their pins.
+pub fn subst_and_peel(rt: &RType, env: &Vec<(String, RType)>, funcs: &FuncTable) -> RType {
+    peel_opaque(&substitute_rtype(rt, env), funcs)
 }
 
 // Whether `t` implements `std::Copy`. Built-in types (integers, `&T`,

@@ -18,23 +18,28 @@ use super::*;
 // not `i32`, and `!` is uninhabited so any bound is vacuously
 // true.
 //
-// Architectural shape: `unify`'s Never-coerces-to-anything rule
-// is correct for inference, but it has a side effect at the RPIT
-// pin site that we didn't notice — the slot's Var doesn't get
-// bound, so the pin lookup falls back to the int-default. rt4#1
-// correctly handles the `pinned_rt == Never` case but never
-// triggers because the substitute step doesn't reach Never; the
-// Var stays a Var.
+// Architectural shape: bundling Never-coercion into `unify` is a
+// simplification (Rust separates `unify` from `coerce` — `coerce`
+// has the Never-up rule, `unify` is invariant). The bundling means
+// every consumer of an inference Var has to think about whether
+// the Var was "really unconstrained" vs "unified-with-Never-as-no-
+// op." rt4#1's Never short-circuit assumed the latter; the actual
+// state is the former.
 //
 // Real Rust accepts an always-diverging RPIT body: `!` is
 // uninhabited and the function type-checks at the abstract level.
 //
-// Fix shape: in the per-slot pin logic, when `resolved` is still
-// `InferType::Var(_)` after substitute AND the body's tail type
-// is `Never`, treat the pin as `Never` (or bind the Var to Never
-// before validation). The unify rule itself is fine; the RPIT
-// pin reader needs to recognize the "never coerced via the empty
-// rule" case.
+// Fix shape (landed): split `coerce`/`unify` (Phase 1). `coerce(Never,
+// _)` succeeds without binding (the value-flow rule); `unify` is
+// uniformly invariant. The pin-validation loop interprets an
+// unbound Var as "the body produced no concrete constraint" → pin
+// to `Never` and skip the bound check. Vacuously true on a never-
+// reached path; downstream consumers see a concrete `Never` rather
+// than an unresolved Var. Phase 2's `peel_opaque` then resolves
+// `Opaque{make,0}` to `Never` at the caller, and mono's trait
+// dispatch short-circuits on Never receivers (returns import idx 0
+// — the call is unreachable; wasm validator polymorphic post-
+// `panic`'s `unreachable`).
 #[test]
 fn problem_1_rpit_diverging_only_body_rejected() {
     let bytes = try_compile_example(
@@ -97,11 +102,18 @@ fn problem_2_trait_method_self_bound_dropped() {
 //
 // Real Rust rejects with E0382: "use of moved value `f`".
 //
-// Fix shape: when borrowck sees a method call dispatched as
-// `FnOnce::call_once` (`recv_adjust = Move` on a Param-typed
-// receiver), record the receiver's binding as moved at that
-// CfgStmt. The standard move-state lattice then catches the
-// second call as a use-after-move.
+// Fix shape (landed, Phase 4): borrowck `lower_call` consults
+// `bare_closure_calls[node_id]` (typeck records the binding name
+// when routing a Call through bare-typeparam dispatch) and
+// `method_resolutions[node_id].recv_adjust`. When set, it
+// synthesizes a receiver Operand for the binding — `Move` for
+// `recv_adjust = Move`, `Copy` for borrow/by-ref. The synthesized
+// operand prepends to the call's arg list, so the move-out lands
+// in the CFG at this statement; the standard move-state lattice
+// catches `f(); f();` as use-after-move. Generic over trait
+// identity: any future `recv_adjust = Move` on a Param-typed
+// receiver gets the same treatment without an FnOnce-specific code
+// path.
 #[test]
 fn problem_3_fnonce_called_multiple_times() {
     let err = try_compile_example(
@@ -133,10 +145,14 @@ fn problem_3_fnonce_called_multiple_times() {
 // a placeholder, not a name, but we'd want the same handling for
 // any future built-ins).
 //
-// Fix shape: pre-pop `'static` into the lifetime_param_names slice
-// my where-clause validator consults (or short-circuit the
-// validator when the name is `static`). Same handling applies to
-// the trailing `+ 'lifetime` slot on type predicates.
+// Fix shape: introduce a `lifetime_in_scope(name, &fn_lifetimes)`
+// predicate that's the union of declared params and built-in
+// lifetimes; route the where-clause validator (and the trailing
+// `+ 'lifetime` slot on type predicates) through it. Pre-populating
+// `'static` into the declared-param slice would be a hack — it
+// smuggles built-ins into a slice that elsewhere means "user-
+// declared params" only. Deferred (gates on the rt5 lifetime cluster
+// — #5/#7/#8/#9 — which all need the lifetime story to evolve).
 #[test]
 fn problem_5_where_static_lifetime_rejected() {
     let bytes = try_compile_example(
@@ -157,11 +173,12 @@ fn problem_5_where_static_lifetime_rejected() {
 // them to be sound (or unsound) compile either way.
 //
 // Each of #7–9 demonstrates a different angle on the gap. The
-// fix shape is shared: borrowck needs to consume
-// `lifetime_predicates` as declared facts about the in-scope
-// lifetimes, and either (a) check the function's body against the
-// resulting outlives relations, or (b) check call-site
-// substitutions against the callee's predicates.
+// real fix is a borrowck overhaul: lifetime-variable inference +
+// outlives constraint solving. With that machinery, body-side
+// (#7, #9) and call-site (#8) checks fall out — the predicates
+// become declared facts the solver consumes. Without it, any
+// "fix" for a single test is a band-aid that doesn't eliminate
+// the dead-storage shape. Deferred as a cluster.
 
 // PROBLEM 7: Function body that contradicts its own where-clause
 // is silently accepted. The signature declares `'a: 'b`, but the
@@ -244,17 +261,20 @@ fn problem_9_where_outlives_required_but_missing() {
 // codegen's layout helpers (`byte_size_of`, `flatten_rtype`,
 // `collect_leaves`) hit the `Opaque` arm's `unreachable!()`.
 //
-// Architectural shape: the finalize substitution is incomplete —
-// it walks return_types and method_resolutions, but not the
-// per-NodeId `expr_types` table where binding/expression types
-// are recorded. Any post-typeck pass that reads `expr_types`
-// (mono storage layout, codegen leaf collection) sees `Opaque`
-// for forward-referenced RPIT-bound locals.
+// Architectural shape: post-hoc rewriting of stored types is an
+// open-ended commitment — every new RType-holding table is a new
+// place finalize has to walk. Adding `expr_types` to finalize fixes
+// THIS test but doesn't fix the pattern; the next contributor
+// adding a table re-introduces the bug.
 //
-// Fix shape: walk every `FnSymbol.expr_types` and `Template.expr_types`
-// in `finalize_rpit_substitutions`, substituting each `Opaque{fn,
-// slot} → pin` the same way return_types and trait_dispatches are
-// handled.
+// Fix shape (landed, Phase 2): retire post-hoc rewriting. Add
+// `peel_opaque(rt, &FuncTable)` and `subst_and_peel(rt, env, funcs)`
+// in `src/typeck/types.rs`; mono and codegen route every Param-
+// substitution through `subst_and_peel` so codegen never sees an
+// `Opaque`. `finalize_rpit_substitutions` and friends are deleted.
+// `Opaque` becomes a stable indirection through typeck; new RType-
+// holding tables get peeled automatically when they pass through
+// the mono/codegen substitution boundary.
 #[test]
 fn problem_6_rpit_forward_local_binding_crashes_codegen() {
     let bytes = try_compile_example(

@@ -79,12 +79,15 @@ fn problem_1_move_self_through_shared_ref_rejected() {
 // types. Wherever a narrow value flows entirely through wasm-locals,
 // it carries arbitrary high bits.
 //
-// Fix shape: emit a `(I32Const mask) (I32And)` pair after every
-// arithmetic op whose result type is an unsigned Narrow32 narrower
-// than 32 bits, and a `(I32Const shift) (I32Shl) (I32Const shift)
-// (I32ShrS)` pair for signed narrow targets. Same fix-up applies
-// after casts (problem_3) and at any other site that materializes a
-// narrow value into a wasm-local.
+// Fix shape (landed): centralized into `emit_narrow_normalize(ctx,
+// kind: &IntKind)` (src/codegen.rs). Establishes the invariant
+// "narrow-typed wasm-locals carry in-range values" with enforcement
+// at the producer sites — binop result emission (gated by
+// `op_can_overflow_narrow`) and the `Narrow32 → Narrow32` arm of
+// `emit_int_to_int_cast` when the target is strictly narrower
+// (closes problem_3 too). Other producers (literals — typeck range-
+// checked; function returns — masked at the callee; bitwise ops,
+// compares, memory loads — width-correct already) don't need it.
 #[test]
 fn problem_2_narrow_int_arithmetic_does_not_wrap() {
     expect_answer("redteaming/rt2/narrow_int_add_no_wrap", 42u32);
@@ -104,12 +107,11 @@ fn problem_2_narrow_int_arithmetic_does_not_wrap() {
 // to already be masked; the source is rarely masked because no other
 // layer ever masks it.
 //
-// Fix shape: extend `emit_int_to_int_cast` so the same-class arm
-// inserts a mask (unsigned target) or sign-extend chain (signed
-// target) whenever the *target's* bit width is strictly less than
-// the *source's*. Don't emit anything when widening within Narrow32
-// (e.g. `u8 → u32`) — but only because `u8` was supposed to already
-// be in 0..=255, an invariant problem 2's fix establishes.
+// Fix shape (landed): same as problem 2 — `emit_int_to_int_cast`'s
+// `Narrow32 → Narrow32` arm calls `emit_narrow_normalize(ctx, tgt)`
+// whenever `narrow_bit_width(tgt) < narrow_bit_width(src)`. Same-
+// class widening (e.g. `u8 → u32`) stays a no-op, relying on the
+// invariant problem 2's fix establishes.
 #[test]
 fn problem_3_narrow_int_cast_does_not_truncate() {
     expect_answer("redteaming/rt2/narrow_int_cast_no_truncate", 42u32);

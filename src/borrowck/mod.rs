@@ -173,13 +173,14 @@ fn check_function(
     let cfg_move_sites: Vec<(crate::ast::NodeId, String)>;
     {
         let funcs_ro: &FuncTable = &*funcs;
-        let (param_types, expr_types, method_resolutions, call_resolutions, type_params, type_param_bounds, pattern_ergo) =
+        let (param_types, expr_types, method_resolutions, call_resolutions, bare_closure_calls, type_params, type_param_bounds, pattern_ergo) =
             if let Some(entry) = func_lookup(funcs_ro, &full) {
                 (
                     &entry.param_types,
                     &entry.expr_types,
                     &entry.method_resolutions,
                     &entry.call_resolutions,
+                    &entry.bare_closure_calls,
                     Vec::<String>::new(),
                     Vec::<Vec<Vec<String>>>::new(),
                     &entry.pattern_ergo,
@@ -202,6 +203,7 @@ fn check_function(
                     &t.expr_types,
                     &t.method_resolutions,
                     &t.call_resolutions,
+                    &t.bare_closure_calls,
                     t.type_params.clone(),
                     bounds_clone,
                     &t.pattern_ergo,
@@ -231,6 +233,7 @@ fn check_function(
             expr_types,
             method_resolutions,
             call_resolutions,
+            bare_closure_calls,
             type_params: &type_params,
             type_param_bounds: &type_param_bounds,
             param_types,

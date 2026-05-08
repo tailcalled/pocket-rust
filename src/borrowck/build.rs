@@ -34,6 +34,13 @@ pub struct CfgBuildCtx<'a> {
     pub expr_types: &'a Vec<Option<RType>>,
     pub method_resolutions: &'a Vec<Option<MethodResolution>>,
     pub call_resolutions: &'a Vec<Option<CallResolution>>,
+    // Per-NodeId binding name for bare-closure / bare-typeparam calls.
+    // When set, `f(args)` is dispatched as `f.<call|call_mut|call_once>(args)`
+    // (typeck records this in `check_bare_closure_call` /
+    // `check_bare_typeparam_fn_call`). Borrowck consults it to record the
+    // synthesized receiver effect — Move recv_adjust → move-out on the
+    // binding — even though the surface AST node is `Call`, not `MethodCall`.
+    pub bare_closure_calls: &'a Vec<Option<String>>,
     pub type_params: &'a Vec<String>,
     pub type_param_bounds: &'a Vec<Vec<Vec<String>>>,
     // Resolved parameter types (in order). Length = func.params.len().
@@ -809,7 +816,50 @@ impl<'a> Builder<'a> {
     }
 
     fn lower_call(&mut self, c: &Call, node_id: ast::NodeId) -> Rvalue {
+        // Bare-closure / bare-typeparam call (`f(args)` where `f` is a
+        // local with synthesized closure type or a `F: Fn*`-bounded
+        // type-param). Typeck records the binding name on
+        // `bare_closure_calls[id]` and the dispatch's `recv_adjust` on
+        // `method_resolutions[id]`. Borrowck synthesizes the receiver
+        // effect HERE — without this, the binding's move-out from a
+        // FnOnce dispatch never lands in the CFG, and `f(); f();`
+        // silently slips through as use-after-move. Generic over the
+        // dispatched trait: any future `recv_adjust = Move` on a Param
+        // -typed receiver gets correct treatment automatically.
+        let bare_recv = self
+            .ctx
+            .bare_closure_calls
+            .get(node_id as usize)
+            .and_then(|o| o.as_ref());
+        let bare_recv_op: Option<Operand> = if let Some(name) = bare_recv {
+            let local = self.lookup(name).expect("typeck verified binding in scope");
+            let ty = self.ctx.method_resolutions[node_id as usize]
+                .as_ref()
+                .map(|r| r.recv_adjust)
+                .unwrap_or(ReceiverAdjust::Move);
+            let span = c.callee.span.copy();
+            let op = match ty {
+                ReceiverAdjust::Move => Operand {
+                    kind: OperandKind::Move(local_place(local)),
+                    span,
+                    node_id: Some(node_id),
+                },
+                ReceiverAdjust::BorrowImm | ReceiverAdjust::BorrowMut | ReceiverAdjust::ByRef => {
+                    Operand {
+                        kind: OperandKind::Copy(local_place(local)),
+                        span,
+                        node_id: Some(node_id),
+                    }
+                }
+            };
+            Some(op)
+        } else {
+            None
+        };
         let mut args: Vec<Operand> = Vec::new();
+        if let Some(op) = bare_recv_op {
+            args.push(op);
+        }
         let mut i = 0;
         while i < c.args.len() {
             args.push(self.lower_expr_operand(&c.args[i]));

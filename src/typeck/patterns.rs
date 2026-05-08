@@ -83,7 +83,7 @@ fn check_pattern_with_mode(
                 InferType::Int(_) | InferType::Var(_) => {
                     // Pin the var to int via unification with a fresh int-class var.
                     let v = ctx.subst.fresh_int();
-                    ctx.subst.unify(
+                    ctx.subst.coerce(
                         scrutinee_ty,
                         &InferType::Var(v),
                         ctx.traits,
@@ -105,7 +105,7 @@ fn check_pattern_with_mode(
             }
         }
         PatternKind::LitBool(_) => {
-            ctx.subst.unify(
+            ctx.subst.coerce(
                 scrutinee_ty,
                 &InferType::Bool,
                 ctx.traits,
@@ -184,7 +184,7 @@ fn check_pattern_with_mode(
                 k += 1;
             }
             let tuple_ty = InferType::Tuple(elem_tys.clone());
-            ctx.subst.unify(
+            ctx.subst.coerce(
                 scrutinee_ty,
                 &tuple_ty,
                 ctx.traits,
@@ -210,7 +210,7 @@ fn check_pattern_with_mode(
                 mutable: *mutable,
                 lifetime: LifetimeRepr::Inferred(0),
             };
-            ctx.subst.unify(
+            ctx.subst.coerce(
                 scrutinee_ty,
                 &ref_ty,
                 ctx.traits,
@@ -341,7 +341,7 @@ fn check_pattern_with_mode(
             }
             // Pin scrutinee var to integer class via fresh-int unification.
             let v = ctx.subst.fresh_int();
-            ctx.subst.unify(
+            ctx.subst.coerce(
                 scrutinee_ty,
                 &InferType::Var(v),
                 ctx.traits,
@@ -485,7 +485,7 @@ fn check_variant_tuple_pattern(
         type_args: type_args_infer,
         lifetime_args: Vec::new(),
     };
-    ctx.subst.unify(
+    ctx.subst.coerce(
         scrutinee_ty,
         &enum_infer,
         ctx.traits,
@@ -638,7 +638,7 @@ fn check_variant_struct_pattern(
         type_args: type_args_infer,
         lifetime_args: Vec::new(),
     };
-    ctx.subst.unify(
+    ctx.subst.coerce(
         scrutinee_ty,
         &enum_infer,
         ctx.traits,
@@ -793,7 +793,7 @@ fn check_struct_pattern(
         type_args: type_args_infer,
         lifetime_args: Vec::new(),
     };
-    ctx.subst.unify(
+    ctx.subst.coerce(
         scrutinee_ty,
         &struct_infer,
         ctx.traits,

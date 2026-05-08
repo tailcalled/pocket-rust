@@ -6,8 +6,8 @@ use crate::span::{Error, Span};
 use crate::typeck::{
     CallResolution, EnumTable, FuncTable, LifetimeRepr, MethodCandidate, MethodResolution,
     MovedPlace, RType, StructTable, TraitTable, drop_trait_path, find_inherent_synth_idx,
-    find_trait_impl_idx_by_span, find_trait_impl_method, func_lookup, is_drop, rtype_eq,
-    solve_impl, solve_impl_with_args, substitute_rtype,
+    find_trait_impl_idx_by_span, find_trait_impl_method, func_lookup, is_drop, peel_opaque,
+    rtype_eq, solve_impl, solve_impl_with_args, subst_and_peel, substitute_rtype,
 };
 
 // One fully-substituted monomorphization ready for codegen. Either a
@@ -148,11 +148,11 @@ fn build_env(type_params: &Vec<String>, type_args: &Vec<RType>) -> Vec<(String, 
     env
 }
 
-fn subst_vec(v: &Vec<RType>, env: &Vec<(String, RType)>) -> Vec<RType> {
+fn subst_vec(v: &Vec<RType>, env: &Vec<(String, RType)>, funcs: &FuncTable) -> Vec<RType> {
     let mut out: Vec<RType> = Vec::new();
     let mut i = 0;
     while i < v.len() {
-        out.push(substitute_rtype(&v[i], env));
+        out.push(subst_and_peel(&v[i], env, funcs));
         i += 1;
     }
     out
@@ -179,7 +179,7 @@ fn discover_in_body(
     // Drop will trigger a Drop::drop call at function scope-end.
     let mut p = 0;
     while p < param_types.len() {
-        let pty = substitute_rtype(&param_types[p], env);
+        let pty = subst_and_peel(&param_types[p], env, funcs);
         register_drop_mono(&pty, traits, funcs, table);
         p += 1;
     }
@@ -331,7 +331,7 @@ fn walk_let(
         .as_ref()
         .and_then(|v| expr_types[v.id as usize].as_ref());
     if let Some(ty) = value_ty {
-        let concrete = substitute_rtype(ty, env);
+        let concrete = subst_and_peel(ty, env, funcs);
         register_drop_mono(&concrete, traits, funcs, table);
         // Walk pattern bindings to register Drop monos for any
         // destructured Drop-typed leaves.
@@ -527,7 +527,7 @@ fn walk_expr(
             // Smart-pointer deref: if inner's type is a struct (not Ref/RawPtr),
             // codegen calls Deref::deref. Register that mono here.
             if let Some(inner_ty) = &expr_types[inner.id as usize] {
-                let inner_ty = substitute_rtype(inner_ty, env);
+                let inner_ty = subst_and_peel(inner_ty, env, funcs);
                 if !matches!(&inner_ty, RType::Ref { .. } | RType::RawPtr { .. }) {
                     register_deref_mono(&inner_ty, "Deref", "deref", traits, funcs, table);
                 }
@@ -578,7 +578,7 @@ fn walk_expr(
             if let Some(CallResolution::Generic { template_idx, type_args }) =
                 &call_resolutions[id]
             {
-                let concrete = subst_vec(type_args, env);
+                let concrete = subst_vec(type_args, env, funcs);
                 table.intern(*template_idx, concrete);
             }
         }
@@ -764,7 +764,7 @@ fn walk_expr(
             );
             // for-in lowers to Iterator::next(&mut iter). Register its mono.
             if let Some(iter_ty) = &expr_types[f.iter.id as usize] {
-                let iter_ty = substitute_rtype(iter_ty, env);
+                let iter_ty = subst_and_peel(iter_ty, env, funcs);
                 let iterator_path = vec![
                     "std".to_string(),
                     "iter".to_string(),
@@ -829,8 +829,8 @@ fn walk_expr(
             if let (Some(base_ty), Some(idx_ty)) =
                 (&expr_types[base.id as usize], &expr_types[index.id as usize])
             {
-                let base_ty = substitute_rtype(base_ty, env);
-                let idx_ty = substitute_rtype(idx_ty, env);
+                let base_ty = subst_and_peel(base_ty, env, funcs);
+                let idx_ty = subst_and_peel(idx_ty, env, funcs);
                 let lookup_rt = match &base_ty {
                     RType::Ref { inner, .. } => (**inner).clone(),
                     _ => base_ty.clone(),
@@ -938,12 +938,12 @@ fn walk_method_call(
         // Trait-dispatched method call. Substitute recv and trait_args
         // through env, solve the impl, find the method, register the
         // mono if it's a Template.
-        let concrete_recv = substitute_rtype(&td.recv_type, env);
+        let concrete_recv = subst_and_peel(&td.recv_type, env, funcs);
         let concrete_recv_for_solve = match &concrete_recv {
             RType::Ref { inner, .. } => (**inner).clone(),
             other => other.clone(),
         };
-        let concrete_trait_args = subst_vec(&td.trait_args, env);
+        let concrete_trait_args = subst_vec(&td.trait_args, env, funcs);
         let resolution = match solve_impl_with_args(
             &td.trait_path,
             &concrete_trait_args,
@@ -982,7 +982,7 @@ fn walk_method_call(
             if recorded_type_args.len() == method_param_count {
                 let mut k = 0;
                 while k < method_param_count {
-                    concrete.push(substitute_rtype(&recorded_type_args[k], env));
+                    concrete.push(subst_and_peel(&recorded_type_args[k], env, funcs));
                     k += 1;
                 }
                 table.intern(i, concrete);
@@ -992,7 +992,7 @@ fn walk_method_call(
     }
     // Non-trait dispatched: direct template_idx + type_args.
     if let Some(template_idx) = mr.template_idx {
-        let concrete = subst_vec(&mr.type_args, env);
+        let concrete = subst_vec(&mr.type_args, env, funcs);
         table.intern(template_idx, concrete);
     }
 }
@@ -2761,7 +2761,7 @@ fn resolve_field_info(
     let mut byte_off: u32 = 0;
     let mut k = 0;
     while k < entry.fields.len() {
-        let fty = substitute_rtype(&entry.fields[k].ty, &env);
+        let fty = subst_and_peel(&entry.fields[k].ty, &env, ctx.funcs);
         if entry.fields[k].name == field_name {
             return Some((fty, byte_off));
         }
@@ -2948,6 +2948,16 @@ fn resolve_trait_dispatch_method(
         RType::Ref { inner, .. } => (**inner).clone(),
         other => other.clone(),
     };
+    // Never receiver: this call is on a never-reached path (the
+    // receiver expression diverged before reaching us — RPIT body
+    // returning `!`, etc.). No actual impl exists; wasm's validator
+    // accepts subsequent code as polymorphic after the unreachable
+    // produced by `panic!`/return/etc., so we hand back any valid
+    // import idx (the panic import at slot 0 is always present).
+    // The runtime never executes this call.
+    if matches!(concrete_recv, RType::Never) {
+        return Ok(0);
+    }
     let resolution = match solve_impl_with_args(
         &td.trait_path,
         &td.trait_args,
