@@ -404,24 +404,14 @@ fn resolve_or_alloc_region(
     }
 }
 
-// Compute the outermost region of a place's type given its root
-// `LocalDecl`'s type plus any `Field`/`TupleIndex`/`Deref` projections.
-// For now, supports:
-//   - bare `Local`: the local's outermost region (if its type is a ref).
-//   - `Local.field`: walks struct/tuple to find the field's type, then
-//     uses that type's outermost region.
-//   - `Local.*`: deref of a ref/raw-ptr returns the pointee's outermost
-//     region — but only when that pointee itself is a ref-type
-//     (otherwise the deref produces a place with no region).
-// Returns `None` for non-ref places (owned values, primitive types).
-fn place_outer_region(
-    b: &Builder,
-    place: &crate::borrowck::cfg::Place,
-) -> Option<crate::borrowck::cfg::RegionId> {
+// Compute the resolved type of a place — root local's type with
+// `Field`/`TupleIndex`/`Deref` projections applied. Returns None when
+// a projection can't be resolved (e.g. field name not found on the
+// projected type).
+fn place_type(b: &Builder, place: &crate::borrowck::cfg::Place) -> Option<RType> {
     use crate::borrowck::cfg::Projection;
     let local = &b.locals[place.root as usize];
     let mut ty = local.ty.clone();
-    // Apply projections.
     for proj in &place.projections {
         match proj {
             Projection::Field(name) => {
@@ -445,9 +435,229 @@ fn place_outer_region(
             },
         }
     }
-    match &ty {
-        RType::Ref { lifetime, .. } => lookup_or_static(&b.region_graph, lifetime),
+    Some(ty)
+}
+
+// Outermost region of a place's type. Convenience wrapper around
+// `place_type`. None when the place's type isn't a ref.
+fn place_outer_region(
+    b: &Builder,
+    place: &crate::borrowck::cfg::Place,
+) -> Option<crate::borrowck::cfg::RegionId> {
+    match place_type(b, place)? {
+        RType::Ref { lifetime, .. } => lookup_or_static(&b.region_graph, &lifetime),
         _ => None,
+    }
+}
+
+// Variance-aware constraint emission for value flow (rt6#3): walk
+// paired source/destination types, and at each region-bearing
+// position emit outlives edges per the slot's variance composed with
+// the current outer position. Covariant slot → one edge `src : dst`.
+// Invariant slot → two edges (equate). The two `resolve` closures
+// translate `LifetimeRepr`s into RegionIds — same closure for both
+// sides at an assignment; different closures at a call site (caller
+// graph for src, callee-instantiation map for dst).
+//
+// Composition rules from `src/typeck/variance.rs`: a struct's
+// declared variance for slot i composes with the current outer
+// position. `Cov ∘ Cov = Cov`; `Cov ∘ Inv = Inv`; `Inv ∘ _ = Inv`.
+// `&mut T`'s inner T is Inv, raw-ptr's pointee is Inv,
+// `AssocProj`'s base is Inv. References' OUTER lifetime is always
+// covariant (mutability affects only the inner T).
+fn emit_subtype_flow(
+    src_ty: &RType,
+    dst_ty: &RType,
+    position: crate::typeck::Variance,
+    src_resolve: &dyn Fn(&crate::typeck::LifetimeRepr) -> Option<crate::borrowck::cfg::RegionId>,
+    dst_resolve: &dyn Fn(&crate::typeck::LifetimeRepr) -> Option<crate::borrowck::cfg::RegionId>,
+    structs: &crate::typeck::StructTable,
+    enums: &crate::typeck::EnumTable,
+    out: &mut Vec<crate::borrowck::cfg::OutlivesConstraint>,
+    span: &crate::span::Span,
+    source: crate::borrowck::cfg::ConstraintSource,
+) {
+    use crate::borrowck::cfg::{ConstraintSource, OutlivesConstraint};
+    use crate::typeck::variance::{compose, Variance};
+    match (src_ty, dst_ty) {
+        (
+            RType::Ref { inner: si, lifetime: sl, mutable: sm },
+            RType::Ref { inner: di, lifetime: dl, mutable: dm },
+        ) => {
+            // Reference outer lifetimes: always covariant in the
+            // lifetime (regardless of mutability).
+            if let (Some(sr), Some(dr)) = (src_resolve(sl), dst_resolve(dl)) {
+                push_edge(out, sr, dr, position, span, source);
+            }
+            // Inner T: covariant for `&T`, invariant for `&mut T`.
+            let inner_pos = if *sm || *dm {
+                compose(position, Variance::Invariant)
+            } else {
+                position
+            };
+            emit_subtype_flow(
+                si, di, inner_pos, src_resolve, dst_resolve, structs, enums, out, span, source,
+            );
+        }
+        (
+            RType::Struct {
+                path: sp,
+                type_args: sta,
+                lifetime_args: sla,
+            },
+            RType::Struct {
+                path: dp,
+                type_args: dta,
+                lifetime_args: dla,
+            },
+        ) if sp == dp => {
+            let entry = match crate::typeck::struct_lookup(structs, sp) {
+                Some(e) => e,
+                None => return,
+            };
+            let mut i = 0;
+            while i < sla.len() && i < dla.len() {
+                let slot_var = entry
+                    .lifetime_param_variance
+                    .get(i)
+                    .copied()
+                    .unwrap_or(Variance::Invariant);
+                let composed = compose(position, slot_var);
+                if let (Some(sr), Some(dr)) = (src_resolve(&sla[i]), dst_resolve(&dla[i])) {
+                    push_edge(out, sr, dr, composed, span, source);
+                }
+                i += 1;
+            }
+            let mut i = 0;
+            while i < sta.len() && i < dta.len() {
+                let slot_var = entry
+                    .type_param_variance
+                    .get(i)
+                    .copied()
+                    .unwrap_or(Variance::Invariant);
+                let composed = compose(position, slot_var);
+                emit_subtype_flow(
+                    &sta[i], &dta[i], composed, src_resolve, dst_resolve, structs, enums, out,
+                    span, source,
+                );
+                i += 1;
+            }
+        }
+        (
+            RType::Enum {
+                path: sp,
+                type_args: sta,
+                lifetime_args: sla,
+            },
+            RType::Enum {
+                path: dp,
+                type_args: dta,
+                lifetime_args: dla,
+            },
+        ) if sp == dp => {
+            let entry = match crate::typeck::enum_lookup(enums, sp) {
+                Some(e) => e,
+                None => return,
+            };
+            let mut i = 0;
+            while i < sla.len() && i < dla.len() {
+                let slot_var = entry
+                    .lifetime_param_variance
+                    .get(i)
+                    .copied()
+                    .unwrap_or(Variance::Invariant);
+                let composed = compose(position, slot_var);
+                if let (Some(sr), Some(dr)) = (src_resolve(&sla[i]), dst_resolve(&dla[i])) {
+                    push_edge(out, sr, dr, composed, span, source);
+                }
+                i += 1;
+            }
+            let mut i = 0;
+            while i < sta.len() && i < dta.len() {
+                let slot_var = entry
+                    .type_param_variance
+                    .get(i)
+                    .copied()
+                    .unwrap_or(Variance::Invariant);
+                let composed = compose(position, slot_var);
+                emit_subtype_flow(
+                    &sta[i], &dta[i], composed, src_resolve, dst_resolve, structs, enums, out,
+                    span, source,
+                );
+                i += 1;
+            }
+        }
+        (RType::Tuple(se), RType::Tuple(de)) if se.len() == de.len() => {
+            let mut i = 0;
+            while i < se.len() {
+                emit_subtype_flow(
+                    &se[i], &de[i], position, src_resolve, dst_resolve, structs, enums, out,
+                    span, source,
+                );
+                i += 1;
+            }
+        }
+        (RType::Slice(si), RType::Slice(di)) => {
+            emit_subtype_flow(
+                si, di, position, src_resolve, dst_resolve, structs, enums, out, span, source,
+            );
+        }
+        (RType::RawPtr { inner: si, .. }, RType::RawPtr { inner: di, .. }) => {
+            // Raw-ptr pointee invariant.
+            emit_subtype_flow(
+                si,
+                di,
+                compose(position, Variance::Invariant),
+                src_resolve,
+                dst_resolve,
+                structs,
+                enums,
+                out,
+                span,
+                source,
+            );
+        }
+        // Leaves and mismatched-shape pairs (typeck would have
+        // rejected the latter): no constraint to emit.
+        _ => {
+            let _ = (out, span, source);
+        }
+    }
+}
+
+fn push_edge(
+    out: &mut Vec<crate::borrowck::cfg::OutlivesConstraint>,
+    src: crate::borrowck::cfg::RegionId,
+    dst: crate::borrowck::cfg::RegionId,
+    position: crate::typeck::Variance,
+    span: &crate::span::Span,
+    source: crate::borrowck::cfg::ConstraintSource,
+) {
+    use crate::borrowck::cfg::OutlivesConstraint;
+    use crate::typeck::Variance;
+    match position {
+        Variance::Covariant => {
+            out.push(OutlivesConstraint {
+                sup: src,
+                sub: dst,
+                span: span.copy(),
+                source,
+            });
+        }
+        Variance::Invariant => {
+            out.push(OutlivesConstraint {
+                sup: src,
+                sub: dst,
+                span: span.copy(),
+                source,
+            });
+            out.push(OutlivesConstraint {
+                sup: dst,
+                sub: src,
+                span: span.copy(),
+                source,
+            });
+        }
     }
 }
 
@@ -538,6 +748,7 @@ fn emit_assign_constraints(
     span: &crate::span::Span,
 ) {
     use crate::borrowck::cfg::{ConstraintSource, OperandKind, OutlivesConstraint, Rvalue};
+    use crate::typeck::Variance;
     // Determine the LHS region: outer region of the assigned-to place.
     // None for non-ref LHS.
     let lhs_region = place_outer_region(b, lhs_place);
@@ -546,25 +757,44 @@ fn emit_assign_constraints(
     let is_return = b.return_local == Some(lhs_place.root) && lhs_place.projections.is_empty();
     match rvalue {
         Rvalue::Use(operand) => {
-            if let Some(rhs_region) = operand_region(b, operand) {
-                if is_return {
-                    if let Some(ret_r) = b.region_graph.fn_return_region {
-                        b.region_graph.outlives.push(OutlivesConstraint {
-                            sup: rhs_region,
-                            sub: ret_r,
-                            span: span.copy(),
-                            source: ConstraintSource::FnReturn,
-                        });
-                    }
-                } else if let Some(lhs_r) = lhs_region {
-                    b.region_graph.outlives.push(OutlivesConstraint {
-                        sup: rhs_region,
-                        sub: lhs_r,
-                        span: span.copy(),
-                        source: ConstraintSource::Assign,
-                    });
-                }
+            // Variance-aware paired-types walk: emit constraints at
+            // every region-bearing position in the operand's type
+            // matched to the LHS's expected type. Both sides resolve
+            // through the caller's RegionGraph (assign is intra-fn).
+            let src_ty_opt = operand_type(b, operand);
+            let dst_ty_opt = if is_return {
+                Some(b.ctx.return_type.clone())
+            } else {
+                place_type(b, lhs_place)
+            };
+            if let (Some(src_ty), Some(dst_ty)) = (src_ty_opt, dst_ty_opt) {
+                let mut new_edges: Vec<OutlivesConstraint> = Vec::new();
+                let resolve = |lt: &crate::typeck::LifetimeRepr| -> Option<crate::borrowck::cfg::RegionId> {
+                    lookup_or_static(&b.region_graph, lt)
+                };
+                let source = if is_return {
+                    ConstraintSource::FnReturn
+                } else {
+                    ConstraintSource::Assign
+                };
+                emit_subtype_flow(
+                    &src_ty,
+                    &dst_ty,
+                    Variance::Covariant,
+                    &resolve,
+                    &resolve,
+                    b.ctx.structs,
+                    b.ctx.enums,
+                    &mut new_edges,
+                    span,
+                    source,
+                );
+                b.region_graph.outlives.extend(new_edges);
             }
+            // Suppress unused-warning for OperandKind in this arm.
+            let _ = operand;
+            let _: Option<()> = None;
+            let _ = OperandKind::ConstUnit;
         }
         Rvalue::Borrow { place: src, region: borrow_r, .. } => {
             // The borrow's region is `borrow_r`. If the source place is
@@ -597,8 +827,8 @@ fn emit_assign_constraints(
                 });
             }
         }
-        Rvalue::Call { callee, args, .. } => {
-            emit_call_constraints(b, callee, args, lhs_place, lhs_region, is_return, span);
+        Rvalue::Call { callee, args, call_node_id } => {
+            emit_call_constraints(b, callee, args, *call_node_id, lhs_place, lhs_region, is_return, span);
         }
         // Cast / StructLit / Tuple / Variant / Builtin / Discriminant
         // either don't carry region constraints (Cast erases) or aren't
@@ -612,6 +842,25 @@ fn operand_region(b: &Builder, op: &crate::borrowck::cfg::Operand) -> Option<cra
     match &op.kind {
         OperandKind::Move(p) | OperandKind::Copy(p) => place_outer_region(b, p),
         OperandKind::ConstStr(_) => Some(crate::borrowck::cfg::STATIC_REGION),
+        OperandKind::ConstInt(_) | OperandKind::ConstBool(_) | OperandKind::ConstUnit => None,
+    }
+}
+
+// Resolve an operand's full type (with projections applied). Used by
+// `emit_subtype_flow` to walk the operand's type structure paired
+// against the destination's type. Returns `None` for non-place
+// operands (literals) — those carry no per-region constraints.
+fn operand_type(b: &Builder, op: &crate::borrowck::cfg::Operand) -> Option<RType> {
+    use crate::borrowck::cfg::OperandKind;
+    match &op.kind {
+        OperandKind::Move(p) | OperandKind::Copy(p) => place_type(b, p),
+        // String literals: `&'static str` — represented inline so the
+        // flow walker sees the right shape.
+        OperandKind::ConstStr(_) => Some(RType::Ref {
+            inner: Box::new(RType::Str),
+            mutable: false,
+            lifetime: crate::typeck::LifetimeRepr::Named("static".to_string()),
+        }),
         OperandKind::ConstInt(_) | OperandKind::ConstBool(_) | OperandKind::ConstUnit => None,
     }
 }
@@ -631,21 +880,27 @@ fn emit_call_constraints(
     b: &mut Builder,
     callee: &crate::borrowck::cfg::CallTarget,
     args: &Vec<crate::borrowck::cfg::Operand>,
+    call_node_id: crate::ast::NodeId,
     lhs_place: &crate::borrowck::cfg::Place,
     lhs_region: Option<crate::borrowck::cfg::RegionId>,
     is_return: bool,
     span: &crate::span::Span,
 ) {
     use crate::borrowck::cfg::{CallTarget, ConstraintSource, OutlivesConstraint};
-    // Resolve the callee's signature. For Path callees, look up FnSymbol /
-    // GenericTemplate. MethodResolution callees are deferred — typeck
-    // records the callee path on `MethodResolution`, but plumbing that
-    // through here is more substantial. (Methods invoked directly via
-    // `f.method()` will land in this path once L3 is extended; for the
-    // initial drop, free-fn calls cover rt5#8.)
+    // Resolve the callee's signature. For Path callees, the path is
+    // direct. For MethodResolution callees, typeck recorded the
+    // resolved callee path on `method_resolutions[node_id].callee_path`
+    // (after dispatch + autoderef). Either way we end up with a
+    // `Vec<String>` to look up in `funcs.entries` / `funcs.templates`.
     let path = match callee {
         CallTarget::Path(p) => p.clone(),
-        CallTarget::MethodResolution(_) => return,
+        CallTarget::MethodResolution(_) => {
+            let mr = match b.ctx.method_resolutions.get(call_node_id as usize) {
+                Some(Some(m)) => m,
+                _ => return,
+            };
+            mr.callee_path.clone()
+        }
     };
     let (param_types, return_type, lifetime_params, lifetime_predicates) =
         match crate::typeck::func_lookup(b.ctx.funcs, &path) {

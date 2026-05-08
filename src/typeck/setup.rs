@@ -802,6 +802,7 @@ pub(super) fn collect_funcs(
                     &Vec::new(),
                     &Vec::new(),
                     &Vec::new(),
+                    &Vec::new(),
                     None,
                     funcs,
                     next_idx,
@@ -1021,6 +1022,57 @@ pub(super) fn collect_funcs(
                         .push((module.source_file.clone(), ib.span.copy()));
                     method_prefix.push(format!("__inherent_synth_{}", idx));
                 }
+                // Collect impl-level lifetime where-predicates (`impl<'a, 'b>
+                // Foo where 'a: 'b`). They apply to every method in the
+                // impl — borrowck's RegionGraph reads `lifetime_predicates`
+                // from the per-method FnSymbol, so we prepend the impl's
+                // predicates to each method's own. Mirrors rt4#2's
+                // type-predicate handling above; the impl-block walk
+                // previously fell through on Lifetime arms.
+                let mut impl_lifetime_predicates: Vec<crate::typeck::tables::LifetimePredResolved>
+                    = Vec::new();
+                let mut wi = 0;
+                while wi < ib.where_clause.len() {
+                    if let crate::ast::WherePredicate::Lifetime { lhs, bounds, span } =
+                        &ib.where_clause[wi]
+                    {
+                        if !crate::typeck::lifetime_in_scope(&lhs.name, &impl_lifetime_params) {
+                            return Err(crate::span::Error {
+                                file: module.source_file.clone(),
+                                message: format!(
+                                    "undeclared lifetime `'{}` in impl where-clause",
+                                    lhs.name
+                                ),
+                                span: lhs.span.copy(),
+                            });
+                        }
+                        let mut resolved_bounds: Vec<String> = Vec::new();
+                        let mut bi = 0;
+                        while bi < bounds.len() {
+                            let b = &bounds[bi];
+                            if !crate::typeck::lifetime_in_scope(&b.name, &impl_lifetime_params) {
+                                return Err(crate::span::Error {
+                                    file: module.source_file.clone(),
+                                    message: format!(
+                                        "undeclared lifetime `'{}` in impl where-clause",
+                                        b.name
+                                    ),
+                                    span: b.span.copy(),
+                                });
+                            }
+                            resolved_bounds.push(b.name.clone());
+                            bi += 1;
+                        }
+                        impl_lifetime_predicates.push(
+                            crate::typeck::tables::LifetimePredResolved {
+                                lhs: lhs.name.clone(),
+                                bounds: resolved_bounds,
+                                span: span.copy(),
+                            },
+                        );
+                    }
+                    wi += 1;
+                }
                 let mut k = 0;
                 while k < ib.methods.len() {
                     register_function(
@@ -1031,6 +1083,7 @@ pub(super) fn collect_funcs(
                         &impl_type_params,
                         &impl_lifetime_params,
                         &impl_type_param_bounds,
+                        &impl_lifetime_predicates,
                         trait_impl_idx_for_methods,
                         funcs,
                         next_idx,
@@ -2404,6 +2457,11 @@ pub(super) fn register_function(
     impl_type_params: &Vec<String>,
     impl_lifetime_params: &Vec<String>,
     impl_type_param_bounds: &Vec<Vec<Vec<String>>>,
+    // Impl-block-level lifetime where-clause predicates. Empty for
+    // free fns (no enclosing impl). Methods inside an `impl<'a, 'b>
+    // Foo where 'a: 'b` see the impl's predicates prepended to their
+    // own — borrowck's region pass reads the merged list.
+    impl_lifetime_predicates: &Vec<crate::typeck::tables::LifetimePredResolved>,
     trait_impl_idx: Option<usize>,
     funcs: &mut FuncTable,
     next_idx: &mut u32,
@@ -2745,8 +2803,11 @@ pub(super) fn register_function(
     //     `where_predicates` for call-time enforcement after the
     //     type-param substitution is built.
     let mut where_predicates: Vec<crate::typeck::tables::WherePredResolved> = Vec::new();
+    // Seed with impl-level predicates so methods inside an
+    // `impl<'a, 'b> Foo where 'a: 'b` automatically see the relation
+    // (rt6#2). The method's own where-clause predicates append after.
     let mut lifetime_predicates: Vec<crate::typeck::tables::LifetimePredResolved> =
-        Vec::new();
+        impl_lifetime_predicates.clone();
     let mut wi = 0;
     while wi < f.where_clause.len() {
         match &f.where_clause[wi] {

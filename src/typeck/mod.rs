@@ -564,6 +564,7 @@ pub fn register_synthesized_closure_impl(
             &impl_type_params,
             &impl_lifetime_params,
             &impl_type_param_bounds,
+            &Vec::new(),
             Some(trait_impl_idx),
             funcs,
             next_idx,
