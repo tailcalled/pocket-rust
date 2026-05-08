@@ -11,6 +11,9 @@ use crate::wasm;
 // Globals seeded by `lib.rs`: index 0 is the shadow-stack pointer
 // (`__sp`); index 1 is the heap top (`__heap_top`, bump-allocator
 // cursor for `¤alloc`).
+// Globals seeded by `lib.rs`: index 0 is the shadow-stack pointer
+// (`__sp`); index 1 is the heap top (`__heap_top`, bump-allocator
+// cursor for `¤alloc`).
 const SP_GLOBAL: u32 = 0;
 const HEAP_GLOBAL: u32 = 1;
 
@@ -706,6 +709,7 @@ fn emit_module(
             Item::Trait(_) => {}
             Item::Use(_) => {}
             Item::TypeAlias(_) => {}
+            Item::Const(_) => {}
         }
         i += 1;
     }
@@ -784,6 +788,7 @@ fn build_mono_input_for_template<'a>(
         // preserve that shape.
         pattern_ergo: tmpl.pattern_ergo.clone(),
         bare_closure_calls: tmpl.bare_closure_calls.clone(),
+        const_uses: tmpl.const_uses.clone(),
         wasm_idx,
         is_export: false, // monomorphic instances are never exported
     }
@@ -924,6 +929,7 @@ fn emit_function(
         move_sites: clone_move_sites(&entry.move_sites),
         pattern_ergo: entry.pattern_ergo.clone(),
         bare_closure_calls: entry.bare_closure_calls.clone(),
+        const_uses: entry.const_uses.clone(),
         wasm_idx: entry.idx,
         is_export: current_module.is_empty() && path_prefix.len() == current_module.len(),
     };

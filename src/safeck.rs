@@ -78,6 +78,7 @@ fn check_module(
             Item::Trait(_) => {}
             Item::Use(_) => {}
             Item::TypeAlias(_) => {}
+            Item::Const(_) => {}
         }
         i += 1;
     }

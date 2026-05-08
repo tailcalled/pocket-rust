@@ -43,6 +43,11 @@ pub struct MonoFnInput<'a> {
     // ExprKind::Call to detect closure-bare-calls and rewrite as a
     // MethodCall MonoExpr.
     pub bare_closure_calls: Vec<Option<String>>,
+    // Per-NodeId resolved const value (see `FnSymbol.const_uses`).
+    // At each `Var` lowering site, mono checks this table; if Some,
+    // the Var is a const reference and gets lowered to a `Lit`
+    // MonoExpr carrying the value.
+    pub const_uses: Vec<Option<crate::typeck::ConstValue>>,
     pub wasm_idx: u32,
     pub is_export: bool,
 }
@@ -1908,13 +1913,39 @@ fn lower_expr(ctx: &mut LowerCtx, expr: &Expr) -> Result<MonoExpr, Error> {
         ExprKind::CharLit(c) => MonoExprKind::Lit(MonoLit::Char(*c)),
         ExprKind::StrLit(s) => MonoExprKind::Lit(MonoLit::Str(s.clone())),
         ExprKind::Var(name) => {
-            match ctx.lookup(name) {
-                Some(id) => MonoExprKind::Local(id, expr.id),
-                None => return Err(Error {
-                    file: String::new(),
-                    message: format!("lower_to_mono: no binding in scope for `{}`", name),
-                    span,
-                }),
+            // Const reference takes priority over local lookup —
+            // typeck only records `const_uses[id]` when the Var failed
+            // to resolve as a local, so the two can't both fire.
+            if let Some(slot) = ctx.input.const_uses.get(expr.id as usize) {
+                if let Some(value) = slot {
+                    let lit = match value {
+                        crate::typeck::ConstValue::Int { magnitude, negated } => {
+                            MonoLit::Int { magnitude: *magnitude, negated: *negated }
+                        }
+                        crate::typeck::ConstValue::Bool(b) => MonoLit::Bool(*b),
+                        crate::typeck::ConstValue::Char(c) => MonoLit::Char(*c),
+                        crate::typeck::ConstValue::Str(s) => MonoLit::Str(s.clone()),
+                    };
+                    MonoExprKind::Lit(lit)
+                } else {
+                    match ctx.lookup(name) {
+                        Some(id) => MonoExprKind::Local(id, expr.id),
+                        None => return Err(Error {
+                            file: String::new(),
+                            message: format!("lower_to_mono: no binding in scope for `{}`", name),
+                            span,
+                        }),
+                    }
+                }
+            } else {
+                match ctx.lookup(name) {
+                    Some(id) => MonoExprKind::Local(id, expr.id),
+                    None => return Err(Error {
+                        file: String::new(),
+                        message: format!("lower_to_mono: no binding in scope for `{}`", name),
+                        span,
+                    }),
+                }
             }
         }
         ExprKind::Block(b) => MonoExprKind::Block(Box::new(lower_block(ctx, b.as_ref())?)),

@@ -18,6 +18,7 @@ pub enum RawItem {
     Trait(TraitDef),
     Use(UseDecl),
     TypeAlias(TypeAlias),
+    Const(crate::ast::ConstDecl),
 }
 
 // Attach captured `#[derive(...)]` clauses to the following item.
@@ -95,12 +96,7 @@ impl Parser {
         // threaded into the specific AST node by each parser. `impl` and
         // `mod` don't carry their own visibility yet (impl methods are
         // pub'd individually; module visibility isn't enforced).
-        let is_pub = if self.peek_kind(&TokenKind::Pub) {
-            self.pos += 1;
-            true
-        } else {
-            false
-        };
+        let is_pub = self.parse_visibility()?;
         if self.peek_kind(&TokenKind::Mod) {
             // `pub mod` is accepted but currently has no extra effect —
             // module items inside still carry their own `pub`.
@@ -125,11 +121,32 @@ impl Parser {
             Ok(RawItem::Use(self.parse_use_decl_with_vis(is_pub)?))
         } else if self.peek_kind(&TokenKind::Type) {
             Ok(RawItem::TypeAlias(self.parse_type_alias_with_vis(is_pub)?))
+        } else if self.peek_kind(&TokenKind::Const) {
+            Ok(RawItem::Const(self.parse_const_decl_with_vis(is_pub)?))
         } else {
             Err(self.error_at_current(
-                "expected `fn`, `mod`, `struct`, `enum`, `impl`, `trait`, `type`, or `use`",
+                "expected `fn`, `mod`, `struct`, `enum`, `impl`, `trait`, `type`, `const`, or `use`",
             ))
         }
+    }
+
+    fn parse_const_decl_with_vis(&mut self, is_pub: bool) -> Result<crate::ast::ConstDecl, Error> {
+        let const_span = self.expect(&TokenKind::Const, "`const`")?;
+        let (name, name_span) = self.expect_ident()?;
+        self.expect(&TokenKind::Colon, "`:` after const name")?;
+        let ty = self.parse_type()?;
+        self.expect(&TokenKind::Eq, "`=` after const type")?;
+        let value = self.parse_expr()?;
+        let semi_span = self.expect(&TokenKind::Semi, "`;` after const declaration")?;
+        let span = Span::new(const_span.start, semi_span.end);
+        Ok(crate::ast::ConstDecl {
+            name,
+            name_span,
+            ty,
+            value,
+            is_pub,
+            span,
+        })
     }
 
     fn parse_type_alias_with_vis(&mut self, is_pub: bool) -> Result<TypeAlias, Error> {
@@ -405,12 +422,7 @@ impl Parser {
             // is silently allowed but doesn't change anything beyond
             // the method's `is_pub` flag (which won't be checked for
             // trait-impl methods).
-            let method_is_pub = if self.peek_kind(&TokenKind::Pub) {
-                self.pos += 1;
-                true
-            } else {
-                false
-            };
+            let method_is_pub = self.parse_visibility()?;
             // `parse_function_with_vis` consumes an optional leading
             // `unsafe` token before `fn`; we just need to look past
             // that here when checking for the `fn` keyword.
@@ -648,12 +660,7 @@ impl Parser {
     }
 
     fn parse_struct_field(&mut self) -> Result<StructField, Error> {
-        let is_pub = if self.peek_kind(&TokenKind::Pub) {
-            self.pos += 1;
-            true
-        } else {
-            false
-        };
+        let is_pub = self.parse_visibility()?;
         let (name, name_span) = self.expect_ident()?;
         self.expect(&TokenKind::Colon, "`:`")?;
         let ty = self.parse_type()?;
@@ -3916,6 +3923,38 @@ impl Parser {
                 })
             }
         }
+    }
+
+    // Parse an optional visibility prefix on an item declaration.
+    // Accepts `pub`, `pub(crate)`, `pub(super)`, `pub(self)` — the
+    // path-qualified forms collapse to plain `pub` because pocket-
+    // rust has only crate-wide vs private as enforced visibility.
+    // Returns `true` iff any `pub` form was consumed.
+    //
+    // `pub(in path)` (in-module form) is not yet recognized; its `(`
+    // would be left for downstream parsers. In practice pocket-rust's
+    // own source uses only the qualifier-keyword forms.
+    fn parse_visibility(&mut self) -> Result<bool, Error> {
+        if !self.peek_kind(&TokenKind::Pub) {
+            return Ok(false);
+        }
+        self.pos += 1;
+        if !self.peek_kind(&TokenKind::LParen) {
+            return Ok(true);
+        }
+        let qualifier_kind = self.tokens.get(self.pos + 1).map(|t| &t.kind);
+        let recognized = match qualifier_kind {
+            Some(TokenKind::SelfLower) => true,
+            Some(TokenKind::Ident(s)) => s == "crate" || s == "super",
+            _ => false,
+        };
+        if !recognized {
+            // Unknown qualifier — leave `(` for some other parser.
+            return Ok(true);
+        }
+        self.pos += 2; // consume `(` and the qualifier ident/keyword
+        self.expect(&TokenKind::RParen, "`)` after `pub(...)` qualifier")?;
+        Ok(true)
     }
 
     fn expect_ident(&mut self) -> Result<(String, Span), Error> {

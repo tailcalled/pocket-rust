@@ -101,6 +101,9 @@ pub fn compile(
         inherent_synth_specs: Vec::new(),
         closure_counter: 0,
     };
+    let mut consts = typeck::ConstTable {
+        entries: Vec::new(),
+    };
     let mut wasm_mod = wasm::Module::new();
     // Reserve a host-imported `env.panic(ptr: i32, len: i32)`
     // function at wasm function index 0. `panic!(msg)` lowers to a
@@ -175,10 +178,10 @@ pub fn compile(
         // Today there's only one prelude library (`std`), so this is
         // a no-op for std itself and applies to any future libraries.
         inject_preludes(&mut lib_root, libraries, Some(&lib.name));
-        if let Err(e) = typeck::check(&lib_root, &mut structs, &mut enums, &mut aliases, &mut traits, &mut funcs, &mut reexports, &mut next_idx) {
+        if let Err(e) = typeck::check(&lib_root, &mut structs, &mut enums, &mut aliases, &mut traits, &mut funcs, &mut consts, &mut reexports, &mut next_idx) {
             return Err(span::format_error(&e));
         }
-        if let Err(e) = closure_lower::lower(&mut lib_root, &mut structs, &mut enums, &mut aliases, &mut traits, &mut funcs, &mut reexports, &mut next_idx) {
+        if let Err(e) = closure_lower::lower(&mut lib_root, &mut structs, &mut enums, &mut aliases, &mut traits, &mut funcs, &consts, &mut reexports, &mut next_idx) {
             return Err(span::format_error(&e));
         }
         if let Err(e) = borrowck::check(&lib_root, &structs, &enums, &traits, &mut funcs) {
@@ -201,10 +204,10 @@ pub fn compile(
     // User crate gets every prelude library — there's no "self" to
     // exclude.
     inject_preludes(&mut user_root, libraries, None);
-    if let Err(e) = typeck::check(&user_root, &mut structs, &mut enums, &mut aliases, &mut traits, &mut funcs, &mut reexports, &mut next_idx) {
+    if let Err(e) = typeck::check(&user_root, &mut structs, &mut enums, &mut aliases, &mut traits, &mut funcs, &mut consts, &mut reexports, &mut next_idx) {
         return Err(span::format_error(&e));
     }
-    if let Err(e) = closure_lower::lower(&mut user_root, &mut structs, &mut enums, &mut aliases, &mut traits, &mut funcs, &mut reexports, &mut next_idx) {
+    if let Err(e) = closure_lower::lower(&mut user_root, &mut structs, &mut enums, &mut aliases, &mut traits, &mut funcs, &consts, &mut reexports, &mut next_idx) {
         return Err(span::format_error(&e));
     }
     if let Err(e) = borrowck::check(&user_root, &structs, &enums, &traits, &mut funcs) {
@@ -272,6 +275,7 @@ fn resolve_module(
             parser::RawItem::Trait(td) => items.push(Item::Trait(td)),
             parser::RawItem::Use(u) => items.push(Item::Use(u)),
             parser::RawItem::TypeAlias(a) => items.push(Item::TypeAlias(a)),
+            parser::RawItem::Const(c) => items.push(Item::Const(c)),
             parser::RawItem::ModDecl {
                 name: child_name,
                 name_span: child_name_span,

@@ -384,6 +384,12 @@ pub struct FnSymbol {
     // literals), safeck reads `Deref(inner).inner.id`'s entry to detect
     // raw-pointer derefs.
     pub expr_types: Vec<Option<RType>>,
+    // Per-NodeId const-use resolution: when a `Var(name)` resolves to
+    // a `const NAME: T = …;` item rather than a local, this records
+    // the const's value directly (denormalized so mono / codegen don't
+    // need a ConstTable handle). At each Var lowering site, mono
+    // checks this slot; if `Some(value)`, lower as a `Lit` MonoExpr.
+    pub const_uses: Vec<Option<ConstValue>>,
     // Outermost lifetime of each param's ref type, or None for non-ref
     // params. Used by borrowck to map a returned ref's lifetime back to the
     // arg slot(s) whose borrows it inherits.
@@ -540,6 +546,8 @@ pub struct GenericTemplate {
     pub param_types: Vec<RType>,
     pub return_type: Option<RType>,
     pub expr_types: Vec<Option<RType>>,
+    // Same const-use tracking as `FnSymbol.const_uses`. See there.
+    pub const_uses: Vec<Option<ConstValue>>,
     pub param_lifetimes: Vec<Option<LifetimeRepr>>,
     pub ret_lifetime: Option<LifetimeRepr>,
     // For impl methods: the impl's target type pattern (see FnSymbol).
@@ -645,6 +653,50 @@ pub enum ReceiverAdjust {
     BorrowImm,   // recv is owned; method takes &Self → emit &recv
     BorrowMut,   // recv is owned; method takes &mut Self → emit &mut recv
     ByRef,       // recv is &Self/&mut Self; pass i32 directly (incl. mut→imm downgrade)
+}
+
+// `pub? const NAME: TYPE = EXPR;` — resolved entry. The `value`
+// holds the constant's evaluated payload (a primitive literal). Use
+// sites resolve via `path` (full module path); typeck records each
+// use's NodeId in `FnSymbol.const_uses` (parallel to `expr_types`),
+// codegen emits the value at each marked node.
+#[derive(Clone)]
+pub struct ConstEntry {
+    pub path: Vec<String>,
+    pub name_span: Span,
+    pub file: String,
+    pub ty: RType,
+    pub value: ConstValue,
+    pub is_pub: bool,
+}
+
+// Compile-time-evaluated value of a `const` item. MVP supports
+// primitive literals only — that covers `const N: u32 = 8;` and the
+// like used in pocket-rust's own source. A general const-eval pass
+// would extend this with bool/char and computed expressions.
+#[derive(Clone)]
+pub enum ConstValue {
+    // Stored as a u64 magnitude with a sign bit; `negated == true`
+    // means the actual value is `-(magnitude as i64)`.
+    Int { magnitude: u64, negated: bool },
+    Bool(bool),
+    Char(u32),
+    Str(String),
+}
+
+pub struct ConstTable {
+    pub entries: Vec<ConstEntry>,
+}
+
+pub fn const_lookup<'a>(table: &'a ConstTable, path: &Vec<String>) -> Option<&'a ConstEntry> {
+    let mut i = 0;
+    while i < table.entries.len() {
+        if &table.entries[i].path == path {
+            return Some(&table.entries[i]);
+        }
+        i += 1;
+    }
+    None
 }
 
 pub struct FuncTable {

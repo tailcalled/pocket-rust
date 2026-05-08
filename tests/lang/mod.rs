@@ -205,6 +205,7 @@ mod borrowck;
 mod builtins;
 mod closures;
 mod compound_assign;
+mod const_items;
 mod derives;
 mod enums;
 mod generics;

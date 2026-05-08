@@ -77,6 +77,7 @@ fn check_module(
             Item::Enum(_) => {}
             Item::Use(_) => {}
             Item::TypeAlias(_) => {}
+            Item::Const(_) => {}
             Item::Impl(ib) => {
                 let target_name = match &ib.target.kind {
                     crate::ast::TypeKind::Path(p) if p.segments.len() == 1 => {
@@ -174,7 +175,7 @@ fn check_function(
     let cfg_move_sites: Vec<(crate::ast::NodeId, String)>;
     {
         let funcs_ro: &FuncTable = &*funcs;
-        let (param_types, expr_types, method_resolutions, call_resolutions, bare_closure_calls, type_params, type_param_bounds, pattern_ergo, lifetime_params, lifetime_predicates) =
+        let (param_types, expr_types, method_resolutions, call_resolutions, bare_closure_calls, type_params, type_param_bounds, pattern_ergo, lifetime_params, lifetime_predicates, const_uses) =
             if let Some(entry) = func_lookup(funcs_ro, &full) {
                 (
                     &entry.param_types,
@@ -187,6 +188,7 @@ fn check_function(
                     &entry.pattern_ergo,
                     &entry.lifetime_params,
                     &entry.lifetime_predicates,
+                    &entry.const_uses,
                 )
             } else if let Some((_, t)) = template_lookup(funcs_ro, &full) {
                 let mut bounds_clone: Vec<Vec<Vec<String>>> = Vec::new();
@@ -212,6 +214,7 @@ fn check_function(
                     &t.pattern_ergo,
                     &t.lifetime_params,
                     &t.lifetime_predicates,
+                    &t.const_uses,
                 )
             } else {
                 unreachable!("typeck registered this function");
@@ -239,6 +242,7 @@ fn check_function(
             method_resolutions,
             call_resolutions,
             bare_closure_calls,
+            const_uses,
             type_params: &type_params,
             type_param_bounds: &type_param_bounds,
             param_types,

@@ -35,12 +35,13 @@ pub fn lower(
     aliases: &mut typeck::AliasTable,
     traits: &mut TraitTable,
     funcs: &mut FuncTable,
+    consts: &typeck::ConstTable,
     reexports: &mut ReExportTable,
     next_idx: &mut u32,
 ) -> Result<(), Error> {
     let path: Vec<String> = Vec::new();
     let mut path = path;
-    walk_module(module, &mut path, structs, enums, aliases, traits, funcs, reexports, next_idx)?;
+    walk_module(module, &mut path, structs, enums, aliases, traits, funcs, consts, reexports, next_idx)?;
     Ok(())
 }
 
@@ -52,6 +53,7 @@ fn walk_module(
     aliases: &mut typeck::AliasTable,
     traits: &mut TraitTable,
     funcs: &mut FuncTable,
+    consts: &typeck::ConstTable,
     reexports: &mut ReExportTable,
     next_idx: &mut u32,
 ) -> Result<(), Error> {
@@ -64,7 +66,7 @@ fn walk_module(
     let mut i = 0;
     while i < module.items.len() {
         if let Item::Module(m) = &mut module.items[i] {
-            walk_module(m, path, structs, enums, aliases, traits, funcs, reexports, next_idx)?;
+            walk_module(m, path, structs, enums, aliases, traits, funcs, consts, reexports, next_idx)?;
         }
         i += 1;
     }
@@ -122,6 +124,7 @@ fn walk_module(
                 aliases,
                 traits,
                 funcs,
+                consts,
                 reexports,
                 next_idx,
             )?;
@@ -1387,6 +1390,7 @@ fn register_synthesized_impl(
     aliases: &mut typeck::AliasTable,
     traits: &mut TraitTable,
     funcs: &mut FuncTable,
+    consts: &typeck::ConstTable,
     reexports: &mut ReExportTable,
     next_idx: &mut u32,
 ) -> Result<(), Error> {
@@ -1399,6 +1403,7 @@ fn register_synthesized_impl(
         aliases,
         traits,
         funcs,
+        consts,
         reexports,
         next_idx,
     )

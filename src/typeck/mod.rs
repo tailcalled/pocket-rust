@@ -272,7 +272,7 @@ use lifetimes::{
     validate_named_lifetimes,
 };
 
-mod use_scope;
+pub mod use_scope;
 pub use use_scope::{
     ReExportTable, UseEntry, build_reexport_table, field_visible_from, flatten_use_tree,
     fn_defining_module, func_path_resolved, is_visible_from, module_use_entries,
@@ -295,6 +295,7 @@ pub fn check(
     aliases: &mut AliasTable,
     traits: &mut TraitTable,
     funcs: &mut FuncTable,
+    consts: &mut ConstTable,
     reexports: &mut ReExportTable,
     next_idx: &mut u32,
 ) -> Result<(), Error> {
@@ -349,6 +350,10 @@ pub fn check(
 
     let mut path: Vec<String> = Vec::new();
     push_root_name(&mut path, root);
+    collect_consts(root, &mut path, consts, structs, enums, aliases, reexports)?;
+
+    let mut path: Vec<String> = Vec::new();
+    push_root_name(&mut path, root);
     collect_funcs(root, &mut path, root_crate_name, funcs, next_idx, structs, enums, aliases, traits, reexports)?;
 
     validate_supertrait_obligations(traits)?;
@@ -356,7 +361,7 @@ pub fn check(
     let mut path: Vec<String> = Vec::new();
     push_root_name(&mut path, root);
     let mut current_file = root.source_file.clone();
-    check_module(root, &mut path, root_crate_name, &mut current_file, structs, enums, aliases, traits, funcs, reexports)?;
+    check_module(root, &mut path, root_crate_name, &mut current_file, structs, enums, aliases, traits, funcs, consts, reexports)?;
 
     // RPIT: each `impl Trait` slot was pinned during its function's
     // body check (`record_rpit_pin` in `check_block_with_expected`).
@@ -428,6 +433,7 @@ pub fn register_synthesized_closure_impl(
     aliases: &mut AliasTable,
     traits: &mut TraitTable,
     funcs: &mut FuncTable,
+    consts: &ConstTable,
     reexports: &mut ReExportTable,
     next_idx: &mut u32,
 ) -> Result<(), Error> {
@@ -607,6 +613,7 @@ pub fn register_synthesized_closure_impl(
             aliases,
             traits,
             funcs,
+            consts,
             reexports,
             &use_scope,
         )?;
@@ -1830,6 +1837,11 @@ pub(crate) struct CheckCtx<'a> {
     // node". `check_pattern` writes here when it traverses ref scrutinees
     // with non-ref patterns or applies a non-Move default binding mode.
     pub(crate) pattern_ergo: Vec<PatternErgo>,
+    // Per-NodeId resolved const value: when a `Var(name)` resolved to
+    // a const item, the const's value is denormalized here. Codegen
+    // reads at use sites and emits a literal. `None` for locals /
+    // unresolved Vars (the latter being typeck errors).
+    pub(crate) const_uses: Vec<Option<ConstValue>>,
     pub(crate) subst: Subst,
     pub(crate) current_module: &'a Vec<String>,
     pub(crate) current_file: &'a str,
@@ -1838,6 +1850,7 @@ pub(crate) struct CheckCtx<'a> {
     pub(crate) aliases: &'a AliasTable,
     pub(crate) traits: &'a TraitTable,
     pub(crate) funcs: &'a mut FuncTable,
+    pub(crate) consts: &'a ConstTable,
     pub(crate) self_target: Option<&'a RType>,
     pub(crate) type_params: &'a Vec<String>,
     pub(crate) reexports: &'a ReExportTable,
@@ -1950,6 +1963,7 @@ fn check_module(
     aliases: &AliasTable,
     traits: &TraitTable,
     funcs: &mut FuncTable,
+    consts: &ConstTable,
     reexports: &ReExportTable,
 ) -> Result<(), Error> {
     let saved = current_file.clone();
@@ -1960,11 +1974,11 @@ fn check_module(
     while i < module.items.len() {
         match &module.items[i] {
             Item::Function(f) => {
-                check_function(f, path, path, None, current_file, structs, enums, aliases, traits, funcs, reexports, &use_scope)?
+                check_function(f, path, path, None, current_file, structs, enums, aliases, traits, funcs, consts, reexports, &use_scope)?
             }
             Item::Module(m) => {
                 path.push(m.name.clone());
-                check_module(m, path, root_crate_name, current_file, structs, enums, aliases, traits, funcs, reexports)?;
+                check_module(m, path, root_crate_name, current_file, structs, enums, aliases, traits, funcs, consts, reexports)?;
                 path.pop();
             }
             Item::Struct(_) => {}
@@ -2033,6 +2047,7 @@ fn check_module(
                         aliases,
                         traits,
                         funcs,
+                        consts,
                         reexports,
                         &use_scope,
                     )?;
@@ -2042,6 +2057,7 @@ fn check_module(
             Item::Trait(_) => {}
             Item::Use(_) => {}
             Item::TypeAlias(_) => {}
+            Item::Const(_) => {}
         }
         i += 1;
     }
@@ -2060,6 +2076,7 @@ fn check_function(
     aliases: &AliasTable,
     traits: &TraitTable,
     funcs: &mut FuncTable,
+    consts: &ConstTable,
     reexports: &ReExportTable,
     module_use_scope: &Vec<UseEntry>,
 ) -> Result<(), Error> {
@@ -2186,12 +2203,13 @@ fn check_function(
     };
 
     let node_count = func.node_count as usize;
-    let (expr_infer_types, lit_constraints, method_resolutions, call_resolutions, builtin_type_targets, pattern_ergo, closure_records, bare_closure_calls, subst) = {
+    let (expr_infer_types, lit_constraints, method_resolutions, call_resolutions, builtin_type_targets, pattern_ergo, closure_records, bare_closure_calls, const_uses, subst) = {
         let mut method_res: Vec<Option<PendingMethodCall>> = Vec::with_capacity(node_count);
         let mut call_res: Vec<Option<PendingCall>> = Vec::with_capacity(node_count);
         let mut expr_infer: Vec<Option<InferType>> = Vec::with_capacity(node_count);
         let mut btt: Vec<Option<Vec<RType>>> = Vec::with_capacity(node_count);
         let mut pat_ergo: Vec<PatternErgo> = Vec::with_capacity(node_count);
+        let mut const_uses_init: Vec<Option<ConstValue>> = Vec::with_capacity(node_count);
         let mut i = 0;
         while i < node_count {
             method_res.push(None);
@@ -2199,6 +2217,7 @@ fn check_function(
             expr_infer.push(None);
             btt.push(None);
             pat_ergo.push(PatternErgo::default());
+            const_uses_init.push(None);
             i += 1;
         }
         // Initialize the use scope with the module's flattened entries.
@@ -2218,6 +2237,7 @@ fn check_function(
             call_resolutions: call_res,
             builtin_type_targets: btt,
             pattern_ergo: pat_ergo,
+            const_uses: const_uses_init,
             subst: Subst {
                 bindings: Vec::new(),
                 is_num_lit: Vec::new(),
@@ -2229,6 +2249,7 @@ fn check_function(
             aliases,
             traits,
             funcs: &mut *funcs,
+            consts,
             self_target,
             type_params: &type_param_names,
             type_param_bounds: &type_param_bounds,
@@ -2253,6 +2274,7 @@ fn check_function(
             ctx.pattern_ergo,
             ctx.closure_records,
             ctx.bare_closure_calls,
+            ctx.const_uses,
             ctx.subst,
         )
     };
@@ -2641,6 +2663,7 @@ fn check_function(
     }
     if let Some(e) = entry_idx {
         funcs.entries[e].expr_types = expr_types;
+        funcs.entries[e].const_uses = const_uses;
         funcs.entries[e].method_resolutions = method_resolutions;
         funcs.entries[e].call_resolutions = call_resolutions;
         funcs.entries[e].builtin_type_targets = builtin_type_targets;
@@ -2652,6 +2675,7 @@ fn check_function(
         while t < funcs.templates.len() {
             if funcs.templates[t].path == full {
                 funcs.templates[t].expr_types = expr_types;
+                funcs.templates[t].const_uses = const_uses;
                 funcs.templates[t].method_resolutions = method_resolutions;
                 funcs.templates[t].call_resolutions = call_resolutions;
                 funcs.templates[t].builtin_type_targets = builtin_type_targets;
@@ -3692,6 +3716,36 @@ fn check_expr_inner(ctx: &mut CheckCtx, expr: &Expr) -> Result<InferType, Error>
                     record_capture_if_needed(ctx, name, i);
                     return Ok(binding_ty);
                 }
+            }
+            // Const fallback: not a local — try resolving the name as
+            // a `const NAME: T = …;` item via the use_scope. If found,
+            // record the const's path on `const_uses[id]` for codegen
+            // and yield the const's type as the expression's type.
+            let single = vec![name.clone()];
+            let resolved = crate::typeck::use_scope::resolve_via_use_scopes(
+                &single,
+                &ctx.use_scope,
+                |cand| const_lookup(ctx.consts, cand).is_some(),
+            )
+            .or_else(|| {
+                // Fall back to `<current_module>::name`.
+                let mut full = ctx.current_module.clone();
+                full.push(name.clone());
+                if const_lookup(ctx.consts, &full).is_some() {
+                    Some(full)
+                } else {
+                    None
+                }
+            });
+            if let Some(path) = resolved {
+                let entry = const_lookup(ctx.consts, &path)
+                    .expect("just verified above");
+                let ty = rtype_to_infer(&entry.ty);
+                let id = expr.id as usize;
+                if id < ctx.const_uses.len() {
+                    ctx.const_uses[id] = Some(entry.value.clone());
+                }
+                return Ok(ty);
             }
             Err(Error {
                 file: ctx.current_file.to_string(),
@@ -5467,13 +5521,13 @@ use methods::check_method_call;
 
 mod tables;
 pub use tables::{
-    AliasEntry, AliasTable, CallResolution, CaptureInfo, CaptureMode, ClosureInfo, EnumEntry,
-    EnumTable, EnumVariantEntry, FnSymbol, FuncTable, GenericTemplate, LifetimePredResolved,
-    MethodResolution, MoveStatus, MovedPlace, PatternErgo, RTypedField, ReceiverAdjust,
-    StructEntry, StructTable, SupertraitRef, TraitDispatch, TraitEntry, TraitImplEntry,
-    TraitMethodEntry, TraitReceiverShape, TraitTable, VariantPayloadResolved, alias_lookup,
-    enum_lookup, find_inherent_synth_idx, func_lookup, struct_lookup, template_lookup,
-    trait_lookup,
+    AliasEntry, AliasTable, CallResolution, CaptureInfo, CaptureMode, ClosureInfo, ConstEntry,
+    ConstTable, ConstValue, EnumEntry, EnumTable, EnumVariantEntry, FnSymbol, FuncTable,
+    GenericTemplate, LifetimePredResolved, MethodResolution, MoveStatus, MovedPlace, PatternErgo,
+    RTypedField, ReceiverAdjust, StructEntry, StructTable, SupertraitRef, TraitDispatch,
+    TraitEntry, TraitImplEntry, TraitMethodEntry, TraitReceiverShape, TraitTable,
+    VariantPayloadResolved, alias_lookup, const_lookup, enum_lookup, find_inherent_synth_idx,
+    func_lookup, struct_lookup, template_lookup, trait_lookup,
 };
 
 mod traits;
@@ -5487,7 +5541,7 @@ pub(crate) use traits::try_match_against_infer;
 
 mod setup;
 use setup::{
-    collect_enum_names, collect_funcs, collect_struct_names, collect_trait_names,
+    collect_consts, collect_enum_names, collect_funcs, collect_struct_names, collect_trait_names,
     push_root_name, resolve_enum_variants, resolve_impl_target, resolve_struct_fields,
     resolve_trait_methods, resolve_type_aliases, validate_supertrait_obligations,
 };
@@ -5604,6 +5658,37 @@ fn check_place_inner(ctx: &mut CheckCtx, expr: &Expr) -> Result<InferType, Error
                     record_capture_if_needed(ctx, name, i);
                     return Ok(binding_ty);
                 }
+            }
+            // Const fallback: same shape as the value-position arm.
+            // A const-receiver method call (e.g. binop LHS) lands here
+            // first because operator desugar routes through method
+            // dispatch which place-checks the receiver. Record the
+            // value on `const_uses` so codegen / borrowck inline it,
+            // and return the const's type so dispatch proceeds.
+            let single = vec![name.clone()];
+            let resolved = crate::typeck::use_scope::resolve_via_use_scopes(
+                &single,
+                &ctx.use_scope,
+                |cand| const_lookup(ctx.consts, cand).is_some(),
+            )
+            .or_else(|| {
+                let mut full = ctx.current_module.clone();
+                full.push(name.clone());
+                if const_lookup(ctx.consts, &full).is_some() {
+                    Some(full)
+                } else {
+                    None
+                }
+            });
+            if let Some(path) = resolved {
+                let entry = const_lookup(ctx.consts, &path)
+                    .expect("just verified above");
+                let ty = rtype_to_infer(&entry.ty);
+                let id = expr.id as usize;
+                if id < ctx.const_uses.len() {
+                    ctx.const_uses[id] = Some(entry.value.clone());
+                }
+                return Ok(ty);
             }
             Err(Error {
                 file: ctx.current_file.to_string(),

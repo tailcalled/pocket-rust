@@ -41,6 +41,11 @@ pub struct CfgBuildCtx<'a> {
     // synthesized receiver effect — Move recv_adjust → move-out on the
     // binding — even though the surface AST node is `Call`, not `MethodCall`.
     pub bare_closure_calls: &'a Vec<Option<String>>,
+    // Per-NodeId const-use slots (see `FnSymbol.const_uses`). When a
+    // `Var` resolves to a const item rather than a local, the slot is
+    // `Some(value)`. Borrowck lowers such Vars to inline constant
+    // operands rather than place reads — consts have no place.
+    pub const_uses: &'a Vec<Option<crate::typeck::ConstValue>>,
     // User-declared lifetime parameter names on the fn (for `<'a, 'b>`
     // — empty if the fn has no lifetime generics). Used by Phase L1 to
     // populate `RegionGraph.sig_named`.
@@ -450,14 +455,56 @@ fn place_outer_region(
     }
 }
 
+// How to resolve a `LifetimeRepr` into a RegionId in a particular
+// context. The walker needs two of these — one for the source type's
+// lifetimes, one for the destination's — because they may live in
+// different namespaces (caller's RegionGraph vs callee's instantiation
+// map at a call site).
+//
+// Designed as an explicit enum (no `dyn Fn` trait objects, since
+// pocket-rust's parser doesn't accept `dyn`). The walker matches on
+// the variant inside `resolve_lifetime` to pick the right lookup.
+enum ResolveTarget<'a> {
+    // Resolve through the caller's per-fn `RegionGraph`. Used for
+    // assignments (source and dest both in the caller) and for the
+    // source side of a call.
+    Caller(&'a crate::borrowck::cfg::RegionGraph),
+    // Resolve through a callee instantiation map. Used for the
+    // destination side of a call: the callee's signature uses its own
+    // `'a, 'b, ...` and `Inferred(N)` ids, which we've remapped to
+    // fresh caller-side RegionIds via `named_subst` / `inferred_subst`.
+    Callee {
+        named_subst: &'a Vec<(String, crate::borrowck::cfg::RegionId)>,
+        inferred_subst: &'a Vec<(u32, crate::borrowck::cfg::RegionId)>,
+    },
+}
+
+fn resolve_lifetime(
+    target: &ResolveTarget,
+    lt: &crate::typeck::LifetimeRepr,
+) -> Option<crate::borrowck::cfg::RegionId> {
+    use crate::typeck::LifetimeRepr;
+    match target {
+        ResolveTarget::Caller(graph) => lookup_or_static(graph, lt),
+        ResolveTarget::Callee { named_subst, inferred_subst } => match lt {
+            LifetimeRepr::Named(name) => subst_lookup_named(name, named_subst),
+            LifetimeRepr::Inferred(id) => {
+                for (n, r) in inferred_subst.iter() {
+                    if *n == *id {
+                        return Some(*r);
+                    }
+                }
+                None
+            }
+        },
+    }
+}
+
 // Variance-aware constraint emission for value flow (rt6#3): walk
 // paired source/destination types, and at each region-bearing
 // position emit outlives edges per the slot's variance composed with
 // the current outer position. Covariant slot → one edge `src : dst`.
-// Invariant slot → two edges (equate). The two `resolve` closures
-// translate `LifetimeRepr`s into RegionIds — same closure for both
-// sides at an assignment; different closures at a call site (caller
-// graph for src, callee-instantiation map for dst).
+// Invariant slot → two edges (equate).
 //
 // Composition rules from `src/typeck/variance.rs`: a struct's
 // declared variance for slot i composes with the current outer
@@ -469,8 +516,8 @@ fn emit_subtype_flow(
     src_ty: &RType,
     dst_ty: &RType,
     position: crate::typeck::Variance,
-    src_resolve: &dyn Fn(&crate::typeck::LifetimeRepr) -> Option<crate::borrowck::cfg::RegionId>,
-    dst_resolve: &dyn Fn(&crate::typeck::LifetimeRepr) -> Option<crate::borrowck::cfg::RegionId>,
+    src_target: &ResolveTarget,
+    dst_target: &ResolveTarget,
     structs: &crate::typeck::StructTable,
     enums: &crate::typeck::EnumTable,
     out: &mut Vec<crate::borrowck::cfg::OutlivesConstraint>,
@@ -486,7 +533,7 @@ fn emit_subtype_flow(
         ) => {
             // Reference outer lifetimes: always covariant in the
             // lifetime (regardless of mutability).
-            if let (Some(sr), Some(dr)) = (src_resolve(sl), dst_resolve(dl)) {
+            if let (Some(sr), Some(dr)) = (resolve_lifetime(src_target, sl), resolve_lifetime(dst_target, dl)) {
                 push_edge(out, sr, dr, position, span, source);
             }
             // Inner T: covariant for `&T`, invariant for `&mut T`.
@@ -496,7 +543,7 @@ fn emit_subtype_flow(
                 position
             };
             emit_subtype_flow(
-                si, di, inner_pos, src_resolve, dst_resolve, structs, enums, out, span, source,
+                si, di, inner_pos, src_target, dst_target, structs, enums, out, span, source,
             );
         }
         (
@@ -523,7 +570,7 @@ fn emit_subtype_flow(
                     .copied()
                     .unwrap_or(Variance::Invariant);
                 let composed = compose(position, slot_var);
-                if let (Some(sr), Some(dr)) = (src_resolve(&sla[i]), dst_resolve(&dla[i])) {
+                if let (Some(sr), Some(dr)) = (resolve_lifetime(src_target, &sla[i]), resolve_lifetime(dst_target, &dla[i])) {
                     push_edge(out, sr, dr, composed, span, source);
                 }
                 i += 1;
@@ -537,7 +584,7 @@ fn emit_subtype_flow(
                     .unwrap_or(Variance::Invariant);
                 let composed = compose(position, slot_var);
                 emit_subtype_flow(
-                    &sta[i], &dta[i], composed, src_resolve, dst_resolve, structs, enums, out,
+                    &sta[i], &dta[i], composed, src_target, dst_target, structs, enums, out,
                     span, source,
                 );
                 i += 1;
@@ -567,7 +614,7 @@ fn emit_subtype_flow(
                     .copied()
                     .unwrap_or(Variance::Invariant);
                 let composed = compose(position, slot_var);
-                if let (Some(sr), Some(dr)) = (src_resolve(&sla[i]), dst_resolve(&dla[i])) {
+                if let (Some(sr), Some(dr)) = (resolve_lifetime(src_target, &sla[i]), resolve_lifetime(dst_target, &dla[i])) {
                     push_edge(out, sr, dr, composed, span, source);
                 }
                 i += 1;
@@ -581,7 +628,7 @@ fn emit_subtype_flow(
                     .unwrap_or(Variance::Invariant);
                 let composed = compose(position, slot_var);
                 emit_subtype_flow(
-                    &sta[i], &dta[i], composed, src_resolve, dst_resolve, structs, enums, out,
+                    &sta[i], &dta[i], composed, src_target, dst_target, structs, enums, out,
                     span, source,
                 );
                 i += 1;
@@ -591,7 +638,7 @@ fn emit_subtype_flow(
             let mut i = 0;
             while i < se.len() {
                 emit_subtype_flow(
-                    &se[i], &de[i], position, src_resolve, dst_resolve, structs, enums, out,
+                    &se[i], &de[i], position, src_target, dst_target, structs, enums, out,
                     span, source,
                 );
                 i += 1;
@@ -599,7 +646,7 @@ fn emit_subtype_flow(
         }
         (RType::Slice(si), RType::Slice(di)) => {
             emit_subtype_flow(
-                si, di, position, src_resolve, dst_resolve, structs, enums, out, span, source,
+                si, di, position, src_target, dst_target, structs, enums, out, span, source,
             );
         }
         (RType::RawPtr { inner: si, .. }, RType::RawPtr { inner: di, .. }) => {
@@ -608,8 +655,8 @@ fn emit_subtype_flow(
                 si,
                 di,
                 compose(position, Variance::Invariant),
-                src_resolve,
-                dst_resolve,
+                src_target,
+                dst_target,
                 structs,
                 enums,
                 out,
@@ -769,9 +816,7 @@ fn emit_assign_constraints(
             };
             if let (Some(src_ty), Some(dst_ty)) = (src_ty_opt, dst_ty_opt) {
                 let mut new_edges: Vec<OutlivesConstraint> = Vec::new();
-                let resolve = |lt: &crate::typeck::LifetimeRepr| -> Option<crate::borrowck::cfg::RegionId> {
-                    lookup_or_static(&b.region_graph, lt)
-                };
+                let target = ResolveTarget::Caller(&b.region_graph);
                 let source = if is_return {
                     ConstraintSource::FnReturn
                 } else {
@@ -781,8 +826,8 @@ fn emit_assign_constraints(
                     &src_ty,
                     &dst_ty,
                     Variance::Covariant,
-                    &resolve,
-                    &resolve,
+                    &target,
+                    &target,
                     b.ctx.structs,
                     b.ctx.enums,
                     &mut new_edges,
@@ -791,9 +836,7 @@ fn emit_assign_constraints(
                 );
                 b.region_graph.outlives.extend(new_edges);
             }
-            // Suppress unused-warning for OperandKind in this arm.
             let _ = operand;
-            let _: Option<()> = None;
             let _ = OperandKind::ConstUnit;
         }
         Rvalue::Borrow { place: src, region: borrow_r, .. } => {
@@ -1394,6 +1437,31 @@ impl<'a> Builder<'a> {
                 Operand { kind: OperandKind::ConstUnit, span, node_id: nid }
             }
             ExprKind::Var(name) => {
+                // Const-reference fallback: typeck records const uses
+                // on `const_uses[id]`; those Vars have no local.
+                // Lower them to a constant operand carrying the
+                // value's payload so move/borrow analyses see no
+                // place to track. Locals checked first — typeck
+                // ensures the two are mutually exclusive.
+                if let Some(opt) = self.ctx.const_uses.get(expr.id as usize) {
+                    if let Some(value) = opt {
+                        use crate::typeck::ConstValue;
+                        let kind = match value {
+                            ConstValue::Int { magnitude, negated } => {
+                                let signed = if *negated {
+                                    (*magnitude as i64).wrapping_neg() as u64
+                                } else {
+                                    *magnitude
+                                };
+                                OperandKind::ConstInt(signed)
+                            }
+                            ConstValue::Bool(b) => OperandKind::ConstBool(*b),
+                            ConstValue::Char(c) => OperandKind::ConstInt(*c as u64),
+                            ConstValue::Str(s) => OperandKind::ConstStr(s.clone()),
+                        };
+                        return Operand { kind, span, node_id: nid };
+                    }
+                }
                 let local = self.lookup(name).expect("typeck verified");
                 let place = local_place(local);
                 let ty = self.locals[local as usize].ty.clone();
@@ -1512,6 +1580,19 @@ impl<'a> Builder<'a> {
     fn lower_expr_place(&mut self, expr: &Expr) -> Place {
         match &expr.kind {
             ExprKind::Var(name) => {
+                // Const place fallback: typeck records const-receiver
+                // uses (e.g. `CONST.method()` or `CONST + n` whose
+                // desugar puts CONST in receiver-place position) on
+                // `const_uses[id]`. Materialize the value into a
+                // synthetic temp local + initial assignment so
+                // downstream borrowck has a real Place to track. The
+                // temp's type is the const's, derived from
+                // `expr_types`.
+                if let Some(opt) = self.ctx.const_uses.get(expr.id as usize) {
+                    if let Some(value) = opt {
+                        return self.materialize_const_place(value, expr);
+                    }
+                }
                 let local = self.lookup(name).expect("typeck verified");
                 local_place(local)
             }
@@ -1931,6 +2012,46 @@ impl<'a> Builder<'a> {
             span,
             node_id: None,
         }
+    }
+
+    // Materialize a const value into a synthetic temp local so
+    // place-position uses (binop receivers, method receivers,
+    // `&CONST` borrows) have a real Place to track. The temp's type
+    // is read from `expr_types` (recorded by typeck at the Var's
+    // NodeId). The initial assignment carries the const's payload as
+    // an `Operand::Const*`.
+    fn materialize_const_place(
+        &mut self,
+        value: &crate::typeck::ConstValue,
+        expr: &Expr,
+    ) -> Place {
+        use crate::typeck::ConstValue;
+        let span = expr.span.copy();
+        let ty = self.expr_type(expr.id);
+        let temp = self.alloc_temp(ty, span.copy());
+        self.push_stmt(CfgStmtKind::StorageLive(temp), span.copy());
+        let kind = match value {
+            ConstValue::Int { magnitude, negated } => {
+                let signed = if *negated {
+                    (*magnitude as i64).wrapping_neg() as u64
+                } else {
+                    *magnitude
+                };
+                OperandKind::ConstInt(signed)
+            }
+            ConstValue::Bool(b) => OperandKind::ConstBool(*b),
+            ConstValue::Char(c) => OperandKind::ConstInt(*c as u64),
+            ConstValue::Str(s) => OperandKind::ConstStr(s.clone()),
+        };
+        let init_op = Operand { kind, span: span.copy(), node_id: Some(expr.id) };
+        self.push_stmt(
+            CfgStmtKind::Assign {
+                place: local_place(temp),
+                rvalue: Rvalue::Use(init_op),
+            },
+            span.copy(),
+        );
+        local_place(temp)
     }
 
     fn lower_struct_lit(&mut self, lit: &StructLit, node_id: ast::NodeId) -> Rvalue {

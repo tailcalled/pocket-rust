@@ -90,6 +90,7 @@ pub(super) fn collect_trait_names(module: &Module, path: &mut Vec<String>, table
             Item::Impl(_) => {}
             Item::Use(_) => {}
             Item::TypeAlias(_) => {}
+            Item::Const(_) => {}
         }
         i += 1;
     }
@@ -154,6 +155,98 @@ pub(super) fn resolve_type_aliases(
         i += 1;
     }
     Ok(())
+}
+
+// `pub? const NAME: TYPE = EXPR;` collection. Walks the module tree,
+// resolves each const's declared type, evaluates the value
+// expression at compile time, and registers the entry in the shared
+// `ConstTable`. The MVP accepts only primitive-literal value
+// expressions (Int / NegInt / Bool / Char / Str); anything more
+// complex requires a const-eval pass which is future work.
+pub(super) fn collect_consts(
+    module: &Module,
+    path: &mut Vec<String>,
+    consts: &mut crate::typeck::tables::ConstTable,
+    structs: &StructTable,
+    enums: &EnumTable,
+    aliases: &AliasTable,
+    reexports: &ReExportTable,
+) -> Result<(), Error> {
+    let use_scope = module_use_entries(module, "");
+    let mut i = 0;
+    while i < module.items.len() {
+        match &module.items[i] {
+            Item::Const(cd) => {
+                let mut full = path.clone();
+                full.push(cd.name.clone());
+                let ty = resolve_type(
+                    &cd.ty,
+                    path,
+                    structs,
+                    enums,
+                    aliases,
+                    None,
+                    &Vec::new(),
+                    &use_scope,
+                    reexports,
+                    &module.source_file,
+                )?;
+                let value = eval_const_expr(&cd.value, &cd.ty, &module.source_file)?;
+                consts.entries.push(crate::typeck::tables::ConstEntry {
+                    path: full,
+                    name_span: cd.name_span.copy(),
+                    file: module.source_file.clone(),
+                    ty,
+                    value,
+                    is_pub: cd.is_pub,
+                });
+            }
+            Item::Module(m) => {
+                path.push(m.name.clone());
+                collect_consts(m, path, consts, structs, enums, aliases, reexports)?;
+                path.pop();
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    Ok(())
+}
+
+// MVP const-eval: accept primitive-literal expressions, including
+// suffixed integer literals which the parser desugars to `lit as
+// <kind>` (`Cast` wrapping `IntLit` / `NegIntLit`). Bool / char /
+// string literals appear directly. Returns the `ConstValue` payload
+// codegen will inline at use sites.
+fn eval_const_expr(
+    e: &crate::ast::Expr,
+    declared_ty: &crate::ast::Type,
+    file: &str,
+) -> Result<crate::typeck::tables::ConstValue, Error> {
+    use crate::ast::ExprKind;
+    use crate::typeck::tables::ConstValue;
+    // Peel `Cast` wrappers: `42u32` parses as `(42 as u32)`. The
+    // outer cast pins the type at typeck; the const's value is the
+    // inner literal's magnitude.
+    let inner = match &e.kind {
+        ExprKind::Cast { inner, .. } => inner.as_ref(),
+        _ => e,
+    };
+    match &inner.kind {
+        ExprKind::IntLit(n) => Ok(ConstValue::Int { magnitude: *n, negated: false }),
+        ExprKind::NegIntLit(n) => Ok(ConstValue::Int { magnitude: *n, negated: true }),
+        ExprKind::BoolLit(b) => Ok(ConstValue::Bool(*b)),
+        ExprKind::CharLit(c) => Ok(ConstValue::Char(*c)),
+        ExprKind::StrLit(s) => Ok(ConstValue::Str(s.clone())),
+        _ => {
+            let _ = declared_ty;
+            Err(Error {
+                file: file.to_string(),
+                message: "const initializer must be a primitive literal (integer, bool, char, or string)".to_string(),
+                span: e.span.copy(),
+            })
+        }
+    }
 }
 
 // Second pass over trait declarations: resolve each method's full
@@ -445,6 +538,7 @@ pub(super) fn resolve_trait_methods(
             Item::Impl(_) => {}
             Item::Use(_) => {}
             Item::TypeAlias(_) => {}
+            Item::Const(_) => {}
         }
         i += 1;
     }
@@ -501,6 +595,7 @@ pub(super) fn collect_struct_names(module: &Module, path: &mut Vec<String>, tabl
             Item::Trait(_) => {}
             Item::Use(_) => {}
             Item::TypeAlias(_) => {}
+            Item::Const(_) => {}
         }
         i += 1;
     }
@@ -563,6 +658,7 @@ pub(super) fn collect_enum_names(module: &Module, path: &mut Vec<String>, table:
             Item::Trait(_) => {}
             Item::Use(_) => {}
             Item::TypeAlias(_) => {}
+            Item::Const(_) => {}
         }
         i += 1;
     }
@@ -679,6 +775,7 @@ pub(super) fn resolve_enum_variants(
             Item::Trait(_) => {}
             Item::Use(_) => {}
             Item::TypeAlias(_) => {}
+            Item::Const(_) => {}
         }
         i += 1;
     }
@@ -770,6 +867,7 @@ pub(super) fn resolve_struct_fields(
             Item::Trait(_) => {}
             Item::Use(_) => {}
             Item::TypeAlias(_) => {}
+            Item::Const(_) => {}
         }
         i += 1;
     }
@@ -1128,6 +1226,7 @@ pub(super) fn collect_funcs(
             Item::Trait(_) => {}
             Item::Use(_) => {}
             Item::TypeAlias(_) => {}
+            Item::Const(_) => {}
         }
         i += 1;
     }
@@ -3058,6 +3157,7 @@ pub(super) fn register_function(
             param_types,
             return_type,
             expr_types: Vec::new(),
+            const_uses: Vec::new(),
             param_lifetimes,
             ret_lifetime,
             impl_target: impl_target_for_storage,
@@ -3118,6 +3218,7 @@ pub(super) fn register_function(
             param_types,
             return_type,
             expr_types: Vec::new(),
+            const_uses: Vec::new(),
             param_lifetimes,
             ret_lifetime,
             impl_target: impl_target_for_storage,

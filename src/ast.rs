@@ -23,6 +23,22 @@ pub enum Item {
     Trait(TraitDef),
     Use(UseDecl),
     TypeAlias(TypeAlias),
+    Const(ConstDecl),
+}
+
+// `pub? const NAME: TYPE = EXPR;` — a named compile-time constant.
+// MVP: `EXPR` must be evaluable to a primitive literal during typeck
+// setup. Path references that resolve to a const become Use sites
+// whose codegen-time emission inlines the value. No `const fn`
+// — the value computation is purely literal.
+#[derive(Clone)]
+pub struct ConstDecl {
+    pub name: String,
+    pub name_span: Span,
+    pub ty: Type,
+    pub value: Expr,
+    pub is_pub: bool,
+    pub span: Span,
 }
 
 // `pub? type Name<'a, T> = TypeExpr;` — a name for an existing type.
