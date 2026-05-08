@@ -455,56 +455,16 @@ fn place_outer_region(
     }
 }
 
-// How to resolve a `LifetimeRepr` into a RegionId in a particular
-// context. The walker needs two of these — one for the source type's
-// lifetimes, one for the destination's — because they may live in
-// different namespaces (caller's RegionGraph vs callee's instantiation
-// map at a call site).
-//
-// Designed as an explicit enum (no `dyn Fn` trait objects, since
-// pocket-rust's parser doesn't accept `dyn`). The walker matches on
-// the variant inside `resolve_lifetime` to pick the right lookup.
-enum ResolveTarget<'a> {
-    // Resolve through the caller's per-fn `RegionGraph`. Used for
-    // assignments (source and dest both in the caller) and for the
-    // source side of a call.
-    Caller(&'a crate::borrowck::cfg::RegionGraph),
-    // Resolve through a callee instantiation map. Used for the
-    // destination side of a call: the callee's signature uses its own
-    // `'a, 'b, ...` and `Inferred(N)` ids, which we've remapped to
-    // fresh caller-side RegionIds via `named_subst` / `inferred_subst`.
-    Callee {
-        named_subst: &'a Vec<(String, crate::borrowck::cfg::RegionId)>,
-        inferred_subst: &'a Vec<(u32, crate::borrowck::cfg::RegionId)>,
-    },
-}
-
-fn resolve_lifetime(
-    target: &ResolveTarget,
-    lt: &crate::typeck::LifetimeRepr,
-) -> Option<crate::borrowck::cfg::RegionId> {
-    use crate::typeck::LifetimeRepr;
-    match target {
-        ResolveTarget::Caller(graph) => lookup_or_static(graph, lt),
-        ResolveTarget::Callee { named_subst, inferred_subst } => match lt {
-            LifetimeRepr::Named(name) => subst_lookup_named(name, named_subst),
-            LifetimeRepr::Inferred(id) => {
-                for (n, r) in inferred_subst.iter() {
-                    if *n == *id {
-                        return Some(*r);
-                    }
-                }
-                None
-            }
-        },
-    }
-}
-
 // Variance-aware constraint emission for value flow (rt6#3): walk
 // paired source/destination types, and at each region-bearing
 // position emit outlives edges per the slot's variance composed with
 // the current outer position. Covariant slot → one edge `src : dst`.
 // Invariant slot → two edges (equate).
+//
+// The two `resolve` closures translate `LifetimeRepr`s into RegionIds
+// in their respective contexts — same closure for both sides at an
+// assignment (caller's RegionGraph), different closures at a call
+// site (caller graph for src, callee-instantiation map for dst).
 //
 // Composition rules from `src/typeck/variance.rs`: a struct's
 // declared variance for slot i composes with the current outer
@@ -512,12 +472,18 @@ fn resolve_lifetime(
 // `&mut T`'s inner T is Inv, raw-ptr's pointee is Inv,
 // `AssocProj`'s base is Inv. References' OUTER lifetime is always
 // covariant (mutability affects only the inner T).
+//
+// Note: the `&dyn Fn(...)` parameters here are pocket-rust's natural
+// shape for "two different lookup strategies." Pocket-rust's parser
+// does not yet accept `dyn` (which is why selfhost trips on this
+// signature); proper `dyn` support is queued behind the `format!` /
+// `Display` / `Write` work, which all need it.
 fn emit_subtype_flow(
     src_ty: &RType,
     dst_ty: &RType,
     position: crate::typeck::Variance,
-    src_target: &ResolveTarget,
-    dst_target: &ResolveTarget,
+    src_resolve: &dyn Fn(&crate::typeck::LifetimeRepr) -> Option<crate::borrowck::cfg::RegionId>,
+    dst_resolve: &dyn Fn(&crate::typeck::LifetimeRepr) -> Option<crate::borrowck::cfg::RegionId>,
     structs: &crate::typeck::StructTable,
     enums: &crate::typeck::EnumTable,
     out: &mut Vec<crate::borrowck::cfg::OutlivesConstraint>,
@@ -533,7 +499,7 @@ fn emit_subtype_flow(
         ) => {
             // Reference outer lifetimes: always covariant in the
             // lifetime (regardless of mutability).
-            if let (Some(sr), Some(dr)) = (resolve_lifetime(src_target, sl), resolve_lifetime(dst_target, dl)) {
+            if let (Some(sr), Some(dr)) = (src_resolve(sl), dst_resolve(dl)) {
                 push_edge(out, sr, dr, position, span, source);
             }
             // Inner T: covariant for `&T`, invariant for `&mut T`.
@@ -543,7 +509,7 @@ fn emit_subtype_flow(
                 position
             };
             emit_subtype_flow(
-                si, di, inner_pos, src_target, dst_target, structs, enums, out, span, source,
+                si, di, inner_pos, src_resolve, dst_resolve, structs, enums, out, span, source,
             );
         }
         (
@@ -570,7 +536,7 @@ fn emit_subtype_flow(
                     .copied()
                     .unwrap_or(Variance::Invariant);
                 let composed = compose(position, slot_var);
-                if let (Some(sr), Some(dr)) = (resolve_lifetime(src_target, &sla[i]), resolve_lifetime(dst_target, &dla[i])) {
+                if let (Some(sr), Some(dr)) = (src_resolve(&sla[i]), dst_resolve(&dla[i])) {
                     push_edge(out, sr, dr, composed, span, source);
                 }
                 i += 1;
@@ -584,7 +550,7 @@ fn emit_subtype_flow(
                     .unwrap_or(Variance::Invariant);
                 let composed = compose(position, slot_var);
                 emit_subtype_flow(
-                    &sta[i], &dta[i], composed, src_target, dst_target, structs, enums, out,
+                    &sta[i], &dta[i], composed, src_resolve, dst_resolve, structs, enums, out,
                     span, source,
                 );
                 i += 1;
@@ -614,7 +580,7 @@ fn emit_subtype_flow(
                     .copied()
                     .unwrap_or(Variance::Invariant);
                 let composed = compose(position, slot_var);
-                if let (Some(sr), Some(dr)) = (resolve_lifetime(src_target, &sla[i]), resolve_lifetime(dst_target, &dla[i])) {
+                if let (Some(sr), Some(dr)) = (src_resolve(&sla[i]), dst_resolve(&dla[i])) {
                     push_edge(out, sr, dr, composed, span, source);
                 }
                 i += 1;
@@ -628,7 +594,7 @@ fn emit_subtype_flow(
                     .unwrap_or(Variance::Invariant);
                 let composed = compose(position, slot_var);
                 emit_subtype_flow(
-                    &sta[i], &dta[i], composed, src_target, dst_target, structs, enums, out,
+                    &sta[i], &dta[i], composed, src_resolve, dst_resolve, structs, enums, out,
                     span, source,
                 );
                 i += 1;
@@ -638,7 +604,7 @@ fn emit_subtype_flow(
             let mut i = 0;
             while i < se.len() {
                 emit_subtype_flow(
-                    &se[i], &de[i], position, src_target, dst_target, structs, enums, out,
+                    &se[i], &de[i], position, src_resolve, dst_resolve, structs, enums, out,
                     span, source,
                 );
                 i += 1;
@@ -646,7 +612,7 @@ fn emit_subtype_flow(
         }
         (RType::Slice(si), RType::Slice(di)) => {
             emit_subtype_flow(
-                si, di, position, src_target, dst_target, structs, enums, out, span, source,
+                si, di, position, src_resolve, dst_resolve, structs, enums, out, span, source,
             );
         }
         (RType::RawPtr { inner: si, .. }, RType::RawPtr { inner: di, .. }) => {
@@ -655,8 +621,8 @@ fn emit_subtype_flow(
                 si,
                 di,
                 compose(position, Variance::Invariant),
-                src_target,
-                dst_target,
+                src_resolve,
+                dst_resolve,
                 structs,
                 enums,
                 out,
@@ -816,7 +782,11 @@ fn emit_assign_constraints(
             };
             if let (Some(src_ty), Some(dst_ty)) = (src_ty_opt, dst_ty_opt) {
                 let mut new_edges: Vec<OutlivesConstraint> = Vec::new();
-                let target = ResolveTarget::Caller(&b.region_graph);
+                // Both sides resolve through the caller's RegionGraph
+                // — assignment is intra-fn.
+                let resolve = |lt: &crate::typeck::LifetimeRepr| -> Option<crate::borrowck::cfg::RegionId> {
+                    lookup_or_static(&b.region_graph, lt)
+                };
                 let source = if is_return {
                     ConstraintSource::FnReturn
                 } else {
@@ -826,8 +796,8 @@ fn emit_assign_constraints(
                     &src_ty,
                     &dst_ty,
                     Variance::Covariant,
-                    &target,
-                    &target,
+                    &resolve,
+                    &resolve,
                     b.ctx.structs,
                     b.ctx.enums,
                     &mut new_edges,
