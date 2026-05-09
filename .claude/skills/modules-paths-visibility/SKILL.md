@@ -44,19 +44,38 @@ The injection is centralized in `inject_preludes(module, libraries, self_name)`.
 
 ## Visibility
 
-`pub` modifier on functions, structs, struct fields, traits, impl methods (inherent — trait-impl methods inherit), `use` declarations. AST nodes carry `is_pub: bool`; typeck tables (`FnSymbol`/`GenericTemplate`/`StructEntry`/`StructField`/`TraitEntry`/`UseEntry`) propagate the flag.
+Visibility modifiers on functions, structs, struct fields, traits, impl methods (inherent — trait-impl methods inherit), `use` declarations, type aliases, enums, and consts. Forms accepted by the parser:
 
-The check `is_visible_from(defining_module, is_pub, accessor_module)` mirrors Rust: pub items go anywhere; non-pub items reach only the defining module and its descendants.
+- `pub` → `Visibility::Public`
+- `pub(crate)` → `Visibility::Crate`
+- `pub(super)` → `Visibility::Super`
+- `pub(self)` → `Visibility::SelfMod` (same effect as no modifier)
+- `pub(in <path>)` → `Visibility::InPath(Path)` where the path names an ancestor module via `crate::a::b`, `super::a`, `self::a`, or an unqualified absolute `a::b` (rooted at the crate)
+- (no modifier) → `Visibility::Private`
 
-The defining module is the path's prefix excluding the item's own name (and excluding the impl-target name for methods, via `fn_defining_module(path, is_method=true)`).
+Parsed in `parser.rs` by `parse_visibility`. Note: `crate` and `super` are lexed as `Ident`, but `in` is the keyword `TokenKind::In`.
+
+At item registration (`setup::resolve_visibility`), the AST `Visibility` is resolved to a `ResolvedVisibility` that bakes in the *defining module* and the *crate name*:
+
+- `Public` → visible everywhere
+- `InCrate(crate_name)` → visible iff `accessor_crate == crate_name`
+- `InModule { crate_name, scope }` → visible iff same crate AND `accessor_module` starts with `scope`
+
+`Super` resolves to `InModule { scope: defining_module - 1 }` (rejected at the crate root). `InPath(p)` resolves the path and rejects it if the resolved path isn't an ancestor of the defining module.
+
+Lookup-time check: `is_visible_from(&entry.vis, accessor_module, accessor_crate)` defers to `ResolvedVisibility::is_visible_from`. The accessor's crate is derived from its module path via `accessor_crate_of(module)` — paths always start with the crate prefix (empty for the user crate, the library name for libraries).
 
 Wired into:
 - struct lookups (in `resolve_type`, `check_struct_lit`)
+- enum lookups (in `resolve_type`, enum-variant pattern checks)
+- type-alias lookups (in `resolve_type`)
 - trait lookups (in `resolve_trait_path`)
-- function-call lookups (in `check_call`)
+- function-call lookups (in `check_call`, both non-generic and template paths)
 - per-field reads/writes (in `check_field_access` and the struct-literal field initializer check via `field_visible_from`)
 
-Errors read like `function/struct/trait/field `X` is private`.
+`CheckCtx` carries `current_module: &Vec<String>` and `current_crate: &str`. Setup-time accessor sites that don't have a CheckCtx (e.g. `resolve_type`) derive the crate via `accessor_crate_of(current_module)`.
+
+Errors read like `function/struct/trait/enum/field `X` is private`.
 
 ## `pub use` re-exports
 

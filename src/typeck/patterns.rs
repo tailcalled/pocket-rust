@@ -4,7 +4,6 @@ use super::{
     infer_substitute, infer_to_rtype_for_check, infer_to_string, is_visible_from,
     lookup_variant_path, place_to_string, resolve_via_use_scopes, rtype_to_infer,
     segments_to_string, struct_lookup, struct_lookup_resolved, substitute_rtype,
-    type_defining_module,
 };
 use crate::ast::{Path, Pattern};
 use crate::span::{Error, Span};
@@ -452,9 +451,9 @@ fn check_variant_tuple_pattern(
     };
     let entry = enum_lookup(ctx.enums, &enum_path).expect("variant lookup returned a real enum");
     if !is_visible_from(
-        &type_defining_module(&entry.path),
-        entry.is_pub,
+        &entry.vis,
         ctx.current_module,
+        ctx.current_crate,
     ) {
         return Err(Error {
             file: ctx.current_file.to_string(),
@@ -580,9 +579,9 @@ fn check_variant_struct_pattern(
     };
     let entry = enum_lookup(ctx.enums, &enum_path).expect("variant lookup returned a real enum");
     if !is_visible_from(
-        &type_defining_module(&entry.path),
-        entry.is_pub,
+        &entry.vis,
         ctx.current_module,
+        ctx.current_crate,
     ) {
         return Err(Error {
             file: ctx.current_file.to_string(),
@@ -600,7 +599,7 @@ fn check_variant_struct_pattern(
                     name: fs[k].name.clone(),
                     name_span: fs[k].name_span.copy(),
                     ty: fs[k].ty.clone(),
-                    is_pub: fs[k].is_pub,
+                    vis: fs[k].vis.clone(),
                 });
                 k += 1;
             }
@@ -746,9 +745,9 @@ fn check_struct_pattern(
         }
     };
     if !is_visible_from(
-        &type_defining_module(&entry.path),
-        entry.is_pub,
+        &entry.vis,
         ctx.current_module,
+        ctx.current_crate,
     ) {
         return Err(Error {
             file: ctx.current_file.to_string(),
@@ -765,7 +764,7 @@ fn check_struct_pattern(
                 name: entry.fields[k].name.clone(),
                 name_span: entry.fields[k].name_span.copy(),
                 ty: entry.fields[k].ty.clone(),
-                is_pub: entry.fields[k].is_pub,
+                vis: entry.fields[k].vis.clone(),
             });
             k += 1;
         }

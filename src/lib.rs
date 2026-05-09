@@ -245,7 +245,7 @@ fn inject_preludes(module: &mut Module, libraries: &[Library], self_name: Option
                             path,
                             span: prelude_span.copy(),
                         },
-                        is_pub: false,
+                        vis: crate::ast::Visibility::Private,
                         span: prelude_span,
                     }),
                 );

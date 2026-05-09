@@ -274,10 +274,10 @@ use lifetimes::{
 
 pub mod use_scope;
 pub use use_scope::{
-    ReExportTable, UseEntry, build_reexport_table, field_visible_from, flatten_use_tree,
-    fn_defining_module, func_path_resolved, is_visible_from, module_use_entries,
+    ReExportTable, UseEntry, accessor_crate_of, build_reexport_table, field_visible_from,
+    flatten_use_tree, func_path_resolved, is_visible_from, module_use_entries,
     resolve_via_reexports, resolve_via_use_scopes, struct_lookup_resolved,
-    trait_lookup_resolved, type_defining_module,
+    trait_lookup_resolved,
 };
 
 mod path_resolve;
@@ -315,15 +315,15 @@ pub fn check(
     }
     let mut path: Vec<String> = Vec::new();
     push_root_name(&mut path, root);
-    collect_struct_names(root, &mut path, structs);
+    collect_struct_names(root, &mut path, root_crate_name, structs)?;
 
     let mut path: Vec<String> = Vec::new();
     push_root_name(&mut path, root);
-    collect_enum_names(root, &mut path, enums);
+    collect_enum_names(root, &mut path, root_crate_name, enums)?;
 
     let mut path: Vec<String> = Vec::new();
     push_root_name(&mut path, root);
-    collect_trait_names(root, &mut path, traits);
+    collect_trait_names(root, &mut path, root_crate_name, traits)?;
 
     // Resolve type aliases before struct/enum field resolution so a
     // field type can reference an alias. Aliases themselves resolve in
@@ -350,7 +350,7 @@ pub fn check(
 
     let mut path: Vec<String> = Vec::new();
     push_root_name(&mut path, root);
-    collect_consts(root, &mut path, consts, structs, enums, aliases, reexports)?;
+    collect_consts(root, &mut path, root_crate_name, consts, structs, enums, aliases, reexports)?;
 
     let mut path: Vec<String> = Vec::new();
     push_root_name(&mut path, root);
@@ -427,6 +427,7 @@ fn register_closure_structs(structs: &mut StructTable, funcs: &FuncTable) {
 pub fn register_synthesized_closure_impl(
     ib: &crate::ast::ImplBlock,
     parent_module_path: &Vec<String>,
+    crate_name: &str,
     source_file: &str,
     structs: &mut StructTable,
     enums: &mut EnumTable,
@@ -565,6 +566,7 @@ pub fn register_synthesized_closure_impl(
         setup::register_function(
             &ib.methods[k],
             parent_module_path,
+            crate_name,
             &method_prefix,
             Some(&target_rt),
             &impl_type_params,
@@ -605,6 +607,7 @@ pub fn register_synthesized_closure_impl(
         check_function(
             &ib.methods[k],
             parent_module_path,
+            crate_name,
             &method_prefix,
             Some(&target_rt),
             source_file,
@@ -731,7 +734,7 @@ fn push_closure_struct(structs: &mut StructTable, ci: &ClosureInfo) {
             name: ci.captures[i].binding_name.clone(),
             name_span: ci.body_span.copy(),
             ty,
-            is_pub: false,
+            vis: ResolvedVisibility::Public,
         });
         i += 1;
     }
@@ -751,7 +754,7 @@ fn push_closure_struct(structs: &mut StructTable, ci: &ClosureInfo) {
         type_param_variance: tpv,
         lifetime_param_variance: lpv,
         fields,
-        is_pub: false,
+        vis: ResolvedVisibility::Public,
     });
 }
 
@@ -1844,6 +1847,7 @@ pub(crate) struct CheckCtx<'a> {
     pub(crate) const_uses: Vec<Option<ConstValue>>,
     pub(crate) subst: Subst,
     pub(crate) current_module: &'a Vec<String>,
+    pub(crate) current_crate: &'a str,
     pub(crate) current_file: &'a str,
     pub(crate) structs: &'a StructTable,
     pub(crate) enums: &'a EnumTable,
@@ -1974,7 +1978,7 @@ fn check_module(
     while i < module.items.len() {
         match &module.items[i] {
             Item::Function(f) => {
-                check_function(f, path, path, None, current_file, structs, enums, aliases, traits, funcs, consts, reexports, &use_scope)?
+                check_function(f, path, root_crate_name, path, None, current_file, structs, enums, aliases, traits, funcs, consts, reexports, &use_scope)?
             }
             Item::Module(m) => {
                 path.push(m.name.clone());
@@ -2039,6 +2043,7 @@ fn check_module(
                     check_function(
                         &ib.methods[k],
                         path,
+                        root_crate_name,
                         &method_prefix,
                         Some(&target_rt),
                         current_file,
@@ -2068,6 +2073,7 @@ fn check_module(
 fn check_function(
     func: &Function,
     current_module: &Vec<String>,
+    current_crate: &str,
     path_prefix: &Vec<String>,
     self_target: Option<&RType>,
     current_file: &str,
@@ -2243,6 +2249,7 @@ fn check_function(
                 is_num_lit: Vec::new(),
             },
             current_module,
+            current_crate,
             current_file,
             structs,
             enums,
@@ -2997,7 +3004,7 @@ fn check_block_inner(ctx: &mut CheckCtx, block: &Block) -> Result<InferType, Err
                 } else {
                     &ctx.current_module[0]
                 };
-                flatten_use_tree(&Vec::new(), &decl.tree, crate_root, decl.is_pub, &mut ctx.use_scope);
+                flatten_use_tree(&Vec::new(), &decl.tree, crate_root, decl.vis.is_pub_form(), &mut ctx.use_scope);
             }
         }
         i += 1;
@@ -5524,8 +5531,8 @@ pub use tables::{
     AliasEntry, AliasTable, CallResolution, CaptureInfo, CaptureMode, ClosureInfo, ConstEntry,
     ConstTable, ConstValue, EnumEntry, EnumTable, EnumVariantEntry, FnSymbol, FuncTable,
     GenericTemplate, LifetimePredResolved, MethodResolution, MoveStatus, MovedPlace, PatternErgo,
-    RTypedField, ReceiverAdjust, StructEntry, StructTable, SupertraitRef, TraitDispatch,
-    TraitEntry, TraitImplEntry, TraitMethodEntry, TraitReceiverShape, TraitTable,
+    ResolvedVisibility, RTypedField, ReceiverAdjust, StructEntry, StructTable, SupertraitRef,
+    TraitDispatch, TraitEntry, TraitImplEntry, TraitMethodEntry, TraitReceiverShape, TraitTable,
     VariantPayloadResolved, alias_lookup, const_lookup, enum_lookup, find_inherent_synth_idx,
     func_lookup, struct_lookup, template_lookup, trait_lookup,
 };
@@ -6395,9 +6402,7 @@ fn check_call(ctx: &mut CheckCtx, call: &Call, call_expr: &Expr) -> Result<Infer
     // Try non-generic first.
     if let Some(entry_idx) = funcs_entry_index(ctx.funcs, &full) {
         let entry = &ctx.funcs.entries[entry_idx];
-        let is_method = entry.impl_target.is_some();
-        let def_mod = fn_defining_module(&entry.path, is_method);
-        if !is_visible_from(&def_mod, entry.is_pub, ctx.current_module) {
+        if !is_visible_from(&entry.vis, ctx.current_module, ctx.current_crate) {
             return Err(Error {
                 file: ctx.current_file.to_string(),
                 message: format!(
@@ -6458,11 +6463,9 @@ fn check_call(ctx: &mut CheckCtx, call: &Call, call_expr: &Expr) -> Result<Infer
     }
     // Try a generic template.
     if let Some((template_idx, _)) = template_lookup(ctx.funcs, &full) {
-        let tmpl_is_pub = ctx.funcs.templates[template_idx].is_pub;
+        let tmpl_vis = ctx.funcs.templates[template_idx].vis.clone();
         let tmpl_path = ctx.funcs.templates[template_idx].path.clone();
-        let tmpl_is_method = ctx.funcs.templates[template_idx].impl_target.is_some();
-        let def_mod = fn_defining_module(&tmpl_path, tmpl_is_method);
-        if !is_visible_from(&def_mod, tmpl_is_pub, ctx.current_module) {
+        if !is_visible_from(&tmpl_vis, ctx.current_module, ctx.current_crate) {
             return Err(Error {
                 file: ctx.current_file.to_string(),
                 message: format!(
@@ -6773,11 +6776,7 @@ fn check_variant_struct_lit(
     disc: usize,
 ) -> Result<InferType, Error> {
     let entry = enum_lookup(ctx.enums, &enum_path).expect("variant lookup returned a real enum");
-    if !is_visible_from(
-        &type_defining_module(&entry.path),
-        entry.is_pub,
-        ctx.current_module,
-    ) {
+    if !is_visible_from(&entry.vis, ctx.current_module, ctx.current_crate) {
         return Err(Error {
             file: ctx.current_file.to_string(),
             message: format!("enum `{}` is private", place_to_string(&entry.path)),
@@ -6794,7 +6793,7 @@ fn check_variant_struct_lit(
                     name: fields[k].name.clone(),
                     name_span: fields[k].name_span.copy(),
                     ty: fields[k].ty.clone(),
-                    is_pub: fields[k].is_pub,
+                    vis: fields[k].vis.clone(),
                 });
                 k += 1;
             }
@@ -6996,11 +6995,7 @@ fn check_variant_call(
     disc: usize,
 ) -> Result<InferType, Error> {
     let entry = enum_lookup(ctx.enums, &enum_path).expect("variant lookup returned a real enum");
-    if !is_visible_from(
-        &type_defining_module(&entry.path),
-        entry.is_pub,
-        ctx.current_module,
-    ) {
+    if !is_visible_from(&entry.vis, ctx.current_module, ctx.current_crate) {
         return Err(Error {
             file: ctx.current_file.to_string(),
             message: format!("enum `{}` is private", place_to_string(&entry.path)),
@@ -7170,7 +7165,7 @@ fn check_struct_lit(
             });
         }
     };
-    if !is_visible_from(&type_defining_module(&entry.path), entry.is_pub, ctx.current_module) {
+    if !is_visible_from(&entry.vis, ctx.current_module, ctx.current_crate) {
         return Err(Error {
             file: ctx.current_file.to_string(),
             message: format!("struct `{}` is private", place_to_string(&entry.path)),
@@ -7180,20 +7175,14 @@ fn check_struct_lit(
     let struct_type_params: Vec<String> = entry.type_params.clone();
     let mut def_field_names: Vec<String> = Vec::new();
     let mut def_field_types: Vec<RType> = Vec::new();
-    let mut def_field_pubs: Vec<bool> = Vec::new();
+    let mut def_field_vis: Vec<crate::typeck::ResolvedVisibility> = Vec::new();
     let mut k = 0;
     while k < entry.fields.len() {
         def_field_names.push(entry.fields[k].name.clone());
         def_field_types.push(entry.fields[k].ty.clone());
-        def_field_pubs.push(entry.fields[k].is_pub);
+        def_field_vis.push(entry.fields[k].vis.clone());
         k += 1;
     }
-    // Field-level visibility: constructing a struct from outside its
-    // defining module requires every field to be `pub`. Inside the
-    // module, all fields are reachable regardless.
-    let struct_def_module = type_defining_module(&entry.path);
-    let inside_def_module: bool =
-        is_visible_from(&struct_def_module, false, ctx.current_module);
     // Allocate fresh type-arg vars for this struct's params. If the path's
     // last segment carried turbofish args, unify them.
     let last_seg = &lit.path.segments[lit.path.segments.len() - 1];
@@ -7261,7 +7250,7 @@ fn check_struct_lit(
                 });
             }
         };
-        if !inside_def_module && !def_field_pubs[found_idx] {
+        if !field_visible_from(&def_field_vis[found_idx], ctx.current_module, ctx.current_crate) {
             return Err(Error {
                 file: ctx.current_file.to_string(),
                 message: format!(
@@ -7388,7 +7377,7 @@ fn check_field_access(
         if entry.fields[i].name == fa.field {
             // Field-level visibility: a non-pub field is only readable
             // from inside the struct's defining module (or descendants).
-            if !field_visible_from(&struct_path, entry.fields[i].is_pub, ctx.current_module) {
+            if !field_visible_from(&entry.fields[i].vis, ctx.current_module, ctx.current_crate) {
                 return Err(Error {
                     file: ctx.current_file.to_string(),
                     message: format!(

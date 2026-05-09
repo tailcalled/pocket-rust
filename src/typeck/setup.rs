@@ -7,7 +7,7 @@ use super::{
     module_use_entries, outer_lifetime, place_to_string, require_no_inferred_lifetimes,
     resolve_type, resolve_via_use_scopes, rtype_eq, rtype_to_string, segments_to_string,
     struct_env, struct_lookup, substitute_rtype, supertrait_closure, template_lookup,
-    trait_lookup, trait_lookup_resolved, type_defining_module, validate_named_lifetimes,
+    trait_lookup, trait_lookup_resolved, validate_named_lifetimes,
 };
 use crate::ast::{Function, Item, Module};
 use crate::span::{Error, Span};
@@ -22,7 +22,12 @@ pub(super) fn push_root_name(path: &mut Vec<String>, root: &Module) {
 // shell `TraitMethodEntry` placeholders (names + spans only). Full
 // signature resolution happens in `resolve_trait_methods` after structs
 // are resolved.
-pub(super) fn collect_trait_names(module: &Module, path: &mut Vec<String>, table: &mut TraitTable) {
+pub(super) fn collect_trait_names(
+    module: &Module,
+    path: &mut Vec<String>,
+    crate_name: &str,
+    table: &mut TraitTable,
+) -> Result<(), Error> {
     let mut i = 0;
     while i < module.items.len() {
         match &module.items[i] {
@@ -67,12 +72,13 @@ pub(super) fn collect_trait_names(module: &Module, path: &mut Vec<String>, table
                     trait_type_param_defaults.push(None);
                     tp += 1;
                 }
+                let vis = resolve_visibility(&td.vis, path, crate_name, &td.name_span, &module.source_file)?;
                 table.entries.push(TraitEntry {
                     path: full,
                     name_span: td.name_span.copy(),
                     file: module.source_file.clone(),
                     methods,
-                    is_pub: td.is_pub,
+                    vis,
                     supertraits: Vec::new(),
                     assoc_types: assoc_type_names,
                     trait_type_params,
@@ -81,7 +87,7 @@ pub(super) fn collect_trait_names(module: &Module, path: &mut Vec<String>, table
             }
             Item::Module(m) => {
                 path.push(m.name.clone());
-                collect_trait_names(m, path, table);
+                collect_trait_names(m, path, crate_name, table)?;
                 path.pop();
             }
             Item::Function(_) => {}
@@ -94,6 +100,7 @@ pub(super) fn collect_trait_names(module: &Module, path: &mut Vec<String>, table
         }
         i += 1;
     }
+    Ok(())
 }
 
 // Walk the module tree and register every `pub? type Name<...>? = T;`
@@ -102,6 +109,131 @@ pub(super) fn collect_trait_names(module: &Module, path: &mut Vec<String>, table
 // fail with the standard "unknown type" diagnostic). Runs before
 // struct/enum field resolution so subsequent type lookups see aliases
 // in the path table.
+// Resolve an AST `Visibility` (parser-side, with sugar variants) to
+// a `ResolvedVisibility` (typeck-side, with the defining module
+// baked in). `defining_module` is the full module path the item is
+// declared in (e.g. `["std", "vec"]` for an item in `std::vec`).
+// `crate_name` is the current crate's root name ("" for the user
+// crate, "std" for the stdlib library).
+//
+// `pub(super)` resolves to the parent module path. At the crate root
+// it errors — there's no parent module within the crate. `pub(in
+// path)` resolves the user-named path; the result must be an
+// ancestor of `defining_module` (rejected otherwise — visibility
+// can't EXPAND beyond the item's defining module's ancestors).
+pub(super) fn resolve_visibility(
+    vis: &crate::ast::Visibility,
+    defining_module: &Vec<String>,
+    crate_name: &str,
+    span: &crate::span::Span,
+    file: &str,
+) -> Result<crate::typeck::tables::ResolvedVisibility, Error> {
+    use crate::ast::Visibility;
+    use crate::typeck::tables::ResolvedVisibility;
+    match vis {
+        Visibility::Public => Ok(ResolvedVisibility::Public),
+        Visibility::Crate => Ok(ResolvedVisibility::InCrate(crate_name.to_string())),
+        Visibility::SelfMod | Visibility::Private => Ok(ResolvedVisibility::InModule {
+            crate_name: crate_name.to_string(),
+            scope: defining_module.clone(),
+        }),
+        Visibility::Super => {
+            if defining_module.is_empty() {
+                return Err(Error {
+                    file: file.to_string(),
+                    message: "`pub(super)` is not allowed at the crate root".to_string(),
+                    span: span.copy(),
+                });
+            }
+            let mut parent = defining_module.clone();
+            parent.pop();
+            Ok(ResolvedVisibility::InModule {
+                crate_name: crate_name.to_string(),
+                scope: parent,
+            })
+        }
+        Visibility::InPath(path) => {
+            let resolved = resolve_pub_in_path(path, defining_module, crate_name)?;
+            // The resolved path must be an ancestor (prefix) of the
+            // defining module — visibility can shrink relative to
+            // private/default but never expand beyond ancestors.
+            if resolved.len() > defining_module.len() {
+                return Err(Error {
+                    file: file.to_string(),
+                    message: format!(
+                        "visibility path `{}` is not an ancestor of the item's defining module",
+                        crate::typeck::place_to_string(&resolved),
+                    ),
+                    span: span.copy(),
+                });
+            }
+            let mut i = 0;
+            while i < resolved.len() {
+                if resolved[i] != defining_module[i] {
+                    return Err(Error {
+                        file: file.to_string(),
+                        message: format!(
+                            "visibility path `{}` is not an ancestor of the item's defining module",
+                            crate::typeck::place_to_string(&resolved),
+                        ),
+                        span: span.copy(),
+                    });
+                }
+                i += 1;
+            }
+            Ok(ResolvedVisibility::InModule {
+                crate_name: crate_name.to_string(),
+                scope: resolved,
+            })
+        }
+    }
+}
+
+// Resolve a `pub(in path)` user-written path to a concrete module
+// path. Accepts `crate::a::b`, `super::a`, `self::a`, or unqualified
+// `a::b` (treated as relative to the crate root).
+fn resolve_pub_in_path(
+    path: &crate::ast::Path,
+    defining_module: &Vec<String>,
+    crate_name: &str,
+) -> Result<Vec<String>, Error> {
+    let segs: Vec<String> = path.segments.iter().map(|s| s.name.clone()).collect();
+    if segs.is_empty() {
+        return Ok(Vec::new());
+    }
+    let (start_idx, mut out) = match segs[0].as_str() {
+        "crate" => {
+            // For libs, paths start with the lib name; for user crate
+            // they don't. Mirror `rewrite_crate_prefix` semantics.
+            let mut base = Vec::new();
+            if !crate_name.is_empty() {
+                base.push(crate_name.to_string());
+            }
+            (1usize, base)
+        }
+        "super" => {
+            let mut base = defining_module.clone();
+            if base.is_empty() {
+                return Err(Error {
+                    file: String::new(),
+                    message: "`pub(in super)` at crate root has no parent module".to_string(),
+                    span: path.span.copy(),
+                });
+            }
+            base.pop();
+            (1usize, base)
+        }
+        "self" => (1usize, defining_module.clone()),
+        _ => (0usize, Vec::new()),
+    };
+    let mut i = start_idx;
+    while i < segs.len() {
+        out.push(segs[i].clone());
+        i += 1;
+    }
+    Ok(out)
+}
+
 pub(super) fn resolve_type_aliases(
     module: &Module,
     path: &mut Vec<String>,
@@ -135,6 +267,7 @@ pub(super) fn resolve_type_aliases(
                     reexports,
                     &module.source_file,
                 )?;
+                let vis = resolve_visibility(&ta.vis, path, root_crate_name, &ta.name_span, &module.source_file)?;
                 aliases.entries.push(AliasEntry {
                     path: full,
                     name_span: ta.name_span.copy(),
@@ -142,7 +275,7 @@ pub(super) fn resolve_type_aliases(
                     type_params: type_param_names,
                     lifetime_params: lifetime_param_names,
                     target,
-                    is_pub: ta.is_pub,
+                    vis,
                 });
             }
             Item::Module(m) => {
@@ -166,13 +299,14 @@ pub(super) fn resolve_type_aliases(
 pub(super) fn collect_consts(
     module: &Module,
     path: &mut Vec<String>,
+    crate_name: &str,
     consts: &mut crate::typeck::tables::ConstTable,
     structs: &StructTable,
     enums: &EnumTable,
     aliases: &AliasTable,
     reexports: &ReExportTable,
 ) -> Result<(), Error> {
-    let use_scope = module_use_entries(module, "");
+    let use_scope = module_use_entries(module, crate_name);
     let mut i = 0;
     while i < module.items.len() {
         match &module.items[i] {
@@ -192,18 +326,19 @@ pub(super) fn collect_consts(
                     &module.source_file,
                 )?;
                 let value = eval_const_expr(&cd.value, &cd.ty, &module.source_file)?;
+                let vis = resolve_visibility(&cd.vis, path, crate_name, &cd.name_span, &module.source_file)?;
                 consts.entries.push(crate::typeck::tables::ConstEntry {
                     path: full,
                     name_span: cd.name_span.copy(),
                     file: module.source_file.clone(),
                     ty,
                     value,
-                    is_pub: cd.is_pub,
+                    vis,
                 });
             }
             Item::Module(m) => {
                 path.push(m.name.clone());
-                collect_consts(m, path, consts, structs, enums, aliases, reexports)?;
+                collect_consts(m, path, crate_name, consts, structs, enums, aliases, reexports)?;
                 path.pop();
             }
             _ => {}
@@ -553,7 +688,12 @@ fn classify_receiver_shape(rt: &RType) -> TraitReceiverShape {
     }
 }
 
-pub(super) fn collect_struct_names(module: &Module, path: &mut Vec<String>, table: &mut StructTable) {
+pub(super) fn collect_struct_names(
+    module: &Module,
+    path: &mut Vec<String>,
+    crate_name: &str,
+    table: &mut StructTable,
+) -> Result<(), Error> {
     let mut i = 0;
     while i < module.items.len() {
         match &module.items[i] {
@@ -572,6 +712,7 @@ pub(super) fn collect_struct_names(module: &Module, path: &mut Vec<String>, tabl
                     .collect();
                 let tpv = vec![crate::typeck::Variance::Covariant; type_param_names.len()];
                 let lpv = vec![crate::typeck::Variance::Covariant; lifetime_param_names.len()];
+                let vis = resolve_visibility(&sd.vis, path, crate_name, &sd.name_span, &module.source_file)?;
                 table.entries.push(StructEntry {
                     path: full,
                     name_span: sd.name_span.copy(),
@@ -581,12 +722,12 @@ pub(super) fn collect_struct_names(module: &Module, path: &mut Vec<String>, tabl
                     type_param_variance: tpv,
                     lifetime_param_variance: lpv,
                     fields: Vec::new(),
-                    is_pub: sd.is_pub,
+                    vis,
                 });
             }
             Item::Module(m) => {
                 path.push(m.name.clone());
-                collect_struct_names(m, path, table);
+                collect_struct_names(m, path, crate_name, table)?;
                 path.pop();
             }
             Item::Function(_) => {}
@@ -599,13 +740,19 @@ pub(super) fn collect_struct_names(module: &Module, path: &mut Vec<String>, tabl
         }
         i += 1;
     }
+    Ok(())
 }
 
 // First-pass enum collection: register every `enum E { ... }` with shell
 // variant entries (names + spans). Variant payload types are resolved
 // later by `resolve_enum_variants`, after both struct and enum names
 // are known so payloads can reference either.
-pub(super) fn collect_enum_names(module: &Module, path: &mut Vec<String>, table: &mut EnumTable) {
+pub(super) fn collect_enum_names(
+    module: &Module,
+    path: &mut Vec<String>,
+    crate_name: &str,
+    table: &mut EnumTable,
+) -> Result<(), Error> {
     let mut i = 0;
     while i < module.items.len() {
         match &module.items[i] {
@@ -635,6 +782,7 @@ pub(super) fn collect_enum_names(module: &Module, path: &mut Vec<String>, table:
                 }
                 let tpv = vec![crate::typeck::Variance::Covariant; type_param_names.len()];
                 let lpv = vec![crate::typeck::Variance::Covariant; lifetime_param_names.len()];
+                let vis = resolve_visibility(&ed.vis, path, crate_name, &ed.name_span, &module.source_file)?;
                 table.entries.push(EnumEntry {
                     path: full,
                     name_span: ed.name_span.copy(),
@@ -644,12 +792,12 @@ pub(super) fn collect_enum_names(module: &Module, path: &mut Vec<String>, table:
                     type_param_variance: tpv,
                     lifetime_param_variance: lpv,
                     variants,
-                    is_pub: ed.is_pub,
+                    vis,
                 });
             }
             Item::Module(m) => {
                 path.push(m.name.clone());
-                collect_enum_names(m, path, table);
+                collect_enum_names(m, path, crate_name, table)?;
                 path.pop();
             }
             Item::Function(_) => {}
@@ -662,6 +810,7 @@ pub(super) fn collect_enum_names(module: &Module, path: &mut Vec<String>, table:
         }
         i += 1;
     }
+    Ok(())
 }
 
 // Second-pass: resolve each variant's payload types now that both struct
@@ -731,11 +880,18 @@ pub(super) fn resolve_enum_variants(
                                     reexports,
                                     &module.source_file,
                                 )?;
+                                let field_vis = resolve_visibility(
+                                    &fields[j].vis,
+                                    path,
+                                    root_crate_name,
+                                    &fields[j].name_span,
+                                    &module.source_file,
+                                )?;
                                 out.push(RTypedField {
                                     name: fields[j].name.clone(),
                                     name_span: fields[j].name_span.copy(),
                                     ty: rt,
-                                    is_pub: fields[j].is_pub,
+                                    vis: field_vis,
                                 });
                                 j += 1;
                             }
@@ -839,11 +995,18 @@ pub(super) fn resolve_struct_fields(
                         &sd.fields[k].ty.span,
                         &module.source_file,
                     )?;
+                    let field_vis = resolve_visibility(
+                        &sd.fields[k].vis,
+                        path,
+                        root_crate_name,
+                        &sd.fields[k].name_span,
+                        &module.source_file,
+                    )?;
                     resolved.push(RTypedField {
                         name: sd.fields[k].name.clone(),
                         name_span: sd.fields[k].name_span.copy(),
                         ty: rt,
-                        is_pub: sd.fields[k].is_pub,
+                        vis: field_vis,
                     });
                     k += 1;
                 }
@@ -895,6 +1058,7 @@ pub(super) fn collect_funcs(
                 register_function(
                     f,
                     path,
+                    root_crate_name,
                     path,
                     None,
                     &Vec::new(),
@@ -1176,6 +1340,7 @@ pub(super) fn collect_funcs(
                     register_function(
                         &ib.methods[k],
                         path,
+                        root_crate_name,
                         &method_prefix,
                         Some(&target_rt),
                         &impl_type_params,
@@ -1715,7 +1880,7 @@ pub(super) fn resolve_trait_path(
     let mut k = 0;
     while k < attempts.len() {
         if let Some(entry) = trait_lookup_resolved(traits, reexports, &attempts[k]) {
-            if !is_visible_from(&type_defining_module(&entry.path), entry.is_pub, current_module) {
+            if !is_visible_from(&entry.vis, current_module, crate::typeck::accessor_crate_of(current_module)) {
                 return Err(Error {
                     file: file.to_string(),
                     message: format!("trait `{}` is private", place_to_string(&entry.path)),
@@ -2551,6 +2716,7 @@ fn substitute_rpit_synths_to_opaque(
 pub(super) fn register_function(
     f: &Function,
     current_module: &Vec<String>,
+    crate_name: &str,
     path_prefix: &Vec<String>,
     self_target: Option<&RType>,
     impl_type_params: &Vec<String>,
@@ -3162,7 +3328,7 @@ pub(super) fn register_function(
             ret_lifetime,
             impl_target: impl_target_for_storage,
             trait_impl_idx,
-            is_pub: f.is_pub,
+            vis: resolve_visibility(&f.vis, current_module, crate_name, &f.name_span, source_file)?,
             is_unsafe: f.is_unsafe,
             method_resolutions: Vec::new(),
             call_resolutions: Vec::new(),
@@ -3223,7 +3389,7 @@ pub(super) fn register_function(
             ret_lifetime,
             impl_target: impl_target_for_storage,
             trait_impl_idx,
-            is_pub: f.is_pub,
+            vis: resolve_visibility(&f.vis, current_module, crate_name, &f.name_span, source_file)?,
             is_unsafe: f.is_unsafe,
             method_resolutions: Vec::new(),
             call_resolutions: Vec::new(),

@@ -499,7 +499,7 @@ fn build_struct_clone_method(sd: &StructDef, return_type: Type, span: &Span) -> 
         body,
         where_clause: Vec::new(),
         node_count: b.next_id,
-        is_pub: false,
+        vis: crate::ast::Visibility::Private,
         is_unsafe: false,
     }
 }
@@ -553,7 +553,7 @@ fn build_enum_clone_method(ed: &EnumDef, return_type: Type, span: &Span) -> Func
         body,
         where_clause: Vec::new(),
         node_count: b.next_id,
-        is_pub: false,
+        vis: crate::ast::Visibility::Private,
         is_unsafe: false,
     }
 }
@@ -690,7 +690,7 @@ fn build_struct_eq_method(sd: &StructDef, other_target: &Type, span: &Span) -> F
         body,
         where_clause: Vec::new(),
         node_count: b.next_id,
-        is_pub: false,
+        vis: crate::ast::Visibility::Private,
         is_unsafe: false,
     }
 }
@@ -720,7 +720,7 @@ fn build_ne_method_from_eq(span: &Span) -> Function {
         body,
         where_clause: Vec::new(),
         node_count: b.next_id,
-        is_pub: false,
+        vis: crate::ast::Visibility::Private,
         is_unsafe: false,
     }
 }
@@ -814,7 +814,7 @@ fn build_enum_eq_method(ed: &EnumDef, other_target: &Type, span: &Span) -> Funct
         body,
         where_clause: Vec::new(),
         node_count: b.next_id,
-        is_pub: false,
+        vis: crate::ast::Visibility::Private,
         is_unsafe: false,
     }
 }
@@ -932,7 +932,7 @@ fn build_struct_lt_method(sd: &StructDef, other_target: &Type, span: &Span) -> F
         body,
         where_clause: Vec::new(),
         node_count: b.next_id,
-        is_pub: false,
+        vis: crate::ast::Visibility::Private,
         is_unsafe: false,
     }
 }
@@ -1022,7 +1022,7 @@ fn build_enum_lt_method(ed: &EnumDef, other_target: &Type, span: &Span) -> Funct
         body,
         where_clause: Vec::new(),
         node_count: b.next_id,
-        is_pub: false,
+        vis: crate::ast::Visibility::Private,
         is_unsafe: false,
     }
 }
@@ -1137,7 +1137,7 @@ fn build_simple_partial_ord_companion(name: &str, negate: bool, span: &Span) -> 
         body,
         where_clause: Vec::new(),
         node_count: b.next_id,
-        is_pub: false,
+        vis: crate::ast::Visibility::Private,
         is_unsafe: false,
     }
 }

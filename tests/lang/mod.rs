@@ -188,6 +188,28 @@ where
     expect_export(dir, "answer", expected)
 }
 
+// Compile a multi-file inline VFS (entry = `lib.rs`), instantiate,
+// invoke `answer`, and assert the result. Mirrors `expect_answer` but
+// for tests that don't ship a fixture directory under `examples/`.
+pub fn expect_answer_sources<R>(files: &[(&str, &str)], expected: R)
+where
+    R: wasmi::WasmResults + PartialEq + std::fmt::Debug,
+{
+    let mut vfs = Vfs::new();
+    for (name, src) in files {
+        vfs.insert((*name).to_string(), (*src).to_string());
+    }
+    let libs = vec![load_stdlib()];
+    let module = compile(&libs, &vfs, "lib.rs").expect("compile failed");
+    let bytes = module.encode();
+    let (mut store, instance) = instantiate(&bytes);
+    let f = instance
+        .get_typed_func::<(), R>(&store, "answer")
+        .expect("export `answer` not found / wrong signature");
+    let actual = f.call(&mut store, ()).expect("call failed");
+    assert_eq!(actual, expected);
+}
+
 // Inline-source helpers for the raw-pointer / unsafe / builtins tests
 // that don't have an `examples/` directory.
 pub fn answer_u32(bytes: &[u8]) -> i32 {

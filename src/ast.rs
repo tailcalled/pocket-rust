@@ -26,6 +26,50 @@ pub enum Item {
     Const(ConstDecl),
 }
 
+// Visibility on item declarations (functions, structs, enums, etc.).
+// Carries the parser-level qualifier; typeck setup resolves each
+// occurrence to a `ResolvedVisibility` (in `typeck/tables.rs`) once
+// the item's defining module is known.
+//
+// Form mapping (matches Rust):
+//   * `pub`              → `Public`
+//   * `pub(crate)`       → `Crate`
+//   * `pub(super)`       → `Super` — same as `pub(in <parent>)`.
+//   * `pub(self)`        → `SelfMod` — sugar for `pub(in <defining>)`.
+//   * `pub(in path)`     → `InPath(path)` — `path` must resolve to an
+//     ancestor of the item's defining module within the same crate.
+//   * (no qualifier)     → `Private` — visible only within the item's
+//     defining module and its descendants.
+#[derive(Clone)]
+pub enum Visibility {
+    Public,
+    Crate,
+    Super,
+    SelfMod,
+    InPath(Path),
+    Private,
+}
+
+impl Visibility {
+    // Whether the item carries any `pub` prefix (any non-Private
+    // form). Matches the semantics of the old `is_pub: bool` field —
+    // legacy call sites that treated `pub`, `pub(crate)`, `pub(super)`
+    // etc. uniformly as "this item is exported from its module" use
+    // this. New code that needs to distinguish, say, `pub(crate)` from
+    // `pub` should resolve to `ResolvedVisibility` and use
+    // `is_visible_from`.
+    pub fn is_pub_form(&self) -> bool {
+        !matches!(self, Visibility::Private)
+    }
+
+    // Strict-`pub` check — true only for the unrestricted form. Useful
+    // for export decisions where `pub(crate)` should NOT be treated as
+    // public (e.g. a wasm export gate).
+    pub fn is_public(&self) -> bool {
+        matches!(self, Visibility::Public)
+    }
+}
+
 // `pub? const NAME: TYPE = EXPR;` — a named compile-time constant.
 // MVP: `EXPR` must be evaluable to a primitive literal during typeck
 // setup. Path references that resolve to a const become Use sites
@@ -37,7 +81,7 @@ pub struct ConstDecl {
     pub name_span: Span,
     pub ty: Type,
     pub value: Expr,
-    pub is_pub: bool,
+    pub vis: Visibility,
     pub span: Span,
 }
 
@@ -54,7 +98,7 @@ pub struct TypeAlias {
     pub lifetime_params: Vec<LifetimeParam>,
     pub type_params: Vec<TypeParam>,
     pub target: Type,
-    pub is_pub: bool,
+    pub vis: Visibility,
     pub span: Span,
 }
 
@@ -69,7 +113,7 @@ pub struct UseDecl {
     // `pub use foo::Bar;` — the imported name is itself visible to
     // outside modules (re-exported). For ordinary `use` (no `pub`),
     // the import is private to its enclosing module.
-    pub is_pub: bool,
+    pub vis: Visibility,
     pub span: Span,
 }
 
@@ -142,7 +186,7 @@ pub struct TraitDef {
     // this trait must bind every name listed here.
     pub assoc_types: Vec<TraitAssocType>,
     pub span: Span,
-    pub is_pub: bool,
+    pub vis: Visibility,
 }
 
 // `type Name;` inside a trait body. No defaults, no bounds yet.
@@ -226,7 +270,7 @@ pub struct StructDef {
     pub lifetime_params: Vec<LifetimeParam>,
     pub type_params: Vec<TypeParam>,
     pub fields: Vec<StructField>,
-    pub is_pub: bool,
+    pub vis: Visibility,
     // `#[derive(Trait1, Trait2)]` clauses captured at parse time. The
     // separate `derive_expand` stage consumes them and synthesizes the
     // corresponding trait impls — typeck never sees this field.
@@ -238,7 +282,7 @@ pub struct StructField {
     pub name: String,
     pub name_span: Span,
     pub ty: Type,
-    pub is_pub: bool,
+    pub vis: Visibility,
 }
 
 // `enum NAME<'a, T> { Variant1, Variant2(T1, T2), Variant3 { f: T } }`.
@@ -253,7 +297,7 @@ pub struct EnumDef {
     pub lifetime_params: Vec<LifetimeParam>,
     pub type_params: Vec<TypeParam>,
     pub variants: Vec<EnumVariant>,
-    pub is_pub: bool,
+    pub vis: Visibility,
     pub derives: Vec<DeriveClause>,
 }
 
@@ -307,7 +351,7 @@ pub struct Function {
     // Number of NodeIds allocated within this function's body. Side vectors
     // (typeck/borrowck/codegen) sized to this length, indexed by Expr.id.
     pub node_count: u32,
-    pub is_pub: bool,
+    pub vis: Visibility,
     // `unsafe fn …` — calls to this function must lexically appear
     // inside an `unsafe { … }` block, and the function's body is
     // implicitly in unsafe context (so it can deref raw pointers and

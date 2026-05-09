@@ -73,7 +73,7 @@ pub struct RTypedField {
     pub name: String,
     pub name_span: Span,
     pub ty: RType,
-    pub is_pub: bool,
+    pub vis: ResolvedVisibility,
 }
 
 pub struct StructEntry {
@@ -96,7 +96,7 @@ pub struct StructEntry {
     pub type_param_variance: Vec<crate::typeck::variance::Variance>,
     pub lifetime_param_variance: Vec<crate::typeck::variance::Variance>,
     pub fields: Vec<RTypedField>,
-    pub is_pub: bool,
+    pub vis: ResolvedVisibility,
 }
 
 pub struct StructTable {
@@ -128,7 +128,7 @@ pub struct EnumEntry {
     pub type_param_variance: Vec<crate::typeck::variance::Variance>,
     pub lifetime_param_variance: Vec<crate::typeck::variance::Variance>,
     pub variants: Vec<EnumVariantEntry>,
-    pub is_pub: bool,
+    pub vis: ResolvedVisibility,
 }
 
 pub struct EnumVariantEntry {
@@ -235,7 +235,7 @@ pub struct AliasEntry {
     pub type_params: Vec<String>,
     pub lifetime_params: Vec<String>,
     pub target: RType,
-    pub is_pub: bool,
+    pub vis: ResolvedVisibility,
 }
 
 pub fn alias_lookup<'a>(table: &'a AliasTable, path: &Vec<String>) -> Option<&'a AliasEntry> {
@@ -274,7 +274,7 @@ pub struct TraitEntry {
     pub name_span: Span,
     pub file: String,
     pub methods: Vec<TraitMethodEntry>,
-    pub is_pub: bool,
+    pub vis: ResolvedVisibility,
     pub supertraits: Vec<SupertraitRef>,
     // `type Name;` declarations inside the trait body. Each impl of
     // this trait must bind exactly these names (no missing, no extras).
@@ -371,7 +371,7 @@ pub struct FnSymbol {
     // For trait-impl methods, the index into `TraitTable.impls` of the
     // owning impl row. None for free fns and inherent methods.
     pub trait_impl_idx: Option<usize>,
-    pub is_pub: bool,
+    pub vis: ResolvedVisibility,
     // `unsafe fn` — call sites must be lexically inside an `unsafe { … }`
     // block (enforced by `safeck`); the body is implicitly in unsafe
     // context.
@@ -538,7 +538,7 @@ pub struct GenericTemplate {
     // For trait-impl methods, the index into `TraitTable.impls`. None
     // for free fns and inherent methods.
     pub trait_impl_idx: Option<usize>,
-    pub is_pub: bool,
+    pub vis: ResolvedVisibility,
     pub is_unsafe: bool,
     pub func: crate::ast::Function,
     pub enclosing_module: Vec<String>,
@@ -655,6 +655,58 @@ pub enum ReceiverAdjust {
     ByRef,       // recv is &Self/&mut Self; pass i32 directly (incl. mut→imm downgrade)
 }
 
+// Per-item visibility, resolved at item registration from the AST's
+// `Visibility`. The defining module + crate name are baked in so
+// `is_visible_from` is a pure check against an accessor's
+// (module, crate). Variants:
+//   * `Public` — visible from any module in any crate.
+//   * `InCrate(name)` — visible from any module in crate `name`. The
+//     `name` is the crate's root name ("" for the user crate, "std"
+//     for the stdlib library, etc.). `pub(crate)` resolves here.
+//   * `InModule { crate_name, scope }` — visible from `scope` and any
+//     descendant module in crate `crate_name`. `pub(super)` resolves
+//     to the parent module path; `pub(self)` and private (no `pub`)
+//     resolve to the defining module's path itself; `pub(in path)`
+//     resolves to the user-named ancestor module.
+#[derive(Clone)]
+pub enum ResolvedVisibility {
+    Public,
+    InCrate(String),
+    InModule {
+        crate_name: String,
+        scope: Vec<String>,
+    },
+}
+
+impl ResolvedVisibility {
+    // Is this item accessible from `accessor_module` in
+    // `accessor_crate`? `accessor_module` is the full module path
+    // within the accessor's crate (e.g. `["foo", "bar"]` for an
+    // access from inside `crate::foo::bar`).
+    pub fn is_visible_from(&self, accessor_module: &Vec<String>, accessor_crate: &str) -> bool {
+        match self {
+            ResolvedVisibility::Public => true,
+            ResolvedVisibility::InCrate(name) => name == accessor_crate,
+            ResolvedVisibility::InModule { crate_name, scope } => {
+                if crate_name != accessor_crate {
+                    return false;
+                }
+                if scope.len() > accessor_module.len() {
+                    return false;
+                }
+                let mut i = 0;
+                while i < scope.len() {
+                    if scope[i] != accessor_module[i] {
+                        return false;
+                    }
+                    i += 1;
+                }
+                true
+            }
+        }
+    }
+}
+
 // `pub? const NAME: TYPE = EXPR;` — resolved entry. The `value`
 // holds the constant's evaluated payload (a primitive literal). Use
 // sites resolve via `path` (full module path); typeck records each
@@ -667,7 +719,7 @@ pub struct ConstEntry {
     pub file: String,
     pub ty: RType,
     pub value: ConstValue,
-    pub is_pub: bool,
+    pub vis: ResolvedVisibility,
 }
 
 // Compile-time-evaluated value of a `const` item. MVP supports

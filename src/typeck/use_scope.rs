@@ -47,7 +47,7 @@ fn collect_reexports_in_module(
     let mut i = 0;
     while i < module.items.len() {
         match &module.items[i] {
-            crate::ast::Item::Use(u) if u.is_pub => {
+            crate::ast::Item::Use(u) if u.vis.is_pub_form() => {
                 // Flatten this pub use's tree into UseEntries (with the
                 // crate-root rewrite), then turn each Explicit entry
                 // into a ReExport at the current module.
@@ -415,85 +415,43 @@ pub fn module_use_entries(module: &crate::ast::Module, crate_root: &str) -> Vec<
     let mut i = 0;
     while i < module.items.len() {
         if let crate::ast::Item::Use(u) = &module.items[i] {
-            flatten_use_tree(&Vec::new(), &u.tree, crate_root, u.is_pub, &mut out);
+            flatten_use_tree(&Vec::new(), &u.tree, crate_root, u.vis.is_pub_form(), &mut out);
         }
         i += 1;
     }
     out
 }
-// Visibility checks for items within and across modules. The basic rule:
-// a `pub` item is visible from anywhere; a non-pub item is visible only
-// from its defining module and that module's descendants.
-//
-// Callers pass `defining_module` explicitly so the rule applies
-// uniformly to free functions, structs, traits, and methods —
-// methods nest under their impl target's name in the path, but the
-// defining module is still the enclosing module, not the struct.
+// Visibility check: defers to `ResolvedVisibility::is_visible_from`.
+// The defining module and `pub`-form data are baked into `vis` at
+// item-registration time (via `setup::resolve_visibility`), so callers
+// only need the accessor's location: its module path and crate name.
 pub fn is_visible_from(
-    defining_module: &Vec<String>,
-    is_pub: bool,
+    vis: &crate::typeck::tables::ResolvedVisibility,
     accessor_module: &Vec<String>,
+    accessor_crate: &str,
 ) -> bool {
-    if is_pub {
-        return true;
-    }
-    if accessor_module.len() < defining_module.len() {
-        return false;
-    }
-    let mut i = 0;
-    while i < defining_module.len() {
-        if accessor_module[i] != defining_module[i] {
-            return false;
-        }
-        i += 1;
-    }
-    true
+    vis.is_visible_from(accessor_module, accessor_crate)
 }
 
-// Defining module for a function-table path: free functions live at
-// `[mod..., name]` (drop one), inherent/trait-impl methods live at
-// `[mod..., StructName, method_name]` (drop two). The
-// `is_method_path` flag is computed from `FnSymbol.impl_target`.
-pub fn fn_defining_module(item_path: &Vec<String>, is_method: bool) -> Vec<String> {
-    let drop = if is_method { 2 } else { 1 };
-    let n = if item_path.len() >= drop {
-        item_path.len() - drop
+// The crate that `module` belongs to. Module paths always start with
+// the crate prefix (the user crate uses `""` and lives at empty
+// prefix; libraries like std live at `["std", ...]`). So the first
+// segment IS the crate name, or `""` for the user crate.
+pub fn accessor_crate_of(module: &Vec<String>) -> &str {
+    if module.is_empty() {
+        ""
     } else {
-        0
-    };
-    let mut out: Vec<String> = Vec::new();
-    let mut i = 0;
-    while i < n {
-        out.push(item_path[i].clone());
-        i += 1;
+        &module[0]
     }
-    out
 }
 
-// Defining module for a struct/trait at `[mod..., name]`.
-pub fn type_defining_module(item_path: &Vec<String>) -> Vec<String> {
-    if item_path.is_empty() {
-        return Vec::new();
-    }
-    let mut out: Vec<String> = Vec::new();
-    let mut i = 0;
-    while i + 1 < item_path.len() {
-        out.push(item_path[i].clone());
-        i += 1;
-    }
-    out
-}
-
-// Field-level visibility: a non-pub struct field is only accessible
-// from inside the struct's defining module (or any descendant).
+// Field-level visibility: same as item visibility but operating on a
+// field's `vis`. Kept as a separate helper to make field-access call
+// sites read clearly.
 pub fn field_visible_from(
-    struct_path: &Vec<String>,
-    field_is_pub: bool,
+    field_vis: &crate::typeck::tables::ResolvedVisibility,
     accessor_module: &Vec<String>,
+    accessor_crate: &str,
 ) -> bool {
-    is_visible_from(
-        &type_defining_module(struct_path),
-        field_is_pub,
-        accessor_module,
-    )
+    field_vis.is_visible_from(accessor_module, accessor_crate)
 }

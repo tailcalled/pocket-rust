@@ -2652,7 +2652,7 @@ impl<'a> Builder<'a> {
                                 name: f.name.clone(),
                                 name_span: f.name_span.copy(),
                                 ty: f.ty.clone(),
-                                is_pub: f.is_pub,
+                                vis: f.vis.clone(),
                             })
                             .collect();
                         let mut env: Vec<(String, RType)> = Vec::new();
@@ -3014,7 +3014,7 @@ impl<'a> Builder<'a> {
                                         name: f.name.clone(),
                                         name_span: f.name_span.copy(),
                                         ty: f.ty.clone(),
-                                        is_pub: f.is_pub,
+                                        vis: f.vis.clone(),
                                     })
                                     .collect::<Vec<_>>(),
                                 env,
@@ -3181,7 +3181,7 @@ fn substitute_variant_payload(
                     name: fields[i].name.clone(),
                     name_span: fields[i].name_span.copy(),
                     ty: substitute_rtype(&fields[i].ty, env),
-                    is_pub: fields[i].is_pub,
+                    vis: fields[i].vis.clone(),
                 });
                 i += 1;
             }

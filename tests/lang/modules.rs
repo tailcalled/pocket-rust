@@ -159,3 +159,141 @@ fn private_struct_field_construction_is_rejected() {
         err
     );
 }
+
+// `pub(crate)` widens visibility to the entire crate but not beyond.
+// Since the test compiler treats the test program as the user crate,
+// `pub(crate) fn` is reachable from any module in that crate.
+#[test]
+fn pub_crate_function_is_visible_from_sibling_module() {
+    let src = "mod a;\nmod b;\nfn answer() -> u32 { b::call_a() }";
+    expect_answer_sources(
+        &[
+            ("lib.rs", src),
+            ("a.rs", "pub(crate) fn secret() -> u32 { 42 }"),
+            (
+                "b.rs",
+                "use crate::a::secret;\npub fn call_a() -> u32 { secret() }",
+            ),
+        ],
+        42u32,
+    );
+}
+
+// `pub(super)` only exposes the item to the parent module. Sibling-of-
+// parent access must still go through the parent.
+#[test]
+fn pub_super_function_is_visible_from_parent() {
+    let src = "mod outer;\nfn answer() -> u32 { outer::call() }";
+    expect_answer_sources(
+        &[
+            ("lib.rs", src),
+            (
+                "outer.rs",
+                "mod inner;\npub fn call() -> u32 { inner::secret() }",
+            ),
+            ("outer/inner.rs", "pub(super) fn secret() -> u32 { 42 }"),
+        ],
+        42u32,
+    );
+}
+
+// `pub(super)` is *not* visible from the grandparent (the crate root).
+#[test]
+fn pub_super_function_not_visible_from_grandparent_is_rejected() {
+    let err = compile_sources(&[
+        (
+            "lib.rs",
+            "mod outer;\nfn answer() -> u32 { outer::inner::secret() }",
+        ),
+        ("outer.rs", "pub mod inner;"),
+        ("outer/inner.rs", "pub(super) fn secret() -> u32 { 42 }"),
+    ]);
+    assert!(
+        err.contains("private"),
+        "expected `private` error for pub(super) reach, got: {}",
+        err
+    );
+}
+
+// `pub(self)` is identical in effect to no modifier — the item stays
+// confined to its defining module. Outside callers see `private`.
+#[test]
+fn pub_self_function_call_from_outside_is_rejected() {
+    let err = compile_sources(&[
+        ("lib.rs", "mod inner;\nfn answer() -> u32 { inner::secret() }"),
+        ("inner.rs", "pub(self) fn secret() -> u32 { 7 }"),
+    ]);
+    assert!(
+        err.contains("private"),
+        "expected `private` error for pub(self) reach, got: {}",
+        err
+    );
+}
+
+// `pub(in crate::a)` exposes the item to a specific ancestor module
+// and its descendants only. The ancestor's siblings still see it as
+// private.
+#[test]
+fn pub_in_path_visible_within_named_ancestor() {
+    let src = "mod a;\nfn answer() -> u32 { a::call() }";
+    expect_answer_sources(
+        &[
+            ("lib.rs", src),
+            (
+                "a.rs",
+                "mod inner;\npub fn call() -> u32 { inner::secret() }",
+            ),
+            ("a/inner.rs", "pub(in crate::a) fn secret() -> u32 { 42 }"),
+        ],
+        42u32,
+    );
+}
+
+#[test]
+fn pub_in_path_not_visible_outside_named_ancestor_is_rejected() {
+    let err = compile_sources(&[
+        (
+            "lib.rs",
+            "mod a;\nmod b;\nfn answer() -> u32 { b::call() }",
+        ),
+        ("a.rs", "pub mod inner;"),
+        ("a/inner.rs", "pub(in crate::a) fn secret() -> u32 { 42 }"),
+        (
+            "b.rs",
+            "use crate::a::inner::secret;\npub fn call() -> u32 { secret() }",
+        ),
+    ]);
+    assert!(
+        err.contains("private"),
+        "expected `private` error for pub(in crate::a) reach from sibling, got: {}",
+        err
+    );
+}
+
+// `pub(in <path>)` requires the path to name an ancestor module. A
+// non-ancestor path is a static error at item registration.
+#[test]
+fn pub_in_path_non_ancestor_is_rejected() {
+    let err = compile_sources(&[
+        ("lib.rs", "mod a;\nmod b;\nfn answer() -> u32 { 0 }"),
+        ("a.rs", "pub(in crate::b) fn nope() -> u32 { 1 }"),
+        ("b.rs", "pub fn call() -> u32 { 0 }"),
+    ]);
+    assert!(
+        err.contains("not an ancestor"),
+        "expected `not an ancestor` error, got: {}",
+        err
+    );
+}
+
+// `pub(super)` at the crate root has no parent — reject at item
+// registration time.
+#[test]
+fn pub_super_at_crate_root_is_rejected() {
+    let err = compile_source("pub(super) fn nope() -> u32 { 0 }\nfn answer() -> u32 { 0 }");
+    assert!(
+        err.contains("crate root") || err.contains("super"),
+        "expected pub(super)-at-root error, got: {}",
+        err
+    );
+}

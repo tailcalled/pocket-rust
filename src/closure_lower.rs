@@ -41,13 +41,15 @@ pub fn lower(
 ) -> Result<(), Error> {
     let path: Vec<String> = Vec::new();
     let mut path = path;
-    walk_module(module, &mut path, structs, enums, aliases, traits, funcs, consts, reexports, next_idx)?;
+    let crate_name = module.name.clone();
+    walk_module(module, &mut path, &crate_name, structs, enums, aliases, traits, funcs, consts, reexports, next_idx)?;
     Ok(())
 }
 
 fn walk_module(
     module: &mut Module,
     path: &mut Vec<String>,
+    crate_name: &str,
     structs: &mut StructTable,
     enums: &mut typeck::EnumTable,
     aliases: &mut typeck::AliasTable,
@@ -66,7 +68,7 @@ fn walk_module(
     let mut i = 0;
     while i < module.items.len() {
         if let Item::Module(m) = &mut module.items[i] {
-            walk_module(m, path, structs, enums, aliases, traits, funcs, consts, reexports, next_idx)?;
+            walk_module(m, path, crate_name, structs, enums, aliases, traits, funcs, consts, reexports, next_idx)?;
         }
         i += 1;
     }
@@ -118,6 +120,7 @@ fn walk_module(
             register_synthesized_impl(
                 ib,
                 path,
+                crate_name,
                 &module.source_file,
                 structs,
                 enums,
@@ -831,7 +834,7 @@ fn synthesize_impl_for_closure(
         body: block,
         where_clause: Vec::new(),
         node_count: id_alloc.next,
-        is_pub: true,
+        vis: crate::ast::Visibility::Public,
         is_unsafe: false,
     };
 
@@ -1384,6 +1387,7 @@ fn struct_or_enum_path(
 fn register_synthesized_impl(
     ib: &ImplBlock,
     parent_module_path: &Vec<String>,
+    crate_name: &str,
     source_file: &str,
     structs: &mut StructTable,
     enums: &mut typeck::EnumTable,
@@ -1397,6 +1401,7 @@ fn register_synthesized_impl(
     typeck::register_synthesized_closure_impl(
         ib,
         parent_module_path,
+        crate_name,
         source_file,
         structs,
         enums,

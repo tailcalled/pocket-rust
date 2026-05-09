@@ -1,7 +1,7 @@
 use super::{
     AliasTable, EnumEntry, EnumTable, LifetimeRepr, ReExportTable, RType, StructTable, UseEntry,
-    alias_lookup, enum_lookup, int_kind_from_name, is_visible_from, resolve_via_reexports,
-    resolve_via_use_scopes, struct_lookup_resolved, substitute_rtype, type_defining_module,
+    accessor_crate_of, alias_lookup, enum_lookup, int_kind_from_name, is_visible_from,
+    resolve_via_reexports, resolve_via_use_scopes, struct_lookup_resolved, substitute_rtype,
 };
 use crate::ast::{PathSegment, Type, TypeKind};
 use crate::span::{Error, Span};
@@ -163,7 +163,7 @@ pub fn resolve_type(
             // alias-vs-struct shadowing decision (a future Rust feature)
             // would only need to flip the lookup order.
             if let Some(a_entry) = alias_lookup(aliases, &full) {
-                if !is_visible_from(&type_defining_module(&a_entry.path), a_entry.is_pub, current_module) {
+                if !is_visible_from(&a_entry.vis, current_module, accessor_crate_of(current_module)) {
                     return Err(Error {
                         file: file.to_string(),
                         message: format!("type alias `{}` is private", place_to_string(&a_entry.path)),
@@ -209,7 +209,7 @@ pub fn resolve_type(
             // matches."
             if let Some(e_entry) = enum_lookup_resolved(enums, reexports, &full) {
                 full = e_entry.path.clone();
-                if !is_visible_from(&type_defining_module(&e_entry.path), e_entry.is_pub, current_module) {
+                if !is_visible_from(&e_entry.vis, current_module, accessor_crate_of(current_module)) {
                     return Err(Error {
                         file: file.to_string(),
                         message: format!("enum `{}` is private", place_to_string(&e_entry.path)),
@@ -273,7 +273,7 @@ pub fn resolve_type(
             // `RType::Struct.path` should be the trait's actual
             // location, not the re-export alias).
             full = entry.path.clone();
-            if !is_visible_from(&type_defining_module(&entry.path), entry.is_pub, current_module) {
+            if !is_visible_from(&entry.vis, current_module, accessor_crate_of(current_module)) {
                 return Err(Error {
                     file: file.to_string(),
                     message: format!("struct `{}` is private", place_to_string(&entry.path)),
