@@ -255,6 +255,10 @@ pub(crate) fn infer_to_rtype_for_check(t: &InferType) -> RType {
             fn_path: fn_path.clone(),
             slot: *slot,
         },
+        InferType::FnPtr { params, ret } => RType::FnPtr {
+            params: params.iter().map(infer_to_rtype_for_check).collect(),
+            ret: Box::new(infer_to_rtype_for_check(ret)),
+        },
     }
 }
 
@@ -816,6 +820,13 @@ pub(crate) enum InferType {
         fn_path: Vec<String>,
         slot: u32,
     },
+    // InferType counterpart of `RType::FnPtr`. Inference flows
+    // through param/ret slots structurally — unification matches arity
+    // and recurses, with `Never`/`Var` coercing per the usual rules.
+    FnPtr {
+        params: Vec<InferType>,
+        ret: Box<InferType>,
+    },
 }
 
 // Build a name → InferType env from a generic struct/template's type-param
@@ -898,6 +909,10 @@ pub(crate) fn rtype_to_infer(rt: &RType) -> InferType {
             fn_path: fn_path.clone(),
             slot: *slot,
         },
+        RType::FnPtr { params, ret } => InferType::FnPtr {
+            params: params.iter().map(rtype_to_infer).collect(),
+            ret: Box::new(rtype_to_infer(ret)),
+        },
     }
 }
 
@@ -975,6 +990,10 @@ pub(crate) fn infer_substitute(t: &InferType, env: &Vec<(String, InferType)>) ->
         InferType::Opaque { fn_path, slot } => InferType::Opaque {
             fn_path: fn_path.clone(),
             slot: *slot,
+        },
+        InferType::FnPtr { params, ret } => InferType::FnPtr {
+            params: params.iter().map(|p| infer_substitute(p, env)).collect(),
+            ret: Box::new(infer_substitute(ret, env)),
         },
     }
 }
@@ -1092,6 +1111,18 @@ fn rewrite_placeholders(
         // resolve_type will reject the whole `impl Trait` later if it
         // reaches a non-arg site. Pass through unchanged.
         TypeKind::ImplTrait(b) => TypeKind::ImplTrait(b.clone()),
+        TypeKind::FnPtr { params, ret } => {
+            let mut new_params: Vec<Type> = Vec::with_capacity(params.len());
+            let mut i = 0;
+            while i < params.len() {
+                new_params.push(rewrite_placeholders(&params[i], synth_names, prefix));
+                i += 1;
+            }
+            let new_ret = ret
+                .as_ref()
+                .map(|r| Box::new(rewrite_placeholders(r, synth_names, prefix)));
+            TypeKind::FnPtr { params: new_params, ret: new_ret }
+        }
     };
     Type { kind, span: ty.span.copy() }
 }
@@ -1182,6 +1213,23 @@ pub(crate) fn infer_to_string(t: &InferType) -> String {
         InferType::Char => "char".to_string(),
         InferType::Opaque { fn_path, slot } => {
             format!("impl <{}#{}>", place_to_string(fn_path), slot)
+        }
+        InferType::FnPtr { params, ret } => {
+            let mut s = String::from("fn(");
+            let mut i = 0;
+            while i < params.len() {
+                if i > 0 {
+                    s.push_str(", ");
+                }
+                s.push_str(&infer_to_string(&params[i]));
+                i += 1;
+            }
+            s.push(')');
+            if !matches!(ret.as_ref(), InferType::Tuple(v) if v.is_empty()) {
+                s.push_str(" -> ");
+                s.push_str(&infer_to_string(ret));
+            }
+            s
         }
     }
 }
@@ -1278,6 +1326,10 @@ impl Subst {
             InferType::Opaque { fn_path, slot } => InferType::Opaque {
                 fn_path: fn_path.clone(),
                 slot: *slot,
+            },
+            InferType::FnPtr { params, ret } => InferType::FnPtr {
+                params: params.iter().map(|p| self.substitute(p)).collect(),
+                ret: Box::new(self.substitute(ret)),
             },
         }
     }
@@ -1563,6 +1615,36 @@ impl Subst {
                 InferType::Opaque { fn_path: a_fp, slot: a_slot },
                 InferType::Opaque { fn_path: b_fp, slot: b_slot },
             ) if a_fp == b_fp && a_slot == b_slot => Ok(()),
+            (
+                InferType::FnPtr { params: pa, ret: ra },
+                InferType::FnPtr { params: pb, ret: rb },
+            ) => {
+                if pa.len() != pb.len() {
+                    return Err(Error {
+                        file: file.to_string(),
+                        message: format!(
+                            "fn-ptr arity mismatch: expected {} params, got {}",
+                            pb.len(),
+                            pa.len()
+                        ),
+                        span: span.copy(),
+                    });
+                }
+                let mut i = 0;
+                while i < pa.len() {
+                    self.unify(
+                        &pa[i],
+                        &pb[i],
+                        traits,
+                        type_params,
+                        type_param_bounds,
+                        span,
+                        file,
+                    )?;
+                    i += 1;
+                }
+                self.unify(ra.as_ref(), rb.as_ref(), traits, type_params, type_param_bounds, span, file)
+            }
             (InferType::Tuple(ea), InferType::Tuple(eb)) => {
                 if ea.len() != eb.len() {
                     return Err(Error {
@@ -1794,6 +1876,10 @@ impl Subst {
             InferType::Never => RType::Never,
             InferType::Char => RType::Char,
             InferType::Opaque { fn_path, slot } => RType::Opaque { fn_path, slot },
+            InferType::FnPtr { params, ret } => RType::FnPtr {
+                params: params.iter().map(|p| self.finalize(p)).collect(),
+                ret: Box::new(self.finalize(&ret)),
+            },
         }
     }
 }
@@ -1831,6 +1917,11 @@ pub(crate) struct CheckCtx<'a> {
     // Pending per-MethodCall and per-Call resolutions, indexed by Expr.id.
     pub(crate) method_resolutions: Vec<Option<PendingMethodCall>>,
     pub(crate) call_resolutions: Vec<Option<PendingCall>>,
+    // Per-NodeId fn-item address. Recorded when a bare-name `Var(name)`
+    // expression resolved to a non-generic fn item that's being coerced
+    // into an `RType::FnPtr` slot. Stores the FuncTable callee_idx;
+    // copied into FnSymbol/Template.fn_item_addrs at end-of-fn.
+    pub(crate) fn_item_addrs: Vec<Option<usize>>,
     // Per-NodeId resolved RType type-args for builtins that need them at
     // codegen (`¤size_of::<T>()`). `None` outside builtin-with-types
     // sites. Finalized into FnSymbol.builtin_type_targets at end-of-fn.
@@ -2210,13 +2301,14 @@ fn check_function(
     };
 
     let node_count = func.node_count as usize;
-    let (expr_infer_types, lit_constraints, method_resolutions, call_resolutions, builtin_type_targets, pattern_ergo, closure_records, bare_closure_calls, const_uses, subst) = {
+    let (expr_infer_types, lit_constraints, method_resolutions, call_resolutions, fn_item_addrs, builtin_type_targets, pattern_ergo, closure_records, bare_closure_calls, const_uses, subst) = {
         let mut method_res: Vec<Option<PendingMethodCall>> = Vec::with_capacity(node_count);
         let mut call_res: Vec<Option<PendingCall>> = Vec::with_capacity(node_count);
         let mut expr_infer: Vec<Option<InferType>> = Vec::with_capacity(node_count);
         let mut btt: Vec<Option<Vec<RType>>> = Vec::with_capacity(node_count);
         let mut pat_ergo: Vec<PatternErgo> = Vec::with_capacity(node_count);
         let mut const_uses_init: Vec<Option<ConstValue>> = Vec::with_capacity(node_count);
+        let mut fn_item_addrs_init: Vec<Option<usize>> = Vec::with_capacity(node_count);
         let mut i = 0;
         while i < node_count {
             method_res.push(None);
@@ -2225,6 +2317,7 @@ fn check_function(
             btt.push(None);
             pat_ergo.push(PatternErgo::default());
             const_uses_init.push(None);
+            fn_item_addrs_init.push(None);
             i += 1;
         }
         // Initialize the use scope with the module's flattened entries.
@@ -2242,6 +2335,7 @@ fn check_function(
             lit_constraints: Vec::new(),
             method_resolutions: method_res,
             call_resolutions: call_res,
+            fn_item_addrs: fn_item_addrs_init,
             builtin_type_targets: btt,
             pattern_ergo: pat_ergo,
             const_uses: const_uses_init,
@@ -2278,6 +2372,7 @@ fn check_function(
             ctx.lit_constraints,
             ctx.method_resolutions,
             ctx.call_resolutions,
+            ctx.fn_item_addrs,
             ctx.builtin_type_targets,
             ctx.pattern_ergo,
             ctx.closure_records,
@@ -2574,6 +2669,22 @@ fn check_function(
                     type_args: concrete,
                 }));
             }
+            Some(PendingCall::Indirect { callee_local_name, param_infers, ret_infer }) => {
+                let mut params: Vec<RType> = Vec::with_capacity(param_infers.len());
+                let mut j = 0;
+                while j < param_infers.len() {
+                    params.push(subst.finalize(&param_infers[j]));
+                    j += 1;
+                }
+                let ret = subst.finalize(ret_infer);
+                call_resolutions_final.push(Some(CallResolution::Indirect {
+                    callee_local_name: callee_local_name.clone(),
+                    fn_ptr_ty: RType::FnPtr {
+                        params,
+                        ret: Box::new(ret),
+                    },
+                }));
+            }
             None => call_resolutions_final.push(None),
         }
         i += 1;
@@ -2674,6 +2785,7 @@ fn check_function(
         funcs.entries[e].const_uses = const_uses;
         funcs.entries[e].method_resolutions = method_resolutions;
         funcs.entries[e].call_resolutions = call_resolutions;
+        funcs.entries[e].fn_item_addrs = fn_item_addrs;
         funcs.entries[e].builtin_type_targets = builtin_type_targets;
         funcs.entries[e].pattern_ergo = pattern_ergo;
         funcs.entries[e].closures = closures;
@@ -2686,6 +2798,7 @@ fn check_function(
                 funcs.templates[t].const_uses = const_uses;
                 funcs.templates[t].method_resolutions = method_resolutions;
                 funcs.templates[t].call_resolutions = call_resolutions;
+                funcs.templates[t].fn_item_addrs = fn_item_addrs;
                 funcs.templates[t].builtin_type_targets = builtin_type_targets;
                 funcs.templates[t].pattern_ergo = pattern_ergo;
                 funcs.templates[t].closures = closures;
@@ -2717,6 +2830,15 @@ pub(crate) enum PendingCall {
         // var per construction site (or set to a concrete value if
         // the user wrote turbofish). Finalized at end-of-fn.
         type_var_ids: Vec<u32>,
+    },
+    // `f(args)` where `f` is a local of `fn(...) -> R` type. Records
+    // the local's name (codegen recovers the storage via local lookup)
+    // and the FnPtr's signature as InferTypes (finalized at end-of-fn
+    // and lowered to `CallResolution::Indirect` with concrete RTypes).
+    Indirect {
+        callee_local_name: String,
+        param_infers: Vec<InferType>,
+        ret_infer: InferType,
     },
 }
 
@@ -2906,6 +3028,13 @@ fn rtype_to_infer_with_opaque_vars(
             base: Box::new(rtype_to_infer_with_opaque_vars(base, subst, out)),
             trait_path: trait_path.clone(),
             name: name.clone(),
+        },
+        RType::FnPtr { params, ret } => InferType::FnPtr {
+            params: params
+                .iter()
+                .map(|p| rtype_to_infer_with_opaque_vars(p, subst, out))
+                .collect(),
+            ret: Box::new(rtype_to_infer_with_opaque_vars(ret, subst, out)),
         },
     }
 }
@@ -3754,6 +3883,67 @@ fn check_expr_inner(ctx: &mut CheckCtx, expr: &Expr) -> Result<InferType, Error>
                     ctx.const_uses[id] = Some(entry.value.clone());
                 }
                 return Ok(ty);
+            }
+            // Fn-item fallback: a bare path that resolves to a non-
+            // generic fn item is an fn-pointer value at this expression
+            // position. Generic fn items aren't supported as fn-pointer
+            // addresses today (would need higher-order type-arg
+            // threading); rejected with a directed error.
+            let single_fn = vec![name.clone()];
+            let fn_path = crate::typeck::use_scope::resolve_via_use_scopes(
+                &single_fn,
+                &ctx.use_scope,
+                |cand| func_lookup(ctx.funcs, cand).is_some()
+                    || template_lookup(ctx.funcs, cand).is_some(),
+            )
+            .or_else(|| {
+                let mut full = ctx.current_module.clone();
+                full.push(name.clone());
+                if func_lookup(ctx.funcs, &full).is_some()
+                    || template_lookup(ctx.funcs, &full).is_some()
+                {
+                    Some(full)
+                } else {
+                    None
+                }
+            });
+            if let Some(path) = fn_path {
+                if let Some(entry) = func_lookup(ctx.funcs, &path) {
+                    let mut callee_idx: Option<usize> = None;
+                    let mut k = 0;
+                    while k < ctx.funcs.entries.len() {
+                        if ctx.funcs.entries[k].path == path {
+                            callee_idx = Some(k);
+                            break;
+                        }
+                        k += 1;
+                    }
+                    let ret = entry
+                        .return_type
+                        .clone()
+                        .unwrap_or_else(|| RType::Tuple(Vec::new()));
+                    let fn_ptr_rt = RType::FnPtr {
+                        params: entry.param_types.clone(),
+                        ret: Box::new(ret),
+                    };
+                    if let Some(ci) = callee_idx {
+                        let id = expr.id as usize;
+                        if id < ctx.fn_item_addrs.len() {
+                            ctx.fn_item_addrs[id] = Some(ci);
+                        }
+                    }
+                    return Ok(rtype_to_infer(&fn_ptr_rt));
+                }
+                if template_lookup(ctx.funcs, &path).is_some() {
+                    return Err(Error {
+                        file: ctx.current_file.to_string(),
+                        message: format!(
+                            "cannot take address of generic fn `{}` as a fn pointer (specify type arguments to monomorphize first)",
+                            name
+                        ),
+                        span: expr.span.copy(),
+                    });
+                }
             }
             Err(Error {
                 file: ctx.current_file.to_string(),
@@ -5979,6 +6169,52 @@ fn check_cast(
 // resolves to the same `Fn::call` trait dispatch. Records the
 // callee's binding name on `ctx.bare_closure_calls[id]` so mono knows
 // to lower this Call as a MethodCall MonoExpr.
+// `f(args)` where `f: fn(T1, T2) -> R`. Type-check arity + each arg
+// against the FnPtr's params, record `PendingCall::Indirect` so the
+// finalizer lowers it to `CallResolution::Indirect` for codegen, and
+// return the FnPtr's return type.
+fn check_indirect_call(
+    ctx: &mut CheckCtx,
+    call: &Call,
+    call_expr: &Expr,
+    callee_name: String,
+    param_types: Vec<InferType>,
+    return_type: InferType,
+) -> Result<InferType, Error> {
+    if call.args.len() != param_types.len() {
+        return Err(Error {
+            file: ctx.current_file.to_string(),
+            message: format!(
+                "wrong number of arguments to fn pointer `{}`: expected {}, got {}",
+                callee_name,
+                param_types.len(),
+                call.args.len()
+            ),
+            span: call_expr.span.copy(),
+        });
+    }
+    let mut k = 0;
+    while k < call.args.len() {
+        let arg_ty = check_expr(ctx, &call.args[k])?;
+        ctx.subst.coerce(
+            &arg_ty,
+            &param_types[k],
+            ctx.traits,
+            ctx.type_params,
+            ctx.type_param_bounds,
+            &call.args[k].span,
+            ctx.current_file,
+        )?;
+        k += 1;
+    }
+    ctx.call_resolutions[call_expr.id as usize] = Some(PendingCall::Indirect {
+        callee_local_name: callee_name,
+        param_infers: param_types,
+        ret_infer: return_type.clone(),
+    });
+    Ok(return_type)
+}
+
 fn check_bare_closure_call(
     ctx: &mut CheckCtx,
     call: &Call,
@@ -6326,6 +6562,13 @@ fn check_call(ctx: &mut CheckCtx, call: &Call, call_expr: &Expr) -> Result<Infer
             };
             if is_closure {
                 return check_bare_closure_call(ctx, call, call_expr, name, ty);
+            }
+            // Local of `fn(...) -> R` type — dispatch as an indirect
+            // call. Type-check args against the FnPtr's params, then
+            // record `CallResolution::Indirect` so codegen emits args
+            // + `local.get callee` + `call_indirect`.
+            if let InferType::FnPtr { params, ret } = &resolved {
+                return check_indirect_call(ctx, call, call_expr, name, params.clone(), (**ret).clone());
             }
             // Type-param-typed local with an `Fn`/`FnMut`/`FnOnce`
             // bound — the canonical APIT path: `fn apply(f: impl

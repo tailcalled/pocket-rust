@@ -1338,6 +1338,20 @@ fn rtype_to_ast_type(rt: &RType, span: &Span, source_file: &str) -> Result<Type,
                 span: span.copy(),
             });
         }
+        RType::FnPtr { params, ret } => {
+            let mut new_params: Vec<Type> = Vec::with_capacity(params.len());
+            let mut i = 0;
+            while i < params.len() {
+                new_params.push(rtype_to_ast_type(&params[i], span, source_file)?);
+                i += 1;
+            }
+            let new_ret = if matches!(ret.as_ref(), RType::Tuple(v) if v.is_empty()) {
+                None
+            } else {
+                Some(Box::new(rtype_to_ast_type(ret, span, source_file)?))
+            };
+            TypeKind::FnPtr { params: new_params, ret: new_ret }
+        }
     };
     Ok(Type { kind, span: span.copy() })
 }

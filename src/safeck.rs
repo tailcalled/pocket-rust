@@ -268,7 +268,13 @@ fn walk_call(state: &mut SafeState, call: &Call, expr: &Expr) -> Result<(), Erro
         Some(CallResolution::Generic { template_idx, .. }) => {
             state.funcs.templates[*template_idx].is_unsafe
         }
-        Some(CallResolution::Variant { .. }) | None => false,
+        // Indirect calls don't carry an `unsafe` marker on the FnPtr
+        // type today (no `unsafe fn(...) -> R` syntax). When that lands,
+        // route the unsafe bit through the FnPtr's type and re-check
+        // here. For now: treat as safe.
+        Some(CallResolution::Variant { .. })
+        | Some(CallResolution::Indirect { .. })
+        | None => false,
     };
     if callee_unsafe && !state.in_unsafe {
         return Err(Error {

@@ -1732,6 +1732,36 @@ impl Parser {
                 span,
             });
         }
+        if self.peek_kind(&TokenKind::Fn) {
+            // `fn(T1, T2) -> R` — a function-pointer type. Return type
+            // is optional (`fn(T)` returns `()`).
+            let fn_span = self.expect(&TokenKind::Fn, "`fn`")?;
+            self.expect(&TokenKind::LParen, "`(`")?;
+            let mut params: Vec<Type> = Vec::new();
+            if !self.peek_kind(&TokenKind::RParen) {
+                params.push(self.parse_type()?);
+                while self.peek_kind(&TokenKind::Comma) {
+                    self.pos += 1;
+                    if self.peek_kind(&TokenKind::RParen) {
+                        break;
+                    }
+                    params.push(self.parse_type()?);
+                }
+            }
+            let rp = self.expect(&TokenKind::RParen, "`)`")?;
+            let (ret, end) = if self.peek_kind(&TokenKind::Arrow) {
+                self.pos += 1;
+                let r = self.parse_type()?;
+                let end = r.span.end.copy();
+                (Some(Box::new(r)), end)
+            } else {
+                (None, rp.end)
+            };
+            return Ok(Type {
+                kind: TypeKind::FnPtr { params, ret },
+                span: Span::new(fn_span.start, end),
+            });
+        }
         let path = self.parse_path_with_type_args()?;
         let span = path.span.copy();
         Ok(Type {

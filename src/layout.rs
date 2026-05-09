@@ -336,6 +336,16 @@ fn walk_expr_address(expr: &MonoExpr, addressed: &mut Vec<bool>) {
                 i += 1;
             }
         }
+        // FnItemAddr: pure constant, no inner exprs to address.
+        MonoExprKind::FnItemAddr { .. } => {}
+        MonoExprKind::CallIndirect { callee, args, .. } => {
+            walk_expr_address(callee, addressed);
+            let mut i = 0;
+            while i < args.len() {
+                walk_expr_address(&args[i], addressed);
+                i += 1;
+            }
+        }
     }
 }
 

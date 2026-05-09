@@ -1521,6 +1521,11 @@ fn fill_assoc_trait_path_via_closure(
         | RType::Never
         | RType::Char
         | RType::Opaque { .. } => rt.clone(),
+        RType::FnPtr { params, ret } => {
+            let new_params: Vec<RType> = params.iter().map(|p| recurse(p)).collect();
+            let new_ret = recurse(ret);
+            RType::FnPtr { params: new_params, ret: Box::new(new_ret) }
+        }
     }
 }
 
@@ -1676,6 +1681,11 @@ fn walk_resolve_self_proj(
         | RType::Never
         | RType::Char
         | RType::Opaque { .. } => rt.clone(),
+        RType::FnPtr { params, ret } => {
+            let new_params: Vec<RType> = params.iter().map(|p| recurse(p)).collect();
+            let new_ret = recurse(ret);
+            RType::FnPtr { params: new_params, ret: Box::new(new_ret) }
+        }
     }
 }
 
@@ -1746,6 +1756,14 @@ fn fill_assoc_trait_path(rt: &RType, default_trait_path: &Vec<String>) -> RType 
         | RType::Never
         | RType::Char
         | RType::Opaque { .. } => rt.clone(),
+        RType::FnPtr { params, ret } => {
+            let new_params: Vec<RType> = params
+                .iter()
+                .map(|p| fill_assoc_trait_path(p, default_trait_path))
+                .collect();
+            let new_ret = fill_assoc_trait_path(ret, default_trait_path);
+            RType::FnPtr { params: new_params, ret: Box::new(new_ret) }
+        }
     }
 }
 
@@ -2647,6 +2665,18 @@ fn rewrite_rpit_in_type(
         TypeKind::SelfType => TypeKind::SelfType,
         TypeKind::Never => TypeKind::Never,
         TypeKind::Placeholder => TypeKind::Placeholder,
+        TypeKind::FnPtr { params, ret } => {
+            let mut new_params: Vec<Type> = Vec::with_capacity(params.len());
+            let mut i = 0;
+            while i < params.len() {
+                new_params.push(rewrite_rpit_in_type(&params[i], synth_names, bounds_per_slot));
+                i += 1;
+            }
+            let new_ret = ret
+                .as_ref()
+                .map(|r| Box::new(rewrite_rpit_in_type(r, synth_names, bounds_per_slot)));
+            TypeKind::FnPtr { params: new_params, ret: new_ret }
+        }
     };
     Type { kind, span: ty.span.copy() }
 }
@@ -2710,6 +2740,10 @@ fn substitute_rpit_synths_to_opaque(
         | RType::Never
         | RType::Char
         | RType::Opaque { .. } => rt.clone(),
+        RType::FnPtr { params, ret } => RType::FnPtr {
+            params: params.iter().map(&recurse).collect(),
+            ret: Box::new(recurse(ret)),
+        },
     }
 }
 
@@ -3332,6 +3366,7 @@ pub(super) fn register_function(
             is_unsafe: f.is_unsafe,
             method_resolutions: Vec::new(),
             call_resolutions: Vec::new(),
+            fn_item_addrs: Vec::new(),
             moved_places: Vec::new(),
             move_sites: Vec::new(),
             builtin_type_targets: Vec::new(),
@@ -3393,6 +3428,7 @@ pub(super) fn register_function(
             is_unsafe: f.is_unsafe,
             method_resolutions: Vec::new(),
             call_resolutions: Vec::new(),
+            fn_item_addrs: Vec::new(),
             moved_places: Vec::new(),
             move_sites: Vec::new(),
             builtin_type_targets: Vec::new(),

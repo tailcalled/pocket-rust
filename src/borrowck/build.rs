@@ -46,6 +46,13 @@ pub struct CfgBuildCtx<'a> {
     // `Some(value)`. Borrowck lowers such Vars to inline constant
     // operands rather than place reads — consts have no place.
     pub const_uses: &'a Vec<Option<crate::typeck::ConstValue>>,
+    // Per-NodeId fn-item address (see `FnSymbol.fn_item_addrs`). When
+    // a `Var(name)` resolves to a fn item being coerced into an
+    // `RType::FnPtr` slot, the entry is `Some(callee_idx)`. Borrowck
+    // treats the value as a Copy scalar (the funcref slot index) with
+    // no underlying place to track — emitted as a placeholder constant
+    // operand.
+    pub fn_item_addrs: &'a Vec<Option<usize>>,
     // User-declared lifetime parameter names on the fn (for `<'a, 'b>`
     // — empty if the fn has no lifetime generics). Used by Phase L1 to
     // populate `RegionGraph.sig_named`.
@@ -306,6 +313,14 @@ fn collect_sig_regions(rt: &RType, graph: &mut crate::borrowck::cfg::RegionGraph
         | RType::Never
         | RType::Param(_)
         | RType::Opaque { .. } => {}
+        // FnPtr inner types may carry refs/lifetime args. Recurse so
+        // any inferred lifetimes inside get a region id.
+        RType::FnPtr { params, ret } => {
+            for p in params {
+                collect_sig_regions(p, graph, counter);
+            }
+            collect_sig_regions(ret, graph, counter);
+        }
     }
 }
 
@@ -1054,6 +1069,12 @@ fn collect_callee_inferred(
         | RType::Never
         | RType::Param(_)
         | RType::Opaque { .. } => {}
+        RType::FnPtr { params, ret } => {
+            for p in params {
+                collect_callee_inferred(p, out, counter);
+            }
+            collect_callee_inferred(ret, out, counter);
+        }
     }
 }
 
@@ -1430,6 +1451,17 @@ impl<'a> Builder<'a> {
                             ConstValue::Str(s) => OperandKind::ConstStr(s.clone()),
                         };
                         return Operand { kind, span, node_id: nid };
+                    }
+                }
+                // Fn-item-address fallback: typeck records a callee_idx
+                // when a bare-name Var coerces into an FnPtr slot. The
+                // value is a Copy i32 (funcref-table slot resolved at
+                // codegen); borrowck has no place to track, so emit a
+                // ConstInt(0) placeholder. The actual slot value is
+                // computed in codegen via `intern_table_slot`.
+                if let Some(opt) = self.ctx.fn_item_addrs.get(expr.id as usize) {
+                    if opt.is_some() {
+                        return Operand { kind: OperandKind::ConstInt(0), span, node_id: nid };
                     }
                 }
                 let local = self.lookup(name).expect("typeck verified");
@@ -1883,6 +1915,15 @@ impl<'a> Builder<'a> {
                     disc: *disc,
                     fields: VariantFields::Tuple(args),
                 };
+            }
+            Some(CallResolution::Indirect { callee_local_name, .. }) => {
+                // Indirect call through an FnPtr local — borrowck has
+                // no signature-level lifetime relationships to trace
+                // (the FnPtr value itself is Copy + carries no borrow
+                // edges), so synthesize a single-segment placeholder
+                // path with the local name. Borrow propagation through
+                // args still happens via `args` above.
+                CallTarget::Path(vec![callee_local_name.clone()])
             }
             None => {
                 // Unresolved call — typeck would have errored. Use a

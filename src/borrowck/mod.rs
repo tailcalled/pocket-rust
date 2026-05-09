@@ -175,7 +175,7 @@ fn check_function(
     let cfg_move_sites: Vec<(crate::ast::NodeId, String)>;
     {
         let funcs_ro: &FuncTable = &*funcs;
-        let (param_types, expr_types, method_resolutions, call_resolutions, bare_closure_calls, type_params, type_param_bounds, pattern_ergo, lifetime_params, lifetime_predicates, const_uses) =
+        let (param_types, expr_types, method_resolutions, call_resolutions, bare_closure_calls, type_params, type_param_bounds, pattern_ergo, lifetime_params, lifetime_predicates, const_uses, fn_item_addrs) =
             if let Some(entry) = func_lookup(funcs_ro, &full) {
                 (
                     &entry.param_types,
@@ -189,6 +189,7 @@ fn check_function(
                     &entry.lifetime_params,
                     &entry.lifetime_predicates,
                     &entry.const_uses,
+                    &entry.fn_item_addrs,
                 )
             } else if let Some((_, t)) = template_lookup(funcs_ro, &full) {
                 let mut bounds_clone: Vec<Vec<Vec<String>>> = Vec::new();
@@ -215,6 +216,7 @@ fn check_function(
                     &t.lifetime_params,
                     &t.lifetime_predicates,
                     &t.const_uses,
+                    &t.fn_item_addrs,
                 )
             } else {
                 unreachable!("typeck registered this function");
@@ -243,6 +245,7 @@ fn check_function(
             call_resolutions,
             bare_closure_calls,
             const_uses,
+            fn_item_addrs,
             type_params: &type_params,
             type_param_bounds: &type_param_bounds,
             param_types,

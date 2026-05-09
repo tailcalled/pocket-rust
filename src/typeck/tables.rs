@@ -407,6 +407,12 @@ pub struct FnSymbol {
     pub method_resolutions: Vec<Option<MethodResolution>>,
     // Per `Call` expression, indexed by Expr.id.
     pub call_resolutions: Vec<Option<CallResolution>>,
+    // Per-NodeId fn-item address — populated when a bare-name `Var(name)`
+    // expression resolved to a non-generic fn item in an fn-pointer-typed
+    // position. Stores the FuncTable callee_idx; codegen looks up the
+    // wasm idx and emits `i32.const intern_table_slot(wasm_idx)`. None
+    // for every other expr id.
+    pub fn_item_addrs: Vec<Option<usize>>,
     // T4.6: places whose move-state at the binding's scope-end was non-Init,
     // snapshotted from borrowck's walk. Codegen consults this to decide what
     // to do at each Drop binding's drop point: `Init` means the binding
@@ -500,6 +506,14 @@ pub enum CallResolution {
         disc: u32,
         type_args: Vec<RType>,
     },
+    // Indirect call through a local of `fn(...) -> R` type. The local
+    // holds the funcref-table slot index; codegen emits the args, then
+    // a `local.get` (via the recorded callee place), then `call_indirect`
+    // with a typeidx interned from the FnPtr's signature.
+    Indirect {
+        callee_local_name: String,
+        fn_ptr_ty: RType,
+    },
 }
 
 // A generic function declaration. Its body is type-checked once,
@@ -555,6 +569,8 @@ pub struct GenericTemplate {
     pub impl_target: Option<RType>,
     pub method_resolutions: Vec<Option<MethodResolution>>,
     pub call_resolutions: Vec<Option<CallResolution>>,
+    // Per-NodeId fn-item address — see `FnSymbol.fn_item_addrs`.
+    pub fn_item_addrs: Vec<Option<usize>>,
     // T4.6: see FnSymbol.moved_places. For templates the snapshot is taken
     // from the polymorphic body walk and reused across monomorphizations
     // (move semantics don't depend on concrete type args).

@@ -1475,5 +1475,13 @@ fn collect_sized_required_params(t: &RType, sized_ctx: bool, out: &mut Vec<Strin
         // hidden concrete type are enforced when the body's actual
         // return type is validated against the slot's bounds.
         RType::Opaque { .. } => {}
+        // FnPtr is itself Sized; recurse into params + ret to catch any
+        // Param bindings nested under fn-ptr type-args.
+        RType::FnPtr { params, ret } => {
+            for p in params {
+                collect_sized_required_params(p, true, out);
+            }
+            collect_sized_required_params(ret, true, out);
+        }
     }
 }

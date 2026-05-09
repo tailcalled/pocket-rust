@@ -85,6 +85,16 @@ pub fn freshen_inferred_lifetimes(rt: &mut RType, next_id: &mut u32) {
         // Opaque carries no lifetime args — the bounds + pin are
         // tracked on the FnSymbol, not on the RType node.
         RType::Opaque { .. } => {}
+        // FnPtr carries no lifetime args of its own at the FnPtr layer
+        // (no HRTB syntax yet), but inner refs may. Recurse into params + ret.
+        RType::FnPtr { params, ret } => {
+            let mut i = 0;
+            while i < params.len() {
+                freshen_inferred_lifetimes(&mut params[i], next_id);
+                i += 1;
+            }
+            freshen_inferred_lifetimes(ret, next_id);
+        }
     }
 }
 
@@ -164,6 +174,14 @@ pub fn require_no_inferred_lifetimes(
         RType::Never => Ok(()),
         RType::Char => Ok(()),
         RType::Opaque { .. } => Ok(()),
+        RType::FnPtr { params, ret } => {
+            let mut i = 0;
+            while i < params.len() {
+                require_no_inferred_lifetimes(&params[i], span, file)?;
+                i += 1;
+            }
+            require_no_inferred_lifetimes(ret, span, file)
+        }
     }
 }
 
@@ -227,6 +245,14 @@ pub fn validate_named_lifetimes(
         RType::Never => Ok(()),
         RType::Char => Ok(()),
         RType::Opaque { .. } => Ok(()),
+        RType::FnPtr { params, ret } => {
+            let mut i = 0;
+            while i < params.len() {
+                validate_named_lifetimes(&params[i], lifetime_params, span, file)?;
+                i += 1;
+            }
+            validate_named_lifetimes(ret, lifetime_params, span, file)
+        }
     }
 }
 

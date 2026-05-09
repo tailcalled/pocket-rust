@@ -13,15 +13,28 @@ Structured representation of WASM constructs:
 - `Export` — exports user crate-root functions by name.
 - `FuncBody` — function locals + instructions.
 - `Data` — data segments (active-mode only).
-- `Instruction` — covering `const`/`get`/`set`/`call`/`drop`, arithmetic on `i32`/`i64`, load/store with `align`/`offset` immediates, structured `Block`/`Loop`/`If`/`Else`/`End`/`Br`/`BrIf`/`Return`/`Unreachable`.
+- `func_table: Vec<u32>` — function-pointer / vtable backing storage. Each entry is a wasm function index (the same value a `Call(idx)` would use, after the import offset). Drives both the Table and Element sections at encode time.
+- `Instruction` — covering `const`/`get`/`set`/`call`/`call_indirect`/`drop`, arithmetic on `i32`/`i64`, load/store with `align`/`offset` immediates, structured `Block`/`Loop`/`If`/`Else`/`End`/`Br`/`BrIf`/`Return`/`Unreachable`.
 
 Plus byte encoding (`Module::encode`).
 
 ## Encoders
 
 - uLEB128 / sLEB128 writers.
-- Per-section encoders for type / function / memory / global / export / code / data sections.
-- Section ordering follows the wasm spec.
+- Per-section encoders for type / function / table / memory / global / export / element / code / data sections.
+- Section ordering follows the wasm spec: Type(1) → Import(2) → Function(3) → Table(4) → Memory(5) → Global(6) → Export(7) → Element(9) → Code(10) → Data(11).
+
+## Function table + Element section
+
+Indirect calls (function pointers, dyn-trait vtables) dispatch through a single funcref table populated at module-init time. The mechanism:
+
+- `Module::intern_table_slot(wasm_idx) -> u32` — call to reserve a table slot for a function. Returns the slot index; deduplicates so repeated calls with the same `wasm_idx` collapse to one slot. Codegen calls this when it lowers a fn-pointer coercion or builds a vtable entry.
+- A non-empty `func_table` triggers two sections at encode time:
+  - **Table section (id 4)** — declares one funcref table sized `min == max == func_table.len()`. The table never grows at runtime.
+  - **Element section (id 9)** — one MVP active-mode segment (flag byte `0x00`), placing every entry at offset 0 of table 0. Encoded as `0x00 | i32.const 0 ; end | vec(funcidx)`.
+- `Instruction::CallIndirect { type_idx, table_idx }` (opcode `0x11`) — stack discipline: args first, then the i32 table slot, then the instruction; results land per the referenced FuncType. `table_idx` is always 0 today (only one funcref table); kept as a field for forward-compat.
+
+If `func_table` is empty, neither section is emitted, so existing module shapes are byte-identical to before.
 
 ## `BlockType` variants
 

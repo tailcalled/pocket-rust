@@ -198,6 +198,16 @@ pub enum RType {
         fn_path: Vec<String>,
         slot: u32,
     },
+    // `fn(T1, T2) -> R` — a function-pointer type. Carries the same
+    // payload shape as the AST `TypeKind::FnPtr` but with resolved
+    // RTypes. Layout: a single i32 at runtime — an index into the
+    // module's funcref table. Created via `resolve_type` from
+    // `TypeKind::FnPtr` and via coercion from a bare fn-item name in
+    // a position that demands an FnPtr.
+    FnPtr {
+        params: Vec<RType>,
+        ret: Box<RType>,
+    },
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -294,6 +304,10 @@ pub fn rtype_eq(a: &RType, b: &RType) -> bool {
         ) => ta == tb && na == nb && rtype_eq(ba, bb),
         (RType::Never, RType::Never) => true,
         (RType::Char, RType::Char) => true,
+        (
+            RType::FnPtr { params: pa, ret: ra },
+            RType::FnPtr { params: pb, ret: rb },
+        ) => rtype_vec_eq(pa, pb) && rtype_eq(ra, rb),
         _ => false,
     }
 }
@@ -318,6 +332,9 @@ pub fn rtype_contains_param(t: &RType) -> bool {
         // concrete type is resolved through the FnSymbol's pin, not
         // by walking the RType tree.
         RType::Opaque { .. } => false,
+        RType::FnPtr { params, ret } => {
+            params.iter().any(rtype_contains_param) || rtype_contains_param(ret)
+        }
     }
 }
 
@@ -401,6 +418,23 @@ pub fn rtype_to_string(t: &RType) -> String {
         RType::Never => "!".to_string(),
         RType::Char => "char".to_string(),
         RType::Opaque { fn_path, slot } => format!("impl <{}#{}>", place_to_string(fn_path), slot),
+        RType::FnPtr { params, ret } => {
+            let mut s = String::from("fn(");
+            let mut i = 0;
+            while i < params.len() {
+                if i > 0 {
+                    s.push_str(", ");
+                }
+                s.push_str(&rtype_to_string(&params[i]));
+                i += 1;
+            }
+            s.push(')');
+            if !matches!(ret.as_ref(), RType::Tuple(v) if v.is_empty()) {
+                s.push_str(" -> ");
+                s.push_str(&rtype_to_string(ret));
+            }
+            s
+        }
     }
 }
 
@@ -458,6 +492,7 @@ pub fn rtype_size(ty: &RType, structs: &StructTable) -> u32 {
         RType::Opaque { .. } => unreachable!(
             "rtype_size called on Opaque RPIT type — codegen must resolve to the FnSymbol's rpit_pin first"
         ),
+        RType::FnPtr { .. } => 1,
     }
 }
 
@@ -536,6 +571,8 @@ pub fn flatten_rtype(ty: &RType, structs: &StructTable, out: &mut Vec<crate::was
         RType::Opaque { .. } => unreachable!(
             "flatten_rtype called on Opaque RPIT type — codegen must resolve to the FnSymbol's rpit_pin first"
         ),
+        // Single i32 — the funcref-table slot index.
+        RType::FnPtr { .. } => out.push(crate::wasm::ValType::I32),
     }
 }
 
@@ -604,6 +641,8 @@ pub fn byte_size_of(rt: &RType, structs: &StructTable, enums: &EnumTable) -> u32
         RType::Opaque { .. } => unreachable!(
             "byte_size_of called on Opaque RPIT type — codegen must resolve to the FnSymbol's rpit_pin first"
         ),
+        // Funcref-table slot index — 4 bytes.
+        RType::FnPtr { .. } => 4,
     }
 }
 
@@ -715,6 +754,10 @@ pub fn substitute_rtype(rt: &RType, env: &Vec<(String, RType)>) -> RType {
             fn_path: fn_path.clone(),
             slot: *slot,
         },
+        RType::FnPtr { params, ret } => RType::FnPtr {
+            params: params.iter().map(|p| substitute_rtype(p, env)).collect(),
+            ret: Box::new(substitute_rtype(ret, env)),
+        },
     }
 }
 
@@ -774,6 +817,10 @@ pub fn peel_opaque(rt: &RType, funcs: &FuncTable) -> RType {
         | RType::Never
         | RType::Char
         | RType::Param(_) => rt.clone(),
+        RType::FnPtr { params, ret } => RType::FnPtr {
+            params: params.iter().map(|p| peel_opaque(p, funcs)).collect(),
+            ret: Box::new(peel_opaque(ret, funcs)),
+        },
     }
 }
 
@@ -818,6 +865,12 @@ pub fn is_copy_with_bounds(
     type_params: &Vec<String>,
     type_param_bounds: &Vec<Vec<Vec<String>>>,
 ) -> bool {
+    // FnPtr is unconditionally Copy: it's a single i32 table slot.
+    // There's no way to express `impl<...> Copy for fn(...) -> R` in
+    // source (no fn-ptr-shaped type pattern), so special-case here.
+    if matches!(t, RType::FnPtr { .. }) {
+        return true;
+    }
     solve_impl_in_ctx(&copy_trait_path(), t, traits, type_params, type_param_bounds, 0).is_some()
 }
 

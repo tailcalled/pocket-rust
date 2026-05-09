@@ -338,6 +338,22 @@ fn walk(
         | RType::Str
         | RType::Never
         | RType::Opaque { .. } => {}
+        // Function pointers are covariant in their return type and
+        // contravariant in their parameters (the same convention rustc
+        // uses for `fn(T) -> R`). Conservative for now: walk both at
+        // `Invariant` so layout-affecting variance never widens too far.
+        // No fields of `&fn(...)` exist in pocket-rust today, so this
+        // only matters once a struct stores an FnPtr generically — at
+        // which point we can revisit.
+        RType::FnPtr { params, ret } => {
+            let inv = compose(position, Variance::Invariant);
+            let mut i = 0;
+            while i < params.len() {
+                walk(&params[i], inv, tp_names, lp_names, out_tp, out_lp, structs, enums, struct_snap, enum_snap);
+                i += 1;
+            }
+            walk(ret, inv, tp_names, lp_names, out_tp, out_lp, structs, enums, struct_snap, enum_snap);
+        }
     }
 }
 

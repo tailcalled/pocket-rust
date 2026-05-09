@@ -609,6 +609,22 @@ fn try_match_rtype_ctx(
             try_match_rtype_ctx(ia, ib, subst, true)
         }
         (RType::Str, RType::Str) => true,
+        (
+            RType::FnPtr { params: pa, ret: ra },
+            RType::FnPtr { params: pb, ret: rb },
+        ) => {
+            if pa.len() != pb.len() {
+                return false;
+            }
+            let mut i = 0;
+            while i < pa.len() {
+                if !try_match_rtype_ctx(&pa[i], &pb[i], subst, true) {
+                    return false;
+                }
+                i += 1;
+            }
+            try_match_rtype_ctx(ra, rb, subst, true)
+        }
         _ => false,
     }
 }
@@ -780,6 +796,25 @@ fn try_match_against_infer_ctx(
         RType::Opaque { fn_path: pa_fp, slot: pa_slot } => match resolved {
             InferType::Opaque { fn_path: rb_fp, slot: rb_slot } => {
                 pa_fp == &rb_fp && *pa_slot == rb_slot
+            }
+            _ => false,
+        },
+        // Two function-pointer types match structurally: same arity,
+        // recursing on each param + ret. Recursion uses a Sized context
+        // — fn-ptr params/ret are always Sized.
+        RType::FnPtr { params: pa, ret: ra } => match resolved {
+            InferType::FnPtr { params: rb, ret: rb_ret } => {
+                if pa.len() != rb.len() {
+                    return false;
+                }
+                let mut i = 0;
+                while i < pa.len() {
+                    if !try_match_against_infer_ctx(&pa[i], &rb[i], subst, env, pending, true) {
+                        return false;
+                    }
+                    i += 1;
+                }
+                try_match_against_infer_ctx(ra, &rb_ret, subst, env, pending, true)
             }
             _ => false,
         },

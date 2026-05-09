@@ -48,6 +48,11 @@ pub struct MonoFnInput<'a> {
     // the Var is a const reference and gets lowered to a `Lit`
     // MonoExpr carrying the value.
     pub const_uses: Vec<Option<crate::typeck::ConstValue>>,
+    // Per-NodeId fn-item address (see `FnSymbol.fn_item_addrs`). At
+    // each `Var` lowering site, mono checks this table; if Some, the
+    // Var is a fn-item-as-fn-pointer and lowers to `MonoExprKind::
+    // FnItemAddr` carrying the resolved wasm idx.
+    pub fn_item_addrs: Vec<Option<usize>>,
     pub wasm_idx: u32,
     pub is_export: bool,
 }
@@ -1520,6 +1525,22 @@ pub enum MonoExprKind {
         wasm_idx: u32,
         args: Vec<MonoExpr>,
     },
+    // Take the address of a fn item — yields an i32 funcref-table slot.
+    // `wasm_idx` is the function's wasm index; codegen calls
+    // `intern_table_slot(wasm_idx)` to materialize the slot index, then
+    // emits `i32.const <slot>`.
+    FnItemAddr {
+        wasm_idx: u32,
+    },
+    // Indirect call through an FnPtr value. `callee` lowers to the
+    // value (an i32 table slot). `fn_ptr_ty` carries the signature so
+    // codegen can intern the matching FuncType in `wasm.types` and
+    // pass the typeidx to `call_indirect`.
+    CallIndirect {
+        callee: Box<MonoExpr>,
+        args: Vec<MonoExpr>,
+        fn_ptr_ty: RType,
+    },
     // Pre-resolved method dispatch. `recv_adjust` says whether to
     // emit `&recv` / `&mut recv` / `recv` / pass-through.
     MethodCall {
@@ -1913,10 +1934,17 @@ fn lower_expr(ctx: &mut LowerCtx, expr: &Expr) -> Result<MonoExpr, Error> {
         ExprKind::CharLit(c) => MonoExprKind::Lit(MonoLit::Char(*c)),
         ExprKind::StrLit(s) => MonoExprKind::Lit(MonoLit::Str(s.clone())),
         ExprKind::Var(name) => {
+            // Fn-item-as-fn-pointer takes priority over local lookup —
+            // typeck only records `fn_item_addrs[id]` when the Var
+            // resolved to a fn item (no local of the same name).
+            if let Some(Some(callee_idx)) = ctx.input.fn_item_addrs.get(expr.id as usize) {
+                let wasm_idx = ctx.funcs.entries[*callee_idx].idx;
+                MonoExprKind::FnItemAddr { wasm_idx }
+            }
             // Const reference takes priority over local lookup —
             // typeck only records `const_uses[id]` when the Var failed
             // to resolve as a local, so the two can't both fire.
-            if let Some(slot) = ctx.input.const_uses.get(expr.id as usize) {
+            else if let Some(slot) = ctx.input.const_uses.get(expr.id as usize) {
                 if let Some(value) = slot {
                     let lit = match value {
                         crate::typeck::ConstValue::Int { magnitude, negated } => {
@@ -2301,6 +2329,35 @@ fn lower_expr(ctx: &mut LowerCtx, expr: &Expr) -> Result<MonoExpr, Error> {
                         type_args: type_args.clone(),
                         disc: *disc,
                         payload: out_args,
+                    }
+                }
+                CallResolution::Indirect { callee_local_name, fn_ptr_ty } => {
+                    // Resolve the callee local by name to a BindingId,
+                    // then emit a CallIndirect. The callee's value (an
+                    // i32 table slot) lowers via the standard
+                    // `MonoExprKind::Local` path. The signature drives
+                    // the typeidx at codegen.
+                    let binding_id = match ctx.lookup(callee_local_name) {
+                        Some(id) => id,
+                        None => return Err(Error {
+                            file: String::new(),
+                            message: format!(
+                                "lower_to_mono: callee local `{}` not found in scope",
+                                callee_local_name
+                            ),
+                            span,
+                        }),
+                    };
+                    let callee_ty = fn_ptr_ty.clone();
+                    let callee = MonoExpr {
+                        kind: MonoExprKind::Local(binding_id, u32::MAX),
+                        ty: callee_ty,
+                        span: span.copy(),
+                    };
+                    MonoExprKind::CallIndirect {
+                        callee: Box::new(callee),
+                        args: out_args,
+                        fn_ptr_ty: fn_ptr_ty.clone(),
                     }
                 }
             }

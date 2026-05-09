@@ -230,6 +230,7 @@ mod compound_assign;
 mod const_items;
 mod derives;
 mod enums;
+mod fn_pointers;
 mod generics;
 mod if_exprs;
 mod int_literals;

@@ -422,6 +422,41 @@ pub fn resolve_type(
             message: "type placeholder `_` is only allowed in turbofish args and `let` annotations".to_string(),
             span: ty.span.copy(),
         }),
+        TypeKind::FnPtr { params, ret } => {
+            let mut rparams: Vec<RType> = Vec::with_capacity(params.len());
+            let mut i = 0;
+            while i < params.len() {
+                rparams.push(resolve_type(
+                    &params[i],
+                    current_module,
+                    structs,
+                    enums,
+                    aliases,
+                    self_target,
+                    type_params,
+                    use_scope,
+                    reexports,
+                    file,
+                )?);
+                i += 1;
+            }
+            let rret = match ret {
+                Some(r) => resolve_type(
+                    r,
+                    current_module,
+                    structs,
+                    enums,
+                    aliases,
+                    self_target,
+                    type_params,
+                    use_scope,
+                    reexports,
+                    file,
+                )?,
+                None => RType::Tuple(Vec::new()),
+            };
+            Ok(RType::FnPtr { params: rparams, ret: Box::new(rret) })
+        }
     }
 }
 

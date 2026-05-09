@@ -34,6 +34,18 @@ struct MonoState {
     str_pool_bytes: Vec<u8>,
     str_pool_entries: Vec<StrPoolEntry>,
     str_pool_base_offset: u32,
+    // Function-pointer / vtable table-slot requests, accumulated during
+    // body codegen. Each entry is a wasm function index; the slot index
+    // is `table_base_offset + entry's position`. Deduplicates the same
+    // wasm idx across multiple `FnItemAddr` sites. Flushed into
+    // `wasm_mod.func_table` at end of crate codegen.
+    pending_table_slots: Vec<u32>,
+    // Cumulative size of earlier crates' func_table contributions, set
+    // at MonoState construction time. `intern_table_slot` returns
+    // `table_base_offset + local_index` so the emitted slot indices
+    // remain valid after this crate's pending entries are appended to
+    // the shared `wasm_mod.func_table`.
+    table_base_offset: u32,
 }
 
 struct StrPoolEntry {
@@ -48,7 +60,25 @@ impl MonoState {
             str_pool_bytes: Vec::new(),
             str_pool_entries: Vec::new(),
             str_pool_base_offset,
+            pending_table_slots: Vec::new(),
+            table_base_offset: 0,
         }
+    }
+
+    // Reserve a func-table slot for `wasm_idx`, returning the absolute
+    // slot index (already shifted by any earlier-crate contributions).
+    // Repeated calls with the same wasm_idx collapse to one slot.
+    fn intern_table_slot(&mut self, wasm_idx: u32) -> u32 {
+        let mut i = 0;
+        while i < self.pending_table_slots.len() {
+            if self.pending_table_slots[i] == wasm_idx {
+                return self.table_base_offset + i as u32;
+            }
+            i += 1;
+        }
+        let slot = self.pending_table_slots.len() as u32;
+        self.pending_table_slots.push(wasm_idx);
+        self.table_base_offset + slot
     }
 
     // Intern a string literal into this crate's pool. Returns the
@@ -148,7 +178,9 @@ pub fn emit(
     // helper claims an idx; without bumping `next_idx`, the user
     // crate's typeck would later register `answer` at the same idx
     // and the wasm export would point at the mono'd helper's body.)
+    let table_base_offset: u32 = wasm_mod.func_table.len() as u32;
     let mut mono = MonoState::new(*next_idx, str_pool_base_offset);
+    mono.table_base_offset = table_base_offset;
     // Eager mono expansion: walk every reachable function body and
     // intern each (template, args) pair before any byte emission. Then
     // codegen iterates the populated mono table to emit bodies. Any
@@ -214,6 +246,21 @@ pub fn emit(
         wasm_mod.globals[1].init =
             wasm::Instruction::I32Const((STR_POOL_BASE as i32) + (new_total as i32));
     }
+    // Flush this crate's func-table contributions into the wasm module.
+    // Each pending entry is a wasm function index; appending to
+    // `wasm_mod.func_table` materializes the matching Table + Element
+    // sections at encode time. Slot indices in `i32.const` instructions
+    // we already emitted are local to this crate's contribution, so when
+    // a prior crate already populated entries we shift by the existing
+    // length. Today only one crate ever populates fn-pointer slots (the
+    // user crate), so this shifting is conservative.
+    let table_base = wasm_mod.func_table.len() as u32;
+    let mut i = 0;
+    while i < mono.pending_table_slots.len() {
+        wasm_mod.func_table.push(mono.pending_table_slots[i]);
+        i += 1;
+    }
+    let _ = table_base;
     Ok(())
 }
 
@@ -524,6 +571,13 @@ fn collect_leaves(
         RType::Opaque { .. } => unreachable!(
             "collect_leaves on Opaque RPIT — typeck should have substituted via FnSymbol.rpit_slots[slot].pin before codegen reaches layout"
         ),
+        // FnPtr is a single i32 leaf (the funcref-table slot index).
+        RType::FnPtr { .. } => out.push(MemLeaf {
+            byte_offset: base_offset,
+            byte_size: 4,
+            signed: false,
+            valtype: wasm::ValType::I32,
+        }),
     }
 }
 
@@ -789,6 +843,7 @@ fn build_mono_input_for_template<'a>(
         pattern_ergo: tmpl.pattern_ergo.clone(),
         bare_closure_calls: tmpl.bare_closure_calls.clone(),
         const_uses: tmpl.const_uses.clone(),
+        fn_item_addrs: tmpl.fn_item_addrs.clone(),
         wasm_idx,
         is_export: false, // monomorphic instances are never exported
     }
@@ -870,6 +925,12 @@ fn subst_opt_call_resolutions(
                 disc: *disc,
                 type_args: subst_vec(type_args, env, funcs),
             },
+            CallResolution::Indirect { callee_local_name, fn_ptr_ty } => {
+                CallResolution::Indirect {
+                    callee_local_name: callee_local_name.clone(),
+                    fn_ptr_ty: substitute_rtype(fn_ptr_ty, env),
+                }
+            }
         }));
     }
     out
@@ -930,6 +991,7 @@ fn emit_function(
         pattern_ergo: entry.pattern_ergo.clone(),
         bare_closure_calls: entry.bare_closure_calls.clone(),
         const_uses: entry.const_uses.clone(),
+        fn_item_addrs: entry.fn_item_addrs.clone(),
         wasm_idx: entry.idx,
         is_export: current_module.is_empty() && path_prefix.len() == current_module.len(),
     };
@@ -2311,6 +2373,22 @@ fn stash_match_scrutinee(ctx: &mut FnCtx, ty: &RType) -> PatScrut {
         }
         PatScrut::Locals { start }
     }
+}
+
+// Intern a FuncType into the per-fn `pending_types` vec, returning the
+// global typeidx (`pending_types_base + position`). Used by
+// `CallIndirect` and the multi-value `BlockType::TypeIdx` path.
+fn intern_pending_func_type(ctx: &mut FnCtx, ft: wasm::FuncType) -> u32 {
+    let mut k = 0;
+    while k < ctx.pending_types.len() {
+        if func_type_eq(&ctx.pending_types[k], &ft) {
+            return ctx.pending_types_base + k as u32;
+        }
+        k += 1;
+    }
+    let idx = ctx.pending_types_base + ctx.pending_types.len() as u32;
+    ctx.pending_types.push(ft);
+    idx
 }
 
 fn block_type_for(ctx: &mut FnCtx, ty: &RType) -> wasm::BlockType {
@@ -3833,6 +3911,8 @@ fn expr_kind_name(e: &crate::mono::MonoExprKind) -> &'static str {
         K::Continue { .. } => "Continue",
         K::Return { .. } => "Return",
         K::MacroCall { .. } => "MacroCall",
+        K::FnItemAddr { .. } => "FnItemAddr",
+        K::CallIndirect { .. } => "CallIndirect",
     }
 }
 
@@ -3919,6 +3999,18 @@ fn first_unsupported_expr(e: &crate::mono::MonoExpr) -> String {
         K::Continue { .. } => "Continue".to_string(),
         K::Return { .. } => "Return".to_string(),
         K::MacroCall { name, .. } => format!("MacroCall({})", name),
+        K::FnItemAddr { .. } => "FnItemAddr".to_string(),
+        K::CallIndirect { callee, args, .. } => {
+            if !mono_supports_expr(callee) {
+                return format!("CallIndirect.callee->{}", first_unsupported_expr(callee));
+            }
+            for a in args {
+                if !mono_supports_expr(a) {
+                    return format!("CallIndirect->{}", first_unsupported_expr(a));
+                }
+            }
+            "CallIndirect".to_string()
+        }
     }
 }
 
@@ -4103,6 +4195,10 @@ fn mono_supports_expr(e: &crate::mono::MonoExpr) -> bool {
             None => true,
         },
         K::MacroCall { name, args } => name == "panic" && args.iter().all(mono_supports_expr),
+        K::FnItemAddr { .. } => true,
+        K::CallIndirect { callee, args, .. } => {
+            mono_supports_expr(callee) && args.iter().all(mono_supports_expr)
+        }
         _ => false,
     }
 }
@@ -4915,6 +5011,56 @@ fn codegen_mono_expr(
             codegen_mono_expr(ctx, &args[0])?;
             ctx.instructions.push(wasm::Instruction::Call(0));
             ctx.instructions.push(wasm::Instruction::Unreachable);
+            Ok(())
+        }
+        K::FnItemAddr { wasm_idx } => {
+            // Reserve a funcref-table slot for this wasm idx (deduped)
+            // and emit `i32.const <slot>` — the FnPtr's runtime value.
+            let slot = ctx.mono.intern_table_slot(*wasm_idx);
+            ctx.instructions.push(wasm::Instruction::I32Const(slot as i32));
+            Ok(())
+        }
+        K::CallIndirect { callee, args, fn_ptr_ty } => {
+            // sret allocation: pre-emit before args (matches direct
+            // calls, so the indirect-call signature on the wasm side
+            // shapes the same as the direct-call signature).
+            let returns_enum = matches!(&expr.ty, RType::Enum { .. });
+            if returns_enum {
+                emit_sret_alloc(ctx, &expr.ty);
+            }
+            // Push args.
+            let mut i = 0;
+            while i < args.len() {
+                codegen_mono_expr(ctx, &args[i])?;
+                i += 1;
+            }
+            // Push the callee (an i32 funcref-table slot).
+            codegen_mono_expr(ctx, callee)?;
+            // Build the matching FuncType and intern its typeidx.
+            let (params, ret) = match fn_ptr_ty {
+                RType::FnPtr { params, ret } => (params.clone(), (**ret).clone()),
+                _ => unreachable!("CallIndirect.fn_ptr_ty must be RType::FnPtr"),
+            };
+            let mut wasm_params: Vec<wasm::ValType> = Vec::new();
+            // sret: leading i32 out-pointer for enum returns.
+            if returns_enum {
+                wasm_params.push(wasm::ValType::I32);
+            }
+            let mut k = 0;
+            while k < params.len() {
+                crate::typeck::flatten_rtype(&params[k], ctx.structs, &mut wasm_params);
+                k += 1;
+            }
+            let mut wasm_results: Vec<wasm::ValType> = Vec::new();
+            if !returns_enum {
+                crate::typeck::flatten_rtype(&ret, ctx.structs, &mut wasm_results);
+            }
+            let func_type = wasm::FuncType { params: wasm_params, results: wasm_results };
+            let type_idx = intern_pending_func_type(ctx, func_type);
+            ctx.instructions.push(wasm::Instruction::CallIndirect {
+                type_idx,
+                table_idx: 0,
+            });
             Ok(())
         }
         _ => Err(Error {

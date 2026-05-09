@@ -12,6 +12,15 @@ pub struct Module {
     pub exports: Vec<Export>,
     pub code: Vec<FuncBody>,
     pub datas: Vec<Data>,
+    // Function-pointer / vtable backing storage. Each entry is a wasm
+    // function index (the same index a `Call(idx)` would use, post
+    // import-offset). At encode time, a non-empty `func_table` produces
+    // both the Table section (one funcref table sized to fit) and the
+    // Element section (a single active segment placing every entry at
+    // offset 0). Slots are dense — the table's index space matches
+    // `func_table`'s positions one-to-one. Use `intern_table_slot` to
+    // deduplicate; never push to `func_table` directly.
+    pub func_table: Vec<u32>,
 }
 
 // One imported function. `module` and `name` are the two-string key
@@ -95,6 +104,15 @@ pub enum Instruction {
     GlobalSet(u32),
     Drop,
     Call(u32),
+    // Indirect call through a function table. `type_idx` references a
+    // FuncType in the type section — the runtime traps if the slot's
+    // function doesn't have a matching signature. `table_idx` selects
+    // the funcref table; pocket-rust only emits one (the func_table
+    // populated via `Module::intern_table_slot`), so this is always 0
+    // today, but kept as a field for clarity/forward-compatibility.
+    // Stack discipline: args first, then the i32 table slot, then this
+    // instruction; result(s) per the referenced FuncType land on top.
+    CallIndirect { type_idx: u32, table_idx: u32 },
     I32Add,
     I32Sub,
     I32Mul,
@@ -204,7 +222,25 @@ impl Module {
             exports: Vec::new(),
             code: Vec::new(),
             datas: Vec::new(),
+            func_table: Vec::new(),
         }
+    }
+
+    // Reserve a function-table slot for `wasm_idx`, returning the slot
+    // index. Repeated calls with the same `wasm_idx` collapse to one
+    // slot — fn-pointer coercions of the same function and trait-impl
+    // method registrations across multiple vtables share storage.
+    pub fn intern_table_slot(&mut self, wasm_idx: u32) -> u32 {
+        let mut i = 0;
+        while i < self.func_table.len() {
+            if self.func_table[i] == wasm_idx {
+                return i as u32;
+            }
+            i += 1;
+        }
+        let slot = self.func_table.len() as u32;
+        self.func_table.push(wasm_idx);
+        slot
     }
 
     pub fn encode(&self) -> Vec<u8> {
@@ -226,6 +262,9 @@ impl Module {
         if !self.functions.is_empty() {
             encode_function_section(&mut bytes, &self.functions);
         }
+        if !self.func_table.is_empty() {
+            encode_table_section(&mut bytes, self.func_table.len() as u32);
+        }
         if !self.memories.is_empty() {
             encode_memory_section(&mut bytes, &self.memories);
         }
@@ -234,6 +273,9 @@ impl Module {
         }
         if !self.exports.is_empty() {
             encode_export_section(&mut bytes, &self.exports);
+        }
+        if !self.func_table.is_empty() {
+            encode_element_section(&mut bytes, &self.func_table);
         }
         if !self.code.is_empty() {
             encode_code_section(&mut bytes, &self.code);
@@ -350,6 +392,36 @@ fn encode_function_section(out: &mut Vec<u8>, funcs: &Vec<u32>) {
         i += 1;
     }
     encode_section(out, 3, payload);
+}
+
+// Section id 4. One funcref table sized exactly to `count` (min == max),
+// so the table never grows at runtime — every slot is populated by the
+// matching Element section.
+fn encode_table_section(out: &mut Vec<u8>, count: u32) {
+    let mut payload: Vec<u8> = Vec::new();
+    write_uleb128(&mut payload, 1); // one table
+    payload.push(0x70); // funcref elemtype
+    encode_limits(&mut payload, count, &Some(count));
+    encode_section(out, 4, payload);
+}
+
+// Section id 9. One active-mode segment placing `func_table` at offset
+// 0 of table 0. MVP encoding (flag byte 0x00) — implicit table index,
+// implicit funcref elemtype, vec(funcidx) payload.
+fn encode_element_section(out: &mut Vec<u8>, func_table: &Vec<u32>) {
+    let mut payload: Vec<u8> = Vec::new();
+    write_uleb128(&mut payload, 1); // one segment
+    payload.push(0x00); // flags: active, table 0, funcref, funcidx vec
+    payload.push(0x41); // i32.const opcode for the offset expr
+    write_sleb128(&mut payload, 0);
+    payload.push(0x0b); // end of offset expr
+    write_uleb128(&mut payload, func_table.len() as u32);
+    let mut i = 0;
+    while i < func_table.len() {
+        write_uleb128(&mut payload, func_table[i]);
+        i += 1;
+    }
+    encode_section(out, 9, payload);
 }
 
 fn encode_memory_section(out: &mut Vec<u8>, mems: &Vec<Memory>) {
@@ -492,6 +564,11 @@ fn encode_instruction(out: &mut Vec<u8>, inst: &Instruction) {
         Instruction::Call(idx) => {
             out.push(0x10);
             write_uleb128(out, *idx);
+        }
+        Instruction::CallIndirect { type_idx, table_idx } => {
+            out.push(0x11);
+            write_uleb128(out, *type_idx);
+            write_uleb128(out, *table_idx);
         }
         Instruction::GlobalGet(idx) => {
             out.push(0x23);

@@ -440,6 +440,14 @@ pub enum TypeKind {
     // survives into typeck (return position, struct field, alias, …)
     // is rejected with "`impl Trait` not allowed here".
     ImplTrait(Vec<TraitBound>),
+    // `fn(T1, T2) -> R` — a function-pointer type. A bare-name fn item
+    // can coerce to this in any position that demands one (let-anno,
+    // fn arg, struct field, return). The pointer is a single i32 at
+    // runtime — an index into the module's funcref table — and `f(args)`
+    // on a value of this type lowers to `call_indirect`. Return type
+    // is `None` for the unit-returning form `fn(T)` and `Some(t)` for
+    // `fn(T) -> R`.
+    FnPtr { params: Vec<Type>, ret: Option<Box<Type>> },
     // `_` in type position — a placeholder for type inference. Valid
     // in turbofish args and let-annotations (`let x: Vec<_> = …`,
     // `Vec::<_>::new()`). At those sites typeck pre-walks the AST,

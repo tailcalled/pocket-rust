@@ -416,6 +416,11 @@ fn rtype_contains_ref(t: &crate::typeck::RType) -> bool {
         // Treat as ref-bearing so borrow propagation doesn't drop a
         // borrow that the underlying type actually keeps live.
         RType::Opaque { .. } => true,
+        // FnPtr is a single i32 table-slot index — the pointer itself
+        // is Copy and doesn't keep any input borrows alive. Inner refs
+        // in the signature are not stored, just declared, so they don't
+        // propagate borrows either.
+        RType::FnPtr { .. } => false,
     }
 }
 
