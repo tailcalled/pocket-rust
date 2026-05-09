@@ -144,7 +144,7 @@ pub fn build(func: &Function, ctx: &CfgBuildCtx) -> Cfg {
     while i < func.params.len() {
         let p = &func.params[i];
         let rt = ctx.param_types[i].clone();
-        let id = b.alloc_local(Some(p.name.clone()), rt, p.name_span.copy(), false, false);
+        let id = b.alloc_local(Some(p.name.clone()), rt, p.name_span.copy(), p.mutable, false);
         b.bind_name(&p.name, id);
         b.param_count += 1;
         i += 1;

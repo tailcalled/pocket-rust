@@ -2164,7 +2164,8 @@ fn check_function(
             tp += 1;
         }
     }
-    // Build initial locals from params (params are immutable bindings in our subset).
+    // Build initial locals from params. `fn f(mut x: T)` makes the
+    // parameter binding mutable so the body can re-assign `x`.
     let mut locals: Vec<LocalEntry> = Vec::new();
     let mut k = 0;
     while k < func.params.len() {
@@ -2189,7 +2190,7 @@ fn check_function(
         locals.push(LocalEntry {
             name: func.params[k].name.clone(),
             ty: rtype_to_infer(&rt),
-            mutable: false,
+            mutable: func.params[k].mutable,
             declared_uninit: false,
         });
         k += 1;

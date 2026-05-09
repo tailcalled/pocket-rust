@@ -702,6 +702,7 @@ fn synthesize_impl_for_closure(
                 },
                 span: span.copy(),
             },
+            mutable: false,
         },
         FnFamily::FnMut => Param {
             name: "self".to_string(),
@@ -717,6 +718,7 @@ fn synthesize_impl_for_closure(
                 },
                 span: span.copy(),
             },
+            mutable: false,
         },
         FnFamily::FnOnce => Param {
             name: "self".to_string(),
@@ -725,12 +727,14 @@ fn synthesize_impl_for_closure(
                 kind: TypeKind::SelfType,
                 span: span.copy(),
             },
+            mutable: false,
         },
     };
     let args_param = Param {
         name: "__args".to_string(),
         name_span: span.copy(),
         ty: arg_tuple_ty.clone(),
+        mutable: false,
     };
 
     // Build the body: `let <pat0> = __args.0; let <pat1> = __args.1;

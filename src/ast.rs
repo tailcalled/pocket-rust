@@ -392,6 +392,11 @@ pub struct Param {
     pub name: String,
     pub name_span: Span,
     pub ty: Type,
+    // `fn f(mut x: T)` — the parameter binding is mutable inside the
+    // body. Receiver `mut self` desugars to `mutable: true` here too.
+    // `&mut self` is *not* mut-binding (only the pointee is mutable);
+    // its mutability lives on the `Ref` type. Default false.
+    pub mutable: bool,
 }
 
 #[derive(Clone)]

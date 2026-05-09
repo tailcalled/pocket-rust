@@ -319,6 +319,7 @@ fn mk_self_param(span: &Span) -> Param {
         name: "self".to_string(),
         name_span: span.copy(),
         ty: mk_ref_type(mk_self_type(span), false),
+        mutable: false,
     }
 }
 
@@ -327,6 +328,7 @@ fn mk_other_param(target: &Type, span: &Span) -> Param {
         name: "other".to_string(),
         name_span: span.copy(),
         ty: mk_ref_type(target.clone(), false),
+        mutable: false,
     }
 }
 
@@ -714,6 +716,7 @@ fn build_ne_method_from_eq(span: &Span) -> Function {
                 name: "other".to_string(),
                 name_span: span.copy(),
                 ty: mk_ref_type(mk_self_type(span), false),
+                mutable: false,
             },
         ],
         return_type: Some(mk_bool_type(span)),
@@ -1131,6 +1134,7 @@ fn build_simple_partial_ord_companion(name: &str, negate: bool, span: &Span) -> 
                 name: "other".to_string(),
                 name_span: span.copy(),
                 ty: mk_ref_type(mk_self_type(span), false),
+                mutable: false,
             },
         ],
         return_type: Some(mk_bool_type(span)),

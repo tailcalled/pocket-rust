@@ -1492,6 +1492,25 @@ impl Parser {
     // regular `self: Self` / `self: &Self` / `self: &mut Self` param. Only
     // valid as the first param (caller restricts).
     fn try_parse_receiver(&mut self) -> Result<Option<Param>, Error> {
+        // `mut self` — by-value receiver with mutable binding.
+        if self.peek_kind(&TokenKind::Mut) {
+            let save_pos = self.pos;
+            self.pos += 1;
+            if self.peek_kind(&TokenKind::SelfLower) {
+                let span = self.tokens[self.pos].span.copy();
+                self.pos += 1;
+                return Ok(Some(Param {
+                    name: "self".to_string(),
+                    name_span: span.copy(),
+                    ty: Type {
+                        kind: TypeKind::SelfType,
+                        span,
+                    },
+                    mutable: true,
+                }));
+            }
+            self.pos = save_pos;
+        }
         if self.peek_kind(&TokenKind::SelfLower) {
             let span = self.tokens[self.pos].span.copy();
             self.pos += 1;
@@ -1502,6 +1521,7 @@ impl Parser {
                     kind: TypeKind::SelfType,
                     span,
                 },
+                mutable: false,
             }));
         }
         if self.peek_kind(&TokenKind::Amp) {
@@ -1540,6 +1560,7 @@ impl Parser {
                         },
                         span: outer,
                     },
+                    mutable: false,
                 }));
             }
             // Not a receiver — backtrack so parse_param sees the original `&`.
@@ -1549,6 +1570,12 @@ impl Parser {
     }
 
     fn parse_param(&mut self) -> Result<Param, Error> {
+        let mutable = if self.peek_kind(&TokenKind::Mut) {
+            self.pos += 1;
+            true
+        } else {
+            false
+        };
         let (name, name_span) = self.expect_ident()?;
         self.expect(&TokenKind::Colon, "`:`")?;
         let ty = self.parse_type()?;
@@ -1556,6 +1583,7 @@ impl Parser {
             name,
             name_span,
             ty,
+            mutable,
         })
     }
 

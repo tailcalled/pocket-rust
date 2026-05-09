@@ -232,3 +232,69 @@ fn tailless_block_assigned_to_typed_let_is_rejected() {
         err
     );
 }
+
+// `fn f(mut x: T)` — the parameter binding is mutable so the body
+// can re-assign through `x`. Mirrors `let mut x = …; x = …`.
+#[test]
+fn mut_param_reassign_returns_99() {
+    expect_answer_sources(
+        &[(
+            "lib.rs",
+            "fn bump(mut x: u32) -> u32 { x = 99; x }\nfn answer() -> u32 { bump(1) }",
+        )],
+        99u32,
+    );
+}
+
+// `mut` on the parameter is what enables compound-assign (`x += 1`)
+// against the binding itself.
+#[test]
+fn mut_param_compound_assign_returns_42() {
+    expect_answer_sources(
+        &[(
+            "lib.rs",
+            "fn bump(mut x: u32) -> u32 { x += 1; x += 1; x }\nfn answer() -> u32 { bump(40) }",
+        )],
+        42u32,
+    );
+}
+
+// `mut self` on a method receiver — by-value receiver with mutable
+// binding. Re-assigning `self` inside the method is allowed and the
+// returned value reflects the assignment.
+#[test]
+fn mut_self_receiver_reassign_returns_77() {
+    expect_answer_sources(
+        &[(
+            "lib.rs",
+            "struct S { v: u32 }\nimpl S { fn bump(mut self) -> u32 { self = S { v: 77 }; self.v } }\nfn answer() -> u32 { S { v: 1 }.bump() }",
+        )],
+        77u32,
+    );
+}
+
+// Negative: an immutable parameter cannot be assigned to. Same error
+// shape as `let x = …; x = …` would produce.
+#[test]
+fn assignment_to_immutable_param_is_rejected() {
+    let err = compile_source("fn f(x: u32) -> u32 { x = 6; x }\nfn answer() -> u32 { f(1) }");
+    assert!(
+        err.contains("not declared as `mut`"),
+        "expected mut-required error for non-mut param, got: {}",
+        err
+    );
+}
+
+// Negative: compound assignment to a non-mut param is rejected. `x +=
+// 1` desugars to a method call on `&mut x`; autoref-mut is only tried
+// against a mutable place, so the missing-method diagnostic surfaces
+// (mirrors the same shape as `let x: u32 = 0; x += 1`).
+#[test]
+fn compound_assign_to_immutable_param_is_rejected() {
+    let err = compile_source("fn f(x: u32) -> u32 { x += 1; x }\nfn answer() -> u32 { f(1) }");
+    assert!(
+        err.contains("no method `add_assign`"),
+        "expected no-method error for compound-assign on non-mut param, got: {}",
+        err
+    );
+}

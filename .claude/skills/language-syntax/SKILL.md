@@ -9,6 +9,8 @@ description: Use when working with the surface syntax pocket-rust accepts — st
 
 `fn NAME(P1: T1, P2: T2, …)` with an optional return type. Optional generic type parameters: `fn NAME<T1, T2>(...)`. May be prefixed with `unsafe` (`unsafe fn`, `pub unsafe fn`) — calls to an unsafe fn must lexically appear inside an `unsafe { … }` block, and the body of an `unsafe fn` is implicitly an unsafe context. No attributes, no `where` clauses, no const generics.
 
+Each parameter is `[mut] NAME: T`. The optional `mut` makes the parameter binding mutable inside the body (same effect as `let mut x = …`) — the body can re-assign `x`, take `&mut x`, or autoref-mut for compound-assign / `&mut self` method calls. `mut` only affects the local binding; it doesn't appear in the function's outward type, so callers see the same signature whether the param is `mut` or not. Mirrored on receiver shorthand: `mut self` gives a by-value mutable receiver. (`&mut self`'s `mut` is on the *reference type*, not the binding — orthogonal axis.) Parsed by `parse_param` / `try_parse_receiver` in `parser.rs`; the AST `Param.mutable` flag flows into typeck's `LocalEntry.mutable` and borrowck's `LocalDecl.mutable`.
+
 Function body: a block — a sequence of statements followed by an optional tail expression. A tail-less function body (or block) evaluates to `()` (the unit tuple); the function's declared return type — or `()` when no `-> Type` was given — is unified against that.
 
 ## Statements
