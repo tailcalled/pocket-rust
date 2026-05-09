@@ -17,6 +17,10 @@ pub enum TokenKind {
     Unsafe,
     Impl,
     Trait,
+    // `dyn` — trait-object marker. `dyn Trait + 'a` is a DST type; only
+    // valid behind a reference or `Box`. Method calls dispatch through
+    // a vtable. See `dyn-trait` skill.
+    Dyn,
     For,
     In,
     SelfLower,
@@ -144,6 +148,7 @@ pub fn token_kind_name(t: &TokenKind) -> &'static str {
         TokenKind::Unsafe => "`unsafe`",
         TokenKind::Impl => "`impl`",
         TokenKind::Trait => "`trait`",
+        TokenKind::Dyn => "`dyn`",
         TokenKind::Type => "`type`",
         TokenKind::Where => "`where`",
         TokenKind::Return => "`return`",
@@ -293,6 +298,11 @@ pub fn tokenize(file: &str, source: &str) -> Result<Vec<Token>, Error> {
             } else if text == "trait" {
                 tokens.push(Token {
                     kind: TokenKind::Trait,
+                    span,
+                });
+            } else if text == "dyn" {
+                tokens.push(Token {
+                    kind: TokenKind::Dyn,
                     span,
                 });
             } else if text == "type" {

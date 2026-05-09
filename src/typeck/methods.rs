@@ -791,6 +791,16 @@ pub(super) fn check_method_call(
             };
             return check_method_call_symbolic(ctx, mc, call_expr, name.clone(), shape);
         }
+        // Dyn-trait receiver dispatch: `&dyn Trait` / `&mut dyn Trait`.
+        if let InferType::Dyn { bounds, .. } = inner.as_ref() {
+            return check_dyn_method_call(
+                ctx,
+                mc,
+                call_expr,
+                bounds.clone(),
+                *mutable,
+            );
+        }
     }
     // RPIT existential receiver: when the recv type is an `Opaque`,
     // method dispatch consults the slot's bounds — same shape as
@@ -1483,5 +1493,153 @@ fn collect_sized_required_params(t: &RType, sized_ctx: bool, out: &mut Vec<Strin
             }
             collect_sized_required_params(ret, true, out);
         }
+        // `dyn Trait` is itself unsized but carries no Param-bearing
+        // slots — bound paths are canonicalized strings.
+        RType::Dyn { .. } => {}
     }
+}
+
+// `recv.method(args)` where `recv: &dyn Trait` / `&mut dyn Trait`.
+// Phase 2 v1 supports single-bound dyn types only; the method must be
+// declared directly on the named trait (supertrait method dispatch is
+// gap-tested for now).
+fn check_dyn_method_call(
+    ctx: &mut CheckCtx,
+    mc: &crate::ast::MethodCall,
+    call_expr: &Expr,
+    bounds: Vec<Vec<String>>,
+    recv_mut: bool,
+) -> Result<InferType, Error> {
+    if bounds.is_empty() {
+        return Err(Error {
+            file: ctx.current_file.to_string(),
+            message: "internal: dyn-trait receiver had empty bound list".to_string(),
+            span: mc.method_span.copy(),
+        });
+    }
+    if bounds.len() > 1 {
+        return Err(Error {
+            file: ctx.current_file.to_string(),
+            message: "method dispatch on multi-bound `dyn` types isn't supported yet".to_string(),
+            span: mc.method_span.copy(),
+        });
+    }
+    let trait_path = bounds[0].clone();
+    // Defensive: re-run object-safety. Obj-safety should already have
+    // fired at the coercion that produced this value, but a value
+    // arriving via fn arg with a `&dyn` annotation didn't go through
+    // coerce_at on the caller's side.
+    super::dyn_safety::check_object_safety(
+        &trait_path,
+        ctx.traits,
+        &mc.method_span,
+        ctx.current_file,
+    )?;
+    let entry = match trait_lookup(ctx.traits, &trait_path) {
+        Some(e) => e,
+        None => return Err(Error {
+            file: ctx.current_file.to_string(),
+            message: format!(
+                "trait `{}` not found",
+                place_to_string(&trait_path)
+            ),
+            span: mc.method_span.copy(),
+        }),
+    };
+    let mut found_idx: Option<usize> = None;
+    let mut k = 0;
+    while k < entry.methods.len() {
+        if entry.methods[k].name == mc.method {
+            found_idx = Some(k);
+            break;
+        }
+        k += 1;
+    }
+    let method_idx = match found_idx {
+        Some(i) => i,
+        None => return Err(Error {
+            file: ctx.current_file.to_string(),
+            message: format!(
+                "no method `{}` on `dyn {}`",
+                mc.method,
+                place_to_string(&trait_path),
+            ),
+            span: mc.method_span.copy(),
+        }),
+    };
+    let method = &entry.methods[method_idx];
+    // Receiver shape must match the dyn-ref's mutability.
+    match (&method.receiver_shape, recv_mut) {
+        (Some(TraitReceiverShape::BorrowImm), false)
+        | (Some(TraitReceiverShape::BorrowImm), true) // `&self` reachable through `&mut`
+        | (Some(TraitReceiverShape::BorrowMut), true) => {}
+        (Some(TraitReceiverShape::BorrowMut), false) => {
+            return Err(Error {
+                file: ctx.current_file.to_string(),
+                message: format!(
+                    "cannot call `&mut self` method `{}` on `&dyn {}` (need `&mut dyn ...`)",
+                    mc.method,
+                    place_to_string(&trait_path),
+                ),
+                span: mc.method_span.copy(),
+            });
+        }
+        _ => return Err(Error {
+            file: ctx.current_file.to_string(),
+            message: format!(
+                "method `{}` on `dyn {}` cannot dispatch (no `&self`/`&mut self` receiver)",
+                mc.method,
+                place_to_string(&trait_path),
+            ),
+            span: mc.method_span.copy(),
+        }),
+    }
+    // Type-check args against the method's parameter types (skipping
+    // the receiver at index 0). Object-safety guarantees no Self in
+    // arg or return positions, so no substitution needed.
+    let arg_types = &method.param_types[1..];
+    if mc.args.len() != arg_types.len() {
+        return Err(Error {
+            file: ctx.current_file.to_string(),
+            message: format!(
+                "wrong number of arguments to `{}::{}`: expected {}, got {}",
+                place_to_string(&trait_path),
+                mc.method,
+                arg_types.len(),
+                mc.args.len(),
+            ),
+            span: mc.method_span.copy(),
+        });
+    }
+    let mut a = 0;
+    while a < mc.args.len() {
+        let arg_ty = check_expr(ctx, &mc.args[a])?;
+        let expected = rtype_to_infer(&arg_types[a]);
+        ctx.subst.coerce(
+            &arg_ty,
+            &expected,
+            ctx.traits,
+            ctx.type_params,
+            ctx.type_param_bounds,
+            &mc.args[a].span,
+            ctx.current_file,
+        )?;
+        a += 1;
+    }
+    let ret_rt = method
+        .return_type
+        .clone()
+        .unwrap_or(RType::Tuple(Vec::new()));
+    // Record the dispatch.
+    let id = call_expr.id as usize;
+    if id < ctx.dyn_method_calls.len() {
+        ctx.dyn_method_calls[id] = Some(crate::typeck::DynMethodDispatch {
+            trait_path: trait_path.clone(),
+            method_idx: method_idx as u32,
+            method_param_types: method.param_types[1..].to_vec(),
+            method_return_type: ret_rt.clone(),
+            recv_mut,
+        });
+    }
+    Ok(rtype_to_infer(&ret_rt))
 }

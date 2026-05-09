@@ -457,7 +457,73 @@ pub fn resolve_type(
             };
             Ok(RType::FnPtr { params: rparams, ret: Box::new(rret) })
         }
+        TypeKind::Dyn { bounds, lifetime } => {
+            // Resolve each trait path through the use scope without a
+            // TraitTable probe (which would require threading it
+            // everywhere). The use-scope rewrites the first segment per
+            // explicit imports; absent that, we fall back to a
+            // module-qualified path. Coercion-site code (which *does*
+            // hold a TraitTable) verifies the path actually names a
+            // trait. Trait arg / assoc-binding payloads on the bound
+            // are dropped — Phase 2 supports only no-args bounds.
+            let mut resolved: Vec<Vec<String>> = Vec::with_capacity(bounds.len());
+            let mut i = 0;
+            while i < bounds.len() {
+                let raw: Vec<String> = bounds[i].path.segments.iter().map(|s| s.name.clone()).collect();
+                // Use-table rewrite (probe-free): match first segment
+                // against explicit imports; absent, fall back to
+                // module-relative.
+                let mut canon = canonicalize_trait_path_via_use(&raw, use_scope);
+                if canon.is_none() {
+                    let mut full = current_module.clone();
+                    let mut j = 0;
+                    while j < raw.len() {
+                        full.push(raw[j].clone());
+                        j += 1;
+                    }
+                    canon = Some(full);
+                }
+                resolved.push(canon.unwrap());
+                i += 1;
+            }
+            let lt = match lifetime {
+                Some(l) => crate::typeck::LifetimeRepr::Named(l.name.clone()),
+                None => crate::typeck::LifetimeRepr::Inferred(0),
+            };
+            Ok(RType::Dyn { bounds: resolved, lifetime: lt })
+        }
     }
+}
+
+// Canonicalize a trait path (raw user segments) against the use scope.
+// Probe-free version of `resolve_via_use_scopes` used by `dyn`-type
+// resolution where a `TraitTable` isn't available. Matches an
+// explicit-import on the first segment; returns None for un-imported
+// names so the caller can fall back to module-relative.
+fn canonicalize_trait_path_via_use(
+    raw: &Vec<String>,
+    scope: &Vec<UseEntry>,
+) -> Option<Vec<String>> {
+    if raw.is_empty() {
+        return None;
+    }
+    let head = &raw[0];
+    let mut s = scope.len();
+    while s > 0 {
+        s -= 1;
+        if let UseEntry::Explicit { local_name, full_path, .. } = &scope[s] {
+            if local_name == head {
+                let mut out = full_path.clone();
+                let mut j = 1;
+                while j < raw.len() {
+                    out.push(raw[j].clone());
+                    j += 1;
+                }
+                return Some(out);
+            }
+        }
+    }
+    None
 }
 
 // Validate and resolve the lifetime args at a struct/enum type-position

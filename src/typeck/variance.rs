@@ -354,6 +354,12 @@ fn walk(
             }
             walk(ret, inv, tp_names, lp_names, out_tp, out_lp, structs, enums, struct_snap, enum_snap);
         }
+        // `dyn Trait + 'a` carries no type-args; its lifetime ties into
+        // any enclosing struct's lifetime params (covariant in `'a`,
+        // following Rust's standard convention).
+        RType::Dyn { lifetime, .. } => {
+            narrow_lifetime(lifetime, position, lp_names, out_lp);
+        }
     }
 }
 

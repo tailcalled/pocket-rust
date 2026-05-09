@@ -208,6 +208,19 @@ pub enum RType {
         params: Vec<RType>,
         ret: Box<RType>,
     },
+    // `dyn TraitA + TraitB + 'a` — trait object DST. `bounds` is the
+    // list of trait paths (resolved to canonical paths) the object
+    // satisfies; `lifetime` is the optional `+ 'a` carry. **Unsized**:
+    // bare `Dyn` is rejected by `byte_size_of`/`flatten_rtype`. Valid
+    // only as the inner of `Ref { inner: Dyn(_), .. }` (or, later,
+    // `Box<dyn _>`), in which case the surface ref is a fat pointer
+    // (data ptr + vtable ptr). Two `Dyn` types are equal iff the
+    // bound paths match in order — pocket-rust doesn't normalize
+    // multi-trait order today.
+    Dyn {
+        bounds: Vec<Vec<String>>,
+        lifetime: LifetimeRepr,
+    },
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -308,6 +321,12 @@ pub fn rtype_eq(a: &RType, b: &RType) -> bool {
             RType::FnPtr { params: pa, ret: ra },
             RType::FnPtr { params: pb, ret: rb },
         ) => rtype_vec_eq(pa, pb) && rtype_eq(ra, rb),
+        // Two trait objects are equal iff their bound paths match in
+        // declaration order. Lifetime carry is structural-only today.
+        (
+            RType::Dyn { bounds: ba, .. },
+            RType::Dyn { bounds: bb, .. },
+        ) => ba == bb,
         _ => false,
     }
 }
@@ -335,6 +354,9 @@ pub fn rtype_contains_param(t: &RType) -> bool {
         RType::FnPtr { params, ret } => {
             params.iter().any(rtype_contains_param) || rtype_contains_param(ret)
         }
+        // Dyn carries trait paths, not type-args, so it never directly
+        // contains a Param.
+        RType::Dyn { .. } => false,
     }
 }
 
@@ -435,6 +457,18 @@ pub fn rtype_to_string(t: &RType) -> String {
             }
             s
         }
+        RType::Dyn { bounds, .. } => {
+            let mut s = String::from("dyn ");
+            let mut i = 0;
+            while i < bounds.len() {
+                if i > 0 {
+                    s.push_str(" + ");
+                }
+                s.push_str(&place_to_string(&bounds[i]));
+                i += 1;
+            }
+            s
+        }
     }
 }
 
@@ -458,8 +492,9 @@ pub fn rtype_size(ty: &RType, structs: &StructTable) -> u32 {
             s
         }
         RType::Ref { inner, .. } => match inner.as_ref() {
-            // Fat ref to a slice: 2 wasm scalars (ptr + len).
-            RType::Slice(_) | RType::Str => 2,
+            // Fat ref to a slice / str / trait-object: 2 wasm scalars
+            // (data ptr + len-or-vtable).
+            RType::Slice(_) | RType::Str | RType::Dyn { .. } => 2,
             _ => 1,
         },
         RType::RawPtr { .. } => 1,
@@ -493,6 +528,7 @@ pub fn rtype_size(ty: &RType, structs: &StructTable) -> u32 {
             "rtype_size called on Opaque RPIT type — codegen must resolve to the FnSymbol's rpit_pin first"
         ),
         RType::FnPtr { .. } => 1,
+        RType::Dyn { .. } => unreachable!("`dyn Trait` is unsized — only valid behind a reference"),
     }
 }
 
@@ -542,11 +578,17 @@ pub fn flatten_rtype(ty: &RType, structs: &StructTable, out: &mut Vec<crate::was
                 out.push(crate::wasm::ValType::I32);
                 out.push(crate::wasm::ValType::I32);
             }
+            // Fat ref to a trait object: (data ptr, vtable ptr).
+            RType::Dyn { .. } => {
+                out.push(crate::wasm::ValType::I32);
+                out.push(crate::wasm::ValType::I32);
+            }
             _ => out.push(crate::wasm::ValType::I32),
         },
         RType::RawPtr { .. } => out.push(crate::wasm::ValType::I32),
         RType::Param(_) => unreachable!("flatten_rtype called on unresolved type parameter"),
         RType::Slice(_) | RType::Str => unreachable!("`[T]` / `str` is unsized — only valid behind a reference"),
+        RType::Dyn { .. } => unreachable!("`dyn Trait` is unsized — only valid behind a reference"),
         RType::Tuple(elems) => {
             let mut i = 0;
             while i < elems.len() {
@@ -587,12 +629,13 @@ pub fn byte_size_of(rt: &RType, structs: &StructTable, enums: &EnumTable) -> u32
             IntKind::U128 | IntKind::I128 => 16,
         },
         RType::Ref { inner, .. } => match inner.as_ref() {
-            // Fat ref: 8 bytes (4 ptr + 4 len) on wasm32.
-            RType::Slice(_) | RType::Str => 8,
+            // Fat ref: 8 bytes (4 ptr + 4 len/vtable) on wasm32.
+            RType::Slice(_) | RType::Str | RType::Dyn { .. } => 8,
             _ => 4,
         },
         RType::RawPtr { .. } => 4,
         RType::Slice(_) | RType::Str => unreachable!("`[T]` / `str` is unsized — only valid behind a reference"),
+        RType::Dyn { .. } => unreachable!("`dyn Trait` is unsized — only valid behind a reference"),
         RType::Struct { path, type_args, .. } => {
             let entry = struct_lookup(structs, path).expect("resolved struct");
             let env = struct_env(&entry.type_params, type_args);
@@ -758,6 +801,12 @@ pub fn substitute_rtype(rt: &RType, env: &Vec<(String, RType)>) -> RType {
             params: params.iter().map(|p| substitute_rtype(p, env)).collect(),
             ret: Box::new(substitute_rtype(ret, env)),
         },
+        // Dyn carries no Param-bearing slots — bound paths are
+        // canonicalized strings; lifetime is structural-only.
+        RType::Dyn { bounds, lifetime } => RType::Dyn {
+            bounds: bounds.clone(),
+            lifetime: lifetime.clone(),
+        },
     }
 }
 
@@ -820,6 +869,10 @@ pub fn peel_opaque(rt: &RType, funcs: &FuncTable) -> RType {
         RType::FnPtr { params, ret } => RType::FnPtr {
             params: params.iter().map(|p| peel_opaque(p, funcs)).collect(),
             ret: Box::new(peel_opaque(ret, funcs)),
+        },
+        RType::Dyn { bounds, lifetime } => RType::Dyn {
+            bounds: bounds.clone(),
+            lifetime: lifetime.clone(),
         },
     }
 }

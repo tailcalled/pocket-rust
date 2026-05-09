@@ -1520,7 +1520,8 @@ fn fill_assoc_trait_path_via_closure(
         | RType::Str
         | RType::Never
         | RType::Char
-        | RType::Opaque { .. } => rt.clone(),
+        | RType::Opaque { .. }
+        | RType::Dyn { .. } => rt.clone(),
         RType::FnPtr { params, ret } => {
             let new_params: Vec<RType> = params.iter().map(|p| recurse(p)).collect();
             let new_ret = recurse(ret);
@@ -1680,7 +1681,8 @@ fn walk_resolve_self_proj(
         | RType::Str
         | RType::Never
         | RType::Char
-        | RType::Opaque { .. } => rt.clone(),
+        | RType::Opaque { .. }
+        | RType::Dyn { .. } => rt.clone(),
         RType::FnPtr { params, ret } => {
             let new_params: Vec<RType> = params.iter().map(|p| recurse(p)).collect();
             let new_ret = recurse(ret);
@@ -1755,7 +1757,8 @@ fn fill_assoc_trait_path(rt: &RType, default_trait_path: &Vec<String>) -> RType 
         | RType::Str
         | RType::Never
         | RType::Char
-        | RType::Opaque { .. } => rt.clone(),
+        | RType::Opaque { .. }
+        | RType::Dyn { .. } => rt.clone(),
         RType::FnPtr { params, ret } => {
             let new_params: Vec<RType> = params
                 .iter()
@@ -2677,6 +2680,13 @@ fn rewrite_rpit_in_type(
                 .map(|r| Box::new(rewrite_rpit_in_type(r, synth_names, bounds_per_slot)));
             TypeKind::FnPtr { params: new_params, ret: new_ret }
         }
+        // `dyn Trait` carries no positions where `impl Trait` syntax
+        // could appear (the bounds are TraitBounds, not Types). Pass
+        // through unchanged.
+        TypeKind::Dyn { bounds, lifetime } => TypeKind::Dyn {
+            bounds: bounds.clone(),
+            lifetime: lifetime.clone(),
+        },
     };
     Type { kind, span: ty.span.copy() }
 }
@@ -2739,7 +2749,8 @@ fn substitute_rpit_synths_to_opaque(
         | RType::Str
         | RType::Never
         | RType::Char
-        | RType::Opaque { .. } => rt.clone(),
+        | RType::Opaque { .. }
+        | RType::Dyn { .. } => rt.clone(),
         RType::FnPtr { params, ret } => RType::FnPtr {
             params: params.iter().map(&recurse).collect(),
             ret: Box::new(recurse(ret)),
@@ -3367,6 +3378,8 @@ pub(super) fn register_function(
             method_resolutions: Vec::new(),
             call_resolutions: Vec::new(),
             fn_item_addrs: Vec::new(),
+            dyn_coercions: Vec::new(),
+            dyn_method_calls: Vec::new(),
             moved_places: Vec::new(),
             move_sites: Vec::new(),
             builtin_type_targets: Vec::new(),
@@ -3429,6 +3442,8 @@ pub(super) fn register_function(
             method_resolutions: Vec::new(),
             call_resolutions: Vec::new(),
             fn_item_addrs: Vec::new(),
+            dyn_coercions: Vec::new(),
+            dyn_method_calls: Vec::new(),
             moved_places: Vec::new(),
             move_sites: Vec::new(),
             builtin_type_targets: Vec::new(),

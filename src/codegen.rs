@@ -46,6 +46,18 @@ struct MonoState {
     // remain valid after this crate's pending entries are appended to
     // the shared `wasm_mod.func_table`.
     table_base_offset: u32,
+    // Per (trait_path, concrete_type) vtable storage. Each entry maps
+    // to a memory address in the data segment where the vtable lives.
+    // Computed on first request — `intern_vtable` walks the trait's
+    // methods, resolves each impl method to a wasm idx via
+    // `solve_impl + funcs.entries[].idx` (or `mono_table.lookup` for
+    // generic impls), interns funcref-table slots for each, packs
+    // them as i32 little-endian bytes, and reserves a region in
+    // `vtable_bytes`. The base address (`VTABLE_BASE + offset`) goes
+    // back to the caller so `RefDynCoerce` can emit it as the second
+    // word of the fat ref.
+    vtables: Vec<((Vec<String>, RType), u32)>,
+    vtable_bytes: Vec<u8>,
 }
 
 struct StrPoolEntry {
@@ -62,6 +74,8 @@ impl MonoState {
             str_pool_base_offset,
             pending_table_slots: Vec::new(),
             table_base_offset: 0,
+            vtables: Vec::new(),
+            vtable_bytes: Vec::new(),
         }
     }
 
@@ -79,6 +93,109 @@ impl MonoState {
         let slot = self.pending_table_slots.len() as u32;
         self.pending_table_slots.push(wasm_idx);
         self.table_base_offset + slot
+    }
+
+    // Intern a vtable for `(trait_path, concrete_type)`. Resolves each
+    // method through `solve_impl` + interns its funcref-table slot;
+    // packs the slots as i32 little-endian bytes; returns the absolute
+    // memory address where the vtable lives. Repeated calls with the
+    // same key return the same address.
+    fn intern_vtable(
+        &mut self,
+        trait_path: &Vec<String>,
+        concrete_ty: &RType,
+        traits: &crate::typeck::TraitTable,
+        funcs: &FuncTable,
+    ) -> Result<u32, Error> {
+        // Dedupe.
+        let mut i = 0;
+        while i < self.vtables.len() {
+            let (key, addr) = &self.vtables[i];
+            if &key.0 == trait_path && crate::typeck::rtype_eq(&key.1, concrete_ty) {
+                return Ok(*addr);
+            }
+            i += 1;
+        }
+        let entry = match crate::typeck::trait_lookup(traits, trait_path) {
+            Some(e) => e,
+            None => return Err(Error {
+                file: String::new(),
+                message: format!(
+                    "intern_vtable: trait `{}` not found",
+                    crate::typeck::place_to_string(trait_path)
+                ),
+                span: crate::span::Span::new(crate::span::Pos::new(0, 0), crate::span::Pos::new(0, 0)),
+            }),
+        };
+        // Resolve the impl; for each trait method, find the matching
+        // impl method's wasm idx, then intern a funcref-table slot.
+        // For now this assumes a non-generic concrete type and a
+        // non-generic impl method. solve_impl returns an impl idx;
+        // walk impls[idx].methods to find each method.
+        let solved = crate::typeck::solve_impl_with_args(
+            trait_path,
+            &Vec::new(),
+            concrete_ty,
+            traits,
+            0,
+        );
+        let solved = match solved {
+            Some(s) => s,
+            None => return Err(Error {
+                file: String::new(),
+                message: format!(
+                    "intern_vtable: no impl of `{}` for `{}`",
+                    crate::typeck::place_to_string(trait_path),
+                    crate::typeck::rtype_to_string(concrete_ty),
+                ),
+                span: crate::span::Span::new(crate::span::Pos::new(0, 0), crate::span::Pos::new(0, 0)),
+            }),
+        };
+        let impl_idx = solved.impl_idx;
+        // Reserve the address (start of this vtable's bytes within the
+        // crate-local vtable pool — which sits at VTABLE_BASE).
+        let addr = VTABLE_BASE + self.vtable_bytes.len() as u32;
+        // Walk trait methods in declaration order. For each, find the
+        // matching FnSymbol in `funcs.entries` whose `trait_impl_idx`
+        // points at this impl and whose path's last segment is the
+        // method name.
+        let mut m = 0;
+        while m < entry.methods.len() {
+            let tm_name = &entry.methods[m].name;
+            let mut wasm_idx: Option<u32> = None;
+            let mut e = 0;
+            while e < funcs.entries.len() {
+                if funcs.entries[e].trait_impl_idx == Some(impl_idx)
+                    && funcs.entries[e].path.last().map(|s| s.as_str()) == Some(tm_name.as_str())
+                {
+                    wasm_idx = Some(funcs.entries[e].idx);
+                    break;
+                }
+                e += 1;
+            }
+            let wi = match wasm_idx {
+                Some(i) => i,
+                None => return Err(Error {
+                    file: String::new(),
+                    message: format!(
+                        "intern_vtable: impl method `{}::{}` for `{}` not found in func table",
+                        crate::typeck::place_to_string(trait_path),
+                        tm_name,
+                        crate::typeck::rtype_to_string(concrete_ty),
+                    ),
+                    span: crate::span::Span::new(crate::span::Pos::new(0, 0), crate::span::Pos::new(0, 0)),
+                }),
+            };
+            let slot = self.intern_table_slot(wi);
+            // Pack slot as little-endian i32.
+            self.vtable_bytes.push((slot & 0xff) as u8);
+            self.vtable_bytes.push(((slot >> 8) & 0xff) as u8);
+            self.vtable_bytes.push(((slot >> 16) & 0xff) as u8);
+            self.vtable_bytes.push(((slot >> 24) & 0xff) as u8);
+            m += 1;
+        }
+        self.vtables.push(((trait_path.clone(), concrete_ty.clone()), addr));
+        Ok(addr)
     }
 
     // Intern a string literal into this crate's pool. Returns the
@@ -140,6 +257,12 @@ fn make_struct_env(type_params: &Vec<String>, type_args: &Vec<RType>) -> Vec<(St
 // The heap (`__heap_top`) is bumped past the pool at end-of-emit so
 // it doesn't collide with the baked-in string data.
 pub const STR_POOL_BASE: u32 = 8;
+
+// Base address for vtable storage. Sits 16 KiB into the first wasm
+// page, leaving STR_POOL_BASE..VTABLE_BASE for the string pool. If the
+// string pool grows past VTABLE_BASE codegen panics — bump the base if
+// that ever fires. Vtables are packed i32 funcref-table-slot indices.
+pub const VTABLE_BASE: u32 = 0x4000;
 
 pub fn emit(
     wasm_mod: &mut wasm::Module,
@@ -261,6 +384,49 @@ pub fn emit(
         i += 1;
     }
     let _ = table_base;
+    // Flush this crate's vtable bytes into a Data segment at
+    // VTABLE_BASE. If the segment doesn't exist yet, create it; if it
+    // does (a prior crate contributed vtables too), append. Bump
+    // __heap_top past whichever data region (str pool or vtable pool)
+    // ends later.
+    if !mono.vtable_bytes.is_empty() {
+        let mut found_vt: Option<usize> = None;
+        let mut i = 0;
+        while i < wasm_mod.datas.len() {
+            if wasm_mod.datas[i].offset == VTABLE_BASE {
+                found_vt = Some(i);
+                break;
+            }
+            i += 1;
+        }
+        let vtable_end: u32 = match found_vt {
+            Some(idx) => {
+                let mut k = 0;
+                while k < mono.vtable_bytes.len() {
+                    wasm_mod.datas[idx].bytes.push(mono.vtable_bytes[k]);
+                    k += 1;
+                }
+                VTABLE_BASE + wasm_mod.datas[idx].bytes.len() as u32
+            }
+            None => {
+                let total = mono.vtable_bytes.len() as u32;
+                wasm_mod.datas.push(wasm::Data {
+                    offset: VTABLE_BASE,
+                    bytes: mono.vtable_bytes.clone(),
+                });
+                VTABLE_BASE + total
+            }
+        };
+        // Bump __heap_top init past whatever's currently there if
+        // vtable_end exceeds it.
+        let current_init = match wasm_mod.globals[1].init {
+            wasm::Instruction::I32Const(n) => n as u32,
+            _ => 0,
+        };
+        if vtable_end > current_init {
+            wasm_mod.globals[1].init = wasm::Instruction::I32Const(vtable_end as i32);
+        }
+    }
     Ok(())
 }
 
@@ -483,8 +649,9 @@ fn collect_leaves(
             }
         }
         RType::Ref { inner, .. } => match inner.as_ref() {
-            // Fat ref to a DST slice or str: two i32 leaves (data ptr, length).
-            RType::Slice(_) | RType::Str => {
+            // Fat ref to a DST slice / str / trait-object: two i32
+            // leaves (data ptr, len-or-vtable).
+            RType::Slice(_) | RType::Str | RType::Dyn { .. } => {
                 out.push(MemLeaf {
                     byte_offset: base_offset,
                     byte_size: 4,
@@ -578,6 +745,9 @@ fn collect_leaves(
             signed: false,
             valtype: wasm::ValType::I32,
         }),
+        RType::Dyn { .. } => unreachable!(
+            "collect_leaves on `dyn Trait` — only valid behind a reference (handled by the Ref arm)"
+        ),
     }
 }
 
@@ -844,6 +1014,8 @@ fn build_mono_input_for_template<'a>(
         bare_closure_calls: tmpl.bare_closure_calls.clone(),
         const_uses: tmpl.const_uses.clone(),
         fn_item_addrs: tmpl.fn_item_addrs.clone(),
+        dyn_coercions: tmpl.dyn_coercions.clone(),
+        dyn_method_calls: tmpl.dyn_method_calls.clone(),
         wasm_idx,
         is_export: false, // monomorphic instances are never exported
     }
@@ -992,6 +1164,8 @@ fn emit_function(
         bare_closure_calls: entry.bare_closure_calls.clone(),
         const_uses: entry.const_uses.clone(),
         fn_item_addrs: entry.fn_item_addrs.clone(),
+        dyn_coercions: entry.dyn_coercions.clone(),
+        dyn_method_calls: entry.dyn_method_calls.clone(),
         wasm_idx: entry.idx,
         is_export: current_module.is_empty() && path_prefix.len() == current_module.len(),
     };
@@ -3913,6 +4087,8 @@ fn expr_kind_name(e: &crate::mono::MonoExprKind) -> &'static str {
         K::MacroCall { .. } => "MacroCall",
         K::FnItemAddr { .. } => "FnItemAddr",
         K::CallIndirect { .. } => "CallIndirect",
+        K::RefDynCoerce { .. } => "RefDynCoerce",
+        K::DynMethodCall { .. } => "DynMethodCall",
     }
 }
 
@@ -4010,6 +4186,23 @@ fn first_unsupported_expr(e: &crate::mono::MonoExpr) -> String {
                 }
             }
             "CallIndirect".to_string()
+        }
+        K::RefDynCoerce { inner_ref, .. } => {
+            if !mono_supports_expr(inner_ref) {
+                return format!("RefDynCoerce->{}", first_unsupported_expr(inner_ref));
+            }
+            "RefDynCoerce".to_string()
+        }
+        K::DynMethodCall { recv, args, .. } => {
+            if !mono_supports_expr(recv) {
+                return format!("DynMethodCall.recv->{}", first_unsupported_expr(recv));
+            }
+            for a in args {
+                if !mono_supports_expr(a) {
+                    return format!("DynMethodCall.arg->{}", first_unsupported_expr(a));
+                }
+            }
+            "DynMethodCall".to_string()
         }
     }
 }
@@ -4198,6 +4391,10 @@ fn mono_supports_expr(e: &crate::mono::MonoExpr) -> bool {
         K::FnItemAddr { .. } => true,
         K::CallIndirect { callee, args, .. } => {
             mono_supports_expr(callee) && args.iter().all(mono_supports_expr)
+        }
+        K::RefDynCoerce { inner_ref, .. } => mono_supports_expr(inner_ref),
+        K::DynMethodCall { recv, args, .. } => {
+            mono_supports_expr(recv) && args.iter().all(mono_supports_expr)
         }
         _ => false,
     }
@@ -5018,6 +5215,69 @@ fn codegen_mono_expr(
             // and emit `i32.const <slot>` — the FnPtr's runtime value.
             let slot = ctx.mono.intern_table_slot(*wasm_idx);
             ctx.instructions.push(wasm::Instruction::I32Const(slot as i32));
+            Ok(())
+        }
+        K::RefDynCoerce { inner_ref, src_concrete_ty, trait_path } => {
+            // Emit the inner ref's i32 data ptr.
+            codegen_mono_expr(ctx, inner_ref)?;
+            // Then push the vtable address as the second word of the
+            // fat ref. Vtable lookup constructs (and interns) the
+            // matching (trait_path, concrete_ty) vtable on first use.
+            let addr = ctx.mono.intern_vtable(trait_path, src_concrete_ty, ctx.traits, ctx.funcs)?;
+            ctx.instructions.push(wasm::Instruction::I32Const(addr as i32));
+            Ok(())
+        }
+        K::DynMethodCall { recv, method_idx, args, method_param_types, method_return_type, recv_mut: _, trait_path: _ } => {
+            // sret pre-emit if returning an enum.
+            let returns_enum = matches!(method_return_type, RType::Enum { .. });
+            if returns_enum {
+                emit_sret_alloc(ctx, method_return_type);
+            }
+            // Emit the receiver's two i32 scalars (data ptr + vtable
+            // ptr); cache the vtable ptr into a wasm local so we can
+            // use it after pushing args.
+            codegen_mono_expr(ctx, recv)?;
+            let vtable_local = ctx.next_wasm_local;
+            ctx.extra_locals.push(wasm::ValType::I32);
+            ctx.next_wasm_local += 1;
+            ctx.instructions.push(wasm::Instruction::LocalSet(vtable_local));
+            let data_ptr_local = ctx.next_wasm_local;
+            ctx.extra_locals.push(wasm::ValType::I32);
+            ctx.next_wasm_local += 1;
+            ctx.instructions.push(wasm::Instruction::LocalSet(data_ptr_local));
+            // Push data ptr as the &self/&mut self arg (first arg slot).
+            ctx.instructions.push(wasm::Instruction::LocalGet(data_ptr_local));
+            // Emit caller-supplied args.
+            let mut i = 0;
+            while i < args.len() {
+                codegen_mono_expr(ctx, &args[i])?;
+                i += 1;
+            }
+            // Load funcref slot from vtable[method_idx*4].
+            ctx.instructions.push(wasm::Instruction::LocalGet(vtable_local));
+            ctx.instructions.push(wasm::Instruction::I32Load {
+                align: 2,
+                offset: (*method_idx) * 4,
+            });
+            // Build the FuncType: prepend i32 receiver, then flatten
+            // each method param + return type.
+            let mut wasm_params: Vec<wasm::ValType> = Vec::new();
+            if returns_enum {
+                wasm_params.push(wasm::ValType::I32); // sret
+            }
+            wasm_params.push(wasm::ValType::I32); // &self
+            let mut k = 0;
+            while k < method_param_types.len() {
+                crate::typeck::flatten_rtype(&method_param_types[k], ctx.structs, &mut wasm_params);
+                k += 1;
+            }
+            let mut wasm_results: Vec<wasm::ValType> = Vec::new();
+            if !returns_enum {
+                crate::typeck::flatten_rtype(method_return_type, ctx.structs, &mut wasm_results);
+            }
+            let func_type = wasm::FuncType { params: wasm_params, results: wasm_results };
+            let type_idx = intern_pending_func_type(ctx, func_type);
+            ctx.instructions.push(wasm::Instruction::CallIndirect { type_idx, table_idx: 0 });
             Ok(())
         }
         K::CallIndirect { callee, args, fn_ptr_ty } => {

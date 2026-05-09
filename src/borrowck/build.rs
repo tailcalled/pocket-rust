@@ -321,6 +321,7 @@ fn collect_sig_regions(rt: &RType, graph: &mut crate::borrowck::cfg::RegionGraph
             }
             collect_sig_regions(ret, graph, counter);
         }
+        RType::Dyn { lifetime, .. } => ensure_lifetime_region(lifetime, graph, counter),
     }
 }
 
@@ -1074,6 +1075,15 @@ fn collect_callee_inferred(
                 collect_callee_inferred(p, out, counter);
             }
             collect_callee_inferred(ret, out, counter);
+        }
+        RType::Dyn { lifetime, .. } => {
+            if let LifetimeRepr::Inferred(id) = lifetime {
+                if *id != 0 && !out.iter().any(|(n, _)| *n == *id) {
+                    let r = *counter;
+                    *counter += 1;
+                    out.push((*id, r));
+                }
+            }
         }
     }
 }

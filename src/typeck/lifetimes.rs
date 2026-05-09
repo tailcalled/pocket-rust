@@ -95,6 +95,16 @@ pub fn freshen_inferred_lifetimes(rt: &mut RType, next_id: &mut u32) {
             }
             freshen_inferred_lifetimes(ret, next_id);
         }
+        // `dyn Trait + 'a` carries one optional lifetime; if elided,
+        // freshen it like an inferred ref-lifetime.
+        RType::Dyn { lifetime, .. } => {
+            if let LifetimeRepr::Inferred(id) = lifetime {
+                if *id == 0 {
+                    *id = *next_id;
+                    *next_id += 1;
+                }
+            }
+        }
     }
 }
 
@@ -182,6 +192,16 @@ pub fn require_no_inferred_lifetimes(
             }
             require_no_inferred_lifetimes(ret, span, file)
         }
+        RType::Dyn { lifetime, .. } => {
+            if matches!(lifetime, LifetimeRepr::Inferred(_)) {
+                return Err(Error {
+                    file: file.to_string(),
+                    message: "missing lifetime specifier on `dyn Trait` in struct field".to_string(),
+                    span: span.copy(),
+                });
+            }
+            Ok(())
+        }
     }
 }
 
@@ -252,6 +272,9 @@ pub fn validate_named_lifetimes(
                 i += 1;
             }
             validate_named_lifetimes(ret, lifetime_params, span, file)
+        }
+        RType::Dyn { lifetime, .. } => {
+            check_named_in_scope(lifetime, lifetime_params, span, file)
         }
     }
 }

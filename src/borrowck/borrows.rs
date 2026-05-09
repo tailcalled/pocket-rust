@@ -421,6 +421,10 @@ fn rtype_contains_ref(t: &crate::typeck::RType) -> bool {
         // in the signature are not stored, just declared, so they don't
         // propagate borrows either.
         RType::FnPtr { .. } => false,
+        // `dyn Trait` is unsized — it only appears behind a Ref, which
+        // the Ref arm already handled above. A bare Dyn shouldn't reach
+        // here, but conservatively treat it as ref-bearing if it does.
+        RType::Dyn { .. } => true,
     }
 }
 

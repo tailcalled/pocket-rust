@@ -66,3 +66,4 @@ Feature-specific knowledge under `.claude/skills/<name>/SKILL.md`, loaded on-dem
 - `testing-conventions` — `examples/`/`tests/` layout, `expect_answer`/`compile_source` helpers, naming.
 - `closures-and-fn-traits` — closure expression syntax, `Fn`/`FnMut`/`FnOnce` family, `Fn(T) -> R` sugar, HRTB. Currently parser-only; semantic synthesis is open work.
 - `fn-pointers` — `fn(T) -> R` types, bare-name fn-item coercion, indirect calls, funcref-table-slot interning, `CallIndirect` emission. Phase 1 of the dyn-trait roadmap.
+- `dyn-trait` — `&dyn Trait` / `&mut dyn Trait` types, lazy object-safety check, fat-pointer coercion, vtable storage in the data segment, method dispatch through `call_indirect`. Phase 2 of the dyn-trait roadmap.

@@ -625,6 +625,7 @@ fn try_match_rtype_ctx(
             }
             try_match_rtype_ctx(ra, rb, subst, true)
         }
+        (RType::Dyn { bounds: ba, .. }, RType::Dyn { bounds: bb, .. }) => ba == bb,
         _ => false,
     }
 }
@@ -816,6 +817,10 @@ fn try_match_against_infer_ctx(
                 }
                 try_match_against_infer_ctx(ra, &rb_ret, subst, env, pending, true)
             }
+            _ => false,
+        },
+        RType::Dyn { bounds: ba, .. } => match resolved {
+            InferType::Dyn { bounds: bb, .. } => ba == &bb,
             _ => false,
         },
     }

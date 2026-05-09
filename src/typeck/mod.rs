@@ -259,6 +259,10 @@ pub(crate) fn infer_to_rtype_for_check(t: &InferType) -> RType {
             params: params.iter().map(infer_to_rtype_for_check).collect(),
             ret: Box::new(infer_to_rtype_for_check(ret)),
         },
+        InferType::Dyn { bounds, lifetime } => RType::Dyn {
+            bounds: bounds.clone(),
+            lifetime: lifetime.clone(),
+        },
     }
 }
 
@@ -285,6 +289,8 @@ pub use use_scope::{
 };
 
 mod path_resolve;
+
+pub mod dyn_safety;
 pub use path_resolve::{
     lookup_variant_path, place_to_string, resolve_full_path, resolve_type,
     segments_to_string,
@@ -827,6 +833,12 @@ pub(crate) enum InferType {
         params: Vec<InferType>,
         ret: Box<InferType>,
     },
+    // InferType counterpart of `RType::Dyn`. Carries the same canonical
+    // trait paths + lifetime; unification compares bound paths.
+    Dyn {
+        bounds: Vec<Vec<String>>,
+        lifetime: LifetimeRepr,
+    },
 }
 
 // Build a name → InferType env from a generic struct/template's type-param
@@ -913,6 +925,10 @@ pub(crate) fn rtype_to_infer(rt: &RType) -> InferType {
             params: params.iter().map(rtype_to_infer).collect(),
             ret: Box::new(rtype_to_infer(ret)),
         },
+        RType::Dyn { bounds, lifetime } => InferType::Dyn {
+            bounds: bounds.clone(),
+            lifetime: lifetime.clone(),
+        },
     }
 }
 
@@ -994,6 +1010,10 @@ pub(crate) fn infer_substitute(t: &InferType, env: &Vec<(String, InferType)>) ->
         InferType::FnPtr { params, ret } => InferType::FnPtr {
             params: params.iter().map(|p| infer_substitute(p, env)).collect(),
             ret: Box::new(infer_substitute(ret, env)),
+        },
+        InferType::Dyn { bounds, lifetime } => InferType::Dyn {
+            bounds: bounds.clone(),
+            lifetime: lifetime.clone(),
         },
     }
 }
@@ -1123,6 +1143,12 @@ fn rewrite_placeholders(
                 .map(|r| Box::new(rewrite_placeholders(r, synth_names, prefix)));
             TypeKind::FnPtr { params: new_params, ret: new_ret }
         }
+        // `dyn Trait` doesn't admit `_` placeholders inside its bound
+        // list (no syntactic position for one). Pass through unchanged.
+        TypeKind::Dyn { bounds, lifetime } => TypeKind::Dyn {
+            bounds: bounds.clone(),
+            lifetime: lifetime.clone(),
+        },
     };
     Type { kind, span: ty.span.copy() }
 }
@@ -1231,6 +1257,18 @@ pub(crate) fn infer_to_string(t: &InferType) -> String {
             }
             s
         }
+        InferType::Dyn { bounds, .. } => {
+            let mut s = String::from("dyn ");
+            let mut i = 0;
+            while i < bounds.len() {
+                if i > 0 {
+                    s.push_str(" + ");
+                }
+                s.push_str(&place_to_string(&bounds[i]));
+                i += 1;
+            }
+            s
+        }
     }
 }
 
@@ -1330,6 +1368,10 @@ impl Subst {
             InferType::FnPtr { params, ret } => InferType::FnPtr {
                 params: params.iter().map(|p| self.substitute(p)).collect(),
                 ret: Box::new(self.substitute(ret)),
+            },
+            InferType::Dyn { bounds, lifetime } => InferType::Dyn {
+                bounds: bounds.clone(),
+                lifetime: lifetime.clone(),
             },
         }
     }
@@ -1616,6 +1658,24 @@ impl Subst {
                 InferType::Opaque { fn_path: b_fp, slot: b_slot },
             ) if a_fp == b_fp && a_slot == b_slot => Ok(()),
             (
+                InferType::Dyn { bounds: ba, .. },
+                InferType::Dyn { bounds: bb, .. },
+            ) => {
+                if ba == bb {
+                    Ok(())
+                } else {
+                    Err(Error {
+                        file: file.to_string(),
+                        message: format!(
+                            "type mismatch: expected `{}`, got `{}`",
+                            infer_to_string(&InferType::Dyn { bounds: bb.clone(), lifetime: LifetimeRepr::Inferred(0) }),
+                            infer_to_string(&InferType::Dyn { bounds: ba.clone(), lifetime: LifetimeRepr::Inferred(0) }),
+                        ),
+                        span: span.copy(),
+                    })
+                }
+            }
+            (
                 InferType::FnPtr { params: pa, ret: ra },
                 InferType::FnPtr { params: pb, ret: rb },
             ) => {
@@ -1880,6 +1940,7 @@ impl Subst {
                 params: params.iter().map(|p| self.finalize(p)).collect(),
                 ret: Box::new(self.finalize(&ret)),
             },
+            InferType::Dyn { bounds, lifetime } => RType::Dyn { bounds, lifetime },
         }
     }
 }
@@ -1892,6 +1953,123 @@ pub(crate) struct LitConstraint {
     // range covers `value`; codegen lowers as `from_i64(-(value as i64))`.
     negative: bool,
     span: Span,
+}
+
+// Coercion of a `&T` / `&mut T` value into a `&dyn Trait` / `&mut dyn
+// Trait` slot. `src_concrete_ty` is the resolved concrete type behind
+// the source ref (`T`); `trait_paths` is the bound list of the target
+// dyn type. Mono uses the (trait_path, concrete_ty) pair to request
+// vtable construction; codegen emits the data ptr from the source ref
+// followed by the vtable address as the second word.
+#[derive(Clone)]
+pub struct DynCoercion {
+    pub src_concrete_ty: RType,
+    pub trait_paths: Vec<Vec<String>>,
+}
+
+// Dispatch record for a method call whose receiver is `&dyn Trait` /
+// `&mut dyn Trait`. Codegen loads vtable[method_idx*4] from the fat
+// ref's vtable pointer and emits `call_indirect` with a typeidx built
+// from `method_param_types`/`method_return_type` (with Self → erased).
+#[derive(Clone)]
+pub struct DynMethodDispatch {
+    pub trait_path: Vec<String>,
+    pub method_idx: u32,
+    // The method's signature, with Self substituted to the dyn-ref's
+    // shape. Used by codegen to build the call_indirect typeidx.
+    pub method_param_types: Vec<RType>,
+    pub method_return_type: RType,
+    // Receiver shape: `&self` → false, `&mut self` → true. Codegen
+    // lowers the receiver fat ref's data ptr as the &self/&mut self
+    // arg.
+    pub recv_mut: bool,
+}
+
+// Coerce `actual` into `expected` at expression `expr_id`. If the
+// shape is the unsizing coercion `&T → &dyn Trait` (or `&mut T → &mut
+// dyn Trait`), runs object-safety + impl-existence checks and records
+// a `DynCoercion` on `ctx.dyn_coercions[expr_id]` so mono lowers the
+// expression as a fat-pointer construction. Otherwise falls back to
+// the standard invariant `coerce`.
+pub(crate) fn coerce_at(
+    ctx: &mut CheckCtx,
+    expr_id: crate::ast::NodeId,
+    actual: &InferType,
+    expected: &InferType,
+    span: &Span,
+) -> Result<(), Error> {
+    let actual_resolved = ctx.subst.substitute(actual);
+    let expected_resolved = ctx.subst.substitute(expected);
+    if let (
+        InferType::Ref { inner: a_inner, mutable: am, .. },
+        InferType::Ref { inner: e_inner, mutable: em, .. },
+    ) = (&actual_resolved, &expected_resolved)
+    {
+        if let InferType::Dyn { bounds, .. } = e_inner.as_ref() {
+            // `&T` coerces to `&dyn Trait`; `&mut T` coerces to either
+            // `&mut dyn Trait` (preserving mutability) or `&dyn Trait`
+            // (downgrading). Disallow the reverse — `&T` → `&mut dyn`.
+            if *em && !*am {
+                return Err(Error {
+                    file: ctx.current_file.to_string(),
+                    message: "cannot coerce `&T` to `&mut dyn Trait`: source ref is not mutable".to_string(),
+                    span: span.copy(),
+                });
+            }
+            // Run object-safety on each bound trait.
+            let mut i = 0;
+            while i < bounds.len() {
+                dyn_safety::check_object_safety(&bounds[i], ctx.traits, span, ctx.current_file)?;
+                i += 1;
+            }
+            // Resolve the source's concrete type and verify the bound
+            // is implemented for it.
+            let src_concrete = ctx.subst.finalize(a_inner);
+            let mut j = 0;
+            while j < bounds.len() {
+                let solved = traits::solve_impl_with_args(
+                    &bounds[j],
+                    &Vec::new(),
+                    &src_concrete,
+                    ctx.traits,
+                    0,
+                );
+                if solved.is_none() {
+                    return Err(Error {
+                        file: ctx.current_file.to_string(),
+                        message: format!(
+                            "cannot coerce to `&dyn {}`: type `{}` does not implement `{}`",
+                            place_to_string(&bounds[j]),
+                            rtype_to_string(&src_concrete),
+                            place_to_string(&bounds[j]),
+                        ),
+                        span: span.copy(),
+                    });
+                }
+                j += 1;
+            }
+            // Record. The expr's recorded `expr_infer_types` stays
+            // `Ref<Dyn>` (the coerced-to type); codegen reads the
+            // matching `DynCoercion` to know how to build the fat ref.
+            let id = expr_id as usize;
+            if id < ctx.dyn_coercions.len() {
+                ctx.dyn_coercions[id] = Some(DynCoercion {
+                    src_concrete_ty: src_concrete,
+                    trait_paths: bounds.clone(),
+                });
+            }
+            return Ok(());
+        }
+    }
+    ctx.subst.coerce(
+        actual,
+        expected,
+        ctx.traits,
+        ctx.type_params,
+        ctx.type_param_bounds,
+        span,
+        ctx.current_file,
+    )
 }
 
 pub(crate) struct LocalEntry {
@@ -1922,6 +2100,19 @@ pub(crate) struct CheckCtx<'a> {
     // into an `RType::FnPtr` slot. Stores the FuncTable callee_idx;
     // copied into FnSymbol/Template.fn_item_addrs at end-of-fn.
     pub(crate) fn_item_addrs: Vec<Option<usize>>,
+    // Per-NodeId dyn-trait coercion record. Set when a `&T` (or `&mut T`)
+    // value flows into a `&dyn Trait` (or `&mut dyn Trait`) slot at one
+    // of the explicit `coerce_at` sites (let-stmt RHS, call arg, fn
+    // return, struct field). Carries the source's concrete type and
+    // the coerced-to trait paths; mono builds the fat pointer +
+    // requests vtable construction, codegen emits the data-segment
+    // address as the second word of the fat ref. None at every other
+    // expr id.
+    pub(crate) dyn_coercions: Vec<Option<DynCoercion>>,
+    // Per-NodeId dyn-method dispatch. Set on a MethodCall expr id when
+    // the receiver was `&dyn Trait` / `&mut dyn Trait`. Codegen reads
+    // the vtable index + method signature here to emit `call_indirect`.
+    pub(crate) dyn_method_calls: Vec<Option<DynMethodDispatch>>,
     // Per-NodeId resolved RType type-args for builtins that need them at
     // codegen (`¤size_of::<T>()`). `None` outside builtin-with-types
     // sites. Finalized into FnSymbol.builtin_type_targets at end-of-fn.
@@ -2301,7 +2492,7 @@ fn check_function(
     };
 
     let node_count = func.node_count as usize;
-    let (expr_infer_types, lit_constraints, method_resolutions, call_resolutions, fn_item_addrs, builtin_type_targets, pattern_ergo, closure_records, bare_closure_calls, const_uses, subst) = {
+    let (expr_infer_types, lit_constraints, method_resolutions, call_resolutions, fn_item_addrs, dyn_coercions, dyn_method_calls, builtin_type_targets, pattern_ergo, closure_records, bare_closure_calls, const_uses, subst) = {
         let mut method_res: Vec<Option<PendingMethodCall>> = Vec::with_capacity(node_count);
         let mut call_res: Vec<Option<PendingCall>> = Vec::with_capacity(node_count);
         let mut expr_infer: Vec<Option<InferType>> = Vec::with_capacity(node_count);
@@ -2309,6 +2500,8 @@ fn check_function(
         let mut pat_ergo: Vec<PatternErgo> = Vec::with_capacity(node_count);
         let mut const_uses_init: Vec<Option<ConstValue>> = Vec::with_capacity(node_count);
         let mut fn_item_addrs_init: Vec<Option<usize>> = Vec::with_capacity(node_count);
+        let mut dyn_coercions_init: Vec<Option<DynCoercion>> = Vec::with_capacity(node_count);
+        let mut dyn_method_calls_init: Vec<Option<DynMethodDispatch>> = Vec::with_capacity(node_count);
         let mut i = 0;
         while i < node_count {
             method_res.push(None);
@@ -2318,6 +2511,8 @@ fn check_function(
             pat_ergo.push(PatternErgo::default());
             const_uses_init.push(None);
             fn_item_addrs_init.push(None);
+            dyn_coercions_init.push(None);
+            dyn_method_calls_init.push(None);
             i += 1;
         }
         // Initialize the use scope with the module's flattened entries.
@@ -2336,6 +2531,8 @@ fn check_function(
             method_resolutions: method_res,
             call_resolutions: call_res,
             fn_item_addrs: fn_item_addrs_init,
+            dyn_coercions: dyn_coercions_init,
+            dyn_method_calls: dyn_method_calls_init,
             builtin_type_targets: btt,
             pattern_ergo: pat_ergo,
             const_uses: const_uses_init,
@@ -2373,6 +2570,8 @@ fn check_function(
             ctx.method_resolutions,
             ctx.call_resolutions,
             ctx.fn_item_addrs,
+            ctx.dyn_coercions,
+            ctx.dyn_method_calls,
             ctx.builtin_type_targets,
             ctx.pattern_ergo,
             ctx.closure_records,
@@ -2786,6 +2985,8 @@ fn check_function(
         funcs.entries[e].method_resolutions = method_resolutions;
         funcs.entries[e].call_resolutions = call_resolutions;
         funcs.entries[e].fn_item_addrs = fn_item_addrs;
+        funcs.entries[e].dyn_coercions = dyn_coercions;
+        funcs.entries[e].dyn_method_calls = dyn_method_calls;
         funcs.entries[e].builtin_type_targets = builtin_type_targets;
         funcs.entries[e].pattern_ergo = pattern_ergo;
         funcs.entries[e].closures = closures;
@@ -2799,6 +3000,8 @@ fn check_function(
                 funcs.templates[t].method_resolutions = method_resolutions;
                 funcs.templates[t].call_resolutions = call_resolutions;
                 funcs.templates[t].fn_item_addrs = fn_item_addrs;
+                funcs.templates[t].dyn_coercions = dyn_coercions;
+                funcs.templates[t].dyn_method_calls = dyn_method_calls;
                 funcs.templates[t].builtin_type_targets = builtin_type_targets;
                 funcs.templates[t].pattern_ergo = pattern_ergo;
                 funcs.templates[t].closures = closures;
@@ -2897,15 +3100,15 @@ fn check_block(
         &mut opaque_slots,
     );
     let span = tail_span_or_block(block);
-    ctx.subst.coerce(
-        &actual,
-        &expected_infer,
-        ctx.traits,
-        ctx.type_params,
-        ctx.type_param_bounds,
-        &span,
-        ctx.current_file,
-    )?;
+    // Use the tail expression's node id (or, for tail-less blocks, the
+    // block's last-stmt id approximated by 0 — there's nothing to
+    // coerce-from anyway). Allows `&T → &dyn Trait` coercion at the
+    // function's tail-return site.
+    let tail_id = match &block.tail {
+        Some(t) => t.id,
+        None => 0,
+    };
+    coerce_at(ctx, tail_id, &actual, &expected_infer, &span)?;
     // Per-Opaque post-unify pinning + bound validation.
     let mut k = 0;
     while k < opaque_slots.len() {
@@ -3035,6 +3238,10 @@ fn rtype_to_infer_with_opaque_vars(
                 .map(|p| rtype_to_infer_with_opaque_vars(p, subst, out))
                 .collect(),
             ret: Box::new(rtype_to_infer_with_opaque_vars(ret, subst, out)),
+        },
+        RType::Dyn { bounds, lifetime } => InferType::Dyn {
+            bounds: bounds.clone(),
+            lifetime: lifetime.clone(),
         },
     }
 }
@@ -3239,15 +3446,7 @@ fn check_let_stmt(ctx: &mut CheckCtx, let_stmt: &LetStmt) -> Result<(), Error> {
             // fresh `InferType::Var` that the unification step pins
             // from the value's type.
             let annot_infer = resolve_type_to_infer(ctx, annotation)?;
-            ctx.subst.coerce(
-                &value_ty,
-                &annot_infer,
-                ctx.traits,
-                ctx.type_params,
-                ctx.type_param_bounds,
-                &value_expr.span,
-                ctx.current_file,
-            )?;
+            coerce_at(ctx, value_expr.id, &value_ty, &annot_infer, &value_expr.span)?;
             annot_infer
         }
         None => value_ty,
@@ -4449,19 +4648,11 @@ fn check_return_expr(
         Some(e) => check_expr(ctx, e)?,
         None => InferType::Tuple(Vec::new()),
     };
-    let span = match value {
-        Some(e) => e.span.copy(),
-        None => expr.span.copy(),
+    let (span, src_id) = match value {
+        Some(e) => (e.span.copy(), e.id),
+        None => (expr.span.copy(), expr.id),
     };
-    ctx.subst.coerce(
-        &actual,
-        &expected,
-        ctx.traits,
-        ctx.type_params,
-        ctx.type_param_bounds,
-        &span,
-        ctx.current_file,
-    )?;
+    coerce_at(ctx, src_id, &actual, &expected, &span)?;
     Ok(InferType::Never)
 }
 
@@ -6196,15 +6387,7 @@ fn check_indirect_call(
     let mut k = 0;
     while k < call.args.len() {
         let arg_ty = check_expr(ctx, &call.args[k])?;
-        ctx.subst.coerce(
-            &arg_ty,
-            &param_types[k],
-            ctx.traits,
-            ctx.type_params,
-            ctx.type_param_bounds,
-            &call.args[k].span,
-            ctx.current_file,
-        )?;
+        coerce_at(ctx, call.args[k].id, &arg_ty, &param_types[k], &call.args[k].span)?;
         k += 1;
     }
     ctx.call_resolutions[call_expr.id as usize] = Some(PendingCall::Indirect {
@@ -6296,15 +6479,7 @@ fn check_bare_closure_call(
     let mut k = 0;
     while k < call.args.len() {
         let arg_ty = check_expr(ctx, &call.args[k])?;
-        ctx.subst.coerce(
-            &arg_ty,
-            &param_types[k],
-            ctx.traits,
-            ctx.type_params,
-            ctx.type_param_bounds,
-            &call.args[k].span,
-            ctx.current_file,
-        )?;
+        coerce_at(ctx, call.args[k].id, &arg_ty, &param_types[k], &call.args[k].span)?;
         k += 1;
     }
     // Trait dispatch: Fn::call(&self, (args,)) -> Output.
@@ -6473,15 +6648,7 @@ fn check_bare_typeparam_fn_call(
     let mut k = 0;
     while k < call.args.len() {
         let arg_ty = check_expr(ctx, &call.args[k])?;
-        ctx.subst.coerce(
-            &arg_ty,
-            &param_types[k],
-            ctx.traits,
-            ctx.type_params,
-            ctx.type_param_bounds,
-            &call.args[k].span,
-            ctx.current_file,
-        )?;
+        coerce_at(ctx, call.args[k].id, &arg_ty, &param_types[k], &call.args[k].span)?;
         k += 1;
     }
     // Pick the matching method name + receiver-adjust per family.
@@ -6692,15 +6859,7 @@ fn check_call(ctx: &mut CheckCtx, call: &Call, call_expr: &Expr) -> Result<Infer
         let mut i = 0;
         while i < call.args.len() {
             let arg_ty = check_expr(ctx, &call.args[i])?;
-            ctx.subst.coerce(
-                &arg_ty,
-                &param_infer[i],
-                ctx.traits,
-                ctx.type_params,
-                ctx.type_param_bounds,
-                &call.args[i].span,
-                ctx.current_file,
-            )?;
+            coerce_at(ctx, call.args[i].id, &arg_ty, &param_infer[i], &call.args[i].span)?;
             i += 1;
         }
         return Ok(return_infer);
@@ -6833,15 +6992,7 @@ fn check_call(ctx: &mut CheckCtx, call: &Call, call_expr: &Expr) -> Result<Infer
                 }
             }
             let arg_ty = check_expr(ctx, &call.args[i])?;
-            ctx.subst.coerce(
-                &arg_ty,
-                &param_infer[i],
-                ctx.traits,
-                ctx.type_params,
-                ctx.type_param_bounds,
-                &call.args[i].span,
-                ctx.current_file,
-            )?;
+            coerce_at(ctx, call.args[i].id, &arg_ty, &param_infer[i], &call.args[i].span)?;
             i += 1;
         }
         // Static enforcement of `Trait<Name = T>` bound constraints.

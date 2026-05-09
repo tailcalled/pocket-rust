@@ -1620,6 +1620,30 @@ impl Parser {
                 span,
             });
         }
+        if self.peek_kind(&TokenKind::Dyn) {
+            // `dyn TraitA + TraitB + 'a` — trait object DST. Parses
+            // structurally as an open list; obj-safety + multi-bound
+            // rules fire at coercion sites in typeck.
+            let dyn_span = self.expect(&TokenKind::Dyn, "`dyn`")?;
+            let mut bounds: Vec<TraitBound> = Vec::new();
+            let mut lifetime: Option<Lifetime> = None;
+            bounds.push(self.parse_trait_bound()?);
+            while self.peek_kind(&TokenKind::Plus) {
+                self.pos += 1;
+                if self.peek_lifetime() {
+                    let (name, span) = self.expect_lifetime()?;
+                    lifetime = Some(Lifetime { name, span });
+                    continue;
+                }
+                bounds.push(self.parse_trait_bound()?);
+            }
+            let end = self.tokens[self.pos.saturating_sub(1)].span.end.copy();
+            let span = Span::new(dyn_span.start, end);
+            return Ok(Type {
+                kind: TypeKind::Dyn { bounds, lifetime },
+                span,
+            });
+        }
         if self.peek_kind(&TokenKind::Bang) {
             // `!` — the never type. Bare bang in type position only.
             let span = self.tokens[self.pos].span.copy();
@@ -4081,6 +4105,7 @@ impl Parser {
             (TokenKind::Unsafe, TokenKind::Unsafe) => true,
             (TokenKind::Impl, TokenKind::Impl) => true,
             (TokenKind::Trait, TokenKind::Trait) => true,
+            (TokenKind::Dyn, TokenKind::Dyn) => true,
             (TokenKind::Type, TokenKind::Type) => true,
             (TokenKind::Where, TokenKind::Where) => true,
             (TokenKind::Return, TokenKind::Return) => true,

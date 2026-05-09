@@ -229,6 +229,7 @@ mod closures;
 mod compound_assign;
 mod const_items;
 mod derives;
+mod dyn_trait;
 mod enums;
 mod fn_pointers;
 mod generics;

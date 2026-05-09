@@ -448,6 +448,12 @@ pub enum TypeKind {
     // is `None` for the unit-returning form `fn(T)` and `Some(t)` for
     // `fn(T) -> R`.
     FnPtr { params: Vec<Type>, ret: Option<Box<Type>> },
+    // `dyn TraitA + TraitB + 'a` — a trait object. The type itself is
+    // a DST (only valid behind `&` / `&mut` / `Box`); the surface ref
+    // becomes a fat pointer (data ptr + vtable ptr) at codegen.
+    // `bounds` is the principal trait list (one or more); `lifetime`
+    // is the optional `+ 'a` lifetime bound on the object.
+    Dyn { bounds: Vec<TraitBound>, lifetime: Option<Lifetime> },
     // `_` in type position — a placeholder for type inference. Valid
     // in turbofish args and let-annotations (`let x: Vec<_> = …`,
     // `Vec::<_>::new()`). At those sites typeck pre-walks the AST,

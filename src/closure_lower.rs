@@ -1352,6 +1352,14 @@ fn rtype_to_ast_type(rt: &RType, span: &Span, source_file: &str) -> Result<Type,
             };
             TypeKind::FnPtr { params: new_params, ret: new_ret }
         }
+        RType::Dyn { .. } => {
+            return Err(Error {
+                file: source_file.to_string(),
+                message: "internal: dyn-trait type in closure signature — not yet handled by lowering"
+                    .to_string(),
+                span: span.copy(),
+            });
+        }
     };
     Ok(Type { kind, span: span.copy() })
 }

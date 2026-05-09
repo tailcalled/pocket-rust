@@ -346,6 +346,17 @@ fn walk_expr_address(expr: &MonoExpr, addressed: &mut Vec<bool>) {
                 i += 1;
             }
         }
+        MonoExprKind::RefDynCoerce { inner_ref, .. } => {
+            walk_expr_address(inner_ref, addressed);
+        }
+        MonoExprKind::DynMethodCall { recv, args, .. } => {
+            walk_expr_address(recv, addressed);
+            let mut i = 0;
+            while i < args.len() {
+                walk_expr_address(&args[i], addressed);
+                i += 1;
+            }
+        }
     }
 }
 

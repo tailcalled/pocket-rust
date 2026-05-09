@@ -53,6 +53,15 @@ pub struct MonoFnInput<'a> {
     // Var is a fn-item-as-fn-pointer and lowers to `MonoExprKind::
     // FnItemAddr` carrying the resolved wasm idx.
     pub fn_item_addrs: Vec<Option<usize>>,
+    // Per-NodeId dyn-trait coercion (see `FnSymbol.dyn_coercions`).
+    // When set, the matching expression is wrapped in
+    // `MonoExprKind::RefDynCoerce` after lowering its inner ref.
+    pub dyn_coercions: Vec<Option<crate::typeck::DynCoercion>>,
+    // Per-NodeId dyn-method dispatch (see `FnSymbol.dyn_method_calls`).
+    // When set on a MethodCall expr, the call lowers to
+    // `MonoExprKind::DynMethodCall` instead of going through the
+    // standard impl-resolution path.
+    pub dyn_method_calls: Vec<Option<crate::typeck::DynMethodDispatch>>,
     pub wasm_idx: u32,
     pub is_export: bool,
 }
@@ -1541,6 +1550,30 @@ pub enum MonoExprKind {
         args: Vec<MonoExpr>,
         fn_ptr_ty: RType,
     },
+    // Coerce `&T` (or `&mut T`) into `&dyn Trait` (or `&mut dyn
+    // Trait`). `inner_ref` is the source ref expression (lowered to
+    // its data ptr); codegen materializes the matching vtable in the
+    // data segment and emits the vtable address as the second word.
+    RefDynCoerce {
+        inner_ref: Box<MonoExpr>,
+        src_concrete_ty: RType,
+        trait_path: Vec<String>,
+    },
+    // Method dispatch through a `&dyn Trait` / `&mut dyn Trait` fat
+    // ref. `recv` is the receiver fat ref (data ptr + vtable ptr);
+    // codegen emits args, then `recv.0` as the &self/&mut self arg,
+    // then loads the function pointer at `recv.1[method_idx*4]`, then
+    // `call_indirect typeidx`. typeidx comes from interning the
+    // method's param/ret types.
+    DynMethodCall {
+        recv: Box<MonoExpr>,
+        method_idx: u32,
+        args: Vec<MonoExpr>,
+        method_param_types: Vec<RType>,
+        method_return_type: RType,
+        recv_mut: bool,
+        trait_path: Vec<String>,
+    },
     // Pre-resolved method dispatch. `recv_adjust` says whether to
     // emit `&recv` / `&mut recv` / `recv` / pass-through.
     MethodCall {
@@ -2364,6 +2397,35 @@ fn lower_expr(ctx: &mut LowerCtx, expr: &Expr) -> Result<MonoExpr, Error> {
             }
         }
         ExprKind::MethodCall(mc) => {
+            // Dyn-method dispatch takes priority over the standard
+            // method-resolution path: typeck records on
+            // `dyn_method_calls[expr.id]` only when the receiver was
+            // `&dyn Trait` / `&mut dyn Trait`, and the standard
+            // `method_resolutions[expr.id]` is empty in that case.
+            if let Some(Some(dmd)) = ctx.input.dyn_method_calls.get(expr.id as usize) {
+                // Lower the receiver as a value (yields the fat ref's
+                // two i32 scalars).
+                let recv = Box::new(lower_expr(ctx, &mc.receiver)?);
+                let mut out_args = Vec::new();
+                let mut i = 0;
+                while i < mc.args.len() {
+                    out_args.push(lower_expr(ctx, &mc.args[i])?);
+                    i += 1;
+                }
+                return Ok(MonoExpr {
+                    kind: MonoExprKind::DynMethodCall {
+                        recv,
+                        method_idx: dmd.method_idx,
+                        args: out_args,
+                        method_param_types: dmd.method_param_types.clone(),
+                        method_return_type: dmd.method_return_type.clone(),
+                        recv_mut: dmd.recv_mut,
+                        trait_path: dmd.trait_path.clone(),
+                    },
+                    ty,
+                    span: expr.span.copy(),
+                });
+            }
             // Resolve method dispatch first so we know recv_adjust
             // before lowering the receiver. Mutability of the autoref
             // (BorrowImm vs BorrowMut) flows into `lower_place` so an
@@ -2665,6 +2727,42 @@ fn lower_expr(ctx: &mut LowerCtx, expr: &Expr) -> Result<MonoExpr, Error> {
             unreachable!("closure expressions rejected at typeck before mono")
         }
     };
+    // If typeck recorded a `&T → &dyn Trait` coercion on this expr id,
+    // wrap the inner expression in RefDynCoerce. The inner's runtime
+    // value is just a single i32 (the source `&T`'s data ptr); the
+    // wrapper provides the second word (vtable address) at codegen.
+    if let Some(Some(dc)) = ctx.input.dyn_coercions.get(expr.id as usize) {
+        // The coerced-to type is `&dyn Trait` (or `&mut`); the inner
+        // is `&T` (or `&mut T`). Reconstruct the inner ref's type from
+        // the recorded `src_concrete_ty` and the outer ref's mutability.
+        let outer_mut = matches!(&ty, RType::Ref { mutable: true, .. });
+        let inner_lifetime = match &ty {
+            RType::Ref { lifetime, .. } => lifetime.clone(),
+            _ => crate::typeck::LifetimeRepr::Inferred(0),
+        };
+        let inner_ref_ty = RType::Ref {
+            inner: Box::new(dc.src_concrete_ty.clone()),
+            mutable: outer_mut,
+            lifetime: inner_lifetime,
+        };
+        let inner_ref_expr = MonoExpr {
+            kind,
+            ty: inner_ref_ty,
+            span: expr.span.copy(),
+        };
+        // Phase 2 v1: single-bound dyn only. Multi-bound was rejected
+        // at coerce_at (or will be at codegen).
+        let trait_path = dc.trait_paths[0].clone();
+        return Ok(MonoExpr {
+            kind: MonoExprKind::RefDynCoerce {
+                inner_ref: Box::new(inner_ref_expr),
+                src_concrete_ty: dc.src_concrete_ty.clone(),
+                trait_path,
+            },
+            ty,
+            span: expr.span.copy(),
+        });
+    }
     Ok(MonoExpr { kind, ty, span: expr.span.copy() })
 }
 

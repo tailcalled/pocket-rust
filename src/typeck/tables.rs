@@ -413,6 +413,15 @@ pub struct FnSymbol {
     // wasm idx and emits `i32.const intern_table_slot(wasm_idx)`. None
     // for every other expr id.
     pub fn_item_addrs: Vec<Option<usize>>,
+    // Per-NodeId dyn-trait coercion record — set when an expression's
+    // value flows from `&T` (or `&mut T`) into a `&dyn Trait` (or
+    // `&mut dyn Trait`) slot. Carries the source's concrete type and
+    // the trait paths; mono uses (trait_path, concrete_ty) to request
+    // a vtable, codegen emits the fat ref. None at every other expr id.
+    pub dyn_coercions: Vec<Option<crate::typeck::DynCoercion>>,
+    // Per-NodeId dyn-method dispatch — set on a MethodCall expr id
+    // when the receiver was `&dyn Trait` / `&mut dyn Trait`.
+    pub dyn_method_calls: Vec<Option<crate::typeck::DynMethodDispatch>>,
     // T4.6: places whose move-state at the binding's scope-end was non-Init,
     // snapshotted from borrowck's walk. Codegen consults this to decide what
     // to do at each Drop binding's drop point: `Init` means the binding
@@ -571,6 +580,10 @@ pub struct GenericTemplate {
     pub call_resolutions: Vec<Option<CallResolution>>,
     // Per-NodeId fn-item address — see `FnSymbol.fn_item_addrs`.
     pub fn_item_addrs: Vec<Option<usize>>,
+    // Per-NodeId dyn-trait coercion record — see `FnSymbol.dyn_coercions`.
+    pub dyn_coercions: Vec<Option<crate::typeck::DynCoercion>>,
+    // Per-NodeId dyn-method dispatch — see `FnSymbol.dyn_method_calls`.
+    pub dyn_method_calls: Vec<Option<crate::typeck::DynMethodDispatch>>,
     // T4.6: see FnSymbol.moved_places. For templates the snapshot is taken
     // from the polymorphic body walk and reused across monomorphizations
     // (move semantics don't depend on concrete type args).
