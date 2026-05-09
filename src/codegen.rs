@@ -48,16 +48,19 @@ struct MonoState {
     table_base_offset: u32,
     // Per (trait_path, concrete_type) vtable storage. Each entry maps
     // to a memory address in the data segment where the vtable lives.
-    // Computed on first request — `intern_vtable` walks the trait's
-    // methods, resolves each impl method to a wasm idx via
-    // `solve_impl + funcs.entries[].idx` (or `mono_table.lookup` for
-    // generic impls), interns funcref-table slots for each, packs
-    // them as i32 little-endian bytes, and reserves a region in
-    // `vtable_bytes`. The base address (`VTABLE_BASE + offset`) goes
-    // back to the caller so `RefDynCoerce` can emit it as the second
-    // word of the fat ref.
+    // Computed on first request — `intern_vtable` writes a header
+    // (drop fn slot at offset 0) followed by one slot per trait method
+    // in declaration order, packs them as i32 little-endian bytes, and
+    // reserves a region in `vtable_bytes`. The base address
+    // (`VTABLE_BASE + offset`) goes back to the caller so
+    // `RefDynCoerce` can emit it as the second word of the fat ref.
     vtables: Vec<((Vec<String>, RType), u32)>,
     vtable_bytes: Vec<u8>,
+    // Wasm function index of a synthesized no-op `drop(&self)` used as
+    // the drop slot in vtables for non-Drop concrete types. Pre-allocated
+    // at the start of every crate's emit() so the slot is always
+    // resolvable without back-patching.
+    noop_drop_wasm_idx: Option<u32>,
 }
 
 struct StrPoolEntry {
@@ -76,6 +79,7 @@ impl MonoState {
             table_base_offset: 0,
             vtables: Vec::new(),
             vtable_bytes: Vec::new(),
+            noop_drop_wasm_idx: None,
         }
     }
 
@@ -151,10 +155,47 @@ impl MonoState {
                 span: crate::span::Span::new(crate::span::Pos::new(0, 0), crate::span::Pos::new(0, 0)),
             }),
         };
+        let impl_unsafe = traits.impls[solved.impl_idx].file.is_empty();
+        let _ = impl_unsafe;
         let impl_idx = solved.impl_idx;
         // Reserve the address (start of this vtable's bytes within the
         // crate-local vtable pool — which sits at VTABLE_BASE).
         let addr = VTABLE_BASE + self.vtable_bytes.len() as u32;
+        // Vtable header: drop fn slot at offset 0. Look up an
+        // `impl Drop for <concrete>` row; if present, use its `drop`
+        // method's wasm idx, else fall back to the synthesized no-op.
+        let drop_trait = crate::typeck::drop_trait_path();
+        let drop_wasm_idx: u32 = match crate::typeck::solve_impl_with_args(
+            &drop_trait,
+            &Vec::new(),
+            concrete_ty,
+            traits,
+            0,
+        ) {
+            Some(drop_solved) => {
+                let mut found: Option<u32> = None;
+                let mut e = 0;
+                while e < funcs.entries.len() {
+                    if funcs.entries[e].trait_impl_idx == Some(drop_solved.impl_idx)
+                        && funcs.entries[e].path.last().map(|s| s.as_str()) == Some("drop")
+                    {
+                        found = Some(funcs.entries[e].idx);
+                        break;
+                    }
+                    e += 1;
+                }
+                match found {
+                    Some(i) => i,
+                    None => self.noop_drop_wasm_idx.expect("noop drop reserved"),
+                }
+            }
+            None => self.noop_drop_wasm_idx.expect("noop drop reserved"),
+        };
+        let drop_slot = self.intern_table_slot(drop_wasm_idx);
+        self.vtable_bytes.push((drop_slot & 0xff) as u8);
+        self.vtable_bytes.push(((drop_slot >> 8) & 0xff) as u8);
+        self.vtable_bytes.push(((drop_slot >> 16) & 0xff) as u8);
+        self.vtable_bytes.push(((drop_slot >> 24) & 0xff) as u8);
         // Walk trait methods in declaration order. For each, find the
         // matching FnSymbol in `funcs.entries` whose `trait_impl_idx`
         // points at this impl and whose path's last segment is the
@@ -304,6 +345,16 @@ pub fn emit(
     let table_base_offset: u32 = wasm_mod.func_table.len() as u32;
     let mut mono = MonoState::new(*next_idx, str_pool_base_offset);
     mono.table_base_offset = table_base_offset;
+    // Reserve a wasm idx for a synthesized no-op drop fn — `(param i32)
+    // -> ()` with an empty body. Used as the drop slot in vtables for
+    // concrete types that aren't Drop. The idx is reserved up-front so
+    // `intern_vtable` (which may run during per-fn codegen) can fill the
+    // slot; the matching FuncType + FuncBody are pushed after
+    // `emit_module` finishes so the position in `wasm_mod.code` lines
+    // up with the reserved idx (typeck-registered fns fill the slots
+    // before it; mono'd fns fill the slots after it).
+    let noop_idx = mono.mono_table.reserve_idx();
+    mono.noop_drop_wasm_idx = Some(noop_idx);
     // Eager mono expansion: walk every reachable function body and
     // intern each (template, args) pair before any byte emission. Then
     // codegen iterates the populated mono table to emit bodies. Any
@@ -311,6 +362,18 @@ pub fn emit(
     // hits an idempotent lookup against the pre-populated table.
     crate::mono::expand(root, structs, enums, traits, funcs, &mut mono.mono_table)?;
     emit_module(wasm_mod, root, &mut module_path, structs, enums, traits, funcs, &mut mono)?;
+    // Push the no-op drop fn now — its slot in wasm_mod.code lines up
+    // with `noop_idx` reserved above.
+    let noop_type_idx = wasm_mod.types.len() as u32;
+    wasm_mod.types.push(wasm::FuncType {
+        params: vec![wasm::ValType::I32],
+        results: Vec::new(),
+    });
+    wasm_mod.functions.push(noop_type_idx);
+    wasm_mod.code.push(wasm::FuncBody {
+        locals: Vec::new(),
+        instructions: Vec::new(),
+    });
     // Iterate the mono table by index (entries may grow if expansion
     // missed a site and codegen's intern allocates a new entry — the
     // index walk picks those up too). For each entry, emit the
@@ -672,12 +735,30 @@ fn collect_leaves(
                 valtype: wasm::ValType::I32,
             }),
         },
-        RType::RawPtr { .. } => out.push(MemLeaf {
-            byte_offset: base_offset,
-            byte_size: 4,
-            signed: false,
-            valtype: wasm::ValType::I32,
-        }),
+        RType::RawPtr { inner, .. } => match inner.as_ref() {
+            // Fat raw pointer to a DST: two i32 leaves (data ptr,
+            // len/vtable), matching `RType::Ref` to a DST.
+            RType::Slice(_) | RType::Str | RType::Dyn { .. } => {
+                out.push(MemLeaf {
+                    byte_offset: base_offset,
+                    byte_size: 4,
+                    signed: false,
+                    valtype: wasm::ValType::I32,
+                });
+                out.push(MemLeaf {
+                    byte_offset: base_offset + 4,
+                    byte_size: 4,
+                    signed: false,
+                    valtype: wasm::ValType::I32,
+                });
+            }
+            _ => out.push(MemLeaf {
+                byte_offset: base_offset,
+                byte_size: 4,
+                signed: false,
+                valtype: wasm::ValType::I32,
+            }),
+        },
         RType::Slice(_) | RType::Str => unreachable!("`[T]` / `str` is unsized — only valid behind a reference"),
         RType::Struct { path, type_args, .. } => {
             let entry = struct_lookup(structs, path).expect("resolved struct");
@@ -1870,6 +1951,47 @@ fn emit_drop_walker(
     ty: &RType,
     addr_local: u32,
 ) -> Result<(), Error> {
+    // Box<dyn Trait> short-circuit. The user-written `impl<T> Drop for
+    // Box<T>` doesn't apply (its body would need sizeof T). Drop the
+    // box by: load data_ptr + vtable_ptr from the box, dispatch the
+    // vtable's drop slot (offset 0) on the data ptr, then free the
+    // buffer (no-op today since `¤free` is a stub).
+    if let RType::Struct { path, type_args, .. } = ty {
+        if crate::typeck::is_std_box_path(path)
+            && type_args.len() == 1
+            && matches!(&type_args[0], RType::Dyn { .. })
+        {
+            // Load data_ptr (i32 at offset 0).
+            ctx.instructions.push(wasm::Instruction::LocalGet(addr_local));
+            ctx.instructions.push(wasm::Instruction::I32Load { align: 2, offset: 0 });
+            let data_local = alloc_i32_local(ctx);
+            ctx.instructions.push(wasm::Instruction::LocalSet(data_local));
+            // Load vtable_ptr (i32 at offset 4).
+            ctx.instructions.push(wasm::Instruction::LocalGet(addr_local));
+            ctx.instructions.push(wasm::Instruction::I32Load { align: 2, offset: 4 });
+            let vtable_local = alloc_i32_local(ctx);
+            ctx.instructions.push(wasm::Instruction::LocalSet(vtable_local));
+            // Push data_ptr as the &self arg.
+            ctx.instructions.push(wasm::Instruction::LocalGet(data_local));
+            // Load drop_fn slot from vtable[0].
+            ctx.instructions.push(wasm::Instruction::LocalGet(vtable_local));
+            ctx.instructions.push(wasm::Instruction::I32Load { align: 2, offset: 0 });
+            let drop_typeidx = intern_pending_func_type(ctx, wasm::FuncType {
+                params: vec![wasm::ValType::I32],
+                results: Vec::new(),
+            });
+            ctx.instructions.push(wasm::Instruction::CallIndirect {
+                type_idx: drop_typeidx,
+                table_idx: 0,
+            });
+            // Free the heap buffer. `¤free` is a no-op stub today, so
+            // skipping the call would be observationally identical, but
+            // emit it for forward-compatibility once a real free lands.
+            ctx.instructions.push(wasm::Instruction::LocalGet(data_local));
+            ctx.instructions.push(wasm::Instruction::Drop);
+            return Ok(());
+        }
+    }
     if crate::typeck::is_drop(ty, ctx.traits) {
         let callee_idx = resolve_drop_method_idx(ctx, ty);
         ctx.instructions.push(wasm::Instruction::LocalGet(addr_local));
@@ -5253,11 +5375,12 @@ fn codegen_mono_expr(
                 codegen_mono_expr(ctx, &args[i])?;
                 i += 1;
             }
-            // Load funcref slot from vtable[method_idx*4].
+            // Load funcref slot from vtable[(method_idx + 1) * 4]. The
+            // +1 skips the drop fn header at offset 0.
             ctx.instructions.push(wasm::Instruction::LocalGet(vtable_local));
             ctx.instructions.push(wasm::Instruction::I32Load {
                 align: 2,
-                offset: (*method_idx) * 4,
+                offset: ((*method_idx) + 1) * 4,
             });
             // Build the FuncType: prepend i32 receiver, then flatten
             // each method param + return type.

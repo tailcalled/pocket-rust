@@ -1955,16 +1955,34 @@ pub(crate) struct LitConstraint {
     span: Span,
 }
 
-// Coercion of a `&T` / `&mut T` value into a `&dyn Trait` / `&mut dyn
-// Trait` slot. `src_concrete_ty` is the resolved concrete type behind
-// the source ref (`T`); `trait_paths` is the bound list of the target
-// dyn type. Mono uses the (trait_path, concrete_ty) pair to request
-// vtable construction; codegen emits the data ptr from the source ref
+// Returns true iff `path` is the canonical `std::boxed::Box` path.
+// Used to recognize `Box<T>` types at coercion + dispatch sites.
+pub fn is_std_box_path(path: &Vec<String>) -> bool {
+    path.len() == 3 && path[0] == "std" && path[1] == "boxed" && path[2] == "Box"
+}
+
+// Coercion of a `&T` / `&mut T` / `Box<T>` value into the matching dyn
+// shape. `src_concrete_ty` is the source's concrete `T`; `trait_paths`
+// is the bound list of the target dyn type. `kind` discriminates the
+// outer container so codegen knows whether to emit a fat reference or
+// a fat box. Mono uses the (trait_path, concrete_ty) pair to request
+// vtable construction; codegen emits the data ptr from the source
 // followed by the vtable address as the second word.
 #[derive(Clone)]
 pub struct DynCoercion {
     pub src_concrete_ty: RType,
     pub trait_paths: Vec<Vec<String>>,
+    pub kind: DynCoercionKind,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum DynCoercionKind {
+    // `&T → &dyn Trait` or `&mut T → &mut dyn Trait` (or downgrade).
+    Ref,
+    // `Box<T> → Box<dyn Trait>`. Box's runtime layout is a single i32
+    // (the heap data ptr) on the source side; the coercion turns it
+    // into a (data_ptr, vtable_ptr) fat box.
+    BoxOwned,
 }
 
 // Dispatch record for a method call whose receiver is `&dyn Trait` /
@@ -2056,9 +2074,71 @@ pub(crate) fn coerce_at(
                 ctx.dyn_coercions[id] = Some(DynCoercion {
                     src_concrete_ty: src_concrete,
                     trait_paths: bounds.clone(),
+                    kind: DynCoercionKind::Ref,
                 });
             }
             return Ok(());
+        }
+    }
+    // Box<T> → Box<dyn Trait>: source = `Struct{["std","boxed","Box"],
+    // [T]}`; target = `Struct{["std","boxed","Box"], [Dyn{...}]}`.
+    // Same obj-safety + impl-existence checks as the ref case, but the
+    // lowered shape is `BoxOwned` (data_ptr field of the source box +
+    // vtable address).
+    if let (
+        InferType::Struct { path: a_path, type_args: a_args, .. },
+        InferType::Struct { path: e_path, type_args: e_args, .. },
+    ) = (&actual_resolved, &expected_resolved)
+    {
+        if a_path == e_path
+            && is_std_box_path(a_path)
+            && a_args.len() == 1
+            && e_args.len() == 1
+        {
+            if let InferType::Dyn { bounds, .. } = &e_args[0] {
+                // The source's type-arg must NOT itself be Dyn (that
+                // would be a no-op identity, handled by normal unify).
+                if !matches!(&a_args[0], InferType::Dyn { .. }) {
+                    let mut i = 0;
+                    while i < bounds.len() {
+                        dyn_safety::check_object_safety(&bounds[i], ctx.traits, span, ctx.current_file)?;
+                        i += 1;
+                    }
+                    let src_concrete = ctx.subst.finalize(&a_args[0]);
+                    let mut j = 0;
+                    while j < bounds.len() {
+                        let solved = traits::solve_impl_with_args(
+                            &bounds[j],
+                            &Vec::new(),
+                            &src_concrete,
+                            ctx.traits,
+                            0,
+                        );
+                        if solved.is_none() {
+                            return Err(Error {
+                                file: ctx.current_file.to_string(),
+                                message: format!(
+                                    "cannot coerce to `Box<dyn {}>`: type `{}` does not implement `{}`",
+                                    place_to_string(&bounds[j]),
+                                    rtype_to_string(&src_concrete),
+                                    place_to_string(&bounds[j]),
+                                ),
+                                span: span.copy(),
+                            });
+                        }
+                        j += 1;
+                    }
+                    let id = expr_id as usize;
+                    if id < ctx.dyn_coercions.len() {
+                        ctx.dyn_coercions[id] = Some(DynCoercion {
+                            src_concrete_ty: src_concrete,
+                            trait_paths: bounds.clone(),
+                            kind: DynCoercionKind::BoxOwned,
+                        });
+                    }
+                    return Ok(());
+                }
+            }
         }
     }
     ctx.subst.coerce(

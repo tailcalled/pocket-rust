@@ -167,3 +167,162 @@ fn dyn_mut_method_on_immut_dyn_is_rejected() {
         err
     );
 }
+
+// `Box<dyn Trait>` — owned trait object. The Box's body is a fat raw
+// pointer (data + vtable); coercion `Box<T> → Box<dyn Trait>`
+// runs the same obj-safety + impl checks as the ref case.
+//
+// Today's typeck propagates the let-anno type into `Box::new`'s `T`
+// inference, so writing `let b: Box<dyn Show> = Box::new(Foo { v: 42 })`
+// is rejected (the call's arg slot is then expected to be `dyn Show`).
+// Workaround: bind the source as `Box<Foo>` first, then coerce. Real
+// fix is to defer let-anno pinning of generic-fn type-args when a
+// dyn coercion is possible at the let boundary — gap-tested.
+#[test]
+fn box_dyn_show_call_returns_42() {
+    expect_answer_sources(
+        &[(
+            "lib.rs",
+            "trait Show { fn show(&self) -> u32; }\n\
+             struct Foo { v: u32 }\n\
+             impl Show for Foo { fn show(&self) -> u32 { self.v } }\n\
+             fn answer() -> u32 { \
+                let bf: Box<Foo> = Box::new(Foo { v: 42 }); \
+                let b: Box<dyn Show> = bf; \
+                b.show() \
+             }",
+        )],
+        42u32,
+    );
+}
+
+// Auto-deref-style method dispatch on Box<dyn Trait> without an
+// explicit `&*` — the box is its own receiver, codegen extracts the
+// fat pointer from the box's flat scalars.
+#[test]
+fn box_dyn_two_impls_returns_30() {
+    expect_answer_sources(
+        &[(
+            "lib.rs",
+            "trait Show { fn show(&self) -> u32; }\n\
+             struct A { v: u32 }\n\
+             struct B { v: u32 }\n\
+             impl Show for A { fn show(&self) -> u32 { self.v + 1 } }\n\
+             impl Show for B { fn show(&self) -> u32 { self.v + 2 } }\n\
+             fn answer() -> u32 { \
+                let ba_inner: Box<A> = Box::new(A { v: 10 }); \
+                let ba: Box<dyn Show> = ba_inner; \
+                let bb_inner: Box<B> = Box::new(B { v: 17 }); \
+                let bb: Box<dyn Show> = bb_inner; \
+                ba.show() + bb.show() \
+             }",
+        )],
+        30u32,
+    );
+}
+
+// `&mut self` method dispatch through `Box<dyn Counter>` — the box
+// owns its T, so `&mut self` methods are reachable.
+#[test]
+fn box_dyn_mut_counter_returns_2() {
+    expect_answer_sources(
+        &[(
+            "lib.rs",
+            "trait Counter { fn bump(&mut self); fn read(&self) -> u32; }\n\
+             struct Ctr { n: u32 }\n\
+             impl Counter for Ctr { \
+                fn bump(&mut self) { self.n = self.n + 1; } \
+                fn read(&self) -> u32 { self.n } \
+             }\n\
+             fn answer() -> u32 { \
+                let bc: Box<Ctr> = Box::new(Ctr { n: 0 }); \
+                let mut b: Box<dyn Counter> = bc; \
+                b.bump(); b.bump(); \
+                b.read() \
+             }",
+        )],
+        2u32,
+    );
+}
+
+// Pass `Box<dyn Show>` as a fn arg. Same fat shape as `&dyn Show`.
+#[test]
+fn box_dyn_passed_as_arg_returns_99() {
+    expect_answer_sources(
+        &[(
+            "lib.rs",
+            "trait Show { fn show(&self) -> u32; }\n\
+             struct Foo { v: u32 }\n\
+             impl Show for Foo { fn show(&self) -> u32 { self.v } }\n\
+             fn ping(b: Box<dyn Show>) -> u32 { b.show() }\n\
+             fn answer() -> u32 { \
+                let bf: Box<Foo> = Box::new(Foo { v: 99 }); \
+                ping(bf) \
+             }",
+        )],
+        99u32,
+    );
+}
+
+// Drop dispatch through the vtable's drop slot. The concrete `Logger`
+// type has a `Drop` impl that writes a sentinel byte through a raw
+// pointer; dropping the `Box<dyn Show>` runs the concrete drop via
+// vtable[0], so the sentinel is observable after the box's scope ends.
+#[test]
+fn box_dyn_drop_fires_returns_42() {
+    expect_answer_sources(
+        &[(
+            "lib.rs",
+            "trait Show { fn show(&self) -> u32; }\n\
+             struct Logger { p: *mut u32 }\n\
+             impl Drop for Logger { fn drop(&mut self) { unsafe { *self.p = 42; } } }\n\
+             impl Show for Logger { fn show(&self) -> u32 { 0 } }\n\
+             fn answer() -> u32 { \
+                let mut sentinel: u32 = 0; \
+                { \
+                    let bl: Box<Logger> = Box::new(Logger { p: &mut sentinel as *mut u32 }); \
+                    let _b: Box<dyn Show> = bl; \
+                } \
+                sentinel \
+             }",
+        )],
+        42u32,
+    );
+}
+
+// Non-Drop concrete type: the vtable's drop slot points at a no-op fn
+// (synthesized at codegen-init), so dropping a `Box<dyn Show>` for a
+// non-Drop type doesn't crash.
+#[test]
+fn box_dyn_drop_noop_for_non_drop_type_returns_7() {
+    expect_answer_sources(
+        &[(
+            "lib.rs",
+            "trait Show { fn show(&self) -> u32; }\n\
+             struct Plain { v: u32 }\n\
+             impl Show for Plain { fn show(&self) -> u32 { self.v } }\n\
+             fn answer() -> u32 { \
+                let bp: Box<Plain> = Box::new(Plain { v: 7 }); \
+                let b: Box<dyn Show> = bp; \
+                b.show() \
+             }",
+        )],
+        7u32,
+    );
+}
+
+// Negative: Box<dyn Foo> rejected when Foo isn't object-safe.
+#[test]
+fn box_dyn_obj_unsafe_is_rejected() {
+    let err = compile_source(
+        "trait Take { fn take(self) -> u32; }\n\
+         struct Foo { v: u32 }\n\
+         impl Take for Foo { fn take(self) -> u32 { self.v } }\n\
+         fn answer() -> u32 { let b: Box<dyn Take> = Box::new(Foo { v: 1 }); 0 }",
+    );
+    assert!(
+        err.contains("by value") || err.contains("object-safe") || err.contains("dyn"),
+        "expected obj-safety error on Box<dyn>, got: {}",
+        err
+    );
+}

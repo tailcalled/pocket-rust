@@ -802,6 +802,23 @@ pub(super) fn check_method_call(
             );
         }
     }
+    // Box<dyn Trait> receiver dispatch: the box owns its T, so both
+    // `&self` and `&mut self` methods are dispatchable. Codegen
+    // extracts the box's two i32s (data ptr + vtable ptr) — same fat
+    // shape as `&dyn Trait`.
+    if let InferType::Struct { path, type_args, .. } = &resolved_recv {
+        if crate::typeck::is_std_box_path(path) && type_args.len() == 1 {
+            if let InferType::Dyn { bounds, .. } = &type_args[0] {
+                return check_dyn_method_call(
+                    ctx,
+                    mc,
+                    call_expr,
+                    bounds.clone(),
+                    true, // owned Box: any receiver shape (`&self`/`&mut self`) works
+                );
+            }
+        }
+    }
     // RPIT existential receiver: when the recv type is an `Opaque`,
     // method dispatch consults the slot's bounds — same shape as
     // Param-receiver symbolic dispatch but the bound list lives on

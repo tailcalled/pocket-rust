@@ -53,6 +53,12 @@ pub struct CfgBuildCtx<'a> {
     // no underlying place to track — emitted as a placeholder constant
     // operand.
     pub fn_item_addrs: &'a Vec<Option<usize>>,
+    // Per-NodeId dyn-method dispatch (see `FnSymbol.dyn_method_calls`).
+    // Borrowck consults this to derive the receiver's borrow shape:
+    // `&dyn Trait` recv → ByRef, `Box<dyn Trait>` recv → BorrowMut
+    // (auto-borrow the owning box), since the standard
+    // `method_resolutions` slot is None for dyn dispatch.
+    pub dyn_method_calls: &'a Vec<Option<crate::typeck::DynMethodDispatch>>,
     // User-declared lifetime parameter names on the fn (for `<'a, 'b>`
     // — empty if the fn has no lifetime generics). Used by Phase L1 to
     // populate `RegionGraph.sig_named`.
@@ -1952,11 +1958,40 @@ impl<'a> Builder<'a> {
         // Receiver lowering depends on the method's receiver-adjust:
         // BorrowImm/BorrowMut take an implicit borrow (== `(&recv)` /
         // `(&mut recv)`); Move consumes the owned value; ByRef passes
-        // an existing reference through.
-        let recv_adjust = self.ctx.method_resolutions[node_id as usize]
-            .as_ref()
-            .map(|r| r.recv_adjust)
-            .unwrap_or(ReceiverAdjust::Move);
+        // an existing reference through. For dyn dispatch, derive
+        // the adjust from the receiver type since `method_resolutions`
+        // is None for those calls.
+        let recv_adjust = if let Some(_dmd) = self.ctx.dyn_method_calls
+            .get(node_id as usize)
+            .and_then(|o| o.as_ref())
+        {
+            let recv_ty = self.expr_type(mc.receiver.id);
+            match &recv_ty {
+                // `&dyn Trait` / `&mut dyn Trait` — already a ref.
+                crate::typeck::RType::Ref { inner, .. }
+                    if matches!(inner.as_ref(), crate::typeck::RType::Dyn { .. }) =>
+                {
+                    ReceiverAdjust::ByRef
+                }
+                // `Box<dyn Trait>` — owned; auto-borrow as &mut so the
+                // call doesn't consume the box. Real Rust treats Box
+                // as Move per call, but for Phase 3 v1 a borrow keeps
+                // borrowck happy without breaking the test surface.
+                crate::typeck::RType::Struct { path, type_args, .. }
+                    if crate::typeck::is_std_box_path(path)
+                        && type_args.len() == 1
+                        && matches!(&type_args[0], crate::typeck::RType::Dyn { .. }) =>
+                {
+                    ReceiverAdjust::BorrowMut
+                }
+                _ => ReceiverAdjust::Move,
+            }
+        } else {
+            self.ctx.method_resolutions[node_id as usize]
+                .as_ref()
+                .map(|r| r.recv_adjust)
+                .unwrap_or(ReceiverAdjust::Move)
+        };
         let recv = match recv_adjust {
             ReceiverAdjust::BorrowImm => self.synth_borrow(&mc.receiver, false),
             ReceiverAdjust::BorrowMut => self.synth_borrow(&mc.receiver, true),

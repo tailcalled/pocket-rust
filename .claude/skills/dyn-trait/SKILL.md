@@ -1,6 +1,6 @@
 ---
 name: dyn-trait
-description: Use when working with trait objects `&dyn Trait` / `&mut dyn Trait` — the parser/AST/RType plumbing, lazy object-safety check, `&T → &dyn Trait` coercion mechanics, vtable storage in the data segment, and `DynMethodCall` dispatch through `call_indirect`. Phase 2 of the dyn-trait roadmap. Phase 1 (`fn-pointers`) is the foundation.
+description: Use when working with trait objects `&dyn Trait` / `&mut dyn Trait` / `Box<dyn Trait>` — the parser/AST/RType plumbing, lazy object-safety check, coercion mechanics, vtable storage (drop slot + method slots) in the data segment, `DynMethodCall` dispatch through `call_indirect`, and the codegen-driven Drop path for `Box<dyn>`. Phases 2-3 of the dyn-trait roadmap. Phase 1 (`fn-pointers`) is the foundation.
 ---
 
 # Trait objects — `&dyn Trait` / `&mut dyn Trait`
@@ -76,13 +76,27 @@ Lives in `MonoState`:
 - `vtables: Vec<((Vec<String>, RType), u32)>` — interns `(trait_path, concrete_ty) → absolute_vtable_address`.
 - `vtable_bytes: Vec<u8>` — the packed i32 little-endian funcref slot indices for every vtable.
 - `VTABLE_BASE = 0x4000` — start of the vtable region in linear memory. The string pool grows from `STR_POOL_BASE = 8` and must not exceed `VTABLE_BASE`. Vtables grow upward; `__heap_top` is bumped past the end of vtable_bytes at end-of-codegen.
+- `noop_drop_wasm_idx: Option<u32>` — wasm index of a synthesized `(param i32) -> ()` no-op fn, pre-allocated at the start of every `emit()`. Used as the drop slot for vtables of non-Drop concrete types.
 
-`MonoState::intern_vtable(trait_path, concrete_ty, traits, funcs)`:
+### Vtable layout
+
+Each vtable starts with a **drop fn slot at offset 0**, followed by one i32 slot per declared trait method in declaration order. Method index in `DynMethodCall` is the position in the trait's `methods` list; codegen reads `vtable[(method_idx + 1) * 4]` to skip the drop header.
+
+```
+offset 0:  drop_fn      ← funcref-table slot for the concrete type's drop
+offset 4:  method[0]    ← first trait method
+offset 8:  method[1]
+...
+```
+
+For Drop concrete types, the drop slot points at `<T as Drop>::drop`. For non-Drop types it points at the synthesized no-op fn.
+
+### `MonoState::intern_vtable(trait_path, concrete_ty, traits, funcs)`
 
 1. Dedupe against existing entries.
 2. `solve_impl_with_args` → `impl_idx`.
-3. Walk the trait's methods; for each, find the matching FnSymbol in `funcs.entries` whose `trait_impl_idx == Some(impl_idx)` and whose path's last segment is the method name.
-4. Intern a funcref-table slot for that wasm idx via `intern_table_slot` (deduped against fn-pointer slots).
+3. **Drop slot**: lookup `impl Drop for concrete_ty` via `solve_impl_with_args(drop_trait_path(), …)`. If found, intern the impl's `drop` fn; else fall back to `noop_drop_wasm_idx`.
+4. Walk the trait's methods; for each, find the matching FnSymbol in `funcs.entries` whose `trait_impl_idx == Some(impl_idx)` and whose path's last segment is the method name. Intern its funcref-table slot.
 5. Pack each slot as 4 little-endian bytes; record the start address (`VTABLE_BASE + vtable_bytes.len()`).
 
 At end of `emit()`, `mono.vtable_bytes` are flushed into a Data segment at offset `VTABLE_BASE` (creating or appending to the segment). `__heap_top` is bumped past whichever data region (string pool or vtable pool) ends later.
@@ -110,10 +124,44 @@ Two new `MonoExprKind` variants:
 7. Build the FuncType (sret? + i32 for &self + per-arg flatten + per-return flatten); intern via `intern_pending_func_type`.
 8. `call_indirect typeidx`.
 
+## `Box<dyn Trait>` (Phase 3)
+
+Owned trait objects build on Phase 2's machinery plus three additions:
+
+### Fat raw pointers
+
+`*mut/const dyn Trait`, `*mut/const [T]`, `*mut/const str` flatten to **2 i32s** (data ptr + len/vtable). Updated in `flatten_rtype` / `byte_size_of` / `rtype_size` / `collect_leaves`. This makes `Box<DST>` automatically fat: `Box<T>` has body `ptr: *mut T`, so substituting T = Dyn yields `*mut dyn Trait` — a fat raw ptr — and the surrounding struct flattens to its 2-i32 contents.
+
+### `Box<T>` → `Box<dyn Trait>` coercion
+
+`coerce_at` recognizes the shape `Struct{["std","boxed","Box"], [T]}` → `Struct{["std","boxed","Box"], [Dyn{...}]}` and runs the same object-safety + impl-existence checks as the ref case. Records `DynCoercion { kind: BoxOwned, src_concrete_ty: T, trait_paths }`.
+
+**Today's limitation:** typeck propagates the let-anno target into a `Box::new(...)` call's type-arg inference, so writing `let b: Box<dyn Show> = Box::new(Foo { v: 42 })` is rejected (the call's arg slot is then expected to be `dyn Show`). Workaround: bind as `Box<T>` first, then coerce:
+
+```
+let bf: Box<Foo> = Box::new(Foo { v: 42 });
+let b: Box<dyn Show> = bf;          // dyn coercion fires here
+```
+
+### Method dispatch on `Box<dyn Trait>`
+
+`check_method_call` recognizes `recv: Box<Dyn>` and routes to `check_dyn_method_call(..., recv_mut: true)` (the box owns its T, so any receiver shape works). Codegen extracts the box's two i32s (data ptr + vtable ptr) as the fat receiver — same emission path as `&dyn Trait`.
+
+Borrowck derives `recv_adjust = BorrowMut` for `Box<dyn>` recv (from the per-NodeId `dyn_method_calls` artifact), so `box.method()` doesn't move the box.
+
+### Drop for `Box<dyn Trait>`
+
+The user-written `impl<T> Drop for Box<T>` body has `let v: T = unsafe { *self.ptr };` which assumes sized T — invalid for T = dyn. Two pieces handle this:
+
+1. `mono::register_drop_mono` skips Box<dyn _> when registering drop monomorphizations.
+2. `emit_drop_walker` short-circuits Box<dyn _>: load data_ptr (offset 0), load vtable_ptr (offset 4), load drop fn slot from `vtable[0]`, `call_indirect` it with data_ptr, then `¤free(data_ptr)` (no-op stub today).
+
+The drop slot of vtables for non-Drop concrete types points at the synthesized no-op fn (`MonoState::noop_drop_wasm_idx`).
+
 ## Open follow-ups
 
+- Direct `let b: Box<dyn Show> = Box::new(Foo { v: 42 })` (without intermediate `Box<Foo>` binding) — needs typeck to defer let-anno propagation when a coercion at the boundary would succeed.
 - Supertrait method dispatch (currently rejects with "method not found on dyn X" if the method is on a supertrait of X).
 - Multi-bound `dyn A + B` (parser accepts; coercion + dispatch reject with "not supported yet").
-- `Box<dyn Trait>` (Phase 3).
 - `dyn Fn(T) -> R` for closures (Phase 4).
 - Generic concrete types via `&dyn Trait` (e.g. `&Wrap<u32>` coercing through `impl<T> Show for Wrap<T>`) — works for non-generic impls today; generic-impl vtables need additional mono integration.

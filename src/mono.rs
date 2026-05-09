@@ -108,6 +108,15 @@ impl MonoTable {
         self.next_idx
     }
 
+    // Reserve a wasm idx for a synthesized non-mono function (e.g.
+    // codegen's no-op drop). Bumps `next_idx` past the reservation
+    // so subsequent monomorphizations don't collide.
+    pub fn reserve_idx(&mut self) -> u32 {
+        let i = self.next_idx;
+        self.next_idx += 1;
+        i
+    }
+
     pub fn len(&self) -> usize {
         self.entries.len()
     }
@@ -404,6 +413,18 @@ fn register_drop_for_pattern_bindings(
 // no-op; for Drop with a non-template (Direct) impl this is also a
 // no-op since there's nothing to monomorphize.
 fn register_drop_mono(ty: &RType, traits: &TraitTable, funcs: &FuncTable, table: &mut MonoTable) {
+    // Box<dyn Trait> uses a vtable-driven drop emitted directly by
+    // codegen (see `emit_drop_walker`'s Box-dyn short-circuit). The
+    // user-written `impl<T> Drop for Box<T>` body assumes sized T, so
+    // monomorphizing it for T = dyn would fail. Skip.
+    if let RType::Struct { path, type_args, .. } = ty {
+        if crate::typeck::is_std_box_path(path)
+            && type_args.len() == 1
+            && matches!(&type_args[0], RType::Dyn { .. })
+        {
+            return;
+        }
+    }
     if !is_drop(ty, traits) {
         return;
     }
@@ -2727,27 +2748,37 @@ fn lower_expr(ctx: &mut LowerCtx, expr: &Expr) -> Result<MonoExpr, Error> {
             unreachable!("closure expressions rejected at typeck before mono")
         }
     };
-    // If typeck recorded a `&T → &dyn Trait` coercion on this expr id,
-    // wrap the inner expression in RefDynCoerce. The inner's runtime
-    // value is just a single i32 (the source `&T`'s data ptr); the
-    // wrapper provides the second word (vtable address) at codegen.
+    // If typeck recorded a dyn coercion on this expr id, wrap the
+    // inner expression in RefDynCoerce. The inner's runtime value is
+    // a single i32 (either the source `&T`'s data ptr or the source
+    // `Box<T>`'s heap ptr); the wrapper provides the second word
+    // (vtable address) at codegen.
     if let Some(Some(dc)) = ctx.input.dyn_coercions.get(expr.id as usize) {
-        // The coerced-to type is `&dyn Trait` (or `&mut`); the inner
-        // is `&T` (or `&mut T`). Reconstruct the inner ref's type from
-        // the recorded `src_concrete_ty` and the outer ref's mutability.
-        let outer_mut = matches!(&ty, RType::Ref { mutable: true, .. });
-        let inner_lifetime = match &ty {
-            RType::Ref { lifetime, .. } => lifetime.clone(),
-            _ => crate::typeck::LifetimeRepr::Inferred(0),
-        };
-        let inner_ref_ty = RType::Ref {
-            inner: Box::new(dc.src_concrete_ty.clone()),
-            mutable: outer_mut,
-            lifetime: inner_lifetime,
+        // The inner type depends on the coercion shape:
+        //   Ref:      inner is `&T` (or `&mut T`) — single i32.
+        //   BoxOwned: inner is `Box<T>` — single i32 (the heap ptr).
+        let inner_ty = match dc.kind {
+            crate::typeck::DynCoercionKind::Ref => {
+                let outer_mut = matches!(&ty, RType::Ref { mutable: true, .. });
+                let inner_lifetime = match &ty {
+                    RType::Ref { lifetime, .. } => lifetime.clone(),
+                    _ => crate::typeck::LifetimeRepr::Inferred(0),
+                };
+                RType::Ref {
+                    inner: Box::new(dc.src_concrete_ty.clone()),
+                    mutable: outer_mut,
+                    lifetime: inner_lifetime,
+                }
+            }
+            crate::typeck::DynCoercionKind::BoxOwned => RType::Struct {
+                path: vec!["std".to_string(), "boxed".to_string(), "Box".to_string()],
+                type_args: vec![dc.src_concrete_ty.clone()],
+                lifetime_args: Vec::new(),
+            },
         };
         let inner_ref_expr = MonoExpr {
             kind,
-            ty: inner_ref_ty,
+            ty: inner_ty,
             span: expr.span.copy(),
         };
         // Phase 2 v1: single-bound dyn only. Multi-bound was rejected

@@ -497,7 +497,10 @@ pub fn rtype_size(ty: &RType, structs: &StructTable) -> u32 {
             RType::Slice(_) | RType::Str | RType::Dyn { .. } => 2,
             _ => 1,
         },
-        RType::RawPtr { .. } => 1,
+        RType::RawPtr { inner, .. } => match inner.as_ref() {
+            RType::Slice(_) | RType::Str | RType::Dyn { .. } => 2,
+            _ => 1,
+        },
         RType::Param(_) => unreachable!("rtype_size called on unresolved type parameter"),
         RType::Slice(_) | RType::Str => unreachable!("`[T]` / `str` is unsized — only valid behind a reference"),
         RType::Tuple(elems) => {
@@ -585,7 +588,17 @@ pub fn flatten_rtype(ty: &RType, structs: &StructTable, out: &mut Vec<crate::was
             }
             _ => out.push(crate::wasm::ValType::I32),
         },
-        RType::RawPtr { .. } => out.push(crate::wasm::ValType::I32),
+        RType::RawPtr { inner, .. } => match inner.as_ref() {
+            // Fat raw pointer to a DST: 2 i32s (data ptr + len-or-vtable),
+            // mirroring Rust's `*mut [T]` / `*mut str` / `*mut dyn Trait`
+            // layout. This makes `Box<DST>` (whose body is `*mut T`) fat
+            // automatically.
+            RType::Slice(_) | RType::Str | RType::Dyn { .. } => {
+                out.push(crate::wasm::ValType::I32);
+                out.push(crate::wasm::ValType::I32);
+            }
+            _ => out.push(crate::wasm::ValType::I32),
+        },
         RType::Param(_) => unreachable!("flatten_rtype called on unresolved type parameter"),
         RType::Slice(_) | RType::Str => unreachable!("`[T]` / `str` is unsized — only valid behind a reference"),
         RType::Dyn { .. } => unreachable!("`dyn Trait` is unsized — only valid behind a reference"),
@@ -633,7 +646,10 @@ pub fn byte_size_of(rt: &RType, structs: &StructTable, enums: &EnumTable) -> u32
             RType::Slice(_) | RType::Str | RType::Dyn { .. } => 8,
             _ => 4,
         },
-        RType::RawPtr { .. } => 4,
+        RType::RawPtr { inner, .. } => match inner.as_ref() {
+            RType::Slice(_) | RType::Str | RType::Dyn { .. } => 8,
+            _ => 4,
+        },
         RType::Slice(_) | RType::Str => unreachable!("`[T]` / `str` is unsized — only valid behind a reference"),
         RType::Dyn { .. } => unreachable!("`dyn Trait` is unsized — only valid behind a reference"),
         RType::Struct { path, type_args, .. } => {
