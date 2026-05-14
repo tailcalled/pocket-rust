@@ -41,36 +41,127 @@ pub fn check_object_safety(
             span: span.copy(),
         }),
     };
-    // Check the trait's own methods.
+    // Check the trait's own methods. Supertrait methods that fail
+    // object-safety are silently skipped from the vtable (the
+    // `dyn_vtable_methods` walker omits them), not errors here —
+    // mirrors Rust's `where Self: Sized` carve-out without requiring
+    // that syntax. The trait's *own* methods must all be safe though;
+    // otherwise the vtable would be empty and dispatch impossible.
     let mut i = 0;
     while i < entry.methods.len() {
         let m = &entry.methods[i];
         check_method_obj_safe(m, trait_path, span, file)?;
         i += 1;
     }
-    // Walk supertraits transitively. Each supertrait must itself be
-    // object-safe — its methods are reachable through the same vtable.
+    Ok(())
+}
+
+// Returns true iff `m` is individually object-safe (receiver shape OK,
+// no method-level type-params, no Self outside receiver). Used by
+// `dyn_vtable_methods` to skip unsafe supertrait methods without
+// failing the whole coercion.
+pub fn is_method_obj_safe(m: &super::tables::TraitMethodEntry) -> bool {
+    match &m.receiver_shape {
+        Some(TraitReceiverShape::BorrowImm) | Some(TraitReceiverShape::BorrowMut) => {}
+        _ => return false,
+    }
+    if !m.type_params.is_empty() {
+        return false;
+    }
+    let mut k = 1;
+    while k < m.param_types.len() {
+        if rtype_mentions_self(&m.param_types[k]) {
+            return false;
+        }
+        k += 1;
+    }
+    if let Some(ret) = &m.return_type {
+        if rtype_mentions_self(ret) {
+            return false;
+        }
+    }
+    true
+}
+
+// Walk a trait + its transitive supertrait closure, returning every
+// object-safe method as `(declaring_trait_path, method_idx_in_that_trait, trait_args_for_that_trait)`
+// in the order they appear in the vtable: direct methods first, then
+// supertrait methods (BFS by trait). Skips object-unsafe supertrait
+// methods (mirrors Rust's `where Self: Sized` carve-out).
+//
+// `trait_args` is the dyn type's positional trait-args for the named
+// `trait_path`. For supertraits, the args are substituted via the
+// supertrait edge's declared args (which reference the parent trait's
+// type-params); we apply the same substitution.
+pub fn dyn_vtable_methods(
+    trait_path: &Vec<String>,
+    trait_args: &Vec<RType>,
+    traits: &TraitTable,
+) -> Vec<(Vec<String>, usize, Vec<RType>)> {
+    let mut out: Vec<(Vec<String>, usize, Vec<RType>)> = Vec::new();
+    let entry = match trait_lookup(traits, trait_path) {
+        Some(e) => e,
+        None => return out,
+    };
+    let mut k = 0;
+    while k < entry.methods.len() {
+        out.push((trait_path.clone(), k, trait_args.clone()));
+        k += 1;
+    }
+    // BFS over supertraits. For each supertrait edge, substitute the
+    // edge's declared args (referencing the parent trait's type-params)
+    // using the parent's `trait_args`.
+    let env: Vec<(String, RType)> = entry
+        .trait_type_params
+        .iter()
+        .zip(trait_args.iter())
+        .map(|(n, t)| (n.clone(), t.clone()))
+        .collect();
     let mut visited: Vec<Vec<String>> = vec![trait_path.clone()];
-    let mut frontier: Vec<Vec<String>> = entry.supertraits.iter().map(|s| s.path.clone()).collect();
-    while let Some(sp) = frontier.pop() {
+    let mut frontier: Vec<(Vec<String>, Vec<RType>)> = entry
+        .supertraits
+        .iter()
+        .map(|s| {
+            let substituted_args: Vec<RType> = s
+                .args
+                .iter()
+                .map(|a| super::types::substitute_rtype(a, &env))
+                .collect();
+            (s.path.clone(), substituted_args)
+        })
+        .collect();
+    while let Some((sp, sp_args)) = frontier.pop() {
         if visited.iter().any(|v| v == &sp) {
             continue;
         }
         visited.push(sp.clone());
         let sup_entry = match trait_lookup(traits, &sp) {
             Some(e) => e,
-            None => continue, // unresolved supertrait — typeck would have caught this earlier
+            None => continue,
         };
         let mut k = 0;
         while k < sup_entry.methods.len() {
-            check_method_obj_safe(&sup_entry.methods[k], &sp, span, file)?;
+            if is_method_obj_safe(&sup_entry.methods[k]) {
+                out.push((sp.clone(), k, sp_args.clone()));
+            }
             k += 1;
         }
+        let sub_env: Vec<(String, RType)> = sup_entry
+            .trait_type_params
+            .iter()
+            .zip(sp_args.iter())
+            .map(|(n, t)| (n.clone(), t.clone()))
+            .collect();
         for s in &sup_entry.supertraits {
-            frontier.push(s.path.clone());
+            let substituted_args: Vec<RType> = s
+                .args
+                .iter()
+                .map(|a| super::types::substitute_rtype(a, &sub_env))
+                .collect();
+            frontier.push((s.path.clone(), substituted_args));
         }
     }
-    Ok(())
+    out
 }
 
 fn check_method_obj_safe(
@@ -156,7 +247,13 @@ fn rtype_mentions_self(t: &RType) -> bool {
         RType::Ref { inner, .. } | RType::RawPtr { inner, .. } | RType::Slice(inner) => {
             rtype_mentions_self(inner)
         }
-        RType::AssocProj { base, .. } => rtype_mentions_self(base),
+        // `Self::AssocName` is OK in dyn-method signatures: the dyn
+        // type's bound list carries the assoc binding (`Output = R`),
+        // so the concrete type is fully determined per-impl. The
+        // dispatch substitutes through that binding before building
+        // the call_indirect typeidx. We *don't* recurse into `base`
+        // here (which would catch the inner `Self`).
+        RType::AssocProj { .. } => false,
         RType::FnPtr { params, ret } => {
             params.iter().any(rtype_mentions_self) || rtype_mentions_self(ret)
         }

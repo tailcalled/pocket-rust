@@ -463,16 +463,19 @@ pub fn resolve_type(
             // everywhere). The use-scope rewrites the first segment per
             // explicit imports; absent that, we fall back to a
             // module-qualified path. Coercion-site code (which *does*
-            // hold a TraitTable) verifies the path actually names a
-            // trait. Trait arg / assoc-binding payloads on the bound
-            // are dropped — Phase 2 supports only no-args bounds.
-            let mut resolved: Vec<Vec<String>> = Vec::with_capacity(bounds.len());
+            // hold a TraitTable) re-canonicalizes via
+            // `canonicalize_dyn_trait_path` so glob-prelude paths like
+            // `Fn` → `std::ops::Fn` get fixed up before use.
+            //
+            // Each bound also captures positional trait_args (from `<…>`
+            // or the `Fn(args)` sugar) and assoc constraints (`Output =
+            // R` from `Fn(args) -> R`) — needed at dispatch time to
+            // substitute `Self::AssocName` projections in method
+            // signatures.
+            let mut resolved: Vec<crate::typeck::DynBound> = Vec::with_capacity(bounds.len());
             let mut i = 0;
             while i < bounds.len() {
                 let raw: Vec<String> = bounds[i].path.segments.iter().map(|s| s.name.clone()).collect();
-                // Use-table rewrite (probe-free): match first segment
-                // against explicit imports; absent, fall back to
-                // module-relative.
                 let mut canon = canonicalize_trait_path_via_use(&raw, use_scope);
                 if canon.is_none() {
                     let mut full = current_module.clone();
@@ -483,7 +486,52 @@ pub fn resolve_type(
                     }
                     canon = Some(full);
                 }
-                resolved.push(canon.unwrap());
+                // Capture positional trait_args from the last segment
+                // (where `parse_trait_bound` parks them).
+                let last_seg = &bounds[i].path.segments[bounds[i].path.segments.len() - 1];
+                let mut trait_args: Vec<RType> = Vec::with_capacity(last_seg.args.len());
+                let mut k = 0;
+                while k < last_seg.args.len() {
+                    trait_args.push(resolve_type(
+                        &last_seg.args[k],
+                        current_module,
+                        structs,
+                        enums,
+                        aliases,
+                        self_target,
+                        type_params,
+                        use_scope,
+                        reexports,
+                        file,
+                    )?);
+                    k += 1;
+                }
+                // Capture associated-type bindings (from the `<Name=Ty>`
+                // syntax or the `Fn(…) -> Ty` Output sugar).
+                let mut assoc_bindings: Vec<(String, RType)> = Vec::with_capacity(bounds[i].assoc_constraints.len());
+                let mut k = 0;
+                while k < bounds[i].assoc_constraints.len() {
+                    let ac = &bounds[i].assoc_constraints[k];
+                    let ty = resolve_type(
+                        &ac.ty,
+                        current_module,
+                        structs,
+                        enums,
+                        aliases,
+                        self_target,
+                        type_params,
+                        use_scope,
+                        reexports,
+                        file,
+                    )?;
+                    assoc_bindings.push((ac.name.clone(), ty));
+                    k += 1;
+                }
+                resolved.push(crate::typeck::DynBound {
+                    trait_path: canon.unwrap(),
+                    trait_args,
+                    assoc_bindings,
+                });
                 i += 1;
             }
             let lt = match lifetime {
@@ -498,8 +546,17 @@ pub fn resolve_type(
 // Canonicalize a trait path (raw user segments) against the use scope.
 // Probe-free version of `resolve_via_use_scopes` used by `dyn`-type
 // resolution where a `TraitTable` isn't available. Matches an
-// explicit-import on the first segment; returns None for un-imported
-// names so the caller can fall back to module-relative.
+// explicit-import on the first segment; failing that, prepends each
+// glob entry's `module_path` to the raw path (innermost glob first).
+// The caller falls back to module-relative if no glob qualifies.
+//
+// Without TraitTable access we can't probe whether the prefixed path
+// actually names a trait — the first glob match wins. That's correct
+// for the stdlib-prelude case (`use std::*;`) since `std::ops::Fn`
+// etc. live two segments deep under the prelude root; we tentatively
+// rewrite `Fn` → `std::Fn` here, which trait_lookup will reject. To
+// handle this, we *also* return a series of candidate full paths so
+// the caller can try each one and pick the one that exists.
 fn canonicalize_trait_path_via_use(
     raw: &Vec<String>,
     scope: &Vec<UseEntry>,

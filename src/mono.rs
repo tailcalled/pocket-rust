@@ -1571,14 +1571,18 @@ pub enum MonoExprKind {
         args: Vec<MonoExpr>,
         fn_ptr_ty: RType,
     },
-    // Coerce `&T` (or `&mut T`) into `&dyn Trait` (or `&mut dyn
-    // Trait`). `inner_ref` is the source ref expression (lowered to
+    // Coerce `&T` / `&mut T` / `Box<T>` into the matching `dyn`
+    // shape. `inner_ref` is the source ref/box expression (lowered to
     // its data ptr); codegen materializes the matching vtable in the
     // data segment and emits the vtable address as the second word.
+    // `bounds` carries all trait paths + trait_args + assoc_bindings
+    // (one entry per principal in a `dyn A + B` type); `intern_vtable`
+    // builds a concatenated vtable for all bounds in declaration order
+    // (post the shared drop header).
     RefDynCoerce {
         inner_ref: Box<MonoExpr>,
         src_concrete_ty: RType,
-        trait_path: Vec<String>,
+        bounds: Vec<crate::typeck::DynBound>,
     },
     // Method dispatch through a `&dyn Trait` / `&mut dyn Trait` fat
     // ref. `recv` is the receiver fat ref (data ptr + vtable ptr);
@@ -2269,6 +2273,63 @@ fn lower_expr(ctx: &mut LowerCtx, expr: &Expr) -> Result<MonoExpr, Error> {
             MonoExprKind::MacroCall { name: name.clone(), args: out_args }
         }
         ExprKind::Call(c) => {
+            // Bare-dyn-fn-call sugar: `f(args)` where `f: &dyn Fn(...)
+            // -> R` (or `&mut dyn FnMut`, or `Box<dyn Fn>`). typeck
+            // records the callee binding on `bare_closure_calls[id]`
+            // AND a `dyn_method_calls[id]` slot. Lower as DynMethodCall
+            // — recv is the dyn fat ref (the binding's value), args is
+            // a single-element vec wrapping a tuple of the original
+            // args (matching the `Fn::call(&self, args: Args)` shape).
+            if let Some(Some(dmd)) = ctx.input.dyn_method_calls.get(expr.id as usize) {
+                if let Some(binding_name) =
+                    ctx.input.bare_closure_calls.get(expr.id as usize).and_then(|o| o.as_ref())
+                {
+                    let recv_binding = ctx.lookup(binding_name).ok_or_else(|| Error {
+                        file: String::new(),
+                        message: format!(
+                            "lower_to_mono: bare-dyn-fn-call recv `{}` not in scope",
+                            binding_name
+                        ),
+                        span: span.copy(),
+                    })?;
+                    let recv_ty = ctx.locals[recv_binding as usize].ty.clone();
+                    let recv = MonoExpr {
+                        kind: MonoExprKind::Local(recv_binding, u32::MAX),
+                        ty: recv_ty,
+                        span: span.copy(),
+                    };
+                    // Pack the call args into a tuple — Fn::call takes
+                    // a single `Args` tuple param after &self.
+                    let mut tuple_elems: Vec<MonoExpr> = Vec::new();
+                    let mut tuple_elem_types: Vec<RType> = Vec::new();
+                    let mut i = 0;
+                    while i < c.args.len() {
+                        let lowered = lower_expr(ctx, &c.args[i])?;
+                        tuple_elem_types.push(lowered.ty.clone());
+                        tuple_elems.push(lowered);
+                        i += 1;
+                    }
+                    let args_tuple_ty = RType::Tuple(tuple_elem_types);
+                    let args_tuple = MonoExpr {
+                        kind: MonoExprKind::Tuple(tuple_elems),
+                        ty: args_tuple_ty,
+                        span: span.copy(),
+                    };
+                    return Ok(MonoExpr {
+                        kind: MonoExprKind::DynMethodCall {
+                            recv: Box::new(recv),
+                            method_idx: dmd.method_idx,
+                            args: vec![args_tuple],
+                            method_param_types: dmd.method_param_types.clone(),
+                            method_return_type: dmd.method_return_type.clone(),
+                            recv_mut: dmd.recv_mut,
+                            trait_path: dmd.trait_path.clone(),
+                        },
+                        ty,
+                        span: expr.span.copy(),
+                    });
+                }
+            }
             // Bare-closure-call sugar: typeck recorded the callee
             // binding name on `bare_closure_calls[id]` when this Call
             // dispatched as `local.call((args,))`. Lower as a
@@ -2781,14 +2842,11 @@ fn lower_expr(ctx: &mut LowerCtx, expr: &Expr) -> Result<MonoExpr, Error> {
             ty: inner_ty,
             span: expr.span.copy(),
         };
-        // Phase 2 v1: single-bound dyn only. Multi-bound was rejected
-        // at coerce_at (or will be at codegen).
-        let trait_path = dc.trait_paths[0].clone();
         return Ok(MonoExpr {
             kind: MonoExprKind::RefDynCoerce {
                 inner_ref: Box::new(inner_ref_expr),
                 src_concrete_ty: dc.src_concrete_ty.clone(),
-                trait_path,
+                bounds: dc.bounds.clone(),
             },
             ty,
             span: expr.span.copy(),

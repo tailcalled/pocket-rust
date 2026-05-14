@@ -54,7 +54,7 @@ struct MonoState {
     // reserves a region in `vtable_bytes`. The base address
     // (`VTABLE_BASE + offset`) goes back to the caller so
     // `RefDynCoerce` can emit it as the second word of the fat ref.
-    vtables: Vec<((Vec<String>, RType), u32)>,
+    vtables: Vec<((Vec<crate::typeck::DynBound>, RType), u32)>,
     vtable_bytes: Vec<u8>,
     // Wasm function index of a synthesized no-op `drop(&self)` used as
     // the drop slot in vtables for non-Drop concrete types. Pre-allocated
@@ -106,58 +106,26 @@ impl MonoState {
     // same key return the same address.
     fn intern_vtable(
         &mut self,
-        trait_path: &Vec<String>,
+        bounds: &Vec<crate::typeck::DynBound>,
         concrete_ty: &RType,
         traits: &crate::typeck::TraitTable,
         funcs: &FuncTable,
     ) -> Result<u32, Error> {
-        // Dedupe.
+        // Dedupe — key on the full bound list (each bound's trait_path
+        // + trait_args + assoc_bindings) plus the concrete type. For
+        // single-bound dyn this matches Phase-2's keying; for
+        // multi-bound it correctly distinguishes `dyn A+B` from
+        // `dyn B+A` (whose vtable layouts differ).
         let mut i = 0;
         while i < self.vtables.len() {
             let (key, addr) = &self.vtables[i];
-            if &key.0 == trait_path && crate::typeck::rtype_eq(&key.1, concrete_ty) {
+            if crate::typeck::dyn_bounds_eq(&key.0, bounds)
+                && crate::typeck::rtype_eq(&key.1, concrete_ty)
+            {
                 return Ok(*addr);
             }
             i += 1;
         }
-        let entry = match crate::typeck::trait_lookup(traits, trait_path) {
-            Some(e) => e,
-            None => return Err(Error {
-                file: String::new(),
-                message: format!(
-                    "intern_vtable: trait `{}` not found",
-                    crate::typeck::place_to_string(trait_path)
-                ),
-                span: crate::span::Span::new(crate::span::Pos::new(0, 0), crate::span::Pos::new(0, 0)),
-            }),
-        };
-        // Resolve the impl; for each trait method, find the matching
-        // impl method's wasm idx, then intern a funcref-table slot.
-        // For now this assumes a non-generic concrete type and a
-        // non-generic impl method. solve_impl returns an impl idx;
-        // walk impls[idx].methods to find each method.
-        let solved = crate::typeck::solve_impl_with_args(
-            trait_path,
-            &Vec::new(),
-            concrete_ty,
-            traits,
-            0,
-        );
-        let solved = match solved {
-            Some(s) => s,
-            None => return Err(Error {
-                file: String::new(),
-                message: format!(
-                    "intern_vtable: no impl of `{}` for `{}`",
-                    crate::typeck::place_to_string(trait_path),
-                    crate::typeck::rtype_to_string(concrete_ty),
-                ),
-                span: crate::span::Span::new(crate::span::Pos::new(0, 0), crate::span::Pos::new(0, 0)),
-            }),
-        };
-        let impl_unsafe = traits.impls[solved.impl_idx].file.is_empty();
-        let _ = impl_unsafe;
-        let impl_idx = solved.impl_idx;
         // Reserve the address (start of this vtable's bytes within the
         // crate-local vtable pool — which sits at VTABLE_BASE).
         let addr = VTABLE_BASE + self.vtable_bytes.len() as u32;
@@ -196,46 +164,131 @@ impl MonoState {
         self.vtable_bytes.push(((drop_slot >> 8) & 0xff) as u8);
         self.vtable_bytes.push(((drop_slot >> 16) & 0xff) as u8);
         self.vtable_bytes.push(((drop_slot >> 24) & 0xff) as u8);
-        // Walk trait methods in declaration order. For each, find the
-        // matching FnSymbol in `funcs.entries` whose `trait_impl_idx`
-        // points at this impl and whose path's last segment is the
-        // method name.
-        let mut m = 0;
-        while m < entry.methods.len() {
-            let tm_name = &entry.methods[m].name;
-            let mut wasm_idx: Option<u32> = None;
-            let mut e = 0;
-            while e < funcs.entries.len() {
-                if funcs.entries[e].trait_impl_idx == Some(impl_idx)
-                    && funcs.entries[e].path.last().map(|s| s.as_str()) == Some(tm_name.as_str())
-                {
-                    wasm_idx = Some(funcs.entries[e].idx);
-                    break;
+        // For each bound (in declaration order), walk
+        // `dyn_vtable_methods` (own methods + safe supertrait methods,
+        // in vtable order) and pack each slot. Each declaring-trait
+        // method is resolved through its OWN impl row, since impls
+        // for supertraits are separate `TraitImplEntry` records.
+        let mut bi = 0;
+        while bi < bounds.len() {
+            let bound = &bounds[bi];
+            let methods = crate::typeck::dyn_safety::dyn_vtable_methods(
+                &bound.trait_path,
+                &bound.trait_args,
+                traits,
+            );
+            let mut m = 0;
+            while m < methods.len() {
+                let (decl_trait, method_idx, decl_trait_args) = &methods[m];
+                let entry = match crate::typeck::trait_lookup(traits, decl_trait) {
+                    Some(e) => e,
+                    None => return Err(Error {
+                        file: String::new(),
+                        message: format!(
+                            "intern_vtable: trait `{}` not found",
+                            crate::typeck::place_to_string(decl_trait)
+                        ),
+                        span: crate::span::Span::new(crate::span::Pos::new(0, 0), crate::span::Pos::new(0, 0)),
+                    }),
+                };
+                let solved = crate::typeck::solve_impl_with_args(
+                    decl_trait,
+                    decl_trait_args,
+                    concrete_ty,
+                    traits,
+                    0,
+                );
+                let solved = match solved {
+                    Some(s) => s,
+                    None => return Err(Error {
+                        file: String::new(),
+                        message: format!(
+                            "intern_vtable: no impl of `{}` for `{}`",
+                            crate::typeck::place_to_string(decl_trait),
+                            crate::typeck::rtype_to_string(concrete_ty),
+                        ),
+                        span: crate::span::Span::new(crate::span::Pos::new(0, 0), crate::span::Pos::new(0, 0)),
+                    }),
+                };
+                let impl_idx = solved.impl_idx;
+                let tm_name = &entry.methods[*method_idx].name;
+                // Try non-generic impl methods first (FnSymbol with
+                // matching trait_impl_idx); fall back to generic-impl
+                // templates and monomorphize them via mono_table.
+                let mut wasm_idx: Option<u32> = None;
+                let mut e = 0;
+                while e < funcs.entries.len() {
+                    if funcs.entries[e].trait_impl_idx == Some(impl_idx)
+                        && funcs.entries[e].path.last().map(|s| s.as_str()) == Some(tm_name.as_str())
+                    {
+                        wasm_idx = Some(funcs.entries[e].idx);
+                        break;
+                    }
+                    e += 1;
                 }
-                e += 1;
+                if wasm_idx.is_none() {
+                    // Generic-impl template path. Find the template
+                    // whose trait_impl_idx + method name match, then
+                    // build concrete args from solved.subst (impl-level
+                    // params only — Phase 6 obj-safety rejects
+                    // method-level type-params on dyn-dispatched
+                    // methods).
+                    let mut t = 0;
+                    while t < funcs.templates.len() {
+                        let tmpl = &funcs.templates[t];
+                        if tmpl.trait_impl_idx == Some(impl_idx)
+                            && tmpl.path.last().map(|s| s.as_str()) == Some(tm_name.as_str())
+                        {
+                            let impl_param_count = tmpl.impl_type_param_count;
+                            let mut concrete: Vec<RType> = Vec::new();
+                            let mut k = 0;
+                            while k < impl_param_count {
+                                let name = &tmpl.type_params[k];
+                                let mut found: Option<RType> = None;
+                                let mut j = 0;
+                                while j < solved.subst.len() {
+                                    if solved.subst[j].0 == *name {
+                                        found = Some(solved.subst[j].1.clone());
+                                        break;
+                                    }
+                                    j += 1;
+                                }
+                                concrete.push(found.expect("impl-param bound by subst"));
+                                k += 1;
+                            }
+                            // Look up the monomorphization in the table
+                            // (expanded eagerly before per-fn codegen).
+                            // If absent, intern lazily — the mono body
+                            // will be emitted in the post-emit loop.
+                            wasm_idx = Some(self.mono_table.intern(t, concrete));
+                            break;
+                        }
+                        t += 1;
+                    }
+                }
+                let wi = match wasm_idx {
+                    Some(i) => i,
+                    None => return Err(Error {
+                        file: String::new(),
+                        message: format!(
+                            "intern_vtable: impl method `{}::{}` for `{}` not found in func table",
+                            crate::typeck::place_to_string(decl_trait),
+                            tm_name,
+                            crate::typeck::rtype_to_string(concrete_ty),
+                        ),
+                        span: crate::span::Span::new(crate::span::Pos::new(0, 0), crate::span::Pos::new(0, 0)),
+                    }),
+                };
+                let slot = self.intern_table_slot(wi);
+                self.vtable_bytes.push((slot & 0xff) as u8);
+                self.vtable_bytes.push(((slot >> 8) & 0xff) as u8);
+                self.vtable_bytes.push(((slot >> 16) & 0xff) as u8);
+                self.vtable_bytes.push(((slot >> 24) & 0xff) as u8);
+                m += 1;
             }
-            let wi = match wasm_idx {
-                Some(i) => i,
-                None => return Err(Error {
-                    file: String::new(),
-                    message: format!(
-                        "intern_vtable: impl method `{}::{}` for `{}` not found in func table",
-                        crate::typeck::place_to_string(trait_path),
-                        tm_name,
-                        crate::typeck::rtype_to_string(concrete_ty),
-                    ),
-                    span: crate::span::Span::new(crate::span::Pos::new(0, 0), crate::span::Pos::new(0, 0)),
-                }),
-            };
-            let slot = self.intern_table_slot(wi);
-            // Pack slot as little-endian i32.
-            self.vtable_bytes.push((slot & 0xff) as u8);
-            self.vtable_bytes.push(((slot >> 8) & 0xff) as u8);
-            self.vtable_bytes.push(((slot >> 16) & 0xff) as u8);
-            self.vtable_bytes.push(((slot >> 24) & 0xff) as u8);
-            m += 1;
+            bi += 1;
         }
-        self.vtables.push(((trait_path.clone(), concrete_ty.clone()), addr));
+        self.vtables.push(((bounds.clone(), concrete_ty.clone()), addr));
         Ok(addr)
     }
 
@@ -5339,13 +5392,13 @@ fn codegen_mono_expr(
             ctx.instructions.push(wasm::Instruction::I32Const(slot as i32));
             Ok(())
         }
-        K::RefDynCoerce { inner_ref, src_concrete_ty, trait_path } => {
+        K::RefDynCoerce { inner_ref, src_concrete_ty, bounds } => {
             // Emit the inner ref's i32 data ptr.
             codegen_mono_expr(ctx, inner_ref)?;
             // Then push the vtable address as the second word of the
             // fat ref. Vtable lookup constructs (and interns) the
-            // matching (trait_path, concrete_ty) vtable on first use.
-            let addr = ctx.mono.intern_vtable(trait_path, src_concrete_ty, ctx.traits, ctx.funcs)?;
+            // matching (bounds, concrete_ty) vtable on first use.
+            let addr = ctx.mono.intern_vtable(bounds, src_concrete_ty, ctx.traits, ctx.funcs)?;
             ctx.instructions.push(wasm::Instruction::I32Const(addr as i32));
             Ok(())
         }

@@ -311,6 +311,209 @@ fn box_dyn_drop_noop_for_non_drop_type_returns_7() {
     );
 }
 
+// `&dyn Trait` from one site passing into a fn taking `&dyn Trait`
+// at another site — the source's already-Dyn inner shouldn't retrigger
+// the coercion + impl-existence check (which would fail vacuously).
+// Tests the "source-already-Dyn → fall through to unify" guard in
+// `coerce_at`.
+#[test]
+fn dyn_passes_through_unchanged_returns_33() {
+    expect_answer_sources(
+        &[
+            ("lib.rs", "mod inner;\nuse crate::inner::Show;\n\
+             struct A { v: u32 }\n\
+             impl Show for A { fn show(&self) -> u32 { self.v } }\n\
+             fn take(s: &dyn Show) -> u32 { s.show() }\n\
+             fn answer() -> u32 { \
+                let a: A = A { v: 33 }; \
+                let s: &dyn Show = &a; \
+                take(s) \
+             }"),
+            ("inner.rs", "pub trait Show { fn show(&self) -> u32; }"),
+        ],
+        33u32,
+    );
+}
+
+// Direct `let b: Box<dyn Show> = Box::new(Foo { ... })` — the
+// annotation's `T = dyn Show` doesn't pre-pin Box::new's type-arg
+// because typeck checks the value expression first (without the
+// annotation hint), then coerce_at runs at the boundary.
+#[test]
+fn box_dyn_direct_coercion_returns_50() {
+    expect_answer_sources(
+        &[(
+            "lib.rs",
+            "trait Show { fn show(&self) -> u32; }\n\
+             struct Foo { v: u32 }\n\
+             impl Show for Foo { fn show(&self) -> u32 { self.v } }\n\
+             fn answer() -> u32 { \
+                let b: Box<dyn Show> = Box::new(Foo { v: 50 }); \
+                b.show() \
+             }",
+        )],
+        50u32,
+    );
+}
+
+// Generic-impl vtable: `&Wrap<u32>` coerces to `&dyn Show` through
+// `impl<T> Show for Wrap<T>`. The impl method is a `GenericTemplate`,
+// not a non-generic `FnSymbol`; `intern_vtable` monomorphizes it via
+// `mono_table.intern` to get a wasm idx for the slot.
+#[test]
+fn dyn_generic_impl_vtable_returns_42() {
+    expect_answer_sources(
+        &[(
+            "lib.rs",
+            "trait Show { fn show(&self) -> u32; }\n\
+             struct Wrap<T> { v: T }\n\
+             impl<T> Show for Wrap<T> { fn show(&self) -> u32 { 42 } }\n\
+             fn answer() -> u32 { \
+                let w: Wrap<u32> = Wrap { v: 7 }; \
+                let s: &dyn Show = &w; \
+                s.show() \
+             }",
+        )],
+        42u32,
+    );
+}
+
+// Supertrait method dispatch: `&dyn Show` where `trait Show: Tag`
+// can also dispatch `.tag()` through the supertrait Tag. The vtable
+// includes Show's methods plus Tag's (BFS through supertrait closure,
+// skipping unsafe methods).
+#[test]
+fn dyn_supertrait_method_dispatch_returns_99() {
+    expect_answer_sources(
+        &[(
+            "lib.rs",
+            "trait Tag { fn tag(&self) -> u32; }\n\
+             trait Show: Tag { fn show(&self) -> u32; }\n\
+             struct Foo { v: u32 }\n\
+             impl Tag for Foo { fn tag(&self) -> u32 { self.v + 7 } }\n\
+             impl Show for Foo { fn show(&self) -> u32 { self.v } }\n\
+             fn answer() -> u32 { \
+                let f: Foo = Foo { v: 92 }; \
+                let s: &dyn Show = &f; \
+                s.tag() \
+             }",
+        )],
+        99u32,
+    );
+}
+
+// `&dyn A + B` — multi-bound trait object. Vtable concatenates A's
+// method slots after B's (post-drop-header). Dispatch finds which
+// bound declares the method and uses its absolute slot offset.
+#[test]
+fn dyn_multi_bound_dispatch_returns_55() {
+    expect_answer_sources(
+        &[(
+            "lib.rs",
+            "trait Show { fn show(&self) -> u32; }\n\
+             trait Tag { fn tag(&self) -> u32; }\n\
+             struct Foo { v: u32 }\n\
+             impl Show for Foo { fn show(&self) -> u32 { self.v } }\n\
+             impl Tag for Foo { fn tag(&self) -> u32 { self.v + 5 } }\n\
+             fn answer() -> u32 { \
+                let f: Foo = Foo { v: 25 }; \
+                let d: &dyn Show + Tag = &f; \
+                d.show() + d.tag() \
+             }",
+        )],
+        55u32,
+    );
+}
+
+// Negative: ambiguous method on multi-bound dyn.
+#[test]
+fn dyn_multi_bound_ambiguous_method_is_rejected() {
+    let err = compile_source(
+        "trait A { fn name(&self) -> u32; }\n\
+         trait B { fn name(&self) -> u32; }\n\
+         struct Foo {}\n\
+         impl A for Foo { fn name(&self) -> u32 { 1 } }\n\
+         impl B for Foo { fn name(&self) -> u32 { 2 } }\n\
+         fn answer() -> u32 { let f: Foo = Foo {}; let d: &dyn A + B = &f; d.name() }",
+    );
+    assert!(
+        err.contains("ambiguous"),
+        "expected ambiguous-method error, got: {}",
+        err
+    );
+}
+
+// Negative: one bound not object-safe.
+#[test]
+fn dyn_multi_bound_obj_unsafe_is_rejected() {
+    let err = compile_source(
+        "trait Show { fn show(&self) -> u32; }\n\
+         trait Take { fn take(self) -> u32; }\n\
+         struct Foo { v: u32 }\n\
+         impl Show for Foo { fn show(&self) -> u32 { self.v } }\n\
+         impl Take for Foo { fn take(self) -> u32 { self.v } }\n\
+         fn answer() -> u32 { let f: Foo = Foo { v: 1 }; let d: &dyn Show + Take = &f; 0 }",
+    );
+    assert!(
+        err.contains("by value") || err.contains("object-safe"),
+        "expected obj-safety error on multi-bound, got: {}",
+        err
+    );
+}
+
+// `&dyn Fn(T) -> R` — a trait object for the closure Fn family.
+// Closures are object-safe by special handling: the `Fn::call`
+// method takes `&self`, and `FnOnce::call_once`'s by-value receiver
+// is exempted (supertrait methods aren't part of `dyn Fn`'s vtable).
+// The dyn type's `(u32,)` trait-args + `Output = u32` assoc binding
+// drive method-signature substitution at dispatch.
+#[test]
+fn dyn_fn_call_returns_42() {
+    expect_answer_sources(
+        &[(
+            "lib.rs",
+            "fn answer() -> u32 { \
+                let cls = |x: u32| -> u32 { x + 1 }; \
+                let f: &dyn Fn(u32) -> u32 = &cls; \
+                f(41) \
+             }",
+        )],
+        42u32,
+    );
+}
+
+// `Box<dyn Fn(T) -> R>` — owned trait object for closures.
+#[test]
+fn box_dyn_fn_call_returns_100() {
+    expect_answer_sources(
+        &[(
+            "lib.rs",
+            "fn answer() -> u32 { \
+                let cls = |x: u32| -> u32 { x * 2 }; \
+                let f: Box<dyn Fn(u32) -> u32> = Box::new(cls); \
+                f(50) \
+             }",
+        )],
+        100u32,
+    );
+}
+
+// Pass `&dyn Fn` as a fn arg.
+#[test]
+fn dyn_fn_passed_as_arg_returns_7() {
+    expect_answer_sources(
+        &[(
+            "lib.rs",
+            "fn apply(f: &dyn Fn(u32) -> u32, x: u32) -> u32 { f(x) }\n\
+             fn answer() -> u32 { \
+                let cls = |x: u32| -> u32 { x + 5 }; \
+                apply(&cls, 2) \
+             }",
+        )],
+        7u32,
+    );
+}
+
 // Negative: Box<dyn Foo> rejected when Foo isn't object-safe.
 #[test]
 fn box_dyn_obj_unsafe_is_rejected() {

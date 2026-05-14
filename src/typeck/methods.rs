@@ -1524,7 +1524,7 @@ fn check_dyn_method_call(
     ctx: &mut CheckCtx,
     mc: &crate::ast::MethodCall,
     call_expr: &Expr,
-    bounds: Vec<Vec<String>>,
+    bounds: Vec<crate::typeck::InferDynBound>,
     recv_mut: bool,
 ) -> Result<InferType, Error> {
     if bounds.is_empty() {
@@ -1534,57 +1534,100 @@ fn check_dyn_method_call(
             span: mc.method_span.copy(),
         });
     }
-    if bounds.len() > 1 {
-        return Err(Error {
-            file: ctx.current_file.to_string(),
-            message: "method dispatch on multi-bound `dyn` types isn't supported yet".to_string(),
-            span: mc.method_span.copy(),
-        });
+    // Canonicalize each bound's trait path and verify obj-safety. Then
+    // search each bound's methods for `mc.method`, computing the
+    // absolute slot offset within the vtable (slots are laid out
+    // post-drop-header in bound order: bound[0]'s methods, then
+    // bound[1]'s, etc.). Multiple matches → ambiguity error
+    // (disambiguation via UFCS isn't supported yet).
+    let canon_paths: Vec<Vec<String>> = bounds
+        .iter()
+        .map(|b| crate::typeck::canonicalize_dyn_trait_path(
+            &b.trait_path,
+            ctx.current_module,
+            ctx.traits,
+            &ctx.use_scope,
+            ctx.reexports,
+            ctx.current_file,
+        ))
+        .collect();
+    let mut b = 0;
+    while b < canon_paths.len() {
+        super::dyn_safety::check_object_safety(
+            &canon_paths[b],
+            ctx.traits,
+            &mc.method_span,
+            ctx.current_file,
+        )?;
+        b += 1;
     }
-    let trait_path = bounds[0].clone();
-    // Defensive: re-run object-safety. Obj-safety should already have
-    // fired at the coercion that produced this value, but a value
-    // arriving via fn arg with a `&dyn` annotation didn't go through
-    // coerce_at on the caller's side.
-    super::dyn_safety::check_object_safety(
-        &trait_path,
-        ctx.traits,
-        &mc.method_span,
-        ctx.current_file,
-    )?;
-    let entry = match trait_lookup(ctx.traits, &trait_path) {
-        Some(e) => e,
-        None => return Err(Error {
-            file: ctx.current_file.to_string(),
-            message: format!(
-                "trait `{}` not found",
-                place_to_string(&trait_path)
-            ),
-            span: mc.method_span.copy(),
-        }),
-    };
-    let mut found_idx: Option<usize> = None;
-    let mut k = 0;
-    while k < entry.methods.len() {
-        if entry.methods[k].name == mc.method {
-            found_idx = Some(k);
-            break;
+    // Each bound contributes a contiguous run of vtable slots in
+    // declaration order — its own methods first, then supertrait
+    // methods (BFS via `dyn_vtable_methods`). The absolute slot index
+    // is `slot_base + offset_within_bound`.
+    let mut found: Vec<(usize, Vec<String>, usize, usize)> = Vec::new(); // (bound_idx, declaring_trait_path, method_idx_in_trait, absolute_slot)
+    let mut slot_base: usize = 0;
+    let mut b = 0;
+    while b < canon_paths.len() {
+        // Substitute the dyn type's trait_args (InferType) through to
+        // RType for the vtable walker. For supertrait propagation the
+        // walker substitutes through SupertraitRef.args.
+        let trait_args_rt: Vec<RType> = bounds[b]
+            .trait_args
+            .iter()
+            .map(|t| ctx.subst.finalize(t))
+            .collect();
+        let methods = super::dyn_safety::dyn_vtable_methods(&canon_paths[b], &trait_args_rt, ctx.traits);
+        let mut k = 0;
+        while k < methods.len() {
+            let (decl_trait, method_idx, _decl_trait_args) = &methods[k];
+            let entry = match trait_lookup(ctx.traits, decl_trait) {
+                Some(e) => e,
+                None => {
+                    k += 1;
+                    continue;
+                }
+            };
+            if entry.methods[*method_idx].name == mc.method {
+                found.push((b, decl_trait.clone(), *method_idx, slot_base + k));
+            }
+            k += 1;
         }
-        k += 1;
+        slot_base += methods.len();
+        b += 1;
     }
-    let method_idx = match found_idx {
-        Some(i) => i,
-        None => return Err(Error {
+    if found.is_empty() {
+        let trait_str: Vec<String> = canon_paths.iter().map(|p| place_to_string(p)).collect();
+        return Err(Error {
             file: ctx.current_file.to_string(),
             message: format!(
                 "no method `{}` on `dyn {}`",
                 mc.method,
-                place_to_string(&trait_path),
+                trait_str.join(" + "),
             ),
             span: mc.method_span.copy(),
-        }),
-    };
-    let method = &entry.methods[method_idx];
+        });
+    }
+    if found.len() > 1 {
+        let trait_str: Vec<String> = found
+            .iter()
+            .map(|(_, dp, _, _)| place_to_string(dp))
+            .collect();
+        return Err(Error {
+            file: ctx.current_file.to_string(),
+            message: format!(
+                "ambiguous method `{}` on multi-bound `dyn` type: declared by both `{}` (disambiguation via UFCS isn't supported)",
+                mc.method,
+                trait_str.join("` and `"),
+            ),
+            span: mc.method_span.copy(),
+        });
+    }
+    let (bound_idx, declaring_trait_path, method_idx_in_trait, absolute_slot) = found[0].clone();
+    let _ = bound_idx;
+    let trait_path = declaring_trait_path.clone();
+    let entry = trait_lookup(ctx.traits, &trait_path).expect("checked above");
+    let method = &entry.methods[method_idx_in_trait];
     // Receiver shape must match the dyn-ref's mutability.
     match (&method.receiver_shape, recv_mut) {
         (Some(TraitReceiverShape::BorrowImm), false)
@@ -1647,16 +1690,19 @@ fn check_dyn_method_call(
         .return_type
         .clone()
         .unwrap_or(RType::Tuple(Vec::new()));
-    // Record the dispatch.
+    // Record the dispatch. `method_idx` is the absolute slot index
+    // within the vtable (post-drop-header), accounting for all bounds'
+    // method counts that precede the matched bound.
     let id = call_expr.id as usize;
     if id < ctx.dyn_method_calls.len() {
         ctx.dyn_method_calls[id] = Some(crate::typeck::DynMethodDispatch {
             trait_path: trait_path.clone(),
-            method_idx: method_idx as u32,
+            method_idx: absolute_slot as u32,
             method_param_types: method.param_types[1..].to_vec(),
             method_return_type: ret_rt.clone(),
             recv_mut,
         });
     }
+    let _ = method_idx_in_trait; // bound-relative idx, kept for diagnostic context above
     Ok(rtype_to_infer(&ret_rt))
 }

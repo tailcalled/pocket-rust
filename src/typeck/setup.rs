@@ -1861,7 +1861,7 @@ pub(super) fn resolve_trait_ref(
     Ok((trait_path, trait_args))
 }
 
-pub(super) fn resolve_trait_path(
+pub fn resolve_trait_path(
     p: &crate::ast::Path,
     current_module: &Vec<String>,
     traits: &TraitTable,

@@ -625,7 +625,7 @@ fn try_match_rtype_ctx(
             }
             try_match_rtype_ctx(ra, rb, subst, true)
         }
-        (RType::Dyn { bounds: ba, .. }, RType::Dyn { bounds: bb, .. }) => ba == bb,
+        (RType::Dyn { bounds: ba, .. }, RType::Dyn { bounds: bb, .. }) => crate::typeck::dyn_bounds_eq(ba, bb),
         _ => false,
     }
 }
@@ -820,7 +820,19 @@ fn try_match_against_infer_ctx(
             _ => false,
         },
         RType::Dyn { bounds: ba, .. } => match resolved {
-            InferType::Dyn { bounds: bb, .. } => ba == &bb,
+            InferType::Dyn { bounds: bb, .. } => {
+                // Compare bound paths only. Trait args + assoc bindings
+                // would need additional unification; skip for now.
+                if ba.len() != bb.len() { return false; }
+                let mut i = 0;
+                while i < ba.len() {
+                    if ba[i].trait_path != bb[i].trait_path {
+                        return false;
+                    }
+                    i += 1;
+                }
+                true
+            }
             _ => false,
         },
     }

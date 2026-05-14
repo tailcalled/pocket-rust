@@ -1,6 +1,6 @@
 ---
 name: dyn-trait
-description: Use when working with trait objects `&dyn Trait` / `&mut dyn Trait` / `Box<dyn Trait>` — the parser/AST/RType plumbing, lazy object-safety check, coercion mechanics, vtable storage (drop slot + method slots) in the data segment, `DynMethodCall` dispatch through `call_indirect`, and the codegen-driven Drop path for `Box<dyn>`. Phases 2-3 of the dyn-trait roadmap. Phase 1 (`fn-pointers`) is the foundation.
+description: Use when working with trait objects `&dyn Trait` / `&mut dyn Trait` / `Box<dyn Trait>` / `dyn Fn(T) -> R` — the parser/AST/RType plumbing, lazy object-safety check, coercion mechanics, vtable storage (drop slot + method slots) in the data segment, `DynMethodCall` dispatch through `call_indirect`, codegen-driven Drop path for `Box<dyn>`, and Fn-family closure dispatch. Phases 2-4 of the dyn-trait roadmap. Phase 1 (`fn-pointers`) is the foundation.
 ---
 
 # Trait objects — `&dyn Trait` / `&mut dyn Trait`
@@ -158,10 +158,97 @@ The user-written `impl<T> Drop for Box<T>` body has `let v: T = unsafe { *self.p
 
 The drop slot of vtables for non-Drop concrete types points at the synthesized no-op fn (`MonoState::noop_drop_wasm_idx`).
 
+## `dyn Fn(T) -> R` for closures (Phase 4)
+
+Trait objects for the Fn-family traits (`Fn` / `FnMut` / `FnOnce`) — `&dyn Fn(u32) -> u32`, `Box<dyn FnMut(...)>`, etc. — built on Phase 2-3 plus four additions:
+
+### `RType::Dyn` carries trait_args + assoc_bindings
+
+`RType::Dyn` and `InferType::Dyn` now hold `Vec<DynBound>` / `Vec<InferDynBound>` instead of bare `Vec<Vec<String>>`. Each bound is:
+
+```
+struct DynBound {
+    trait_path: Vec<String>,
+    trait_args: Vec<RType>,           // `Fn<(u32,)>` → [Tuple([u32])]
+    assoc_bindings: Vec<(String, RType)>, // `Output = R` → [("Output", R)]
+}
+```
+
+`resolve_type`'s Dyn arm captures both from the `parse_trait_bound` output. Equality (`dyn_bounds_eq` / `infer_dyn_bounds_eq`) compares all three components. `DynCoercion` records carry the full bounds (not just trait paths) so codegen has the trait_args when building vtables.
+
+### Object-safety relaxations
+
+Two changes in `dyn_safety::check_object_safety`:
+
+1. **`AssocProj` of `Self` is OK in non-receiver positions.** `fn call(&self, args) -> Self::Output` no longer fails — the dyn type's `assoc_bindings` make the concrete output known per-impl. (The check still rejects bare `Self` in args/return.)
+2. **Supertrait methods aren't required to be object-safe.** `dyn Fn`'s vtable only carries `Fn::call`; `FnOnce::call_once`'s by-value receiver doesn't matter because it's not in the vtable. The supertrait closure walk was removed entirely.
+
+### Substituting method signatures at dispatch
+
+`check_dyn_method_call` and the new `check_bare_dyn_fn_call` resolve the method's `Self::AssocName` projections via the dyn type's `assoc_bindings`, and the trait's positional type-params via `trait_args`:
+
+- `substitute_self_assoc(t, assoc_bindings)` walks an RType replacing `<Self as ?>::Name` with the binding's value when the base is `Self`.
+- `substitute_trait_args(t, trait_type_params, trait_args)` substitutes via the standard `substitute_rtype` env.
+
+Applied to `Fn::call`'s `(&Self, Args) -> Self::Output` signature: `Args` substitutes to the recorded tuple, `Self::Output` substitutes to the recorded R. The result feeds `DynMethodDispatch.method_param_types` / `method_return_type`, which codegen reads to build the `call_indirect` typeidx.
+
+### Bare-call sugar for `f(args)` through `&dyn Fn`
+
+`check_call`'s "local-shadows-fn" branch detects `f: &dyn Fn(...)` / `&mut dyn FnMut(...)` / `Box<dyn Fn>` and routes to `check_bare_dyn_fn_call`, which records both:
+
+- `dyn_method_calls[expr_id]` — the dispatch info (trait_path, method_idx, substituted method signature).
+- `bare_closure_calls[expr_id]` — the callee binding name (mono uses this to find the receiver).
+
+Mono's `ExprKind::Call` handler checks `dyn_method_calls` first; when set, it lowers the call as `MonoExprKind::DynMethodCall { recv: Local(binding), args: vec![Tuple(c.args)], ... }`. The args get packed into a tuple to match the `call(&self, args: Args)` shape.
+
+### Closure-impl exemption at coercion
+
+Synthesized closure structs (`__closure_N`) have their `Fn`/`FnMut`/`FnOnce` impls registered by `closure_lower` after typeck, so `solve_impl` returns None at typeck-coercion time. `coerce_at` exempts closure srcs from the impl-existence check for both `&T → &dyn Trait` and `Box<T> → Box<dyn Trait>` shapes; the impl is verified later at codegen.
+
+### Vtable building with trait_args
+
+`MonoExprKind::RefDynCoerce` now carries `trait_args`; `MonoState::intern_vtable` accepts `trait_args` and passes them to `solve_impl_with_args` so generic Fn impls (`impl<Args> Fn<Args> for __closure_N`) match correctly.
+
+## Multi-bound `dyn A + B` (Phase 5)
+
+Vtable layout extends to: `[drop, A's method slots..., B's method slots...]`. `intern_vtable` walks each bound in declaration order, packing all its method slots. `check_dyn_method_call` (and `intern_vtable`) compute method indexes within the contiguous post-drop region; the absolute index used by `DynMethodCall` is `bound_slot_base + offset_within_bound`.
+
+Method-name ambiguity (the same method declared by two principals) is rejected at dispatch with "ambiguous method `X` on multi-bound dyn type" — UFCS disambiguation isn't supported.
+
+Each bound is independently object-safety-checked at coercion.
+
+## Supertrait method dispatch (Phase 6)
+
+`dyn_safety::dyn_vtable_methods(trait_path, trait_args, traits)` walks a trait + its transitive supertrait closure (BFS), returning `(declaring_trait_path, method_idx, trait_args)` triples in vtable order: direct methods first, then supertrait methods. Object-unsafe supertrait methods are silently **skipped** — they don't fail obj-safety, just don't appear in the vtable (mirrors Rust's `where Self: Sized` carve-out without requiring that syntax). This lets `dyn Fn` keep working: `FnOnce::call_once` (by-value, unsafe) drops out, while `FnMut::call_mut` (safe) stays.
+
+Supertrait trait_args are substituted through the parent trait's type-params: `trait Fn<Args>: FnMut<Args>` → the dyn type's `Fn<(u32,)>` becomes `FnMut<(u32,)>` for the FnMut slots.
+
+Method dispatch on `&dyn Show` where `trait Show: Tag` finds `tag` via the supertrait closure (each `(declaring_trait, method_idx)` triple is searched), then dispatches through the slot for the right supertrait's impl.
+
+`intern_vtable` uses the same walker, resolving each declaring-trait via its own `solve_impl_with_args` row.
+
+## Generic-impl vtables (Phase 7)
+
+`&Wrap<u32>` coercing through `impl<T> Show for Wrap<T>` works because `intern_vtable`'s impl-method lookup falls back to `funcs.templates[]` when the non-generic `funcs.entries[]` search misses. For each generic-impl method:
+
+1. Find the template with `trait_impl_idx == Some(impl_idx)` and matching method name.
+2. Build concrete type-args from `solved.subst` (the impl-level type-param bindings).
+3. Call `mono_table.intern(template_idx, concrete)` — lazily monomorphize and get the slot's wasm idx.
+
+The monomorphization expansion happens in the post-emit mono loop (the same loop that handles regular generic call sites).
+
+## `Box<dyn Trait>` direct coercion (Phase 8)
+
+`let b: Box<dyn Show> = Box::new(Foo { v: 42 })` works directly. `check_let_stmt` type-checks the value expression *without* the annotation's type-arg hint pre-pinning Box::new's `T = dyn Show`; `T` infers to `Foo` from the argument, then `coerce_at` runs at the let boundary and converts `Box<Foo> → Box<dyn Show>`.
+
+## Identity Ref→Dyn fall-through (Phase 9 adjacent)
+
+`coerce_at` guards against firing the `&T → &dyn Trait` coercion when `T` is already `Dyn`. Without the guard, passing `s: &dyn Show` to a fn parameter of type `&dyn Show` would retrigger obj-safety + impl-existence on the source — which fails vacuously since `dyn Show` doesn't `impl Show`. The guard delegates to plain `unify` instead.
+
+Path-equivalence beyond this: trait paths from `resolve_type` are canonicalized at every dispatch + coercion site via `canonicalize_dyn_trait_path`, which uses the full `resolve_trait_path` (TraitTable-aware, sees globs + re-exports). Different `use` spellings for the same trait still produce the same canonical form at dispatch.
+
 ## Open follow-ups
 
-- Direct `let b: Box<dyn Show> = Box::new(Foo { v: 42 })` (without intermediate `Box<Foo>` binding) — needs typeck to defer let-anno propagation when a coercion at the boundary would succeed.
-- Supertrait method dispatch (currently rejects with "method not found on dyn X" if the method is on a supertrait of X).
-- Multi-bound `dyn A + B` (parser accepts; coercion + dispatch reject with "not supported yet").
-- `dyn Fn(T) -> R` for closures (Phase 4).
-- Generic concrete types via `&dyn Trait` (e.g. `&Wrap<u32>` coercing through `impl<T> Show for Wrap<T>`) — works for non-generic impls today; generic-impl vtables need additional mono integration.
+- `dyn FnOnce(...)` — the by-value `call_once(self)` needs the `Box<Self>` receiver exemption (Rust's `where Self: Sized` carve-out). `dyn Fn` and `dyn FnMut` work today.
+- Method-level type-params on dyn dispatch (obj-safety rejects them today; a future generalization could allow them as long as they don't appear in the vtable signature).
+- `dyn Trait` equivalence across distinct compilation contexts (multi-module path normalization beyond the use-scope canonicalization done at use sites).

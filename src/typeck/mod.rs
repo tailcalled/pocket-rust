@@ -6,11 +6,11 @@ use crate::span::{Error, Span};
 
 mod types;
 pub use types::{
-    IntKind, LifetimeRepr, RType, byte_size_of, copy_trait_path, drop_trait_path,
-    int_kind_from_name, numeric_lit_op_traits_for_method, flatten_rtype, int_kind_name, is_copy,
-    is_copy_with_bounds, is_drop, is_raw_ptr, is_sized, is_variant_payload_uninhabited, needs_drop,
-    outer_lifetime, peel_opaque, rtype_contains_param, rtype_eq, rtype_to_string, subst_and_peel,
-    substitute_rtype,
+    DynBound, IntKind, LifetimeRepr, RType, byte_size_of, copy_trait_path, drop_trait_path,
+    dyn_bound_eq, dyn_bounds_eq, int_kind_from_name, numeric_lit_op_traits_for_method,
+    flatten_rtype, int_kind_name, is_copy, is_copy_with_bounds, is_drop, is_raw_ptr, is_sized,
+    is_variant_payload_uninhabited, needs_drop, outer_lifetime, peel_opaque,
+    rtype_contains_param, rtype_eq, rtype_to_string, subst_and_peel, substitute_rtype,
 };
 use types::{int_kind_max, int_kind_neg_magnitude, int_kind_signed, struct_env};
 
@@ -260,9 +260,21 @@ pub(crate) fn infer_to_rtype_for_check(t: &InferType) -> RType {
             ret: Box::new(infer_to_rtype_for_check(ret)),
         },
         InferType::Dyn { bounds, lifetime } => RType::Dyn {
-            bounds: bounds.clone(),
+            bounds: bounds.iter().map(infer_dyn_bound_to_rtype_for_check).collect(),
             lifetime: lifetime.clone(),
         },
+    }
+}
+
+fn infer_dyn_bound_to_rtype_for_check(b: &InferDynBound) -> DynBound {
+    DynBound {
+        trait_path: b.trait_path.clone(),
+        trait_args: b.trait_args.iter().map(infer_to_rtype_for_check).collect(),
+        assoc_bindings: b
+            .assoc_bindings
+            .iter()
+            .map(|(n, t)| (n.clone(), infer_to_rtype_for_check(t)))
+            .collect(),
     }
 }
 
@@ -833,12 +845,21 @@ pub(crate) enum InferType {
         params: Vec<InferType>,
         ret: Box<InferType>,
     },
-    // InferType counterpart of `RType::Dyn`. Carries the same canonical
-    // trait paths + lifetime; unification compares bound paths.
+    // InferType counterpart of `RType::Dyn`. Mirrors the same bound
+    // structure (trait_path, trait_args, assoc_bindings) so dispatch +
+    // coercion can read trait args / assoc bindings during typeck
+    // before everything finalizes back to `RType::Dyn`.
     Dyn {
-        bounds: Vec<Vec<String>>,
+        bounds: Vec<InferDynBound>,
         lifetime: LifetimeRepr,
     },
+}
+
+#[derive(Clone)]
+pub struct InferDynBound {
+    pub trait_path: Vec<String>,
+    pub trait_args: Vec<InferType>,
+    pub assoc_bindings: Vec<(String, InferType)>,
 }
 
 // Build a name → InferType env from a generic struct/template's type-param
@@ -926,9 +947,102 @@ pub(crate) fn rtype_to_infer(rt: &RType) -> InferType {
             ret: Box::new(rtype_to_infer(ret)),
         },
         RType::Dyn { bounds, lifetime } => InferType::Dyn {
-            bounds: bounds.clone(),
+            bounds: bounds.iter().map(rtype_dyn_bound_to_infer).collect(),
             lifetime: lifetime.clone(),
         },
+    }
+}
+
+fn infer_dyn_bound_eq(a: &InferDynBound, b: &InferDynBound) -> bool {
+    if a.trait_path != b.trait_path {
+        return false;
+    }
+    if a.trait_args.len() != b.trait_args.len() {
+        return false;
+    }
+    let mut i = 0;
+    while i < a.trait_args.len() {
+        if !infer_eq(&a.trait_args[i], &b.trait_args[i]) {
+            return false;
+        }
+        i += 1;
+    }
+    if a.assoc_bindings.len() != b.assoc_bindings.len() {
+        return false;
+    }
+    let mut i = 0;
+    while i < a.assoc_bindings.len() {
+        if a.assoc_bindings[i].0 != b.assoc_bindings[i].0
+            || !infer_eq(&a.assoc_bindings[i].1, &b.assoc_bindings[i].1)
+        {
+            return false;
+        }
+        i += 1;
+    }
+    true
+}
+
+fn infer_dyn_bounds_eq(a: &Vec<InferDynBound>, b: &Vec<InferDynBound>) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut i = 0;
+    while i < a.len() {
+        if !infer_dyn_bound_eq(&a[i], &b[i]) {
+            return false;
+        }
+        i += 1;
+    }
+    true
+}
+
+// Best-effort InferType equality — used only for dyn bound comparison.
+// Doesn't unify or substitute through Subst; callers should already
+// have substituted as needed.
+fn infer_eq(a: &InferType, b: &InferType) -> bool {
+    use InferType::*;
+    match (a, b) {
+        (Var(va), Var(vb)) => va == vb,
+        (Int(ka), Int(kb)) => ka == kb,
+        (Bool, Bool) | (Str, Str) | (Never, Never) | (Char, Char) => true,
+        (Param(na), Param(nb)) => na == nb,
+        (Tuple(ea), Tuple(eb)) => {
+            ea.len() == eb.len() && ea.iter().zip(eb.iter()).all(|(x, y)| infer_eq(x, y))
+        }
+        (Struct { path: pa, type_args: aa, .. }, Struct { path: pb, type_args: ab, .. }) => {
+            pa == pb && aa.len() == ab.len() && aa.iter().zip(ab.iter()).all(|(x, y)| infer_eq(x, y))
+        }
+        (Enum { path: pa, type_args: aa, .. }, Enum { path: pb, type_args: ab, .. }) => {
+            pa == pb && aa.len() == ab.len() && aa.iter().zip(ab.iter()).all(|(x, y)| infer_eq(x, y))
+        }
+        (Ref { inner: ia, mutable: ma, .. }, Ref { inner: ib, mutable: mb, .. }) => {
+            ma == mb && infer_eq(ia, ib)
+        }
+        (RawPtr { inner: ia, mutable: ma }, RawPtr { inner: ib, mutable: mb }) => {
+            ma == mb && infer_eq(ia, ib)
+        }
+        (Slice(ia), Slice(ib)) => infer_eq(ia, ib),
+        (AssocProj { base: ba, trait_path: ta, name: na }, AssocProj { base: bb, trait_path: tb, name: nb }) => {
+            ta == tb && na == nb && infer_eq(ba, bb)
+        }
+        (Opaque { fn_path: pa, slot: sa }, Opaque { fn_path: pb, slot: sb }) => pa == pb && sa == sb,
+        (FnPtr { params: pa, ret: ra }, FnPtr { params: pb, ret: rb }) => {
+            pa.len() == pb.len() && pa.iter().zip(pb.iter()).all(|(x, y)| infer_eq(x, y)) && infer_eq(ra, rb)
+        }
+        (Dyn { bounds: ba, .. }, Dyn { bounds: bb, .. }) => infer_dyn_bounds_eq(ba, bb),
+        _ => false,
+    }
+}
+
+fn rtype_dyn_bound_to_infer(b: &DynBound) -> InferDynBound {
+    InferDynBound {
+        trait_path: b.trait_path.clone(),
+        trait_args: b.trait_args.iter().map(rtype_to_infer).collect(),
+        assoc_bindings: b
+            .assoc_bindings
+            .iter()
+            .map(|(n, t)| (n.clone(), rtype_to_infer(t)))
+            .collect(),
     }
 }
 
@@ -1264,7 +1378,7 @@ pub(crate) fn infer_to_string(t: &InferType) -> String {
                 if i > 0 {
                     s.push_str(" + ");
                 }
-                s.push_str(&place_to_string(&bounds[i]));
+                s.push_str(&place_to_string(&bounds[i].trait_path));
                 i += 1;
             }
             s
@@ -1661,7 +1775,7 @@ impl Subst {
                 InferType::Dyn { bounds: ba, .. },
                 InferType::Dyn { bounds: bb, .. },
             ) => {
-                if ba == bb {
+                if infer_dyn_bounds_eq(&ba, &bb) {
                     Ok(())
                 } else {
                     Err(Error {
@@ -1940,7 +2054,21 @@ impl Subst {
                 params: params.iter().map(|p| self.finalize(p)).collect(),
                 ret: Box::new(self.finalize(&ret)),
             },
-            InferType::Dyn { bounds, lifetime } => RType::Dyn { bounds, lifetime },
+            InferType::Dyn { bounds, lifetime } => RType::Dyn {
+                bounds: bounds
+                    .iter()
+                    .map(|b| DynBound {
+                        trait_path: b.trait_path.clone(),
+                        trait_args: b.trait_args.iter().map(|t| self.finalize(t)).collect(),
+                        assoc_bindings: b
+                            .assoc_bindings
+                            .iter()
+                            .map(|(n, t)| (n.clone(), self.finalize(t)))
+                            .collect(),
+                    })
+                    .collect(),
+                lifetime,
+            },
         }
     }
 }
@@ -1961,17 +2089,53 @@ pub fn is_std_box_path(path: &Vec<String>) -> bool {
     path.len() == 3 && path[0] == "std" && path[1] == "boxed" && path[2] == "Box"
 }
 
+// Canonicalize a `dyn`-context trait path. `resolve_type`'s Dyn arm
+// stored a probe-free best-effort canonicalization (use-scope explicit
+// match, otherwise module-relative); that doesn't see glob imports
+// like the stdlib prelude (`use std::*;`), so a bare `Fn` written in
+// user code stays as `[<user-module>, "Fn"]` which `trait_lookup`
+// can't find. Re-canonicalize here with the full `resolve_trait_path`
+// machinery, which probes against TraitTable and handles globs +
+// reexports. Returns the input unchanged if no resolution succeeds —
+// the caller will then surface a clearer "trait not found" error.
+pub fn canonicalize_dyn_trait_path(
+    raw: &Vec<String>,
+    current_module: &Vec<String>,
+    traits: &tables::TraitTable,
+    use_scope: &Vec<UseEntry>,
+    reexports: &ReExportTable,
+    file: &str,
+) -> Vec<String> {
+    let p = crate::ast::Path {
+        segments: raw
+            .iter()
+            .map(|s| crate::ast::PathSegment {
+                name: s.clone(),
+                span: crate::span::Span::new(crate::span::Pos::new(0, 0), crate::span::Pos::new(0, 0)),
+                lifetime_args: Vec::new(),
+                args: Vec::new(),
+            })
+            .collect(),
+        span: crate::span::Span::new(crate::span::Pos::new(0, 0), crate::span::Pos::new(0, 0)),
+    };
+    match setup::resolve_trait_path(&p, current_module, traits, use_scope, reexports, file) {
+        Ok(canon) => canon,
+        Err(_) => raw.clone(),
+    }
+}
+
 // Coercion of a `&T` / `&mut T` / `Box<T>` value into the matching dyn
-// shape. `src_concrete_ty` is the source's concrete `T`; `trait_paths`
-// is the bound list of the target dyn type. `kind` discriminates the
-// outer container so codegen knows whether to emit a fat reference or
-// a fat box. Mono uses the (trait_path, concrete_ty) pair to request
-// vtable construction; codegen emits the data ptr from the source
-// followed by the vtable address as the second word.
+// shape. `src_concrete_ty` is the source's concrete `T`; `bounds` is
+// the trait-bound list of the target dyn type (each carrying
+// `trait_args` + `assoc_bindings`). `kind` discriminates the outer
+// container so codegen knows whether to emit a fat reference or a fat
+// box. Mono uses the (bound, concrete_ty) pair to request vtable
+// construction with the right trait-args; codegen emits the data ptr
+// from the source followed by the vtable address as the second word.
 #[derive(Clone)]
 pub struct DynCoercion {
     pub src_concrete_ty: RType,
-    pub trait_paths: Vec<Vec<String>>,
+    pub bounds: Vec<DynBound>,
     pub kind: DynCoercionKind,
 }
 
@@ -2024,6 +2188,21 @@ pub(crate) fn coerce_at(
     ) = (&actual_resolved, &expected_resolved)
     {
         if let InferType::Dyn { bounds, .. } = e_inner.as_ref() {
+            // The source's inner must NOT itself be a Dyn (that would
+            // be a no-op identity — `&dyn T → &dyn T` — and should go
+            // through normal unify, not trigger a coercion + impl
+            // check that would predictably fail).
+            if matches!(a_inner.as_ref(), InferType::Dyn { .. }) {
+                return ctx.subst.coerce(
+                    actual,
+                    expected,
+                    ctx.traits,
+                    ctx.type_params,
+                    ctx.type_param_bounds,
+                    span,
+                    ctx.current_file,
+                );
+            }
             // `&T` coerces to `&dyn Trait`; `&mut T` coerces to either
             // `&mut dyn Trait` (preserving mutability) or `&dyn Trait`
             // (downgrading). Disallow the reverse — `&T` → `&mut dyn`.
@@ -2034,20 +2213,53 @@ pub(crate) fn coerce_at(
                     span: span.copy(),
                 });
             }
+            // Canonicalize each bound through the full use-scope
+            // resolver (which sees globs + reexports). resolve_type's
+            // probe-free pass leaves bare names like `Fn` un-rewritten.
+            let canon_bounds: Vec<InferDynBound> = bounds
+                .iter()
+                .map(|b| InferDynBound {
+                    trait_path: canonicalize_dyn_trait_path(
+                        &b.trait_path,
+                        ctx.current_module,
+                        ctx.traits,
+                        &ctx.use_scope,
+                        ctx.reexports,
+                        ctx.current_file,
+                    ),
+                    trait_args: b.trait_args.clone(),
+                    assoc_bindings: b.assoc_bindings.clone(),
+                })
+                .collect();
+            let bounds = canon_bounds;
             // Run object-safety on each bound trait.
             let mut i = 0;
             while i < bounds.len() {
-                dyn_safety::check_object_safety(&bounds[i], ctx.traits, span, ctx.current_file)?;
+                dyn_safety::check_object_safety(&bounds[i].trait_path, ctx.traits, span, ctx.current_file)?;
                 i += 1;
             }
             // Resolve the source's concrete type and verify the bound
-            // is implemented for it.
+            // is implemented for it. Synthesized closure structs
+            // (`__closure_N`) get their `Fn`/`FnMut`/`FnOnce` impls
+            // registered post-typeck by `closure_lower`, so the impl
+            // genuinely doesn't exist at this point — skip the check
+            // for closure srcs.
             let src_concrete = ctx.subst.finalize(a_inner);
+            let src_is_closure = matches!(
+                &src_concrete,
+                RType::Struct { path, .. }
+                    if path.last().map(|s| s.starts_with("__closure_")).unwrap_or(false)
+            );
             let mut j = 0;
             while j < bounds.len() {
+                if src_is_closure {
+                    j += 1;
+                    continue;
+                }
+                let trait_args_rt: Vec<RType> = bounds[j].trait_args.iter().map(|t| ctx.subst.finalize(t)).collect();
                 let solved = traits::solve_impl_with_args(
-                    &bounds[j],
-                    &Vec::new(),
+                    &bounds[j].trait_path,
+                    &trait_args_rt,
                     &src_concrete,
                     ctx.traits,
                     0,
@@ -2057,9 +2269,9 @@ pub(crate) fn coerce_at(
                         file: ctx.current_file.to_string(),
                         message: format!(
                             "cannot coerce to `&dyn {}`: type `{}` does not implement `{}`",
-                            place_to_string(&bounds[j]),
+                            place_to_string(&bounds[j].trait_path),
                             rtype_to_string(&src_concrete),
-                            place_to_string(&bounds[j]),
+                            place_to_string(&bounds[j].trait_path),
                         ),
                         span: span.copy(),
                     });
@@ -2071,9 +2283,21 @@ pub(crate) fn coerce_at(
             // matching `DynCoercion` to know how to build the fat ref.
             let id = expr_id as usize;
             if id < ctx.dyn_coercions.len() {
+                let bounds_rt: Vec<DynBound> = bounds
+                    .iter()
+                    .map(|b| DynBound {
+                        trait_path: b.trait_path.clone(),
+                        trait_args: b.trait_args.iter().map(|t| ctx.subst.finalize(t)).collect(),
+                        assoc_bindings: b
+                            .assoc_bindings
+                            .iter()
+                            .map(|(n, t)| (n.clone(), ctx.subst.finalize(t)))
+                            .collect(),
+                    })
+                    .collect();
                 ctx.dyn_coercions[id] = Some(DynCoercion {
                     src_concrete_ty: src_concrete,
-                    trait_paths: bounds.clone(),
+                    bounds: bounds_rt,
                     kind: DynCoercionKind::Ref,
                 });
             }
@@ -2099,17 +2323,43 @@ pub(crate) fn coerce_at(
                 // The source's type-arg must NOT itself be Dyn (that
                 // would be a no-op identity, handled by normal unify).
                 if !matches!(&a_args[0], InferType::Dyn { .. }) {
+                    let canon_bounds: Vec<InferDynBound> = bounds
+                        .iter()
+                        .map(|b| InferDynBound {
+                            trait_path: canonicalize_dyn_trait_path(
+                                &b.trait_path,
+                                ctx.current_module,
+                                ctx.traits,
+                                &ctx.use_scope,
+                                ctx.reexports,
+                                ctx.current_file,
+                            ),
+                            trait_args: b.trait_args.clone(),
+                            assoc_bindings: b.assoc_bindings.clone(),
+                        })
+                        .collect();
+                    let bounds = canon_bounds;
                     let mut i = 0;
                     while i < bounds.len() {
-                        dyn_safety::check_object_safety(&bounds[i], ctx.traits, span, ctx.current_file)?;
+                        dyn_safety::check_object_safety(&bounds[i].trait_path, ctx.traits, span, ctx.current_file)?;
                         i += 1;
                     }
                     let src_concrete = ctx.subst.finalize(&a_args[0]);
+                    let src_is_closure = matches!(
+                        &src_concrete,
+                        RType::Struct { path, .. }
+                            if path.last().map(|s| s.starts_with("__closure_")).unwrap_or(false)
+                    );
                     let mut j = 0;
                     while j < bounds.len() {
+                        if src_is_closure {
+                            j += 1;
+                            continue;
+                        }
+                        let trait_args_rt: Vec<RType> = bounds[j].trait_args.iter().map(|t| ctx.subst.finalize(t)).collect();
                         let solved = traits::solve_impl_with_args(
-                            &bounds[j],
-                            &Vec::new(),
+                            &bounds[j].trait_path,
+                            &trait_args_rt,
                             &src_concrete,
                             ctx.traits,
                             0,
@@ -2119,9 +2369,9 @@ pub(crate) fn coerce_at(
                                 file: ctx.current_file.to_string(),
                                 message: format!(
                                     "cannot coerce to `Box<dyn {}>`: type `{}` does not implement `{}`",
-                                    place_to_string(&bounds[j]),
+                                    place_to_string(&bounds[j].trait_path),
                                     rtype_to_string(&src_concrete),
-                                    place_to_string(&bounds[j]),
+                                    place_to_string(&bounds[j].trait_path),
                                 ),
                                 span: span.copy(),
                             });
@@ -2130,9 +2380,21 @@ pub(crate) fn coerce_at(
                     }
                     let id = expr_id as usize;
                     if id < ctx.dyn_coercions.len() {
+                        let bounds_rt: Vec<DynBound> = bounds
+                            .iter()
+                            .map(|b| DynBound {
+                                trait_path: b.trait_path.clone(),
+                                trait_args: b.trait_args.iter().map(|t| ctx.subst.finalize(t)).collect(),
+                                assoc_bindings: b
+                                    .assoc_bindings
+                                    .iter()
+                                    .map(|(n, t)| (n.clone(), ctx.subst.finalize(t)))
+                                    .collect(),
+                            })
+                            .collect();
                         ctx.dyn_coercions[id] = Some(DynCoercion {
                             src_concrete_ty: src_concrete,
-                            trait_paths: bounds.clone(),
+                            bounds: bounds_rt,
                             kind: DynCoercionKind::BoxOwned,
                         });
                     }
@@ -3320,7 +3582,7 @@ fn rtype_to_infer_with_opaque_vars(
             ret: Box::new(rtype_to_infer_with_opaque_vars(ret, subst, out)),
         },
         RType::Dyn { bounds, lifetime } => InferType::Dyn {
-            bounds: bounds.clone(),
+            bounds: bounds.iter().map(rtype_dyn_bound_to_infer).collect(),
             lifetime: lifetime.clone(),
         },
     }
@@ -6703,6 +6965,224 @@ fn typeparam_fn_signature(
 // `InferType::Param(name)` rather than a synthesized closure struct,
 // and the bare-call records the binding name on side tables so mono
 // lowers as the right method-call shape.
+// If `t` is `&dyn Trait` / `&mut dyn Trait` / `Box<dyn Trait>`, return
+// the dyn bounds, recv mutability (true if &mut dyn or Box<dyn>), and
+// a flag indicating Box receiver. Otherwise None.
+fn extract_dyn_fn_bounds(t: &InferType) -> Option<(Vec<InferDynBound>, bool, bool)> {
+    if let InferType::Ref { inner, mutable, .. } = t {
+        if let InferType::Dyn { bounds, .. } = inner.as_ref() {
+            return Some((bounds.clone(), *mutable, false));
+        }
+    }
+    if let InferType::Struct { path, type_args, .. } = t {
+        if is_std_box_path(path) && type_args.len() == 1 {
+            if let InferType::Dyn { bounds, .. } = &type_args[0] {
+                return Some((bounds.clone(), true, true));
+            }
+        }
+    }
+    None
+}
+
+// `f(args)` where `f: &dyn Fn(...) -> R` / `&mut dyn FnMut(...) -> R`
+// / `Box<dyn Fn(...) -> R>`. Routes through DynMethodDispatch on the
+// appropriate Fn-family trait method.
+fn check_bare_dyn_fn_call(
+    ctx: &mut CheckCtx,
+    call: &Call,
+    call_expr: &Expr,
+    binding_name: String,
+    bounds: Vec<InferDynBound>,
+    recv_mut: bool,
+    _recv_is_box: bool,
+) -> Result<InferType, Error> {
+    if bounds.len() != 1 {
+        return Err(Error {
+            file: ctx.current_file.to_string(),
+            message: "bare-call dispatch on multi-bound `dyn` types not supported".to_string(),
+            span: call_expr.span.copy(),
+        });
+    }
+    // Canonicalize and check the bound is a Fn-family trait.
+    let trait_path = canonicalize_dyn_trait_path(
+        &bounds[0].trait_path,
+        ctx.current_module,
+        ctx.traits,
+        &ctx.use_scope,
+        ctx.reexports,
+        ctx.current_file,
+    );
+    let family_name = trait_path.last().cloned().unwrap_or_default();
+    let method_name = match family_name.as_str() {
+        "Fn" => "call",
+        "FnMut" => "call_mut",
+        "FnOnce" => "call_once",
+        _ => return Err(Error {
+            file: ctx.current_file.to_string(),
+            message: format!(
+                "cannot call `{}`: type `&dyn {}` is not callable (no Fn-family trait)",
+                binding_name,
+                place_to_string(&trait_path),
+            ),
+            span: call_expr.span.copy(),
+        }),
+    };
+    let entry = match tables::trait_lookup(ctx.traits, &trait_path) {
+        Some(e) => e,
+        None => return Err(Error {
+            file: ctx.current_file.to_string(),
+            message: format!("trait `{}` not found", place_to_string(&trait_path)),
+            span: call_expr.span.copy(),
+        }),
+    };
+    let mut method_idx: Option<usize> = None;
+    let mut k = 0;
+    while k < entry.methods.len() {
+        if entry.methods[k].name == method_name {
+            method_idx = Some(k);
+            break;
+        }
+        k += 1;
+    }
+    let method_idx = method_idx.expect("Fn-family trait should declare its method");
+    let method = &entry.methods[method_idx];
+    // Pull args from the dyn type's bounds[0].trait_args — Fn family's
+    // first trait-arg is the `(T1, T2, ...)` tuple of param types.
+    let args_tuple = match bounds[0].trait_args.first() {
+        Some(InferType::Tuple(elems)) => elems.clone(),
+        _ => Vec::new(),
+    };
+    if call.args.len() != args_tuple.len() {
+        return Err(Error {
+            file: ctx.current_file.to_string(),
+            message: format!(
+                "wrong number of arguments to `{}`: expected {}, got {}",
+                binding_name,
+                args_tuple.len(),
+                call.args.len(),
+            ),
+            span: call_expr.span.copy(),
+        });
+    }
+    // Type-check args.
+    let mut a = 0;
+    while a < call.args.len() {
+        let at = check_expr(ctx, &call.args[a])?;
+        coerce_at(ctx, call.args[a].id, &at, &args_tuple[a], &call.args[a].span)?;
+        a += 1;
+    }
+    // Resolve the return type: method.return_type is `Self::Output`
+    // (an AssocProj). Substitute via the dyn type's assoc bindings.
+    let ret_rt = method
+        .return_type
+        .clone()
+        .unwrap_or(RType::Tuple(Vec::new()));
+    let assoc_bindings_rt: Vec<(String, RType)> = bounds[0]
+        .assoc_bindings
+        .iter()
+        .map(|(n, t)| (n.clone(), ctx.subst.finalize(t)))
+        .collect();
+    let ret_rt = substitute_self_assoc(&ret_rt, &assoc_bindings_rt);
+    // Method param types (skip receiver at index 0): also substitute.
+    // For Fn the second param is `Args: (T1, T2, ...)`; substitute the
+    // trait_arg `Args` slot via the dyn type's `trait_args` tuple.
+    let trait_args_rt: Vec<RType> = bounds[0]
+        .trait_args
+        .iter()
+        .map(|t| ctx.subst.finalize(t))
+        .collect();
+    let method_param_types: Vec<RType> = method
+        .param_types
+        .iter()
+        .skip(1)
+        .map(|t| {
+            let t = substitute_self_assoc(t, &assoc_bindings_rt);
+            substitute_trait_args(&t, &entry.trait_type_params, &trait_args_rt)
+        })
+        .collect();
+    let id = call_expr.id as usize;
+    if id < ctx.dyn_method_calls.len() {
+        ctx.dyn_method_calls[id] = Some(DynMethodDispatch {
+            trait_path,
+            method_idx: method_idx as u32,
+            method_param_types,
+            method_return_type: ret_rt.clone(),
+            recv_mut,
+        });
+    }
+    // The receiver binding for codegen — same as bare_closure_calls.
+    if id < ctx.bare_closure_calls.len() {
+        ctx.bare_closure_calls[id] = Some(binding_name);
+    }
+    Ok(rtype_to_infer(&ret_rt))
+}
+
+// Substitute `<Self as ?>::Name` → `binding_value` from
+// `assoc_bindings`. Only matches the assoc-projection shape with
+// Self base; leaves everything else unchanged.
+fn substitute_self_assoc(t: &RType, assoc_bindings: &Vec<(String, RType)>) -> RType {
+    match t {
+        RType::AssocProj { base, name, .. } => {
+            if matches!(base.as_ref(), RType::Param(n) if n == "Self") {
+                for (bname, btype) in assoc_bindings {
+                    if bname == name {
+                        return btype.clone();
+                    }
+                }
+            }
+            // No match — recurse into base.
+            RType::AssocProj {
+                base: Box::new(substitute_self_assoc(base, assoc_bindings)),
+                trait_path: match t {
+                    RType::AssocProj { trait_path, .. } => trait_path.clone(),
+                    _ => Vec::new(),
+                },
+                name: name.clone(),
+            }
+        }
+        RType::Ref { inner, mutable, lifetime } => RType::Ref {
+            inner: Box::new(substitute_self_assoc(inner, assoc_bindings)),
+            mutable: *mutable,
+            lifetime: lifetime.clone(),
+        },
+        RType::RawPtr { inner, mutable } => RType::RawPtr {
+            inner: Box::new(substitute_self_assoc(inner, assoc_bindings)),
+            mutable: *mutable,
+        },
+        RType::Tuple(elems) => RType::Tuple(
+            elems.iter().map(|e| substitute_self_assoc(e, assoc_bindings)).collect()
+        ),
+        RType::Struct { path, type_args, lifetime_args } => RType::Struct {
+            path: path.clone(),
+            type_args: type_args.iter().map(|a| substitute_self_assoc(a, assoc_bindings)).collect(),
+            lifetime_args: lifetime_args.clone(),
+        },
+        RType::Enum { path, type_args, lifetime_args } => RType::Enum {
+            path: path.clone(),
+            type_args: type_args.iter().map(|a| substitute_self_assoc(a, assoc_bindings)).collect(),
+            lifetime_args: lifetime_args.clone(),
+        },
+        RType::Slice(inner) => RType::Slice(Box::new(substitute_self_assoc(inner, assoc_bindings))),
+        RType::FnPtr { params, ret } => RType::FnPtr {
+            params: params.iter().map(|p| substitute_self_assoc(p, assoc_bindings)).collect(),
+            ret: Box::new(substitute_self_assoc(ret, assoc_bindings)),
+        },
+        _ => t.clone(),
+    }
+}
+
+// Substitute trait-level type-params (`Args` in `Fn<Args>`) using the
+// dyn type's trait_args. Maps each `RType::Param(name)` whose name is
+// in `trait_type_params` to the matching `trait_args` entry.
+fn substitute_trait_args(t: &RType, trait_type_params: &Vec<String>, trait_args: &Vec<RType>) -> RType {
+    let env: Vec<(String, RType)> = trait_type_params
+        .iter()
+        .zip(trait_args.iter())
+        .map(|(n, t)| (n.clone(), t.clone()))
+        .collect();
+    substitute_rtype(t, &env)
+}
+
 fn check_bare_typeparam_fn_call(
     ctx: &mut CheckCtx,
     call: &Call,
@@ -6838,6 +7318,17 @@ fn check_call(ctx: &mut CheckCtx, call: &Call, call_expr: &Expr) -> Result<Infer
                         return_type,
                     );
                 }
+            }
+            // Local of `&dyn Fn(...)` / `&mut dyn FnMut(...)` /
+            // `Box<dyn Fn(...)>` type — dispatch as a dyn-method call
+            // on `call`/`call_mut`/`call_once`. The dyn type's bound
+            // list carries the `Args` tuple (positional trait_args)
+            // and `Output` (assoc binding) needed to substitute the
+            // method signature.
+            if let Some((bounds, recv_mut, recv_is_box)) = extract_dyn_fn_bounds(&resolved) {
+                return check_bare_dyn_fn_call(
+                    ctx, call, call_expr, name, bounds, recv_mut, recv_is_box,
+                );
             }
             return Err(Error {
                 file: ctx.current_file.to_string(),

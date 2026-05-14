@@ -208,19 +208,71 @@ pub enum RType {
         params: Vec<RType>,
         ret: Box<RType>,
     },
-    // `dyn TraitA + TraitB + 'a` — trait object DST. `bounds` is the
-    // list of trait paths (resolved to canonical paths) the object
-    // satisfies; `lifetime` is the optional `+ 'a` carry. **Unsized**:
-    // bare `Dyn` is rejected by `byte_size_of`/`flatten_rtype`. Valid
-    // only as the inner of `Ref { inner: Dyn(_), .. }` (or, later,
-    // `Box<dyn _>`), in which case the surface ref is a fat pointer
-    // (data ptr + vtable ptr). Two `Dyn` types are equal iff the
-    // bound paths match in order — pocket-rust doesn't normalize
+    // `dyn TraitA + TraitB + 'a` — trait object DST. Each bound carries
+    // its trait path, positional trait-args (`Fn<(u32,)>` → `[Tuple([u32])]`),
+    // and associated-type bindings (`Fn(u32) -> u32` sugar produces
+    // `Output = u32`). The bindings make `Self::AssocName` projections
+    // resolvable at dispatch time without knowing the concrete impl —
+    // every impl of `dyn Fn(u32) -> u32` MUST set `Output = u32`, so the
+    // dispatch-side substitution is unambiguous.
+    //
+    // **Unsized**: bare `Dyn` is rejected by `byte_size_of` /
+    // `flatten_rtype`. Valid only as the inner of `Ref { inner: Dyn(_),
+    // .. }` or `Box<dyn _>`, in which case the surface container is a
+    // fat pointer (data ptr + vtable ptr).
+    //
+    // Two `Dyn` types are equal iff every bound matches (path, args,
+    // sorted assoc-bindings) in order. Pocket-rust doesn't normalize
     // multi-trait order today.
     Dyn {
-        bounds: Vec<Vec<String>>,
+        bounds: Vec<DynBound>,
         lifetime: LifetimeRepr,
     },
+}
+
+#[derive(Clone)]
+pub struct DynBound {
+    pub trait_path: Vec<String>,
+    // Positional trait-args, e.g. `[Tuple([u32])]` for `Fn<(u32,)>`.
+    pub trait_args: Vec<RType>,
+    // Associated-type bindings, e.g. `[("Output", u32)]` for `Fn(u32) -> u32`.
+    pub assoc_bindings: Vec<(String, RType)>,
+}
+
+pub fn dyn_bound_eq(a: &DynBound, b: &DynBound) -> bool {
+    if a.trait_path != b.trait_path {
+        return false;
+    }
+    if !rtype_vec_eq(&a.trait_args, &b.trait_args) {
+        return false;
+    }
+    if a.assoc_bindings.len() != b.assoc_bindings.len() {
+        return false;
+    }
+    let mut i = 0;
+    while i < a.assoc_bindings.len() {
+        if a.assoc_bindings[i].0 != b.assoc_bindings[i].0
+            || !rtype_eq(&a.assoc_bindings[i].1, &b.assoc_bindings[i].1)
+        {
+            return false;
+        }
+        i += 1;
+    }
+    true
+}
+
+pub fn dyn_bounds_eq(a: &Vec<DynBound>, b: &Vec<DynBound>) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut i = 0;
+    while i < a.len() {
+        if !dyn_bound_eq(&a[i], &b[i]) {
+            return false;
+        }
+        i += 1;
+    }
+    true
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -321,12 +373,13 @@ pub fn rtype_eq(a: &RType, b: &RType) -> bool {
             RType::FnPtr { params: pa, ret: ra },
             RType::FnPtr { params: pb, ret: rb },
         ) => rtype_vec_eq(pa, pb) && rtype_eq(ra, rb),
-        // Two trait objects are equal iff their bound paths match in
-        // declaration order. Lifetime carry is structural-only today.
+        // Two trait objects are equal iff each bound matches (trait_path,
+        // trait_args, assoc_bindings) in order. Lifetime carry is
+        // structural-only today.
         (
             RType::Dyn { bounds: ba, .. },
             RType::Dyn { bounds: bb, .. },
-        ) => ba == bb,
+        ) => dyn_bounds_eq(ba, bb),
         _ => false,
     }
 }
@@ -464,7 +517,7 @@ pub fn rtype_to_string(t: &RType) -> String {
                 if i > 0 {
                     s.push_str(" + ");
                 }
-                s.push_str(&place_to_string(&bounds[i]));
+                s.push_str(&place_to_string(&bounds[i].trait_path));
                 i += 1;
             }
             s
